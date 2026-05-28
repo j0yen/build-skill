@@ -160,19 +160,39 @@ cmd_changelog_prepend() {
     || die "usage: changelog-prepend <build_into> <version> <tldr_file>" 1
   [ -f "$tldr_file" ] || die "tldr file not found: $tldr_file" 2
   local clog="$target/CHANGELOG.md"
-  local date_today
+  local date_today tldr_body
   date_today="$(date -u +%Y-%m-%d)"
-  local new_section
-  new_section="$(printf '## v%s — %s\n\n%s\n\n' "$version" "$date_today" "$(cat "$tldr_file")")"
+  tldr_body="$(cat "$tldr_file")"
+  # Fix per PRD-build-changelog-prepend-fix: previous impl used $() to
+  # assemble the new section, which strips trailing newlines and mashes
+  # the new section into the existing # Changelog header. awk preserves
+  # an existing top-level header at line 1 and slots the new section
+  # immediately under it.
   if [ -f "$clog" ]; then
-    {
-      printf '%s' "$new_section"
-      cat "$clog"
-    } > "$clog.new" && mv "$clog.new" "$clog"
+    awk -v ver="$version" -v dt="$date_today" -v body="$tldr_body" '
+      BEGIN { stripped_header = 0; printed_new = 0 }
+      NR == 1 && /^#[[:space:]]+([Cc]hangelog|CHANGELOG)[[:space:]]*$/ {
+        print
+        stripped_header = 1
+        next
+      }
+      NR == 2 && stripped_header && /^[[:space:]]*$/ { print; next }
+      !printed_new {
+        if (!stripped_header) {
+          print "# Changelog"
+          print ""
+        }
+        print "## v" ver " — " dt
+        print ""
+        print body
+        print ""
+        printed_new = 1
+      }
+      { print }
+    ' "$clog" > "$clog.new" && mv "$clog.new" "$clog"
   else
     {
-      printf '# Changelog\n\n'
-      printf '%s' "$new_section"
+      printf '# Changelog\n\n## v%s — %s\n\n%s\n' "$version" "$date_today" "$tldr_body"
     } > "$clog"
   fi
   printf '%s\n' "$clog"
