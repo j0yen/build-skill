@@ -21,7 +21,7 @@ JQ="${JQ:-/usr/sbin/jq}"
 [ -x "$JQ" ] || { echo "jq not at $JQ" >&2; exit 1; }
 
 emit_one() {
-  local path="$1" slug status_line build_auto build_target build_priority build_into build_version_bump
+  local path="$1" slug status_line build_auto build_target build_priority build_into build_version_bump deferred_acs deferred_ac_reasons
   slug="$(basename "$path" .md)"
   slug="${slug#PRD-}"
 
@@ -34,6 +34,13 @@ emit_one() {
   build_priority=null
   build_into=null
   build_version_bump=null
+  # Per PRD-build-deferred-acs.md AC1: PRDs may declare ground-truth ACs
+  # that /build cannot mechanically verify. Defaults are empty so all
+  # existing PRDs behave unchanged (no-deferral path = current behavior).
+  # Only inline-list form supported here (e.g. `deferred_acs: [1, 3, 5]`);
+  # block-list form lands with deferred_ac_reasons parsing in a later tick.
+  deferred_acs="[]"
+  deferred_ac_reasons="{}"
   status_line=""
 
   # Look at the first 80 lines for the keys we care about. Tolerant of
@@ -42,7 +49,7 @@ emit_one() {
   # the parse. First-match-wins for build_* keys so real frontmatter
   # always beats later in-doc examples.
   local in_fence=false
-  local seen_target=false seen_priority=false seen_into=false seen_bump=false
+  local seen_target=false seen_priority=false seen_into=false seen_bump=false seen_deferred=false
   # strip leading ws, trailing ws, trailing inline-comment (` #...`), surrounding quotes
   strip_val() {
     printf '%s' "$1" | sed -E 's/^[[:space:]]*//;s/[[:space:]]+#.*$//;s/[[:space:]]*$//;s/^"//;s/"$//'
@@ -77,6 +84,31 @@ emit_one() {
         [ -n "$v" ] && build_version_bump="\"$v\""
         seen_bump=true
         ;;
+      "deferred_acs:"*)
+        # Inline-list form only: `deferred_acs: [1, 3, 5]`. Strip the
+        # `deferred_acs:` prefix, then the surrounding brackets, split on
+        # commas, keep digits-only tokens, join into a JSON array. Anything
+        # not matching this shape parses to `[]` — same as absent.
+        [ "$seen_deferred" = true ] && continue
+        v="$(strip_val "$(printf '%s' "$line" | sed -E 's/^deferred_acs[[:space:]]*:[[:space:]]*//')")"
+        # require leading `[` and trailing `]` — otherwise treat as no-op
+        case "$v" in
+          '['*']')
+            inner="${v#\[}"; inner="${inner%\]}"
+            csv=""
+            IFS=',' read -ra toks <<<"$inner"
+            for t in "${toks[@]}"; do
+              tt="$(printf '%s' "$t" | sed -E 's/^[[:space:]]+//;s/[[:space:]]+$//')"
+              case "$tt" in
+                ''|*[!0-9]*) continue ;;
+                *) csv+="${csv:+,}$tt" ;;
+              esac
+            done
+            deferred_acs="[$csv]"
+            ;;
+        esac
+        seen_deferred=true
+        ;;
       "**Status:**"*|"Status:"*|"**Status**"*|"## Status"*)
         [ -z "$status_line" ] && status_line="$(printf '%s' "$line" | sed 's/[*#]//g; s/^[[:space:]]*//; s/[[:space:]]*$//')"
         ;;
@@ -97,10 +129,12 @@ emit_one() {
     --argjson build_priority "$build_priority" \
     --argjson build_into "$build_into" \
     --argjson build_version_bump "$build_version_bump" \
+    --argjson deferred_acs "$deferred_acs" \
+    --argjson deferred_ac_reasons "$deferred_ac_reasons" \
     --arg status_line "$status_line" \
     --argjson size "$size" \
     --arg mtime "$mtime" \
-    '{slug:$slug, path:$path, build_auto:$build_auto, build_target:$build_target, build_priority:$build_priority, build_into:$build_into, build_version_bump:$build_version_bump, status_line:$status_line, size_bytes:$size, mtime_iso:$mtime}'
+    '{slug:$slug, path:$path, build_auto:$build_auto, build_target:$build_target, build_priority:$build_priority, build_into:$build_into, build_version_bump:$build_version_bump, deferred_acs:$deferred_acs, deferred_ac_reasons:$deferred_ac_reasons, status_line:$status_line, size_bytes:$size, mtime_iso:$mtime}'
 }
 
 # Use find -maxdepth 1 so PRDs-archive/ doesn't sneak in.
