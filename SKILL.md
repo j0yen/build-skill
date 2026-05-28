@@ -174,9 +174,20 @@ by one well-defined step. Stop after the action.
   `scripts/extend-handler.sh install <build_into>`. Bin reinstalls to
   `~/.local/bin/` if the crate has a `[[bin]]` (or single-bin
   convention). Counts as one tick action.
-- **push** [rust-extend only]: `git push` to existing `origin`
-  (no force, no new remote). Counts as one tick action and bumps
-  `budget.used.commits`. Skip if no `origin` configured.
+- **push** [rust-extend only]: `wm-push --slug <slug>` from inside
+  `<build_into>`. `wm-push` (installed at `~/.local/bin/wm-push` per
+  PRD-build-push-allowlist) wraps `git push origin <branch>` with a
+  slug-regex + allow-list + origin-URL match + branch-equals-current
+  + fast-forward + ≥1-commit-ahead guard, and has a settings.json
+  allow rule (`Bash(wm-push:*)`) so it doesn't trigger the auto-mode
+  classifier on every tick. If `wm-push` is not on `$PATH`, log
+  `wm-push-missing` to the journal and set the manifest entry's
+  `next: interactive-push` so a human can finish. Same `next:
+  investigate-push-guard-failure` shape if `wm-push` exits 2 with a
+  guard rejection (distinguish from classifier blocks). New slugs
+  need to be added to the `ALLOW` array near the top of `wm-push` —
+  keep it in sync with `wm-publish`'s ALLOW and `~/wintermute/REPOS.md`.
+  Counts as one tick action and bumps `budget.used.commits`.
 - **install / wire** [new-repo only]: When implementation is locally
   green (tests pass, `cargo test --release` ok), install built binaries
   to `~/.local/bin/` via `install -Dm755`. If the PRD includes hooks,
