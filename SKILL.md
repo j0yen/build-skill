@@ -195,15 +195,25 @@ by one well-defined step. Stop after the action.
   `manifest.<slug>.last_error`, and surface for the next reflect
   cycle. The watch state is cheap to keep across ticks; only `wchg
   reset` after the PRD ships.
-- **publish** [new-repo only — never for rust-extend]: Create the GitHub repo:
+- **publish** [new-repo only — never for rust-extend]: Create the GitHub repo via the `wm-publish` wrapper:
   ```
-  gh repo create j0yen/<slug> --public --source=. --remote=origin --push \
-    --description="<one line from the PRD>"
+  wm-publish --slug <slug> --description "<one line from the PRD>"
   ```
-  Write the initial `README.md` from the PRD's TL;DR + acceptance tests
-  + an "Install" block. Update `~/wintermute/REPOS.md` with a one-line
-  entry under the appropriate category section. Bump
-  `budget.used.repos_created`.
+  `wm-publish` (installed at `~/.local/bin/wm-publish` per
+  PRD-build-publish-allowlist) wraps `gh repo create j0yen/<slug>
+  --public --source=. --remote=origin --push --description=…` with a
+  slug-regex + allow-list guard, and has a settings.json allow rule
+  (`Bash(wm-publish:*)`) so it doesn't trigger the auto-mode
+  classifier on every tick. If `wm-publish` is not on `$PATH`, log
+  `wm-publish-missing` to the journal and skip the publish step (the
+  PRD stays `in_progress` for the next reflect). New slugs need to be
+  added to the `ALLOW` array near the top of `wm-publish` — keep it
+  in sync with `~/wintermute/REPOS.md`.
+
+  After the publish lands, write the initial `README.md` from the
+  PRD's TL;DR + acceptance tests + an "Install" block. Update
+  `~/wintermute/REPOS.md` with a one-line entry under the appropriate
+  category section. Bump `budget.used.repos_created`.
 - **archive**: When the PRD passes the **verified-completed** checklist
   (all five must hold), move the PRD to
   `~/wintermute/autobuilder/PRDs-archive/` via `git mv`, update manifest
