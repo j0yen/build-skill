@@ -86,6 +86,12 @@ Build a candidate pool in priority order:
    longer consulted).
 3. None → "nothing to do," log, exit.
 
+Within both buckets, sort by `build_priority` descending
+(`high` > `normal` > `low`; null counts as `normal`), then by
+`last_modified` ascending (oldest queued first within a priority).
+PRDs the user has explicitly bumped to `build_priority: high` get
+picked before their normal-priority siblings.
+
 Then pick **up to 5 PRDs** from the pool that mutually satisfy the
 parallel-dispatch rules in the "Parallelism" section (no shared
 `build_into`, ≤1 kernel-extend, ≤1 reflect-eligible). Fewer than 5 is
