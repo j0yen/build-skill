@@ -413,7 +413,27 @@ admitted ones, stop at 5 or end-of-pool.
 Issue the selected PRDs as **parallel Agent tool calls in a single
 tool-use message**, one Agent call per PRD. Use
 `subagent_type=general-purpose` unless the PRD frontmatter declares
-otherwise. Each agent prompt must include, self-contained:
+otherwise.
+
+**Model override (added 2026-05-28).** Dispatch each branch with
+`model: "sonnet"`. Branch work is well-specified PRD execution behind a
+gate (cargo test / the autobuilder 7-receipt gate catches errors), which
+is Sonnet's sweet spot — running branches on Opus burns tokens without a
+quality gain the gate can't already enforce. The parent tick orchestrator
+(this skill, selecting/dispatching/journaling) stays on the session model
+(Opus) — it makes the judgment calls. **Escalate a branch to
+`model: "opus"`** when any of:
+- the PRD declares `build_priority: high` AND its shape is architectural /
+  ambiguous (new subsystem, cross-cutting design), not a mechanical extend;
+- `build_target: kernel-extend` (hand-written C, subtle, no autobuilder
+  gate — wants the stronger model);
+- the PRD's manifest entry shows it failed or stalled on a prior tick
+  (`last_error` set, or `ticks_invested ≥ 3` with no status change) —
+  retry one tier up before giving up.
+Pass the chosen model via the Agent call's `model` field. When unsure,
+default to Sonnet; the escalation list is the only reason to go Opus.
+
+Each agent prompt must include, self-contained:
 
 - The PRD's absolute path.
 - The PRD's slug.
