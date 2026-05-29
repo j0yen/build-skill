@@ -456,7 +456,18 @@ parallel. Do not chain follow-up Agent calls in the same tick.
 
 - `tick.lock` — parent holds for the whole tick (existing behavior).
 - `state/prd-<slug>.lock` — each branch holds for its Phase 4–7 work.
-  `flock -n`; on failure skip + log.
+  `flock -n`; on failure skip + log. **The lock MUST be tied to the
+  branch agent's own process** — wrap the work as
+  `flock -n state/prd-<slug>.lock <agent-command>` (or hold the fd open
+  9>) so it auto-releases the instant the agent exits. **NEVER hold it
+  via a detached guard like `flock -n <lock> sleep 3600 &`** — if the
+  agent dies, the orphaned `sleep` (reparented to init) keeps the lock
+  for the full hour and every later tick silently skips the PRD on
+  `prd-lock-held` (observed 2026-05-29: autobuilder-publish wedged 40min,
+  0 ticks). **Stale-lock reclaim:** before honoring `prd-lock-held`, a
+  tick checks the holder — if `fuser` shows no process, or the holder's
+  parent is PID 1 (orphan), reclaim the lock (kill the orphan if it's a
+  bare `sleep`) and proceed; the PRD is not actually being worked.
 - `state/manifest.lock` — held briefly (sub-second) by each branch
   around manifest read-modify-write. `flock` blocking.
 - `<repo>/.git/autobuilder-integrate.lock` — held (blocking, ≤120s) by
