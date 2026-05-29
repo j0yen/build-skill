@@ -159,7 +159,9 @@ in this tick's selection run in parallel via Agent tool calls
   cargo + writing src/tests/ files directly with cwd = `build_into`.
   Do NOT init a new repo, do NOT overwrite existing src files (extend,
   don't replace). Record `output_repo_path` = `build_into` in the
-  manifest.
+  manifest. **If this branch shares `build_into` with another branch
+  this tick, cwd is the worktree from `worktree-extend.sh add <build_into>
+  <slug>`, NOT `build_into` itself** (see "Worktree isolation").
 - **iter-1 (kernel-extend)** [kernel-extend only]: do NOT call
   `/autobuilder`. Hand-write the kernel C source per the PRD spec:
   drop new C file(s) into `<build_into>/` (e.g.
@@ -183,7 +185,10 @@ in this tick's selection run in parallel via Agent tool calls
   <bump>` (bump from manifest `version_bump`, default minor), then
   commit with the Joe Yen identity. Commit subject:
   `"<crate>: v<new-version> — <one-line from PRD title>"`. Counts as
-  one tick action.
+  one tick action. **Shared-target branches do NOT do this in place** —
+  they commit implementation-only on their worktree branch, and the
+  version bump + commit happen at `worktree-extend.sh integrate` time
+  (serial, locked) so stacked branches increment cleanly.
 - **changelog & install** [rust-extend only]: extract the PRD's TL;DR
   into a tempfile, run `scripts/extend-handler.sh changelog-prepend
   <build_into> <new-version> <tldr-file>` then
@@ -381,9 +386,16 @@ only the per-tick fan-out grew (1 → 5). User instruction
 After the existing priority sort, pick up to 5 PRDs that mutually
 satisfy:
 
-1. **No shared `build_into`** — rust-extend and kernel-extend targets
-   serialize on disk; running two branches that mutate the same crate
-   races cargo locks and git index. Skip the lower-priority one.
+1. **Shared `build_into` → isolate with worktrees, don't serialize.**
+   Two branches mutating the same crate in place would race cargo locks
+   and the git index. Instead, when ≥2 selected rust-extend PRDs share a
+   `build_into`, each runs in its own git worktree (separate index, tree,
+   and `target/`) — see "Worktree isolation" below. This is the fix for
+   the recall/agorabus/episodic-observer clusters that used to serialize
+   one-per-tick behind a single repo. **Sub-cap: ≤3 same-target branches
+   per tick** — parallel cargo builds of a heavy-dep crate (e.g. recall's
+   fastembed) are memory-hungry; 3 bounds the blast radius. Kernel-extend
+   targets are exempt from worktree fan-out (rule 2 already caps them).
 2. **≤1 `build_target: kernel-extend` per tick** — the kernel
    `makepkg` build saturates the box (load avg ≥ 10 single-threaded);
    running two in parallel triples wall time without finishing faster.
@@ -427,6 +439,52 @@ parallel. Do not chain follow-up Agent calls in the same tick.
   `flock -n`; on failure skip + log.
 - `state/manifest.lock` — held briefly (sub-second) by each branch
   around manifest read-modify-write. `flock` blocking.
+- `<repo>/.git/autobuilder-integrate.lock` — held (blocking, ≤120s) by
+  `worktree-extend.sh integrate` so same-repo integrations serialize.
+  Internal to the helper; branches don't manage it directly.
+
+### Worktree isolation (shared `build_into`, added 2026-05-28)
+
+When a tick selects ≥2 rust-extend PRDs that share one `build_into`
+repo, the branches do **not** mutate that repo in place. The expensive
+work (cargo build/clippy/test/deny) runs in parallel, each branch in its
+own git worktree; only the cheap final step (merge + version bump +
+changelog) is serial. Mechanics live in `scripts/worktree-extend.sh`:
+
+1. **add** — `worktree-extend.sh add <repo> <slug>` creates (or resumes)
+   a worktree at `~/.cache/build-worktrees/<repo>-<slug>` on branch
+   `autobuilder/<slug>`, based on `<repo>`'s current `main` HEAD. The
+   branch agent `cd`s into the printed path for ALL its Phase-4 work.
+   The worktree is a clean checkout of `main`'s HEAD — any dirty files in
+   the main working tree are isolated and ignored.
+2. **build + gate (parallel, in the worktree)** — edit `src/`/`tests/`,
+   run the hard gates, and commit the IMPLEMENTATION on the branch
+   (`git commit` inside the worktree). Do **not** bump the version or
+   touch `CHANGELOG.md` here — that is deferred to integration so stacked
+   branches don't collide on the same version number.
+3. **integrate (serial, locked)** — `worktree-extend.sh integrate <repo>
+   <slug> <bump> <tldr-file>` takes the per-repo integration lock,
+   **refuses if the target's main tree is dirty (exit 3 → leave PRD
+   in_progress, surface `target-dirty`)**, merges `autobuilder/<slug>`
+   into `main` (`--no-ff`; exit 4 on conflict → defer, branch kept),
+   then bumps the version and prepends the CHANGELOG via
+   `extend-handler.sh`, committing with the Joe Yen identity. Because the
+   bump happens here under the lock, sequential branches increment
+   cleanly (e.g. recall 0.5→0.6→0.7 across three branches in one tick).
+4. **push + cleanup** — after a successful integrate, `wm-push --slug
+   <repo>` once, then `worktree-extend.sh cleanup <repo> <slug>
+   --drop-branch`. On a deferred branch (dirty target / conflict / red
+   gate) run `cleanup` WITHOUT `--drop-branch` so the next tick resumes
+   the same branch via `add`.
+
+**Dispatch additions for shared-target branches.** Each such branch's
+agent prompt must also include: its `build_into` repo, that it shares the
+target this tick so it MUST use `worktree-extend.sh add` and operate only
+inside the returned worktree path, that it commits implementation-only on
+its branch (no version bump in the worktree), and that it finishes with
+`worktree-extend.sh integrate` then `wm-push` + `cleanup`. The
+`prd-<slug>.lock` still guards the branch's manifest/journal writes; the
+worktree guards the build tree.
 
 ### Failure isolation
 
@@ -514,11 +572,14 @@ still present in the spec, just never triggered while caps are null.
    non-conflicting actions when possible), but no longer a hard skip.
 7. **Use Joe Yen identity for wintermute commits** — same as
    `CLAUDE_SELF.md` defaults section.
-8. **Parallel branches must not share `build_into`** — Phase 2
-   selection enforces this (see "Parallelism"). If two branches
-   somehow end up mutating the same directory, the second's cargo
-   lock / git index races invalidate the first's work. This rule is
-   load-bearing for the fan-out model.
+8. **Parallel branches sharing `build_into` MUST use isolated
+   worktrees** — never mutate one repo from two branches in place (the
+   second's cargo lock / git index races invalidate the first's work).
+   Shared-target branches go through `worktree-extend.sh`
+   (add → build+gate in the worktree → serial locked integrate); see
+   "Worktree isolation". The serializing integration lock plus the
+   dirty-tree refusal are load-bearing — a branch that writes directly
+   into a shared `build_into` instead of its worktree is a bug.
 
 ## PRD frontmatter the skill reads
 
