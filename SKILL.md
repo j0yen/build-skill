@@ -1,6 +1,6 @@
 ---
 name: build
-description: Continuously implement queued PRDs end-to-end — scan for new PRDs, build them (delegating to /autobuilder for Rust), wire them into the system, publish them as standalone GitHub repos under j0yen, update Abouts (per-repo READMEs + wintermute REPOS.md), and draft follow-on PRDs that expand Claude's own capabilities. Runs every 5 minutes via systemd-user timer; one PRD-relevant action per tick at most. Use when the user says /build, when the SessionStart hook reports a queued PRD, or when the user asks Claude to "make progress on the queue" or "build the next thing."
+description: Continuously implement queued PRDs end-to-end — scan for new PRDs, build them (delegating to /autobuilder for Rust), wire them into the system, publish them as standalone GitHub repos under j0yen, update Abouts (per-repo READMEs + wintermute REPOS.md), and draft follow-on PRDs that expand Claude's own capabilities. Runs every 5 minutes via systemd-user timer; up to 5 PRDs advanced in parallel per tick (one action per PRD). Use when the user says /build, when the SessionStart hook reports a queued PRD, or when the user asks Claude to "make progress on the queue" or "build the next thing."
 ---
 
 # /build — continuous PRD implementation loop
@@ -12,11 +12,13 @@ documenting, then drafting whatever follow-on PRDs the experience made
 obvious.
 
 Cadence is **every 5 minutes** (systemd-user timer `claude-build.timer`).
-Per tick, the skill performs at most **one PRD-relevant action** — pick the
-next PRD that needs work, advance it one stage, persist state, log, exit.
-This keeps the loop low-impact and easy to reason about: in the worst
-case where every tick misbehaves, a full day produces 288 small changes,
-each independently revertable.
+Per tick, the skill advances **up to 5 PRDs in parallel** — one action
+per PRD, dispatched as parallel Agent (subagent) tool calls in a single
+tool-use message, then collected. The per-PRD one-action invariant is
+preserved; only fan-out per tick changed (2026-05-28: 1 → 5 per user
+request). Worst-case blast radius is 5×288 = 1440 small changes/day,
+still bounded and each independently revertable. See the "Parallelism"
+section for selection, dispatch, locking, and failure isolation.
 
 **Auto-publish is the default, no opt-outs, no daily caps (updated
 2026-05-27).** Every PRD is buildable — `build_auto` is no longer
@@ -76,13 +78,19 @@ Run `scripts/scan-prds.sh`. This emits a JSON list of
 
 ### Phase 2 — Select
 
-Pick exactly one PRD to advance, in priority order:
+Build a candidate pool in priority order:
 
-1. A PRD whose manifest `status` is `in_progress` and `last_action` is
+1. PRDs whose manifest `status` is `in_progress` and `last_action` is
    ≥ 1 hour ago (continue interrupted work).
-2. A PRD with `status: queued` (start new work; `build_auto` is no
+2. PRDs with `status: queued` (start new work; `build_auto` is no
    longer consulted).
 3. None → "nothing to do," log, exit.
+
+Then pick **up to 5 PRDs** from the pool that mutually satisfy the
+parallel-dispatch rules in the "Parallelism" section (no shared
+`build_into`, ≤1 kernel-extend, ≤1 reflect-eligible). Fewer than 5 is
+fine; the cap is 5, the floor is whatever the queue admits after
+conflict-pruning. If the pool yields zero, exit clean.
 
 ### Phase 3 — Classify
 
@@ -129,10 +137,12 @@ If classification is ambiguous, mark the PRD `status: needs_classification`
 and emit one line in the journal asking the user to add a hint to the PRD
 frontmatter (e.g., `build_target: rust-cli`).
 
-### Phase 4 — Implement (the one action)
+### Phase 4 — Implement (one action per selected PRD)
 
-Do exactly ONE of the following — whichever advances the selected PRD
-by one well-defined step. Stop after the action.
+For each PRD selected in Phase 2, do exactly ONE of the following —
+whichever advances that PRD by one well-defined step. The 1..=5 PRDs
+in this tick's selection run in parallel via Agent tool calls
+(see "Parallelism" below). Each branch stops after its action.
 
 - **iter-1 (scaffold)**: For a Rust target, invoke `/autobuilder` with
   the PRD path. Let autobuilder run its own loop. Capture the result
@@ -340,18 +350,99 @@ No caps block this action — `budget.caps` are all null.
 
 ### Phase 7 — Persist & log
 
-- Atomic-write `manifest.json` (tempfile + rename).
+Each branch (per selected PRD) persists its own work:
+
+- Acquire `state/manifest.lock` (blocking flock, sub-second hold);
+  read `manifest.json`, update only this branch's slug entry,
+  atomic-write (tempfile + rename); release `manifest.lock`.
 - Append a one-line summary to `~/brain/journal/build/YYYY-MM-DD.md`:
-  `<ISO-ts>  <slug>  <action>  <outcome>  (<key=value...>)`
-- Release `tick.lock`.
+  `<ISO-ts>  <slug>  <action>  <outcome>  (<key=value...>)`. The
+  journal append is naturally serial — each branch appends its own
+  line. Use `>>` to avoid clobbering.
+- Release this branch's `state/prd-<slug>.lock`.
+
+After all parallel branches return, the parent releases `tick.lock`.
+
+## Parallelism (per-tick fan-out, added 2026-05-28)
+
+Each tick advances **up to 5 PRDs in parallel**. The per-PRD
+constraint (one action per PRD per tick) is preserved unchanged;
+only the per-tick fan-out grew (1 → 5). User instruction
+2026-05-28: "this laptop can handle it."
+
+### Selection rules (extends Phase 2)
+
+After the existing priority sort, pick up to 5 PRDs that mutually
+satisfy:
+
+1. **No shared `build_into`** — rust-extend and kernel-extend targets
+   serialize on disk; running two branches that mutate the same crate
+   races cargo locks and git index. Skip the lower-priority one.
+2. **≤1 `build_target: kernel-extend` per tick** — the kernel
+   `makepkg` build saturates the box (load avg ≥ 10 single-threaded);
+   running two in parallel triples wall time without finishing faster.
+3. **≤1 Phase-6-eligible reflect candidate per tick** — the
+   daily-reflect cap still applies (once per day across all branches).
+   If two candidates would otherwise both trigger reflect, designate
+   one as reflect-eligible and the other skips Phase 6.
+
+Fewer than 5 is fine. Selection is greedy — walk the sorted candidate
+pool, admit each PRD that doesn't violate a rule against already-
+admitted ones, stop at 5 or end-of-pool.
+
+### Dispatch
+
+Issue the selected PRDs as **parallel Agent tool calls in a single
+tool-use message**, one Agent call per PRD. Use
+`subagent_type=general-purpose` unless the PRD frontmatter declares
+otherwise. Each agent prompt must include, self-contained:
+
+- The PRD's absolute path.
+- The PRD's slug.
+- "You are advancing ONE PRD as part of a parallel /build tick.
+  Run Phases 3 → 4 → 5 → 7 for this PRD only. Do not invoke /build
+  recursively. Do not touch any PRD other than this one."
+- "Acquire `~/.claude/skills/build/state/prd-<slug>.lock` via
+  `flock -n` before any state mutation. If you can't acquire it,
+  log `prd-lock-held` and exit."
+- "When persisting in Phase 7, acquire `state/manifest.lock`
+  (blocking), do a read-modify-write of your slug's entry only,
+  release. Do NOT rewrite other slugs' entries."
+- "Return a one-line summary of what you did: `<slug>: <action>
+  <outcome>` so the parent's journal sees it."
+
+Issue all calls in a single message — that's what makes them
+parallel. Do not chain follow-up Agent calls in the same tick.
+
+### Locking
+
+- `tick.lock` — parent holds for the whole tick (existing behavior).
+- `state/prd-<slug>.lock` — each branch holds for its Phase 4–7 work.
+  `flock -n`; on failure skip + log.
+- `state/manifest.lock` — held briefly (sub-second) by each branch
+  around manifest read-modify-write. `flock` blocking.
+
+### Failure isolation
+
+A failing branch does not abort siblings. Per-PRD locks auto-release
+on agent process exit. The parent collects all returns; for any
+branch that errored, journal `tick-branch-error  <slug>  <reason>`
+and leave that PRD's manifest entry unchanged. The next tick
+re-selects normally.
+
+If `/autobuilder` rate-limits parallel invocations (not currently
+observed), drop the per-tick cap to 3 by editing this section's "up
+to 5" wording. The cap is a number in the doc, not in code.
 
 ## State files
 
 ```
 ~/.claude/skills/build/state/
-├── manifest.json   # { prds: { "<slug>": { status, revision, ... } } }
-├── budget.json     # { date: "YYYY-MM-DD", caps: {...}, used: {...} }
-└── tick.lock       # flock guard; ephemeral
+├── manifest.json        # { prds: { "<slug>": { status, revision, ... } } }
+├── budget.json          # { date: "YYYY-MM-DD", caps: {...}, used: {...} }
+├── tick.lock            # parent flock; held for the whole tick
+├── manifest.lock        # briefly held around manifest read-modify-write
+└── prd-<slug>.lock      # one per in-flight PRD branch; ephemeral
 ```
 
 ## Manifest entry shape
@@ -403,7 +494,11 @@ still present in the spec, just never triggered while caps are null.
 3. **Never overwrite existing settings.json without an atomic backup**
    (`settings.json.bak.<ts>`).
 4. **Never invoke this skill recursively** — `/build` from inside
-   `/build` is a no-op.
+   `/build` is a no-op. Parallel branches (Phase 4 fan-out) are NOT
+   recursive /build invocations; they're Agent subcalls running one
+   PRD's Phases 3–7 inline. A branch agent that decides to invoke
+   `/build` is a bug — it must instead complete its assigned PRD and
+   return.
 5. **Defer to the user on conflict** — if a PRD mentions a target that
    already exists at a different path than the manifest expects, mark
    `needs_classification` and stop.
@@ -413,6 +508,11 @@ still present in the spec, just never triggered while caps are null.
    non-conflicting actions when possible), but no longer a hard skip.
 7. **Use Joe Yen identity for wintermute commits** — same as
    `CLAUDE_SELF.md` defaults section.
+8. **Parallel branches must not share `build_into`** — Phase 2
+   selection enforces this (see "Parallelism"). If two branches
+   somehow end up mutating the same directory, the second's cargo
+   lock / git index races invalidate the first's work. This rule is
+   load-bearing for the fan-out model.
 
 ## PRD frontmatter the skill reads
 
