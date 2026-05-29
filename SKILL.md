@@ -159,9 +159,30 @@ in this tick's selection run in parallel via Agent tool calls
   cargo + writing src/tests/ files directly with cwd = `build_into`.
   Do NOT init a new repo, do NOT overwrite existing src files (extend,
   don't replace). Record `output_repo_path` = `build_into` in the
-  manifest. **If this branch shares `build_into` with another branch
-  this tick, cwd is the worktree from `worktree-extend.sh add <build_into>
-  <slug>`, NOT `build_into` itself** (see "Worktree isolation").
+  manifest.
+
+  **Worktree isolation invariant — the main checkout is never left dirty
+  between ticks.** For every rust-extend PRD, iter-1 calls
+  `wm-buildtree ensure <slug> <build_into>` and records the returned
+  worktree path as `manifest.<slug>.work_tree`. All subsequent file
+  writes for that PRD target the worktree path, not `build_into` itself.
+  Every tick that mutates files ends with `wm-buildtree commit <slug>
+  <build_into> <msg-file>` so the increment is durable on branch
+  `build/<slug>` and the main checkout stays clean. The final
+  `bump-version & commit` step (see below) becomes: bump in the
+  worktree, commit, then `wm-buildtree land <slug> <build_into>
+  --ff-only` to fast-forward the default branch; `wm-push` runs after
+  a successful land. `wm-buildtree land` exits 4 (no mutation) if the
+  main checkout is dirty, preserving Hard Safety Rule 5 — but now only
+  at the *land* boundary, not on every intermediate increment.
+
+  **Shared-target case (≥2 PRDs share one `build_into` this tick):**
+  use `worktree-extend.sh add <build_into> <slug>` instead of
+  `wm-buildtree ensure` — the shared-target helper uses a different
+  worktree root (`~/.cache/build-worktrees/`) and defers the version
+  bump + CHANGELOG to a serial locked `integrate` step. See "Worktree
+  isolation" for details. Do NOT use `wm-buildtree land` for
+  shared-target branches; use `worktree-extend.sh integrate` + `cleanup`.
 - **iter-1 (kernel-extend)** [kernel-extend only]: do NOT call
   `/autobuilder`. Hand-write the kernel C source per the PRD spec:
   drop new C file(s) into `<build_into>/` (e.g.
@@ -177,6 +198,14 @@ in this tick's selection run in parallel via Agent tool calls
   `manifest.<slug>.last_error`. Counts as one tick action. The first
   successful build verifies the iteration; live `insmod`/reboot
   validation is the user's call (don't auto-reboot).
+
+  **Worktree isolation (kernel-extend):** apply the same
+  `wm-buildtree ensure/commit` discipline as rust-extend — the kernel
+  C files and Kconfig edits all go into the worktree. The
+  `wintermute-kernel/pkg/makepkg` build is triggered from the worktree
+  path. `wm-buildtree land` at verified-complete fast-forwards the
+  `build_into` default branch exactly as for rust-extend. Main checkout
+  of `build_into` is never left dirty between ticks.
 - **iter-2..N (continue)**: If `/autobuilder` left work, hand the same
   PRD back to it. Each `/autobuilder` invocation IS one tick's action;
   do not chain them within a single tick.
@@ -302,6 +331,28 @@ in this tick's selection run in parallel via Agent tool calls
   An unverified PRD never gets archived. If the user manually moves a
   PRD to PRDs-archive/, the next scan detects it as `vanished` and the
   skill stops trying to advance it.
+
+### Recovery — stale dirty-tree from a pre-wm-buildtree tick
+
+If a rust-extend PRD left uncommitted modifications in a shared main
+checkout before `wm-buildtree` was available (the recall logjam pattern),
+the user (or a gated tick) can recover without losing the in-flight work:
+
+1. Run `wm-buildtree ensure <slug> <repo>` — creates the isolated branch
+   `build/<slug>` from the current `main` HEAD.
+2. `git stash` the dirty main tree, then `git stash show -p | git -C
+   <worktree> apply -` to port the stashed diff into the worktree.
+   Alternatively `cp` the modified files manually into the worktree path.
+3. `wm-buildtree commit <slug> <repo> <msg-file>` — commits the salvaged
+   work onto `build/<slug>`.
+4. `git restore .` (or `git checkout -- .`) in the main tree to return it
+   to a clean state — now the other recall-* PRDs can commit their version
+   bumps without triggering Hard Safety Rule 5.
+5. Resume normal tick flow: subsequent ticks for this PRD will find the
+   worktree via `wm-buildtree path` and continue building on the branch.
+
+This migration is user-gated (committing or reverting another PRD's work
+is Rule 5). The skill never auto-triggers it.
 
 ### Phase 5 — Abouts
 
