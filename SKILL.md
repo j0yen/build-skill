@@ -1,6 +1,6 @@
 ---
 name: build
-description: Continuously implement queued PRDs end-to-end — scan for new PRDs, build them (delegating to /autobuilder for Rust), wire them into the system, publish them as standalone GitHub repos under j0yen, update Abouts (per-repo READMEs + wintermute REPOS.md), and draft follow-on PRDs that expand Claude's own capabilities. Runs every 5 minutes via systemd-user timer; up to 5 PRDs advanced in parallel per tick (one action per PRD). Use when the user says /build, when the SessionStart hook reports a queued PRD, or when the user asks Claude to "make progress on the queue" or "build the next thing."
+description: Continuously implement queued PRDs end-to-end — scan for new PRDs, build them (delegating to /autobuilder for Rust), wire them into the system, publish them as standalone GitHub repos under j0yen, update Abouts (per-repo READMEs + wintermute REPOS.md), and draft follow-on PRDs that expand Claude's own capabilities. Runs every 5 minutes via systemd-user timer; up to 10 PRDs advanced in parallel per tick (one action per PRD). Use when the user says /build, when the SessionStart hook reports a queued PRD, or when the user asks Claude to "make progress on the queue" or "build the next thing."
 ---
 
 # /build — continuous PRD implementation loop
@@ -12,7 +12,7 @@ documenting, then drafting whatever follow-on PRDs the experience made
 obvious.
 
 Cadence is **every 5 minutes** (systemd-user timer `claude-build.timer`).
-Per tick, the skill advances **up to 5 PRDs in parallel** — one action
+Per tick, the skill advances **up to 10 PRDs in parallel** — one action
 per PRD, dispatched as parallel Agent (subagent) tool calls in a single
 tool-use message, then collected. The per-PRD one-action invariant is
 preserved; only fan-out per tick changed (2026-05-28: 1 → 5 per user
@@ -92,11 +92,12 @@ Within both buckets, sort by `build_priority` descending
 PRDs the user has explicitly bumped to `build_priority: high` get
 picked before their normal-priority siblings.
 
-Then pick **up to 5 PRDs** from the pool that mutually satisfy the
-parallel-dispatch rules in the "Parallelism" section (no shared
-`build_into`, ≤1 kernel-extend, ≤1 reflect-eligible). Fewer than 5 is
-fine; the cap is 5, the floor is whatever the queue admits after
-conflict-pruning. If the pool yields zero, exit clean.
+Then pick **up to 10 PRDs** from the pool that mutually satisfy the
+parallel-dispatch rules in the "Parallelism" section (shared `build_into`
+isolated via worktrees up to the ≤3 same-target sub-cap, ≤1 kernel-extend,
+≤1 reflect-eligible). Fewer than 10 is fine; the cap is 10, the floor is
+whatever the queue admits after conflict-pruning. If the pool yields zero,
+exit clean.
 
 ### Phase 3 — Classify
 
@@ -146,7 +147,7 @@ frontmatter (e.g., `build_target: rust-cli`).
 ### Phase 4 — Implement (one action per selected PRD)
 
 For each PRD selected in Phase 2, do exactly ONE of the following —
-whichever advances that PRD by one well-defined step. The 1..=5 PRDs
+whichever advances that PRD by one well-defined step. The 1..=10 PRDs
 in this tick's selection run in parallel via Agent tool calls
 (see "Parallelism" below). Each branch stops after its action.
 
@@ -294,11 +295,26 @@ in this tick's selection run in parallel via Agent tool calls
   4. `~/wintermute/REPOS.md` lists this repo under its category with a
      one-line description.
   5. Every acceptance test the PRD declared (numbered list under
-     `## Acceptance` / `## Acceptance tests`) is paired with either a
-     passing `cargo test` name or a smoke-test command in the manifest
-     `verification` field. If any AC has no paired evidence, the PRD
-     is NOT verified-completed — leave `status: in_progress` and
-     surface the gap in the next reflect cycle.
+     `## Acceptance` / `## Acceptance tests`) is paired with EITHER:
+     - a passing `cargo test` name (real test) or a smoke-test command
+       in the manifest `verification` field, OR
+     - a passing `cargo test --test mocks::ac<N>` (mock test under
+       `tests/mocks/ac<N>.rs`) AND the AC is listed in PRD frontmatter
+       `deferred_acs:`, OR
+     - the AC is in BOTH `deferred_acs:` AND `mock_unjustified_for:`
+       with a companion `mock_justifications:` entry (one sentence per
+       listed AC; an entry with no companion justification is a parser
+       error per `scan-prds.sh`).
+
+     Any AC with none of the three remains a hard fail: the PRD is NOT
+     verified-completed — leave `status: in_progress` and surface the
+     gap in the next reflect cycle. This OR-clause pairs the
+     hardware-mock convention (see `~/.claude/skills/autobuilder/SKILL.md`
+     "Hardware mock convention") with the older `deferred_acs:` escape
+     hatch: deferring is honest, but a deferred AC must still take a
+     mock-test path or carry a prose justification. It is back-compat —
+     already-shipped PRDs whose deferred ACs gain a `mock_unjustified_for:`
+     + justification backfill still pass.
 
   **Verified-completed checklist (rust-extend path):**
   Same as above with three substitutions:
@@ -427,14 +443,19 @@ After all parallel branches return, the parent releases `tick.lock`.
 
 ## Parallelism (per-tick fan-out, added 2026-05-28)
 
-Each tick advances **up to 5 PRDs in parallel**. The per-PRD
+Each tick advances **up to 10 PRDs in parallel**. The per-PRD
 constraint (one action per PRD per tick) is preserved unchanged;
-only the per-tick fan-out grew (1 → 5). User instruction
-2026-05-28: "this laptop can handle it."
+only the per-tick fan-out grew (1 → 5 → 10). User instruction
+2026-05-28: "this laptop can handle it"; raised 5 → 10 on 2026-05-29.
+Note: ticks now run detached (claude-build-work.service, 30-min cap) so
+a 10-wide fan-out has room to finish + commit. The ≤3 same-target
+sub-cap below is unchanged — it is the OOM guard for parallel cargo
+builds of one heavy crate (a 5-wide tick already peaked ~4.1 GB; this
+box has ~9 GB no-swap headroom).
 
 ### Selection rules (extends Phase 2)
 
-After the existing priority sort, pick up to 5 PRDs that mutually
+After the existing priority sort, pick up to 10 PRDs that mutually
 satisfy:
 
 1. **Shared `build_into` → isolate with worktrees, don't serialize.**
@@ -455,9 +476,9 @@ satisfy:
    If two candidates would otherwise both trigger reflect, designate
    one as reflect-eligible and the other skips Phase 6.
 
-Fewer than 5 is fine. Selection is greedy — walk the sorted candidate
+Fewer than 10 is fine. Selection is greedy — walk the sorted candidate
 pool, admit each PRD that doesn't violate a rule against already-
-admitted ones, stop at 5 or end-of-pool.
+admitted ones, stop at 10 or end-of-pool.
 
 ### Dispatch
 
