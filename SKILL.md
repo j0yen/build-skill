@@ -447,11 +447,23 @@ Each tick advances **up to 10 PRDs in parallel**. The per-PRD
 constraint (one action per PRD per tick) is preserved unchanged;
 only the per-tick fan-out grew (1 → 5 → 10). User instruction
 2026-05-28: "this laptop can handle it"; raised 5 → 10 on 2026-05-29.
-Note: ticks now run detached (claude-build-work.service, 30-min cap) so
-a 10-wide fan-out has room to finish + commit. The ≤3 same-target
-sub-cap below is unchanged — it is the OOM guard for parallel cargo
-builds of one heavy crate (a 5-wide tick already peaked ~4.1 GB; this
-box has ~9 GB no-swap headroom).
+
+**Fan out to the full cap by default — do NOT self-throttle below 10 on
+memory grounds.** The box has **15 GB RAM (0 swap), typically ~11 GB
+free**. A 5-wide tick peaked ~4.1 GB, so a 10-wide tick peaks ~8 GB —
+comfortably within budget. The real OOM guard is the **≤3 same-target
+sub-cap** below (it bounds parallel cargo builds of ONE heavy crate like
+recall's fastembed); honoring that, total width 10 is safe. Only reduce
+width if `free -g` shows **< 4 GB available** at selection time — and log
+the reason. (Earlier ticks wrongly held to 3 citing a stale "~9 GB"
+figure; that was wrong — see the real numbers above.)
+
+Note on coordination: ticks run detached as `claude-build-work.service`
+(30-min cap), so a 10-wide fan-out has room to finish + commit. Seeing
+`claude-build-work.service` active/activating is **THIS tick's own
+container** — do not mistake it for a competing tick and shrink the
+fan-out; the launcher's overlap guard already guarantees one tick at a
+time.
 
 ### Selection rules (extends Phase 2)
 
