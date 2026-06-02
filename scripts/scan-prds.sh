@@ -59,28 +59,35 @@ emit_one() {
       '```'*) [ "$in_fence" = true ] && in_fence=false || in_fence=true ; continue ;;
     esac
     [ "$in_fence" = true ] && continue
-    case "$line" in
+    # Normalize bold-markdown frontmatter keys (`**build_target:** x`) to the
+    # bare form (`build_target: x`) so the case arms below match both syntaxes.
+    # /dream emits bold markdown; /build's frontmatter historically used bare
+    # YAML keys. Only a leading `**key:**` is rewritten to `key:`; non-key
+    # lines (and the values themselves) are untouched, so first-match-wins and
+    # the fenced-code-block skip above are both preserved.
+    kline="$(printf '%s' "$line" | sed -E 's/^[[:space:]]*\*\*([A-Za-z_]+):\*\*/\1:/')"
+    case "$kline" in
       "build_target:"*)
         [ "$seen_target" = true ] && continue
-        v="$(strip_val "$(printf '%s' "$line" | sed -E 's/^build_target[[:space:]]*:[[:space:]]*//')")"
+        v="$(strip_val "$(printf '%s' "$kline" | sed -E 's/^build_target[[:space:]]*:[[:space:]]*//')")"
         [ -n "$v" ] && build_target="\"$v\""
         seen_target=true
         ;;
       "build_priority:"*)
         [ "$seen_priority" = true ] && continue
-        v="$(strip_val "$(printf '%s' "$line" | sed -E 's/^build_priority[[:space:]]*:[[:space:]]*//')")"
+        v="$(strip_val "$(printf '%s' "$kline" | sed -E 's/^build_priority[[:space:]]*:[[:space:]]*//')")"
         [ -n "$v" ] && build_priority="\"$v\""
         seen_priority=true
         ;;
       "build_into:"*)
         [ "$seen_into" = true ] && continue
-        v="$(strip_val "$(printf '%s' "$line" | sed -E 's/^build_into[[:space:]]*:[[:space:]]*//')")"
+        v="$(strip_val "$(printf '%s' "$kline" | sed -E 's/^build_into[[:space:]]*:[[:space:]]*//')")"
         [ -n "$v" ] && build_into="\"$v\""
         seen_into=true
         ;;
       "build_version_bump:"*)
         [ "$seen_bump" = true ] && continue
-        v="$(strip_val "$(printf '%s' "$line" | sed -E 's/^build_version_bump[[:space:]]*:[[:space:]]*//')")"
+        v="$(strip_val "$(printf '%s' "$kline" | sed -E 's/^build_version_bump[[:space:]]*:[[:space:]]*//')")"
         [ -n "$v" ] && build_version_bump="\"$v\""
         seen_bump=true
         ;;
@@ -90,7 +97,7 @@ emit_one() {
         # commas, keep digits-only tokens, join into a JSON array. Anything
         # not matching this shape parses to `[]` — same as absent.
         [ "$seen_deferred" = true ] && continue
-        v="$(strip_val "$(printf '%s' "$line" | sed -E 's/^deferred_acs[[:space:]]*:[[:space:]]*//')")"
+        v="$(strip_val "$(printf '%s' "$kline" | sed -E 's/^deferred_acs[[:space:]]*:[[:space:]]*//')")"
         # require leading `[` and trailing `]` — otherwise treat as no-op
         case "$v" in
           '['*']')
