@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# scan-prds.sh — emit JSON describing every PRD under ~/wintermute/autobuilder/
-# (excluding PRDs-archive/). Output shape, one object per PRD:
+# scan-prds.sh — emit JSON describing every PRD under ~/Documents/PRDs/
+# (top-level only, so ARCHIVE/ and visions/ are excluded). Output shape,
+# one object per PRD:
 #
 #   { "slug": "...", "path": "...", "build_auto": <bool>,
 #     "build_target": "<string or null>",
@@ -14,8 +15,8 @@
 
 set -uo pipefail
 
-PRD_DIR="${PRD_DIR:-$HOME/wintermute/autobuilder}"
-JQ="${JQ:-/usr/sbin/jq}"
+PRD_DIR="${PRD_DIR:-$HOME/Documents/PRDs}"
+JQ="${JQ:-$(command -v jq 2>/dev/null || echo /usr/bin/jq)}"
 
 [ -d "$PRD_DIR" ] || { printf '[]\n'; exit 0; }
 [ -x "$JQ" ] || { echo "jq not at $JQ" >&2; exit 1; }
@@ -59,13 +60,15 @@ emit_one() {
       '```'*) [ "$in_fence" = true ] && in_fence=false || in_fence=true ; continue ;;
     esac
     [ "$in_fence" = true ] && continue
-    # Normalize bold-markdown frontmatter keys (`**build_target:** x`) to the
-    # bare form (`build_target: x`) so the case arms below match both syntaxes.
-    # /dream emits bold markdown; /build's frontmatter historically used bare
-    # YAML keys. Only a leading `**key:**` is rewritten to `key:`; non-key
-    # lines (and the values themselves) are untouched, so first-match-wins and
-    # the fenced-code-block skip above are both preserved.
-    kline="$(printf '%s' "$line" | sed -E 's/^[[:space:]]*\*\*([A-Za-z_]+):\*\*/\1:/')"
+    # Normalize frontmatter keys so bare-YAML, bold-markdown, and bullet/list
+    # forms all parse identically:
+    #   `build_target: x`      (bare YAML — /build historic)
+    #   `**build_target:** x`  (bold markdown — /dream emits this)
+    #   `- build_target: x`    (bullet list — many PRD frontmatters)
+    # Strip a leading list marker (`- `/`* `/`+ `) first, then rewrite a
+    # leading `**key:**` to `key:`. Values and non-key lines are untouched, so
+    # first-match-wins and the fenced-code-block skip above are both preserved.
+    kline="$(printf '%s' "$line" | sed -E 's/^[[:space:]]*[-*+][[:space:]]+//; s/^[[:space:]]*\*\*([A-Za-z_]+):\*\*/\1:/')"
     case "$kline" in
       "build_target:"*)
         [ "$seen_target" = true ] && continue
@@ -116,8 +119,11 @@ emit_one() {
         esac
         seen_deferred=true
         ;;
-      "**Status:**"*|"Status:"*|"**Status**"*|"## Status"*)
-        [ -z "$status_line" ] && status_line="$(printf '%s' "$line" | sed 's/[*#]//g; s/^[[:space:]]*//; s/[[:space:]]*$//')"
+      "**Status:**"*|"Status:"*|"**Status**"*|"## Status"*|"- Status:"*|"- **Status:**"*|"* Status:"*|"* **Status:**"*)
+        # Strip a leading markdown list marker (`- ` / `* `) first, then the
+        # `*`/`#` decoration, then trim — so `- Status: Draft v0.1` parses the
+        # same as `**Status:** Draft v0.1`.
+        [ -z "$status_line" ] && status_line="$(printf '%s' "$line" | sed -E 's/^[[:space:]]*[-*][[:space:]]+//; s/[*#]//g; s/^[[:space:]]*//; s/[[:space:]]*$//')"
         ;;
     esac
   done < <(head -n 80 "$path")
