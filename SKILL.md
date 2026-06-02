@@ -225,6 +225,28 @@ in this tick's selection run in parallel via Agent tool calls
   `scripts/extend-handler.sh install <build_into>`. Bin reinstalls to
   `~/.local/bin/` if the crate has a `[[bin]]` (or single-bin
   convention). Counts as one tick action.
+
+  **Daemon-restart wiring convention (PRD-vigil-build-restart-wiring):**
+  `extend-handler.sh install` automatically routes each binary through
+  the safe install+restart path when the install dest is backed by an
+  active `~/.config/systemd/user/*.service` unit:
+  - Detection: `scripts/unit-for-dest.sh <dest>` scans `ExecStart=`
+    lines (with `%h`/`%t` expansion) and echoes the backing unit name,
+    or empty if none.
+  - If a unit is found AND `rollout` is on `$PATH`: runs
+    `rollout install <artifact> --dest <dest>` (installs + restarts the
+    unit through the safe path). Verdict: `rollout-install`.
+  - If a unit is found AND `rollout` is NOT installed: falls back to
+    `install -m755`, logs a WARNING to stderr, appends a Pending note to
+    `~/wintermute/autobuilder/notes/gossip.md` naming the unit that was
+    installed-but-not-restarted. Build still exits 0. Verdict:
+    `install-m755-fallback`.
+  - If no unit backs the dest: plain `install -m755`, unchanged
+    behaviour. Verdict: `install-m755`.
+  The chosen verdict is echoed to stderr as `[install-verdict]` for the
+  per-tick log. Non-daemon-backed CLIs, libs, hooks, and config targets
+  are entirely unaffected — no `rollout` invocation, no behavioural diff.
+
 - **push** [rust-extend only]: `wm-push --slug <slug>` from inside
   `<build_into>`. `wm-push` (installed at `~/.local/bin/wm-push` per
   PRD-build-push-allowlist) wraps `git push origin <branch>` with a
@@ -428,18 +450,34 @@ No caps block this action — `budget.caps` are all null.
 
 ### Phase 7 — Persist & log
 
-Each branch (per selected PRD) persists its own work:
+Each branch (per selected PRD) persists its own work using the
+**sidecar mechanism** (added 2026-05-29 — see PRD-build-manifest-write-durability):
 
-- Acquire `state/manifest.lock` (blocking flock, sub-second hold);
-  read `manifest.json`, update only this branch's slug entry,
-  atomic-write (tempfile + rename); release `manifest.lock`.
+**Branch step (no shared-file contention):**
+- Call `scripts/manifest-sidecar.sh write <slug> status=<...>
+  last_action=<ISO> ticks_invested_delta=1 [last_error=<...>]
+  [output_repo_path=<...>] action=<...> outcome=<...>`.
+  This writes `state/status/<slug>.json` atomically (mktemp + rename).
+  Because each branch owns a DISTINCT path, concurrent branches never
+  race — no shared-file lock needed at this step.
 - Append a one-line summary to `~/brain/journal/build/YYYY-MM-DD.md`:
   `<ISO-ts>  <slug>  <action>  <outcome>  (<key=value...>)`. The
   journal append is naturally serial — each branch appends its own
   line. Use `>>` to avoid clobbering.
 - Release this branch's `state/prd-<slug>.lock`.
 
-After all parallel branches return, the parent releases `tick.lock`.
+**Parent step (after all branches return — one serial locked pass):**
+- Call `scripts/manifest-merge-sidecars.sh --cleanup`.
+  This acquires `state/manifest.lock` once, reads `manifest.json`,
+  applies every sidecar in one jq pass, atomic-writes the result,
+  releases the lock, and removes all sidecar files.
+- Then release `tick.lock`.
+
+This two-step design (fan-out writes to distinct sidecar paths, then
+one serial merge) eliminates the N-concurrent-reader/writer race that
+caused silent manifest loss under 9-way branch contention (observed
+2026-05-30). The legacy "acquire manifest.lock + direct RMW" pattern
+is REMOVED; do not reintroduce it in branch agents.
 
 ## Parallelism (per-tick fan-out, added 2026-05-28)
 
@@ -527,9 +565,12 @@ Each agent prompt must include, self-contained:
 - "Acquire `~/.claude/skills/build/state/prd-<slug>.lock` via
   `flock -n` before any state mutation. If you can't acquire it,
   log `prd-lock-held` and exit."
-- "When persisting in Phase 7, acquire `state/manifest.lock`
-  (blocking), do a read-modify-write of your slug's entry only,
-  release. Do NOT rewrite other slugs' entries."
+- "When persisting in Phase 7, call
+  `scripts/manifest-sidecar.sh write <slug> status=<...>
+  last_action=<ISO> ticks_invested_delta=1 action=<...> outcome=<...>`
+  to write a per-slug sidecar (`state/status/<slug>.json`). Do NOT
+  acquire `state/manifest.lock` or write manifest.json directly —
+  the parent merges all sidecars in one serial pass after you return."
 - "Return a one-line summary of what you did: `<slug>: <action>
   <outcome>` so the parent's journal sees it."
 
@@ -552,8 +593,15 @@ parallel. Do not chain follow-up Agent calls in the same tick.
   tick checks the holder — if `fuser` shows no process, or the holder's
   parent is PID 1 (orphan), reclaim the lock (kill the orphan if it's a
   bare `sleep`) and proceed; the PRD is not actually being worked.
-- `state/manifest.lock` — held briefly (sub-second) by each branch
-  around manifest read-modify-write. `flock` blocking.
+- `state/manifest.lock` — held briefly (sub-second) by the **parent**
+  around the post-collection `manifest-merge-sidecars.sh` pass. Branches
+  no longer hold this lock at all — they write per-slug sidecars to
+  distinct paths (`state/status/<slug>.json`) and return. The parent
+  holds the lock for ONE serial jq merge after all branches are done.
+  This eliminates the N-concurrent-writer race that caused silent manifest
+  loss (observed 2026-05-30: 2/9 branches mis-recorded). Implementation:
+  `scripts/manifest-sidecar.sh` (branch writer) and
+  `scripts/manifest-merge-sidecars.sh` (parent merger).
 - `<repo>/.git/autobuilder-integrate.lock` — held (blocking, ≤120s) by
   `worktree-extend.sh integrate` so same-repo integrations serialize.
   Internal to the helper; branches don't manage it directly.

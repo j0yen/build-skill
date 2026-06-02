@@ -124,12 +124,58 @@ cmd_install() {
   [ -n "$target" ] || die "usage: install <build_into>" 1
   [ -f "$target/Cargo.toml" ] || die "no Cargo.toml in $target" 2
   ( cd "$target" && cargo build --release ) || die "cargo build failed" 2
+
+  # Helper: install one binary, routing through rollout install when the dest
+  # backs a live systemd-user unit (PRD-vigil-build-restart-wiring).
+  # Appends the chosen install path ("rollout-install" or "install-m755" or
+  # "install-m755-fallback") to /tmp/extend-install-verdict.<$$> for the
+  # caller's log.  Returns 0 on success, non-zero on install failure.
+  local _verdict_file="/tmp/extend-install-verdict.$$"
+  _install_one_bin() {
+    local src="$1" dest="$2"
+    local _unit_helper
+    _unit_helper="$(dirname "${BASH_SOURCE[0]}")/unit-for-dest.sh"
+    local _backing_unit=""
+    if [ -x "$_unit_helper" ]; then
+      _backing_unit="$(bash "$_unit_helper" "$dest" 2>/dev/null || true)"
+    fi
+    if [ -n "$_backing_unit" ]; then
+      # This dest backs a daemon unit.
+      if command -v rollout &>/dev/null; then
+        # Use rollout install for safe install+restart.
+        rollout install "$src" --dest "$dest" \
+          || die "rollout install of $dest failed" 2
+        printf 'rollout-install  %s  unit=%s\n' "$dest" "$_backing_unit" \
+          >> "$_verdict_file"
+      else
+        # rollout not yet available — fall back gracefully.
+        printf 'extend-handler: WARNING: rollout not installed; ' >&2
+        printf 'falling back to install -m755 for %s (unit %s not restarted)\n' \
+          "$dest" "$_backing_unit" >&2
+        install -Dm755 "$src" "$dest" || die "install of $dest failed" 2
+        printf 'install-m755-fallback  %s  unit=%s  pending=daemon-installed-but-not-restarted\n' \
+          "$dest" "$_backing_unit" >> "$_verdict_file"
+        # Append a Pending note to gossip so self-review sees it.
+        local _gossip="$HOME/wintermute/autobuilder/notes/gossip.md"
+        if [ -d "$(dirname "$_gossip")" ]; then
+          printf '\n- [%s] Pending: daemon `%s` installed binary `%s` but NOT restarted — `rollout install` unavailable (install-m755-fallback)\n' \
+            "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$_backing_unit" "$dest" \
+            >> "$_gossip"
+        fi
+      fi
+    else
+      # No backing unit — plain install, no change to existing behaviour.
+      install -Dm755 "$src" "$dest" || die "install of $dest failed" 2
+      printf 'install-m755  %s  unit=none\n' "$dest" >> "$_verdict_file"
+    fi
+  }
+
   local installed=()
   while IFS= read -r bin; do
     [ -n "$bin" ] || continue
-    install -Dm755 "$target/target/release/$bin" "$HOME/.local/bin/$bin" \
-      || die "install of $bin failed" 2
-    installed+=("$HOME/.local/bin/$bin")
+    local _dest="$HOME/.local/bin/$bin"
+    _install_one_bin "$target/target/release/$bin" "$_dest"
+    installed+=("$_dest")
   done < <(awk '
     /^[[:space:]]*\[\[bin\]\]/ { in_bin = 1; next }
     /^[[:space:]]*\[/ { in_bin = 0 }
@@ -147,9 +193,16 @@ cmd_install() {
       }
     ' "$target/Cargo.toml")"
     if [ -n "$pkg" ] && [ -f "$target/target/release/$pkg" ]; then
-      install -Dm755 "$target/target/release/$pkg" "$HOME/.local/bin/$pkg"
-      installed+=("$HOME/.local/bin/$pkg")
+      local _dest="$HOME/.local/bin/$pkg"
+      _install_one_bin "$target/target/release/$pkg" "$_dest"
+      installed+=("$_dest")
     fi
+  fi
+  # Print verdicts (install path taken) then installed paths, for caller's log.
+  if [ -f "$_verdict_file" ]; then
+    printf '[install-verdict] ' >&2
+    cat "$_verdict_file" >&2
+    rm -f "$_verdict_file"
   fi
   printf '%s\n' "${installed[@]}"
 }
