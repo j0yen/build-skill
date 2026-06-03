@@ -298,6 +298,21 @@ in this tick's selection run in parallel via Agent tool calls
   PRD's TL;DR + acceptance tests + an "Install" block. Update
   `~/wintermute/REPOS.md` with a one-line entry under the appropriate
   category section. Bump `budget.used.repos_created`.
+- **clerical-finalize**: When a candidate's archive gate fails on
+  **only** clerical checks (C2 publish/push, C3 README/CHANGELOG, C4
+  REPOS.md) while C1 (tests green) AND C5 (ACs paired/deferred) already
+  pass, run `scripts/archive-finalize.sh <slug>` as this PRD's ONE
+  action. The helper gates the gate (exits 10 `not-clerical` and mutates
+  nothing if C1 or C5 fail), performs exactly the missing clerical fixes
+  (publish/push, README or `## v<ver>` CHANGELOG from the PRD TL;DR,
+  idempotent REPOS.md row), commits **path-scoped** with the Joe Yen
+  identity (never sweeping a dirty tree), pushes, and re-runs
+  `verified-completed.sh` — echoing `[finalize-verdict] ready|still-blocked`
+  to stderr. It NEVER writes test files, edits `src/`, or alters AC
+  pairing. If the verdict is `ready`, the NEXT tick re-selects and
+  archives. Use `--dry-run` to preview the plan + commit pathspec. Fenced
+  companion to `verified-completed.sh` (classifier) and `extend-handler.sh`
+  (extend mechanics).
 - **archive**: When the PRD passes the **verified-completed** checklist
   (all five must hold), move the PRD to
   `~/wintermute/autobuilder/PRDs-archive/` via `git mv`, update manifest
@@ -369,6 +384,15 @@ in this tick's selection run in parallel via Agent tool calls
   An unverified PRD never gets archived. If the user manually moves a
   PRD to PRDs-archive/, the next scan detects it as `vanished` and the
   skill stops trying to advance it.
+
+  **Clerical-only failures are auto-finishable.** If the only failing
+  checks are C2/C3/C4 (publish/push, README/CHANGELOG, REPOS.md) and both
+  C1 and C5 pass, do NOT re-build or re-queue — run the
+  **clerical-finalize** action above (`scripts/archive-finalize.sh
+  <slug>`). It performs the missing chores under a hard C1/C5 guard so it
+  can only ever do clerical work, then the next tick archives. This is the
+  designated escape from the done→shipped clerical cliff (PRDs that build
+  green but re-fail the gate on README/CHANGELOG/REPOS/push bookkeeping).
 
 ### Recovery — stale dirty-tree from a pre-wm-buildtree tick
 
