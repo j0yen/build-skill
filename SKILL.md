@@ -137,6 +137,19 @@ Read the PRD. Determine its implementation shape:
   treat as new-repo.
 - **Shell scripts / hook scripts** → implement directly with Write/Edit.
   Run with `set -uo pipefail`; smoke-test before committing.
+
+  **Self-mod distribution (build-skill's own files).** When a shell/config
+  PRD's `build_into` points INSIDE this repo (`~/.local/share/build-skill`,
+  i.e. the `~/.claude/skills/build` symlink target — its `scripts/*.sh`,
+  `SKILL.md`, or `.gitignore`), the edit takes effect locally the moment it
+  lands (the symlink means the running skill reads it), but it does NOT
+  reach other clones until pushed. There is no `wm-push`/`wm-publish`
+  wrapper for this repo. So after committing such a self-mod with the Joe
+  Yen identity, run `scripts/self-push.sh` as the final step — it
+  fast-forwards `origin/main` under hard guards (correct repo/remote/branch,
+  no uncommitted tracked changes, strictly fast-forward, ≥1 ahead) and is a
+  no-op when already in sync. If it exits 5 (diverged), `git fetch` +
+  rebase onto `origin/main` first, then re-run; never force-push.
 - **Config / settings.json changes** → edit settings.json with jq plus
   atomic rename. Always snapshot first to `settings.json.bak.<ts>`. For
   ticks that touch settings.json AND one or more hook scripts in the
