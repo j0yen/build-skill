@@ -7,7 +7,7 @@ model: sonnet
 # /build — continuous PRD implementation loop
 
 `/build` is the autonomous self-extension loop. It looks at the PRDs Claude
-and the user have written under `~/wintermute/autobuilder/` and walks each
+and the user have written under `~/Documents/PRDs/` and walks each
 one from "drafted" through "shipped" — implementing, wiring, publishing,
 documenting, then drafting whatever follow-on PRDs the experience made
 obvious.
@@ -16,10 +16,12 @@ Cadence is **every 5 minutes** (systemd-user timer `claude-build.timer`).
 Per tick, the skill advances **up to 10 PRDs in parallel** — one action
 per PRD, dispatched as parallel Agent (subagent) tool calls in a single
 tool-use message, then collected. The per-PRD one-action invariant is
-preserved; only fan-out per tick changed (2026-05-28: 1 → 5 per user
-request). Worst-case blast radius is 5×288 = 1440 small changes/day,
-still bounded and each independently revertable. See the "Parallelism"
-section for selection, dispatch, locking, and failure isolation.
+preserved; only fan-out per tick changed (2026-05-28: 1 → 5; 2026-05-29:
+5 → 10; reaffirmed by user 2026-06-02 — **10 is the operative cap, do not
+self-throttle below it**). Worst-case blast radius is 10×288 = 2880 small
+changes/day, still bounded and each independently revertable. See the
+"Parallelism" section for selection, dispatch, locking, and failure
+isolation.
 
 **Auto-publish is the default, no opt-outs, no daily caps (updated
 2026-05-27).** Every PRD is buildable — `build_auto` is no longer
@@ -30,22 +32,27 @@ follow-on PRD commit+push) are all on. Daily budget caps are set to
 null (unlimited); `budget.json` still records `used[k]` counters as
 telemetry but never blocks an action.
 
-User explicitly authorized (2026-05-25, expanded 2026-05-27):
-- Public GitHub repos under `j0yen/<slug>`
+User explicitly authorized (2026-05-25, expanded 2026-05-27, reaffirmed
+2026-05-30 — **no operator-confirm gate: publish autonomously without review,
+including corporate-derived PRDs; private repos under `joeyen-atscale` are the
+pre-approved, appropriate home for AtScale-derived engineering tooling. Do NOT
+set `next: publish-gated` or wait for confirmation.**):
+- Private GitHub repos under `joeyen-atscale/<slug>`
 - `~/.local/bin/` binary install
 - `~/.claude/scripts/` hook symlinks
 - `~/.claude/settings.json` edits (with timestamped backups)
-- Follow-on PRD authorship into `~/wintermute/autobuilder/`
+- Follow-on PRD authorship into `~/Documents/PRDs/`
 - New tool/mechanism vectors as needed
 
 ## Inputs
 
-- **PRDs:** `~/wintermute/autobuilder/PRD-*.md` (excluding `PRDs-archive/`).
+- **PRDs:** `~/Documents/PRDs/PRD-*.md` (top-level only; `ARCHIVE/` and `visions/` are excluded by the scan's `-maxdepth 1`).
 - **Manifest:** `~/.claude/skills/build/state/manifest.json` — per-PRD
   status, last_action timestamp, blockers, output repo URL when published.
-- **Budget:** `~/.claude/skills/build/state/budget.json` — per-day caps
-  on net-external actions (defaults: 1 new repo/day, 5 commits/day,
-  1 follow-on PRD/day).
+- **Budget:** `~/.claude/skills/build/state/budget.json` — **all budget caps
+  removed (uncapped, per user instruction 2026-05-30).** New repos, commits,
+  pushes, and follow-on PRDs are unlimited. `used[k]` counters are still
+  recorded as telemetry but `caps[k]` are always null and never block an action.
 - **Lock:** `~/.claude/skills/build/state/tick.lock` — `flock`-style
   guard so two concurrent ticks never race.
 
@@ -69,7 +76,7 @@ User explicitly authorized (2026-05-25, expanded 2026-05-27):
 
 Run `scripts/scan-prds.sh`. This emits a JSON list of
 `{path, slug, status, build_auto, last_modified}` for every PRD under
-`~/wintermute/autobuilder/` (top-level only). Diff against `manifest.json`:
+`~/Documents/PRDs/` (top-level only). Diff against `manifest.json`:
 
 - **new** PRDs → add to manifest with `status: queued`, log "discovered
   PRD-<slug>".
@@ -254,14 +261,16 @@ in this tick's selection run in parallel via Agent tool calls
   slug-regex + allow-list + origin-URL match + branch-equals-current
   + fast-forward + ≥1-commit-ahead guard, and has a settings.json
   allow rule (`Bash(wm-push:*)`) so it doesn't trigger the auto-mode
-  classifier on every tick. If `wm-push` is not on `$PATH`, log
-  `wm-push-missing` to the journal and set the manifest entry's
-  `next: interactive-push` so a human can finish. Same `next:
-  investigate-push-guard-failure` shape if `wm-push` exits 2 with a
-  guard rejection (distinguish from classifier blocks). New slugs
-  need to be added to the `ALLOW` array near the top of `wm-push` —
-  keep it in sync with `wm-publish`'s ALLOW and `~/wintermute/REPOS.md`.
-  Counts as one tick action and bumps `budget.used.commits`.
+  classifier on every tick. **If `wm-push` is not on `$PATH`, do NOT
+  defer to a human — push directly:** verify clean tree + branch ==
+  current + fast-forward + ≥1 commit ahead inline, then run
+  `git push origin <branch>`, and log `wm-push-fallback-direct` to the
+  journal. Only set `next: investigate-push-guard-failure` if those
+  inline guards genuinely fail (a correctness stop, not a permission
+  gate) — same if `wm-push` itself exits 2 with a guard rejection. New
+  slugs need to be added to the `ALLOW` array near the top of `wm-push`
+  — keep it in sync with `wm-publish`'s ALLOW and `~/wintermute/REPOS.md`.
+  Counts as one tick action.
 - **install / wire** [new-repo only]: When implementation is locally
   green (tests pass, `cargo test --release` ok), install built binaries
   to `~/.local/bin/` via `install -Dm755`. If the PRD includes hooks,
@@ -285,15 +294,16 @@ in this tick's selection run in parallel via Agent tool calls
   wm-publish --slug <slug> --description "<one line from the PRD>"
   ```
   `wm-publish` (installed at `~/.local/bin/wm-publish` per
-  PRD-build-publish-allowlist) wraps `gh repo create j0yen/<slug>
-  --public --source=. --remote=origin --push --description=…` with a
+  PRD-build-publish-allowlist) wraps `gh repo create joeyen-atscale/<slug>
+  --private --source=. --remote=origin --push --description=…` with a
   slug-regex + allow-list guard, and has a settings.json allow rule
   (`Bash(wm-publish:*)`) so it doesn't trigger the auto-mode
-  classifier on every tick. If `wm-publish` is not on `$PATH`, log
-  `wm-publish-missing` to the journal and skip the publish step (the
-  PRD stays `in_progress` for the next reflect). New slugs need to be
-  added to the `ALLOW` array near the top of `wm-publish` — keep it
-  in sync with `~/wintermute/REPOS.md`.
+  classifier on every tick. **If `wm-publish` is not on `$PATH`, do NOT
+  skip — publish directly:** run `gh repo create joeyen-atscale/<slug> --private
+  --source=. --remote=origin --push --description="<one line from the
+  PRD>"`, and log `wm-publish-fallback-direct` to the journal. New slugs
+  need to be added to the `ALLOW` array near the top of `wm-publish` —
+  keep it in sync with `~/wintermute/REPOS.md`.
 
   After the publish lands, write the initial `README.md` from the
   PRD's TL;DR + acceptance tests + an "Install" block. Update
@@ -314,13 +324,15 @@ in this tick's selection run in parallel via Agent tool calls
   archives. Use `--dry-run` to preview the plan + commit pathspec. Fenced
   companion to `verified-completed.sh` (classifier) and `extend-handler.sh`
   (extend mechanics).
-- **archive**: When the PRD passes the **verified-completed** checklist
-  (all five must hold), move the PRD to
-  `~/wintermute/autobuilder/PRDs-archive/` via `git mv`, update manifest
-  to `status: shipped`, commit with the Joe Yen identity
-  (`git -c user.email=jyen.tech@gmail.com -c user.name="Joe Yen"`).
-  The commit message must include a `Verified-completed:` trailer
-  listing the five checks that passed.
+- **archive**: The publish wrapper (`wm-publish`) already moves the shipped
+  `PRD-<slug>.md` into `~/Documents/PRDs/ARCHIVE/` on a successful repo
+  create, so the file leaves the active queue automatically. When the PRD
+  passes the **verified-completed** checklist (all five must hold), just
+  update manifest to `status: shipped`. (`~/Documents/PRDs` is a plain
+  directory, not a git repo — there is no `git mv`/commit step here; if the
+  PRD was somehow not auto-archived, `mv ~/Documents/PRDs/PRD-<slug>.md
+  ~/Documents/PRDs/ARCHIVE/`.) Record the five passing checks in the
+  manifest entry's `verified_completed` field.
 
   **Verified-completed checklist (new-repo path):**
   1. `output_repo_path` exists locally AND `cargo test --release`
@@ -372,7 +384,7 @@ in this tick's selection run in parallel via Agent tool calls
     -e --skippgpcheck --noconfirm` exits 0 AND produces
     `linux-wintermute-*.pkg.tar.zst`. We do NOT require live boot/insmod
     validation — that's the user's call. Build-cleanliness is the gate.
-  - Check #2 becomes: if `<slug>` already has a j0yen repo
+  - Check #2 becomes: if `<slug>` already has a joeyen-atscale repo
     (agentns/memlog/provfs), the new commit is reachable from
     `origin/main`. Otherwise a fresh repo with the same shape as
     rust-cli.
@@ -509,17 +521,24 @@ is REMOVED; do not reintroduce it in branch agents.
 Each tick advances **up to 10 PRDs in parallel**. The per-PRD
 constraint (one action per PRD per tick) is preserved unchanged;
 only the per-tick fan-out grew (1 → 5 → 10). User instruction
-2026-05-28: "this laptop can handle it"; raised 5 → 10 on 2026-05-29.
+2026-05-28: "this laptop can handle it"; raised 5 → 10 on 2026-05-29;
+**reaffirmed 2026-06-02: run 10-wide — stop inventing reasons to shrink.**
 
 **Fan out to the full cap by default — do NOT self-throttle below 10 on
 memory grounds.** The box has **15 GB RAM (0 swap), typically ~11 GB
 free**. A 5-wide tick peaked ~4.1 GB, so a 10-wide tick peaks ~8 GB —
 comfortably within budget. The real OOM guard is the **≤3 same-target
 sub-cap** below (it bounds parallel cargo builds of ONE heavy crate like
-recall's fastembed); honoring that, total width 10 is safe. Only reduce
-width if `free -g` shows **< 4 GB available** at selection time — and log
-the reason. (Earlier ticks wrongly held to 3 citing a stale "~9 GB"
-figure; that was wrong — see the real numbers above.)
+recall's fastembed); honoring that, total width 10 is safe. The **< 4 GB
+available** check (at selection time) is the ONLY permitted reason to
+reduce width — and it must be logged with the measured number. This rule
+has no cold-build exception: a 2026-06-02 tick reduced 10→6 citing
+"cold from-scratch builds are heavier" with 8.7 GB free — that was a
+violation of this rule, not a refinement of it. If cold-build peaks are
+a genuine concern, stagger the heavy `/autobuilder` branches a few
+seconds apart within the same 10-wide tick; do not cut width. (Earlier
+ticks also wrongly held to 3 citing a stale "~9 GB" figure; same class
+of error.)
 
 Note on coordination: ticks run detached as `claude-build-work.service`
 (30-min cap), so a 10-wide fan-out has room to finish + commit. Seeing
