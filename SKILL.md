@@ -500,33 +500,49 @@ No caps block this action — `budget.caps` are all null.
 
 ### Phase 7 — Persist & log
 
-Each branch (per selected PRD) persists its own work using the
-**sidecar mechanism** (added 2026-05-29 — see PRD-build-manifest-write-durability):
+Each branch (per selected PRD) persists its own work through the shared
+**`scripts/manifest-set.sh`** helper (added 2026-06-02 — see
+PRD-build-durable-manifest-write). Branches MUST NOT hand-roll lock +
+read-modify-write logic anymore; the helper owns the one correct
+implementation (write-ahead intent file → block on the lock with a hard
+60s ceiling → RMW only this slug → drop the intent → release the lock).
 
-**Branch step (no shared-file contention):**
-- Call `scripts/manifest-sidecar.sh write <slug> status=<...>
-  last_action=<ISO> ticks_invested_delta=1 [last_error=<...>]
-  [output_repo_path=<...>] action=<...> outcome=<...>`.
-  This writes `state/status/<slug>.json` atomically (mktemp + rename).
-  Because each branch owns a DISTINCT path, concurrent branches never
-  race — no shared-file lock needed at this step.
+**Branch step:**
+- Build the patch object (the keys to merge into `prds.<slug>`) and write
+  it to a temp file, e.g.:
+  `printf '%s' '{"status":"shipped","last_action":"<ISO>","ticks_invested_delta":1,"output_repo_path":"<...>","action":"<...>","outcome":"<...>"}' > /tmp/<slug>.patch.json`
+  (include `"last_error":"<...>"` only when the build failed).
+- Call `scripts/manifest-set.sh <slug> /tmp/<slug>.patch.json`. The helper
+  writes `state/intent/<slug>.json` (write-ahead) BEFORE attempting the
+  lock, so even an OOM-kill mid-acquire leaves a recoverable pointer. It
+  then acquires `state/manifest.lock.d` (mkdir, retry every 0.2s, hard 60s
+  ceiling — NOT the old 5s give-up), RMWs ONLY `prds.<slug>`, deletes the
+  intent file, and releases the lock. A non-zero exit means the patch did
+  not land but the intent file remains for the parent's replay — do not
+  treat it as success in your summary.
 - Append a one-line summary to `~/brain/journal/build/YYYY-MM-DD.md`:
-  `<ISO-ts>  <slug>  <action>  <outcome>  (<key=value...>)`. The
-  journal append is naturally serial — each branch appends its own
-  line. Use `>>` to avoid clobbering.
+  `<ISO-ts>  <slug>  <action>  <outcome>  (<key=value...>)`. The journal
+  append is naturally serial — each branch appends its own line. Use `>>`
+  to avoid clobbering.
 - Release this branch's `state/prd-<slug>.lock`.
 
-**Parent step (after all branches return — one serial locked pass):**
-- Call `scripts/manifest-merge-sidecars.sh --cleanup`.
-  This acquires `state/manifest.lock` once, reads `manifest.json`,
-  applies every sidecar in one jq pass, atomic-writes the result,
-  releases the lock, and removes all sidecar files.
+**Parent step (after all branches return, before releasing `tick.lock`):**
+- Run `scripts/manifest-set.sh --replay-orphans`. For every
+  `state/intent/*.json` whose patch is not yet reflected in the manifest
+  (a branch that hit the lock ceiling or was killed before its write
+  landed), it applies the patch under the same locked RMW and logs a
+  `manifest-replay` line; intents already reflected are cleaned up without
+  a redundant write. It is a no-op (exit 0, no manifest change) when
+  `state/intent/` is empty. This is the automatic version of the by-hand
+  repair the parent did on 2026-06-02 when 2/6 branches dropped their
+  writes under contention.
 - Then release `tick.lock`.
 
-This two-step design (fan-out writes to distinct sidecar paths, then
-one serial merge) eliminates the N-concurrent-reader/writer race that
-caused silent manifest loss under 9-way branch contention (observed
-2026-05-30). The legacy "acquire manifest.lock + direct RMW" pattern
+This design (per-slug write-ahead intent + a blocking-with-ceiling lock +
+end-of-tick replay) makes a Phase-7 write durable even if the branch loses
+the lock or dies mid-acquire — the failure mode that caused silent manifest
+loss under fan-out (observed 2026-05-30 9-way, 2026-06-02 6-way). The
+legacy "acquire the lock yourself + direct RMW with a 5s give-up" pattern
 is REMOVED; do not reintroduce it in branch agents.
 
 ## Parallelism (per-tick fan-out, added 2026-05-28)
@@ -630,12 +646,16 @@ Each agent prompt must include, self-contained:
 - "Acquire `~/.claude/skills/build/state/prd-<slug>.lock` via
   `flock -n` before any state mutation. If you can't acquire it,
   log `prd-lock-held` and exit."
-- "When persisting in Phase 7, call
-  `scripts/manifest-sidecar.sh write <slug> status=<...>
-  last_action=<ISO> ticks_invested_delta=1 action=<...> outcome=<...>`
-  to write a per-slug sidecar (`state/status/<slug>.json`). Do NOT
-  acquire `state/manifest.lock` or write manifest.json directly —
-  the parent merges all sidecars in one serial pass after you return."
+- "When persisting in Phase 7, write your patch object (the keys to merge
+  into `prds.<slug>`: `status`, `last_action`, `ticks_invested_delta`,
+  `action`, `outcome`, `output_repo_path`, and `last_error` only on
+  failure) to a temp JSON file and call
+  `scripts/manifest-set.sh <slug> <patch.json>`. Do NOT acquire
+  `state/manifest.lock.d` yourself or write manifest.json directly — the
+  helper handles the write-ahead intent, the lock (60s ceiling), and the
+  per-slug RMW. A non-zero exit means your write did not land (the parent's
+  `--replay-orphans` pass will recover it from your intent file); say so in
+  your summary."
 - "Return a one-line summary of what you did: `<slug>: <action>
   <outcome>` so the parent's journal sees it."
 
@@ -658,15 +678,20 @@ parallel. Do not chain follow-up Agent calls in the same tick.
   tick checks the holder — if `fuser` shows no process, or the holder's
   parent is PID 1 (orphan), reclaim the lock (kill the orphan if it's a
   bare `sleep`) and proceed; the PRD is not actually being worked.
-- `state/manifest.lock` — held briefly (sub-second) by the **parent**
-  around the post-collection `manifest-merge-sidecars.sh` pass. Branches
-  no longer hold this lock at all — they write per-slug sidecars to
-  distinct paths (`state/status/<slug>.json`) and return. The parent
-  holds the lock for ONE serial jq merge after all branches are done.
-  This eliminates the N-concurrent-writer race that caused silent manifest
-  loss (observed 2026-05-30: 2/9 branches mis-recorded). Implementation:
-  `scripts/manifest-sidecar.sh` (branch writer) and
-  `scripts/manifest-merge-sidecars.sh` (parent merger).
+- `state/manifest.lock.d` — a mkdir-based lock (macOS has no `flock`)
+  held briefly per write around the read-modify-write of a single
+  `prds.<slug>` entry. Branches do NOT acquire it directly: they call
+  `scripts/manifest-set.sh <slug> <patch.json>`, which writes a
+  write-ahead `state/intent/<slug>.json` first, then blocks on the lock
+  (retry every 0.2s, hard 60s ceiling — not the old 5s give-up), RMWs only
+  that slug, drops the intent, and releases the lock. The parent runs
+  `scripts/manifest-set.sh --replay-orphans` after all branches return to
+  apply any intent whose write never landed. This makes a Phase-7 write
+  durable under contention and across mid-acquire crashes — the failure
+  mode that caused silent manifest loss (2026-05-30 9-way; 2026-06-02
+  6-way, 2/6 branches dropped). Implementation:
+  `scripts/manifest-set.sh` (single helper for both the per-slug write and
+  the parent replay).
 - `<repo>/.git/autobuilder-integrate.lock` — held (blocking, ≤120s) by
   `worktree-extend.sh integrate` so same-repo integrations serialize.
   Internal to the helper; branches don't manage it directly.
@@ -745,7 +770,8 @@ to 5" wording. The cap is a number in the doc, not in code.
 ├── manifest.json        # { prds: { "<slug>": { status, revision, ... } } }
 ├── budget.json          # { date: "YYYY-MM-DD", caps: {...}, used: {...} }
 ├── tick.lock            # parent flock; held for the whole tick
-├── manifest.lock        # briefly held around manifest read-modify-write
+├── manifest.lock.d/     # mkdir-lock, briefly held by manifest-set.sh per RMW
+├── intent/<slug>.json   # write-ahead Phase-7 patches; replayed end-of-tick
 └── prd-<slug>.lock      # one per in-flight PRD branch; ephemeral
 ```
 
