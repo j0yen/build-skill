@@ -770,6 +770,42 @@ its branch (no version bump in the worktree), and that it finishes with
 `prd-<slug>.lock` still guards the branch's manifest/journal writes; the
 worktree guards the build tree.
 
+**Append-only shared-library surface (lib.rs convention).** When a
+shared-target branch adds new public surface to a library crate (a new
+module + re-exports), it MUST use `scripts/lib-register.sh` instead of
+free-form editing `src/lib.rs`. This is the `lib.rs` analogue of the
+`// @build:subcommands` convention for `main.rs` (see
+`build-shared-cli-dispatch-merge-safe`):
+
+```
+# Register a new module (idempotent, append-only):
+scripts/lib-register.sh <worktree_path> <module_name> [<pub_use_path>...]
+
+# Example:
+scripts/lib-register.sh ~/.cache/build-worktrees/mylib-probe probe \
+  "probe::{ProbeReport, Severity}"
+```
+
+The script appends `pub mod <module>;` just before a `// @build:modules`
+end-of-list anchor, and each `pub use` path just before a
+`// @build:reexports` anchor. Re-running with the same args is a no-op
+(idempotent grep-guard). On first call in a repo that lacks the anchors,
+the script seeds both anchors in-place at the end of the existing `pub mod`
+and `pub use` blocks (idempotent — second run does not re-seed). A
+malformed `lib.rs` with no `pub mod` block causes the script to exit 3
+with a clear message rather than corrupting the file.
+
+**When the integration rebase-retry still conflicts** (a legacy repo
+without anchors, or a structural `lib.rs` edit), the normal loom-rebase-
+retry safety net applies; the branch defers and the next tick re-runs
+`lib-register.sh` on the rebased worktree, which idempotently appends to
+the post-first-integrate state.
+
+**Back-compat:** repos that do not adopt the `// @build:modules` /
+`// @build:reexports` anchors are entirely unaffected — the helper is
+additive and opt-in per repo. Free-form `lib.rs` editing still works for
+non-shared targets.
+
 ### Failure isolation
 
 A failing branch does not abort siblings. Per-PRD locks auto-release
