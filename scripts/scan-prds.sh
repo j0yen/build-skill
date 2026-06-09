@@ -15,7 +15,7 @@
 
 set -uo pipefail
 
-PRD_DIR="${PRD_DIR:-$HOME/Documents/PRDs}"
+PRD_DIR="${PRD_DIR:-$HOME/wintermute/autobuilder}"
 JQ="${JQ:-$(command -v jq 2>/dev/null || echo /usr/bin/jq)}"
 
 [ -d "$PRD_DIR" ] || { printf '[]\n'; exit 0; }
@@ -151,7 +151,7 @@ emit_one() {
 }
 
 # Use find -maxdepth 1 so PRDs-archive/ doesn't sneak in.
-find "$PRD_DIR" -maxdepth 1 -type f -name 'PRD-*.md' -print0 \
+find -L "$PRD_DIR" -maxdepth 1 -type f -name 'PRD-*.md' -print0 \
   | sort -z \
   | {
       first=true
