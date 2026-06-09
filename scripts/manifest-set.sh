@@ -107,12 +107,29 @@ try:
         m = json.load(f)
 except FileNotFoundError:
     m = {}
-prds = m.setdefault("prds", {})
-entry = prds.get(slug)
-if not isinstance(entry, dict):
-    entry = {"slug": slug}
-entry.update(patch)
-prds[slug] = entry
+prds = m.get("prds", [])
+if isinstance(prds, list):
+    entry = None
+    idx = None
+    for i, p in enumerate(prds):
+        if isinstance(p, dict) and p.get("slug") == slug:
+            entry = p; idx = i; break
+    if entry is None:
+        entry = {"slug": slug}
+        prds.append(entry)
+        idx = len(prds) - 1
+    entry.update(patch)
+    prds[idx] = entry
+    m["prds"] = prds
+else:
+    if not isinstance(prds, dict):
+        prds = {}
+    entry = prds.get(slug)
+    if not isinstance(entry, dict):
+        entry = {"slug": slug}
+    entry.update(patch)
+    prds[slug] = entry
+    m["prds"] = prds
 json.dump(m, sys.stdout, indent=2, sort_keys=False)
 sys.stdout.write("\n")
 PY
@@ -141,7 +158,11 @@ try:
         m = json.load(f)
 except FileNotFoundError:
     m = {}
-entry = m.get("prds", {}).get(slug, {})
+prds = m.get("prds", {})
+if isinstance(prds, list):
+    entry = next((p for p in prds if isinstance(p, dict) and p.get("slug") == slug), {})
+else:
+    entry = prds.get(slug, {})
 for k, v in patch.items():
     if entry.get(k) != v:
         raise SystemExit(1)
