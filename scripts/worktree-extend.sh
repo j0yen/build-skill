@@ -38,12 +38,49 @@ set -uo pipefail
 
 WT_ROOT="${BUILD_WT_ROOT:-$HOME/.cache/build-worktrees}"
 EXTEND="$(dirname "$0")/extend-handler.sh"
+SIDECAR="$(dirname "$0")/manifest-sidecar.sh"
 GIT_ID=(-c user.email=jyen.tech@gmail.com -c user.name="Joe Yen")
 
 die() { echo "worktree-extend: $2" >&2; exit "$1"; }
 need() { [ -n "${1:-}" ] || die 1 "$2"; }
 
 wt_path() { echo "$WT_ROOT/$(basename "$1")-$2"; }
+
+# Treat Cargo.lock as a generated artifact, not a hand-merged file. The `ours`
+# built-in merge driver keeps main's side instead of conflicting; the lockfile
+# is then regenerated canonically after the merge (see lock_regen). Idempotent:
+# adds the .gitattributes line only when absent, never duplicates it.
+lock_merge_setup() {
+  local repo="$1" ga="$1/.gitattributes" line="Cargo.lock merge=ours"
+  # Enable the built-in `ours` driver on this repo before any merge runs.
+  git -C "$repo" config merge.ours.driver true
+  if [ ! -f "$ga" ] || ! grep -qxF "$line" "$ga"; then
+    printf '%s\n' "$line" >>"$ga"
+  fi
+}
+
+# After a successful source merge, regenerate Cargo.lock so the committed
+# lockfile is canonical for the merged Cargo.toml. --offline first to stay
+# deterministic under the serial integrate flock (no surprise network). If a
+# genuinely new (uncached) dep needs the network, do NOT commit a stale lock:
+# signal the caller (return 7) so integrate records lockfile-regen-needs-net.
+# No-op (return 0) for repos without a Cargo.toml or Cargo.lock churn.
+lock_regen() {
+  local repo="$1"
+  [ -f "$repo/Cargo.toml" ] || return 0          # not a cargo repo: no-op
+  [ -f "$repo/Cargo.lock" ] || return 0          # no lockfile to regenerate
+  command -v cargo >/dev/null 2>&1 || return 0   # no cargo: leave as merged
+  if ( cd "$repo" && cargo generate-lockfile --offline >/dev/null 2>&1 ); then
+    return 0
+  fi
+  # --offline could not satisfy the merged Cargo.toml from cache. Try an
+  # offline build as a fallback (resolves via the cache without re-fetching).
+  if ( cd "$repo" && cargo build --offline --quiet >/dev/null 2>&1 ); then
+    return 0
+  fi
+  # Genuinely needs network for a new/uncached dependency: do not commit stale.
+  return 7
+}
 
 cmd_add() {
   local repo="${1:-}" slug="${2:-}"; need "$repo" "usage: add <repo> <slug>"; need "$slug" "missing slug"
@@ -78,9 +115,19 @@ cmd_integrate() {
   fi
   git -C "$repo" show-ref --verify --quiet "refs/heads/$branch" || die 2 "no branch $branch to integrate"
   git -C "$repo" checkout main >&2 2>/dev/null || git -C "$repo" checkout -q main
+  # Cargo.lock is a generated artifact: keep main's side on merge (ours driver),
+  # then regenerate canonically below. Set up before the merge so it takes effect.
+  lock_merge_setup "$repo"
   if ! git -C "$repo" "${GIT_ID[@]}" merge --no-ff --no-edit "$branch" >&2; then
     git -C "$repo" merge --abort 2>/dev/null
     die 4 "merge conflict integrating $slug; aborted (branch kept for next tick)"
+  fi
+  # Post-merge: regenerate Cargo.lock for the merged Cargo.toml. The trailing
+  # `git add -A` stages it into the single bump commit. If a new uncached dep
+  # needs the network, flag the sidecar rather than committing a stale lock.
+  if ! lock_regen "$repo"; then
+    echo "worktree-extend: $slug: lockfile-regen-needs-net (committing merged source; lock left as merged)" >&2
+    [ -x "$SIDECAR" ] && "$SIDECAR" write "$slug" last_error=lockfile-regen-needs-net >&2 || true
   fi
   # Serial version bump + changelog so stacked branches increment cleanly.
   "$EXTEND" bump-version "$repo" "$bump" >&2 || die 6 "bump-version failed"

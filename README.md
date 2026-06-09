@@ -29,11 +29,17 @@ rescued across re-installs.
 ├── SKILL.md         # the spec Claude loads
 ├── install.sh       # mode-1 (local) and mode-2 (curl|bash) installer
 ├── scripts/
-│   ├── scan-prds.sh             # emit JSON describing every PRD
-│   ├── clear-stale-blockers.sh  # remove resolved version-collision blockers
-│   └── extend-handler.sh        # rust-extend path helpers
+│   ├── scan-prds.sh              # emit JSON describing every PRD
+│   ├── clear-stale-blockers.sh   # remove resolved version-collision blockers
+│   ├── extend-handler.sh         # rust-extend path helpers
+│   ├── manifest-sidecar.sh       # branch Phase-7 sidecar writer (no shared-file race)
+│   └── manifest-merge-sidecars.sh# parent post-collection sidecar merger
+├── tests/
+│   ├── manifest-write-durability.sh  # stress: 12 concurrent writers × 20 runs
+│   └── ...
 ├── state/           # runtime — gitignored
 │   ├── manifest.json
+│   ├── status/      # ephemeral per-PRD sidecars written by branches
 │   └── budget.json
 ├── LICENSE-MIT
 └── LICENSE-APACHE

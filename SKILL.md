@@ -1,6 +1,7 @@
 ---
 name: build
-description: Continuously implement queued PRDs end-to-end — scan for new PRDs, build them (delegating to /autobuilder for Rust), wire them into the system, publish them as standalone GitHub repos under j0yen, update Abouts (per-repo READMEs + wintermute REPOS.md), and draft follow-on PRDs that expand Claude's own capabilities. Runs every 5 minutes via systemd-user timer; up to 10 PRDs advanced in parallel per tick (one action per PRD). Use when the user says /build, when the SessionStart hook reports a queued PRD, or when the user asks Claude to "make progress on the queue" or "build the next thing."
+description: Continuously implement queued PRDs end-to-end — scan for new PRDs, build them (delegating to /autobuilder for Rust, cargo via /cloudbuild), wire them into the system, publish them as standalone GitHub repos under j0yen, update Abouts (per-repo READMEs + wintermute REPOS.md), and draft follow-on PRDs that expand Claude's own capabilities. Runs every 5 minutes via systemd-user timer; up to 10 PRDs advanced in parallel per tick (one action per PRD). Use when the user says /build, when the SessionStart hook reports a queued PRD, or when the user asks Claude to "make progress on the queue" or "build the next thing."
+model: sonnet
 ---
 
 # /build — continuous PRD implementation loop
@@ -566,9 +567,8 @@ otherwise.
 gate (cargo test / the autobuilder 7-receipt gate catches errors), which
 is Sonnet's sweet spot — running branches on Opus burns tokens without a
 quality gain the gate can't already enforce. The parent tick orchestrator
-(this skill, selecting/dispatching/journaling) stays on the session model
-(Opus) — it makes the judgment calls. **Escalate a branch to
-`model: "opus"`** when any of:
+(this skill, selecting/dispatching/journaling) runs on Sonnet (`model: sonnet`
+in the skill frontmatter). **Escalate a branch to `model: "opus"`** when any of:
 - the PRD declares `build_priority: high` AND its shape is architectural /
   ambiguous (new subsystem, cross-cutting design), not a mechanical extend;
 - `build_target: kernel-extend` (hand-written C, subtle, no autobuilder
@@ -578,6 +578,15 @@ quality gain the gate can't already enforce. The parent tick orchestrator
   retry one tier up before giving up.
 Pass the chosen model via the Agent call's `model` field. When unsure,
 default to Sonnet; the escalation list is the only reason to go Opus.
+
+**Cloudbuild (added 2026-06-07).** All `cargo build`, `cargo test`,
+`cargo clippy`, and `cargo deny` invocations inside branch agents MUST
+route through `/cloudbuild` (i.e. invoke the cloudbuild skill or run
+`bash ~/.claude/skills/cloudbuild/cloudbuild.sh build <crate> -- <args>`).
+Do NOT run cargo directly on the laptop for any Rust PRD. This applies to
+both new-scaffold and rust-extend branches. Non-cargo work (Write/Edit,
+shell scripts, gh, git) stays local. Each agent prompt must include this
+directive verbatim: "Route all cargo invocations through cloudbuild."
 
 Each agent prompt must include, self-contained:
 
@@ -658,6 +667,18 @@ changelog) is serial. Mechanics live in `scripts/worktree-extend.sh`:
    `extend-handler.sh`, committing with the Joe Yen identity. Because the
    bump happens here under the lock, sequential branches increment
    cleanly (e.g. recall 0.5→0.6→0.7 across three branches in one tick).
+   **`Cargo.lock` is regenerated, not merged.** integrate sets up a
+   `Cargo.lock merge=ours` driver (`.gitattributes`, created idempotently)
+   so the lockfile never *conflicts* on merge, then runs
+   `cargo generate-lockfile --offline` (fallback `cargo build --offline`)
+   after the source merge and before the bump commit, so the committed
+   `Cargo.lock` is canonical for the merged `Cargo.toml` — staged into the
+   single bump commit by the existing `git add -A`. Branch agents need not
+   and should **not** hand-resolve `Cargo.lock` conflicts; just leave the
+   lockfile alone (`Cargo.toml` conflicts are real and still defer). If a
+   genuinely new uncached dep needs the network, integrate skips with
+   `last_error=lockfile-regen-needs-net` rather than committing a stale
+   lock — the source merge lands but is flagged.
 4. **push + cleanup** — after a successful integrate, `wm-push --slug
    <repo>` once, then `worktree-extend.sh cleanup <repo> <slug>
    --drop-branch`. On a deferred branch (dirty target / conflict / red
