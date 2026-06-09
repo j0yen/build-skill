@@ -103,9 +103,13 @@ cmd_add() {
 }
 
 cmd_integrate() {
+  local no_rebase=""
+  # --no-rebase: skip rebase-retry, reproduce old abort-immediately behaviour.
+  if [ "${1:-}" = "--no-rebase" ]; then no_rebase=1; shift; fi
   local repo="${1:-}" slug="${2:-}" bump="${3:-minor}" tldr="${4:-}"
-  need "$repo" "usage: integrate <repo> <slug> <bump> <tldr-file>"; need "$slug" "missing slug"
+  need "$repo" "usage: integrate [--no-rebase] <repo> <slug> <bump> <tldr-file>"; need "$slug" "missing slug"
   local branch="autobuilder/$slug"
+  local wt; wt="$(wt_path "$repo" "$slug")"
   exec 9>"$repo/.git/autobuilder-integrate.lock"
   flock -w 120 9 || die 5 "could not acquire integration lock for $repo"
 
@@ -120,7 +124,37 @@ cmd_integrate() {
   lock_merge_setup "$repo"
   if ! git -C "$repo" "${GIT_ID[@]}" merge --no-ff --no-edit "$branch" >&2; then
     git -C "$repo" merge --abort 2>/dev/null
-    die 4 "merge conflict integrating $slug; aborted (branch kept for next tick)"
+    # --- rebase-retry path ---
+    if [ -n "$no_rebase" ] || [ ! -d "$wt" ]; then
+      die 4 "merge conflict integrating $slug; aborted (branch kept for next tick)"
+    fi
+    echo "worktree-extend: $slug: merge conflict — attempting rebase onto current main HEAD" >&2
+    local main_head; main_head="$(git -C "$repo" rev-parse main)"
+    # Rebase runs in the branch's worktree (branch checked out there); main is not
+    # checked out in the worktree so the primary tree stays on main and clean.
+    if ! git -C "$wt" "${GIT_ID[@]}" rebase "$main_head" >&2; then
+      git -C "$wt" rebase --abort 2>/dev/null
+      # Collect conflicting paths for sidecar telemetry.
+      local conflict_files; conflict_files="$(git -C "$wt" diff --name-only --diff-filter=U 2>/dev/null | tr '\n' ',' | sed 's/,$//')"
+      [ -z "$conflict_files" ] && conflict_files="unknown"
+      [ -x "$SIDECAR" ] && "$SIDECAR" write "$slug" "last_error=integrate-conflict:${conflict_files}" >&2 || true
+      die 4 "rebase conflict integrating $slug; aborted (branch kept for next tick)"
+    fi
+    # Rebase succeeded. Cheap post-rebase guard: cargo check to catch auto-resolved
+    # edits that reference each other in a non-compiling way.
+    if [ -f "$wt/Cargo.toml" ] && command -v cargo >/dev/null 2>&1; then
+      if ! ( cd "$wt" && cargo check --offline --quiet 2>&1 ); then
+        git -C "$wt" rebase --abort 2>/dev/null || true
+        [ -x "$SIDECAR" ] && "$SIDECAR" write "$slug" "last_error=rebase-broke-build" >&2 || true
+        die 4 "rebase-broke-build integrating $slug; cargo check failed after rebase (branch kept)"
+      fi
+    fi
+    # Retry the merge now that the branch sits cleanly on top of main.
+    if ! git -C "$repo" "${GIT_ID[@]}" merge --no-ff --no-edit "$branch" >&2; then
+      git -C "$repo" merge --abort 2>/dev/null
+      die 4 "merge still conflicted after rebase integrating $slug; aborted (branch kept)"
+    fi
+    echo "worktree-extend: $slug: rebase-retry succeeded" >&2
   fi
   # Post-merge: regenerate Cargo.lock for the merged Cargo.toml. The trailing
   # `git add -A` stages it into the single bump commit. If a new uncached dep

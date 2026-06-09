@@ -715,15 +715,34 @@ changelog) is serial. Mechanics live in `scripts/worktree-extend.sh`:
    (`git commit` inside the worktree). Do **not** bump the version or
    touch `CHANGELOG.md` here — that is deferred to integration so stacked
    branches don't collide on the same version number.
-3. **integrate (serial, locked)** — `worktree-extend.sh integrate <repo>
+3. **integrate (serial, locked)** — `worktree-extend.sh integrate [--no-rebase] <repo>
    <slug> <bump> <tldr-file>` takes the per-repo integration lock,
    **refuses if the target's main tree is dirty (exit 3 → leave PRD
    in_progress, surface `target-dirty`)**, merges `autobuilder/<slug>`
-   into `main` (`--no-ff`; exit 4 on conflict → defer, branch kept),
-   then bumps the version and prepends the CHANGELOG via
-   `extend-handler.sh`, committing with the Joe Yen identity. Because the
-   bump happens here under the lock, sequential branches increment
-   cleanly (e.g. recall 0.5→0.6→0.7 across three branches in one tick).
+   into `main` (`--no-ff`), then bumps the version and prepends the
+   CHANGELOG via `extend-handler.sh`, committing with the Joe Yen
+   identity. Because the bump happens here under the lock, sequential
+   branches increment cleanly (e.g. recall 0.5→0.6→0.7 across three
+   branches in one tick).
+
+   **Rebase-retry on merge conflict (loom-rebase-retry).** When two
+   branches share the same `build_into` target and the first one lands,
+   the second's `integrate` will conflict. Instead of immediately
+   deferring (the old exit 4 loop), integrate now auto-rebases the
+   loser: it runs `git rebase <main_head>` inside the branch's worktree
+   (the primary tree stays on `main` and clean), then runs a fast
+   `cargo check --offline` guard in the worktree, then retries the
+   merge once. Exit outcomes:
+   - Rebase succeeds + check passes + retry merge succeeds → exits 0
+     (branch lands one tick later, no human needed).
+   - Rebase conflicts → `git rebase --abort`, sidecar records
+     `last_error=integrate-conflict:<files>`, exits 4 (branch kept).
+   - Rebase succeeds but cargo check fails → rebase aborted, sidecar
+     records `last_error=rebase-broke-build`, exits 4 (branch kept).
+   - Retry merge still conflicts (should not happen) → exits 4.
+   Pass `--no-rebase` to reproduce the old abort-immediately behaviour
+   (useful for debugging or non-Cargo repos where `cargo check` is
+   meaningless).
    **`Cargo.lock` is regenerated, not merged.** integrate sets up a
    `Cargo.lock merge=ours` driver (`.gitattributes`, created idempotently)
    so the lockfile never *conflicts* on merge, then runs
