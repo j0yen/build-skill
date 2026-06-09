@@ -591,6 +591,25 @@ satisfy:
    per tick** — parallel cargo builds of a heavy-dep crate (e.g. recall's
    fastembed) are memory-hungry; 3 bounds the blast radius. Kernel-extend
    targets are exempt from worktree fan-out (rule 2 already caps them).
+
+   **Serial-fallback override (loom-serial-fallback, PRD-loom-serial-fallback).**
+   Before admitting multiple branches for the same `build_into` target, check
+   whether that target has a conflict streak ≥ 2 (consecutive ticks ending in
+   integrate-conflict or rebase-broke-build for that repo):
+   ```
+   scripts/loom-serial-fallback.sh serial-limit <build_into>
+   ```
+   Exit 0 = serial mode active → admit **at most 1** branch for that repo this
+   tick (call `serial-gate <repo> <count>` per candidate to enforce the cap).
+   Exit 1 = normal parallel → apply the ≤3 sub-cap as usual.
+   Fail-open: any error or absent streak file → exit 1 (no serialization).
+   When serial mode is active, pick the **oldest-deferred branch first**
+   (sort by `last_action` ascending, then `first_deferred_at` if present) so
+   selection is deterministic (AC3). `worktree-extend.sh integrate` calls
+   `streak-record` on every exit-4 (conflict/rebase-broke-build) and
+   `streak-reset` on every clean integrate — the parent tick does NOT need to
+   call these directly. Mode flips are logged to gossip (AC6); never silent.
+
 2. **≤1 `build_target: kernel-extend` per tick** — the kernel
    `makepkg` build saturates the box (load avg ≥ 10 single-threaded);
    running two in parallel triples wall time without finishing faster.
@@ -822,12 +841,17 @@ to 5" wording. The cap is a number in the doc, not in code.
 
 ```
 ~/.claude/skills/build/state/
-├── manifest.json        # { prds: { "<slug>": { status, revision, ... } } }
-├── budget.json          # { date: "YYYY-MM-DD", caps: {...}, used: {...} }
-├── tick.lock            # parent flock; held for the whole tick
-├── manifest.lock.d/     # mkdir-lock, briefly held by manifest-set.sh per RMW
-├── intent/<slug>.json   # write-ahead Phase-7 patches; replayed end-of-tick
-└── prd-<slug>.lock      # one per in-flight PRD branch; ephemeral
+├── manifest.json           # { prds: { "<slug>": { status, revision, ... } } }
+├── budget.json             # { date: "YYYY-MM-DD", caps: {...}, used: {...} }
+├── tick.lock               # parent flock; held for the whole tick
+├── manifest.lock.d/        # mkdir-lock, briefly held by manifest-set.sh per RMW
+├── intent/<slug>.json      # write-ahead Phase-7 patches; replayed end-of-tick
+├── conflict-streaks.json   # per-(repo,pathset) conflict-streak counters
+│                           # { streaks: { "<repo-basename>:<pathset>": { count, ... } } }
+│                           # written by loom-serial-fallback.sh; read at Phase-2 selection
+│                           # to gate serial vs parallel fan-out for a build_into target.
+│                           # Fail-open: absent/malformed → all streaks read as 0.
+└── prd-<slug>.lock         # one per in-flight PRD branch; ephemeral
 ```
 
 ## Manifest entry shape

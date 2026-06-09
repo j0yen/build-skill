@@ -39,6 +39,7 @@ set -uo pipefail
 WT_ROOT="${BUILD_WT_ROOT:-$HOME/.cache/build-worktrees}"
 EXTEND="$(dirname "$0")/extend-handler.sh"
 SIDECAR="$(dirname "$0")/manifest-sidecar.sh"
+SERIAL_FALLBACK="$(dirname "$0")/loom-serial-fallback.sh"
 GIT_ID=(-c user.email=jyen.tech@gmail.com -c user.name="Joe Yen")
 
 die() { echo "worktree-extend: $2" >&2; exit "$1"; }
@@ -126,6 +127,10 @@ cmd_integrate() {
     git -C "$repo" merge --abort 2>/dev/null
     # --- rebase-retry path ---
     if [ -n "$no_rebase" ] || [ ! -d "$wt" ]; then
+      # Collect conflicting paths before aborting for streak telemetry.
+      local _early_cf; _early_cf="$(git -C "$repo" diff --name-only --diff-filter=U 2>/dev/null | sort | tr '\n' ',' | sed 's/,$//')"
+      [ -z "$_early_cf" ] && _early_cf="unknown"
+      [ -x "$SERIAL_FALLBACK" ] && "$SERIAL_FALLBACK" streak-record "$repo" "$_early_cf" >&2 || true
       die 4 "merge conflict integrating $slug; aborted (branch kept for next tick)"
     fi
     echo "worktree-extend: $slug: merge conflict — attempting rebase onto current main HEAD" >&2
@@ -138,6 +143,7 @@ cmd_integrate() {
       local conflict_files; conflict_files="$(git -C "$wt" diff --name-only --diff-filter=U 2>/dev/null | tr '\n' ',' | sed 's/,$//')"
       [ -z "$conflict_files" ] && conflict_files="unknown"
       [ -x "$SIDECAR" ] && "$SIDECAR" write "$slug" "last_error=integrate-conflict:${conflict_files}" >&2 || true
+      [ -x "$SERIAL_FALLBACK" ] && "$SERIAL_FALLBACK" streak-record "$repo" "$conflict_files" >&2 || true
       die 4 "rebase conflict integrating $slug; aborted (branch kept for next tick)"
     fi
     # Rebase succeeded. Cheap post-rebase guard: cargo check to catch auto-resolved
@@ -146,12 +152,16 @@ cmd_integrate() {
       if ! ( cd "$wt" && cargo check --offline --quiet 2>&1 ); then
         git -C "$wt" rebase --abort 2>/dev/null || true
         [ -x "$SIDECAR" ] && "$SIDECAR" write "$slug" "last_error=rebase-broke-build" >&2 || true
+        [ -x "$SERIAL_FALLBACK" ] && "$SERIAL_FALLBACK" streak-record "$repo" "rebase-broke-build" >&2 || true
         die 4 "rebase-broke-build integrating $slug; cargo check failed after rebase (branch kept)"
       fi
     fi
     # Retry the merge now that the branch sits cleanly on top of main.
     if ! git -C "$repo" "${GIT_ID[@]}" merge --no-ff --no-edit "$branch" >&2; then
       git -C "$repo" merge --abort 2>/dev/null
+      local _retry_cf; _retry_cf="$(git -C "$repo" diff --name-only --diff-filter=U 2>/dev/null | sort | tr '\n' ',' | sed 's/,$//')"
+      [ -z "$_retry_cf" ] && _retry_cf="unknown"
+      [ -x "$SERIAL_FALLBACK" ] && "$SERIAL_FALLBACK" streak-record "$repo" "$_retry_cf" >&2 || true
       die 4 "merge still conflicted after rebase integrating $slug; aborted (branch kept)"
     fi
     echo "worktree-extend: $slug: rebase-retry succeeded" >&2
@@ -172,6 +182,8 @@ cmd_integrate() {
   git -C "$repo" add -A >&2
   git -C "$repo" "${GIT_ID[@]}" commit -q -m "$(basename "$repo"): v$newver — $slug (parallel integrate)" >&2 \
     || die 6 "version-bump commit failed"
+  # Clean integrate: reset conflict streak for this repo so parallel fan-out resumes.
+  [ -x "$SERIAL_FALLBACK" ] && "$SERIAL_FALLBACK" streak-reset "$repo" >&2 || true
   echo "$newver"
 }
 
