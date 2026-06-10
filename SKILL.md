@@ -954,6 +954,20 @@ path; the existing repo is mutated in place rather than a new one
 created. See `scripts/extend-handler.sh` for the mechanical helpers
 (validate, current-version, bump-version, install, changelog-prepend).
 
+### Amending PRD frontmatter with vellum
+
+When updating a PRD's `Status:`, `blockers:`, or `iter_log:` from a build tick, prefer `vellum amend` over hand-editing:
+
+```
+vellum amend PRD-<slug>.md --set-status shipped
+vellum amend PRD-<slug>.md --add-blocker "system: needs reboot"
+vellum amend PRD-<slug>.md --append-iter-log "v0.1 — all ACs green"
+```
+
+`vellum amend` writes atomically (temp file + rename) and understands all three `deferred_acs` forms. Use `--dry-run` to preview changes. Falls back gracefully if vellum is absent.
+
+`scripts/scan-prds.sh` also uses `vellum scan` as a fast-path when the binary is on `$PATH`, falling back to the bash parser when absent. Both paths emit identical JSON output.
+
 ## Manual invocation
 
 - `/build` → run one tick (same as the timer).

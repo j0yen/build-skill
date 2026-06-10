@@ -16,6 +16,12 @@
 set -uo pipefail
 
 PRD_DIR="${PRD_DIR:-$HOME/wintermute/autobuilder}"
+
+# Fast path: use vellum if available (same output format, faster + more correct).
+if command -v vellum >/dev/null 2>&1; then
+    exec vellum scan "${PRD_DIR}"
+fi
+# Fallback: bash parser (used when vellum is absent or upgrading).
 JQ="${JQ:-$(command -v jq 2>/dev/null || echo /usr/bin/jq)}"
 
 [ -d "$PRD_DIR" ] || { printf '[]\n'; exit 0; }
