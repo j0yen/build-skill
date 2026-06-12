@@ -1,6 +1,6 @@
 ---
 name: build
-description: Continuously implement queued PRDs end-to-end — scan for new PRDs, build them (delegating to /autobuilder for Rust, cargo via /cloudbuild), wire them into the system, publish them as standalone GitHub repos under j0yen, update Abouts (per-repo READMEs + wintermute REPOS.md), and draft follow-on PRDs that expand Claude's own capabilities. Runs every 5 minutes via systemd-user timer; up to 10 PRDs advanced in parallel per tick (one action per PRD). Use when the user says /build, when the SessionStart hook reports a queued PRD, or when the user asks Claude to "make progress on the queue" or "build the next thing."
+description: Continuously implement queued PRDs end-to-end — scan for new PRDs, build them (delegating to /autobuilder for Rust, cargo via /cloudbuild), wire them into the system, publish them as standalone GitHub repos under j0yen, update Abouts (per-repo READMEs + wintermute REPOS.md), and draft follow-on PRDs that expand Claude's own capabilities. Runs every 5 minutes via systemd-user timer; up to 30 PRDs advanced in parallel per tick (one action per PRD). Use when the user says /build, when the SessionStart hook reports a queued PRD, or when the user asks Claude to "make progress on the queue" or "build the next thing."
 model: sonnet
 ---
 
@@ -13,12 +13,12 @@ documenting, then drafting whatever follow-on PRDs the experience made
 obvious.
 
 Cadence is **every 5 minutes** (systemd-user timer `claude-build.timer`).
-Per tick, the skill advances **up to 10 PRDs in parallel** — one action
+Per tick, the skill advances **up to 30 PRDs in parallel** — one action
 per PRD, dispatched as parallel Agent (subagent) tool calls in a single
 tool-use message, then collected. The per-PRD one-action invariant is
 preserved; only fan-out per tick changed (2026-05-28: 1 → 5; 2026-05-29:
-5 → 10; reaffirmed by user 2026-06-02 — **10 is the operative cap, do not
-self-throttle below it**). Worst-case blast radius is 10×288 = 2880 small
+5 → 10; raised by user 2026-06-11: 10 → 30 — **30 is the operative cap, do not
+self-throttle below it**). Worst-case blast radius is 30×288 = 8640 small
 changes/day, still bounded and each independently revertable. See the
 "Parallelism" section for selection, dispatch, locking, and failure
 isolation.
@@ -100,10 +100,10 @@ Within both buckets, sort by `build_priority` descending
 PRDs the user has explicitly bumped to `build_priority: high` get
 picked before their normal-priority siblings.
 
-Then pick **up to 10 PRDs** from the pool that mutually satisfy the
+Then pick **up to 30 PRDs** from the pool that mutually satisfy the
 parallel-dispatch rules in the "Parallelism" section (shared `build_into`
 isolated via worktrees up to the ≤3 same-target sub-cap, ≤1 kernel-extend,
-≤1 reflect-eligible). Fewer than 10 is fine; the cap is 10, the floor is
+≤1 reflect-eligible). Fewer than 30 is fine; the cap is 30, the floor is
 whatever the queue admits after conflict-pruning. If the pool yields zero,
 exit clean.
 
@@ -168,7 +168,7 @@ frontmatter (e.g., `build_target: rust-cli`).
 ### Phase 4 — Implement (one action per selected PRD)
 
 For each PRD selected in Phase 2, do exactly ONE of the following —
-whichever advances that PRD by one well-defined step. The 1..=10 PRDs
+whichever advances that PRD by one well-defined step. The 1..=30 PRDs
 in this tick's selection run in parallel via Agent tool calls
 (see "Parallelism" below). Each branch stops after its action.
 
@@ -548,30 +548,24 @@ is REMOVED; do not reintroduce it in branch agents.
 
 ## Parallelism (per-tick fan-out, added 2026-05-28)
 
-Each tick advances **up to 10 PRDs in parallel**. The per-PRD
+Each tick advances **up to 30 PRDs in parallel**. The per-PRD
 constraint (one action per PRD per tick) is preserved unchanged;
-only the per-tick fan-out grew (1 → 5 → 10). User instruction
+only the per-tick fan-out grew (1 → 5 → 10 → 30). User instruction
 2026-05-28: "this laptop can handle it"; raised 5 → 10 on 2026-05-29;
-**reaffirmed 2026-06-02: run 10-wide — stop inventing reasons to shrink.**
+raised 10 → 30 by user 2026-06-11 — **30 is the operative cap, do not
+self-throttle below it.**
 
-**Fan out to the full cap by default — do NOT self-throttle below 10 on
+**Fan out to the full cap by default — do NOT self-throttle below 30 on
 memory grounds.** The box has **15 GB RAM (0 swap), typically ~11 GB
-free**. A 5-wide tick peaked ~4.1 GB, so a 10-wide tick peaks ~8 GB —
-comfortably within budget. The real OOM guard is the **≤3 same-target
+free**. Heavy cargo builds route through cloudbuild (Hetzner), so local
+memory pressure is minimal. The real OOM guard is the **≤3 same-target
 sub-cap** below (it bounds parallel cargo builds of ONE heavy crate like
-recall's fastembed); honoring that, total width 10 is safe. The **< 4 GB
+recall's fastembed); honoring that, total width 30 is safe. The **< 4 GB
 available** check (at selection time) is the ONLY permitted reason to
-reduce width — and it must be logged with the measured number. This rule
-has no cold-build exception: a 2026-06-02 tick reduced 10→6 citing
-"cold from-scratch builds are heavier" with 8.7 GB free — that was a
-violation of this rule, not a refinement of it. If cold-build peaks are
-a genuine concern, stagger the heavy `/autobuilder` branches a few
-seconds apart within the same 10-wide tick; do not cut width. (Earlier
-ticks also wrongly held to 3 citing a stale "~9 GB" figure; same class
-of error.)
+reduce width — and it must be logged with the measured number.
 
 Note on coordination: ticks run detached as `claude-build-work.service`
-(30-min cap), so a 10-wide fan-out has room to finish + commit. Seeing
+(30-min cap), so a 30-wide fan-out has room to finish + commit. Seeing
 `claude-build-work.service` active/activating is **THIS tick's own
 container** — do not mistake it for a competing tick and shrink the
 fan-out; the launcher's overlap guard already guarantees one tick at a
@@ -579,7 +573,7 @@ time.
 
 ### Selection rules (extends Phase 2)
 
-After the existing priority sort, pick up to 10 PRDs that mutually
+After the existing priority sort, pick up to 30 PRDs that mutually
 satisfy:
 
 1. **Shared `build_into` → isolate with worktrees, don't serialize.**
@@ -619,9 +613,9 @@ satisfy:
    If two candidates would otherwise both trigger reflect, designate
    one as reflect-eligible and the other skips Phase 6.
 
-Fewer than 10 is fine. Selection is greedy — walk the sorted candidate
+Fewer than 30 is fine. Selection is greedy — walk the sorted candidate
 pool, admit each PRD that doesn't violate a rule against already-
-admitted ones, stop at 10 or end-of-pool.
+admitted ones, stop at 30 or end-of-pool.
 
 ### Dispatch
 
