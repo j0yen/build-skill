@@ -7,7 +7,7 @@ model: sonnet
 # /build — continuous PRD implementation loop
 
 `/build` is the autonomous self-extension loop. It looks at the PRDs Claude
-and the user have written under `~/Documents/PRDs/` and walks each
+and the user have written under `~/wintermute/PRDs/` and walks each
 one from "drafted" through "shipped" — implementing, wiring, publishing,
 documenting, then drafting whatever follow-on PRDs the experience made
 obvious.
@@ -41,12 +41,12 @@ set `next: publish-gated` or wait for confirmation.**):
 - `~/.local/bin/` binary install
 - `~/.claude/scripts/` hook symlinks
 - `~/.claude/settings.json` edits (with timestamped backups)
-- Follow-on PRD authorship into `~/Documents/PRDs/`
+- Follow-on PRD authorship into `~/wintermute/PRDs/`
 - New tool/mechanism vectors as needed
 
 ## Inputs
 
-- **PRDs:** `~/Documents/PRDs/PRD-*.md` (top-level only; `ARCHIVE/` and `visions/` are excluded by the scan's `-maxdepth 1`).
+- **PRDs:** `~/wintermute/PRDs/PRD-*.md` (top-level only; `ARCHIVE/` is excluded by the scan's `-maxdepth 1`).
 - **Manifest:** `~/.claude/skills/build/state/manifest.json` — per-PRD
   status, last_action timestamp, blockers, output repo URL when published.
 - **Budget:** `~/.claude/skills/build/state/budget.json` — **all budget caps
@@ -76,7 +76,7 @@ set `next: publish-gated` or wait for confirmation.**):
 
 Run `scripts/scan-prds.sh`. This emits a JSON list of
 `{path, slug, status, build_auto, last_modified}` for every PRD under
-`~/Documents/PRDs/` (top-level only). Diff against `manifest.json`:
+`~/wintermute/PRDs/` (top-level only). Diff against `manifest.json`:
 
 - **new** PRDs → add to manifest with `status: queued`, log "discovered
   PRD-<slug>".
@@ -337,15 +337,16 @@ in this tick's selection run in parallel via Agent tool calls
   archives. Use `--dry-run` to preview the plan + commit pathspec. Fenced
   companion to `verified-completed.sh` (classifier) and `extend-handler.sh`
   (extend mechanics).
-- **archive**: The publish wrapper (`wm-publish`) already moves the shipped
-  `PRD-<slug>.md` into `~/Documents/PRDs/ARCHIVE/` on a successful repo
-  create, so the file leaves the active queue automatically. When the PRD
-  passes the **verified-completed** checklist (all five must hold), just
-  update manifest to `status: shipped`. (`~/Documents/PRDs` is a plain
-  directory, not a git repo — there is no `git mv`/commit step here; if the
-  PRD was somehow not auto-archived, `mv ~/Documents/PRDs/PRD-<slug>.md
-  ~/Documents/PRDs/ARCHIVE/`.) Record the five passing checks in the
-  manifest entry's `verified_completed` field.
+- **archive**: When the PRD passes the **verified-completed** checklist (all
+  five must hold), update manifest to `status: shipped`, then move the PRD
+  file into `ARCHIVE/` and commit + push to j0yen/PRDs:
+  ```
+  cd ~/wintermute/PRDs
+  git -c user.name=j0yen -c user.email=jyen.tech@gmail.com mv PRD-<slug>.md ARCHIVE/
+  git -c user.name=j0yen -c user.email=jyen.tech@gmail.com commit -m "archive: <slug> shipped"
+  git push
+  ```
+  Record the five passing checks in the manifest entry's `verified_completed` field.
 
   **Verified-completed checklist (new-repo path):**
   1. `output_repo_path` exists locally AND `cargo test --release`
