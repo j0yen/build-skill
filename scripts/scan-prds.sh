@@ -15,7 +15,7 @@
 
 set -uo pipefail
 
-PRD_DIR="${PRD_DIR:-$HOME/wintermute/autobuilder}"
+PRD_DIR="${PRD_DIR:-$HOME/wintermute/PRDs}"
 
 # Fast path: use vellum if available (same output format, faster + more correct).
 if command -v vellum >/dev/null 2>&1; then
