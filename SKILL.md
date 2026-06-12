@@ -784,12 +784,45 @@ its branch (no version bump in the worktree), and that it finishes with
 `prd-<slug>.lock` still guards the branch's manifest/journal writes; the
 worktree guards the build tree.
 
+**Merge-safe CLI dispatcher registration (cli-register.sh convention).**
+When a shared-target branch adds a new CLI subcommand to a binary crate,
+it MUST use `scripts/cli-register.sh` instead of editing `src/main.rs`
+directly. The root cause of the 2026-06-06 conflict (3/6 branches deferred
+on structural `src/main.rs` conflicts) is that appending to a shared file
+always conflicts in parallel git branches — even with anchors. The fix is
+per-new-file registration:
+
+```
+# Step 1 (per-branch): register a new subcommand (creates a new file):
+scripts/cli-register.sh <worktree_path> <SubcmdName> <module_path>
+
+# Example:
+scripts/cli-register.sh ~/.cache/build-worktrees/concord-bridge Bridge bridge
+```
+
+This creates `src/register/<SubcmdName>.register` — a NEW file unique to
+this branch. Two parallel branches adding different subcommands create
+different files, so git merge auto-resolves with zero conflicts.
+
+After all branches are integrated (post-integrate, before version bump):
+
+```
+# Step 2 (post-integrate): assemble the dispatcher from all sidecars:
+scripts/cli-assemble.sh <repo_path>
+```
+
+This reads all `src/register/*.register` files alphabetically and rewrites
+the generated enum + match arms in `src/main.rs` between
+`// @build:subcommands-start` and `// @build:subcommands-end` anchors.
+
+**Back-compat:** repos that do NOT call `cli-register.sh` are entirely
+unaffected. The sidecar directory and assembly step are opt-in per repo;
+free-form `src/main.rs` editing still works for non-shared targets (AC6).
+
 **Append-only shared-library surface (lib.rs convention).** When a
 shared-target branch adds new public surface to a library crate (a new
 module + re-exports), it MUST use `scripts/lib-register.sh` instead of
-free-form editing `src/lib.rs`. This is the `lib.rs` analogue of the
-`// @build:subcommands` convention for `main.rs` (see
-`build-shared-cli-dispatch-merge-safe`):
+free-form editing `src/lib.rs`:
 
 ```
 # Register a new module (idempotent, append-only):
@@ -809,11 +842,10 @@ and `pub use` blocks (idempotent — second run does not re-seed). A
 malformed `lib.rs` with no `pub mod` block causes the script to exit 3
 with a clear message rather than corrupting the file.
 
-**When the integration rebase-retry still conflicts** (a legacy repo
-without anchors, or a structural `lib.rs` edit), the normal loom-rebase-
-retry safety net applies; the branch defers and the next tick re-runs
-`lib-register.sh` on the rebased worktree, which idempotently appends to
-the post-first-integrate state.
+Note: `lib-register.sh` uses the anchor-append pattern which CAN conflict
+when two branches start from the same base and both seed anchors. For
+library crates the rebase-retry safety net mitigates this; for CLI
+dispatcher use `cli-register.sh` (sidecar pattern) instead.
 
 **Back-compat:** repos that do not adopt the `// @build:modules` /
 `// @build:reexports` anchors are entirely unaffected — the helper is
