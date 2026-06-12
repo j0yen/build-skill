@@ -104,15 +104,31 @@ cmd_add() {
 }
 
 cmd_integrate() {
-  local no_rebase=""
+  local no_rebase="" ensure_main=""
   # --no-rebase: skip rebase-retry, reproduce old abort-immediately behaviour.
-  if [ "${1:-}" = "--no-rebase" ]; then no_rebase=1; shift; fi
+  # --ensure-main: if main branch is absent, create it from the default branch HEAD.
+  while true; do
+    case "${1:-}" in
+      --no-rebase)    no_rebase=1; shift ;;
+      --ensure-main)  ensure_main=1; shift ;;
+      *) break ;;
+    esac
+  done
   local repo="${1:-}" slug="${2:-}" bump="${3:-minor}" tldr="${4:-}"
-  need "$repo" "usage: integrate [--no-rebase] <repo> <slug> <bump> <tldr-file>"; need "$slug" "missing slug"
+  need "$repo" "usage: integrate [--no-rebase] [--ensure-main] <repo> <slug> <bump> <tldr-file>"; need "$slug" "missing slug"
   local branch="autobuilder/$slug"
   local wt; wt="$(wt_path "$repo" "$slug")"
   exec 9>"$repo/.git/autobuilder-integrate.lock"
   flock -w 120 9 || die 5 "could not acquire integration lock for $repo"
+
+  # --ensure-main: create main from the default-branch HEAD if it does not exist.
+  # This handles repos where a prior tick's branch was never landed (no main yet).
+  if [ -n "$ensure_main" ] && ! git -C "$repo" show-ref --verify --quiet "refs/heads/main"; then
+    local default_head; default_head="$(git -C "$repo" rev-parse HEAD 2>/dev/null)" || die 2 "--ensure-main: cannot resolve HEAD in $repo"
+    git -C "$repo" "${GIT_ID[@]}" branch main "$default_head" >&2 \
+      || die 2 "--ensure-main: failed to create main branch from HEAD in $repo"
+    echo "worktree-extend: created main branch from HEAD ($default_head) in $repo" >&2
+  fi
 
   # Never merge into a dirty tree.
   if [ -n "$(git -C "$repo" status --porcelain)" ]; then
@@ -130,6 +146,7 @@ cmd_integrate() {
       # Collect conflicting paths before aborting for streak telemetry.
       local _early_cf; _early_cf="$(git -C "$repo" diff --name-only --diff-filter=U 2>/dev/null | sort | tr '\n' ',' | sed 's/,$//')"
       [ -z "$_early_cf" ] && _early_cf="unknown"
+      [ -x "$SIDECAR" ] && "$SIDECAR" write "$slug" "last_error=integrate-conflict:${_early_cf}" >&2 || true
       [ -x "$SERIAL_FALLBACK" ] && "$SERIAL_FALLBACK" streak-record "$repo" "$_early_cf" >&2 || true
       die 4 "merge conflict integrating $slug; aborted (branch kept for next tick)"
     fi
@@ -161,6 +178,7 @@ cmd_integrate() {
       git -C "$repo" merge --abort 2>/dev/null
       local _retry_cf; _retry_cf="$(git -C "$repo" diff --name-only --diff-filter=U 2>/dev/null | sort | tr '\n' ',' | sed 's/,$//')"
       [ -z "$_retry_cf" ] && _retry_cf="unknown"
+      [ -x "$SIDECAR" ] && "$SIDECAR" write "$slug" "last_error=integrate-conflict:${_retry_cf}" >&2 || true
       [ -x "$SERIAL_FALLBACK" ] && "$SERIAL_FALLBACK" streak-record "$repo" "$_retry_cf" >&2 || true
       die 4 "merge still conflicted after rebase integrating $slug; aborted (branch kept)"
     fi
