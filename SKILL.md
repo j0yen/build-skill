@@ -150,6 +150,7 @@ Read the PRD. Determine its implementation shape:
   no uncommitted tracked changes, strictly fast-forward, ≥1 ahead) and is a
   no-op when already in sync. If it exits 5 (diverged), `git fetch` +
   rebase onto `origin/main` first, then re-run; never force-push.
+  # After self-push.sh: answerable-emit.sh self-edit <file> "<why>" false
 - **Config / settings.json changes** → edit settings.json with jq plus
   atomic rename. Always snapshot first to `settings.json.bak.<ts>`. For
   ticks that touch settings.json AND one or more hook scripts in the
@@ -284,6 +285,7 @@ in this tick's selection run in parallel via Agent tool calls
   slugs need to be added to the `ALLOW` array near the top of `wm-push`
   — keep it in sync with `wm-publish`'s ALLOW and `~/wintermute/REPOS.md`.
   Counts as one tick action.
+  # After wm-push succeeds: answerable-emit.sh push <repo> "v<ver> — <one-line>" false
 - **install / wire** [new-repo only]: When implementation is locally
   green (tests pass, `cargo test --release` ok), install built binaries
   to `~/.local/bin/` via `install -Dm755`. If the PRD includes hooks,
@@ -322,6 +324,7 @@ in this tick's selection run in parallel via Agent tool calls
   PRD's TL;DR + acceptance tests + an "Install" block. Update
   `~/wintermute/REPOS.md` with a one-line entry under the appropriate
   category section. Bump `budget.used.repos_created`.
+  # After wm-publish succeeds: answerable-emit.sh publish joeyen-atscale/<slug> "PRD-<slug>: <one-line>" false
 - **clerical-finalize**: When a candidate's archive gate fails on
   **only** clerical checks (C2 publish/push, C3 README/CHANGELOG, C4
   REPOS.md) while C1 (tests green) AND C5 (ACs paired/deferred) already
@@ -496,6 +499,7 @@ untracked. Steps:
    -m "build: draft PRD-build-<topic> (Phase 6 reflect)"` — include a
    one-paragraph body explaining what triggered the reflect.
 3. `git push origin main`. Bumps `budget.used.commits` for telemetry.
+# After Phase-6 PRD commit: answerable-emit.sh draft <prd-path> "Phase 6 reflect" true
 
 No caps block this action — `budget.caps` are all null.
 
