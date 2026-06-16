@@ -645,17 +645,33 @@ in the skill frontmatter). **Escalate a branch to `model: "opus"`** when any of:
 Pass the chosen model via the Agent call's `model` field. When unsure,
 default to Sonnet; the escalation list is the only reason to go Opus.
 
-**Cloudbuild (added 2026-06-07).** All `cargo build`, `cargo test`,
-`cargo clippy`, and `cargo deny` invocations inside branch agents MUST
-route through `/cloudbuild` (i.e. invoke the cloudbuild skill or run
-`bash ~/.claude/skills/cloudbuild/cloudbuild.sh build <crate> -- <args>`).
-Do NOT run cargo directly on the laptop for any Rust PRD. This applies to
-both new-scaffold and rust-extend branches. Non-cargo work (Write/Edit,
-shell scripts, gh, git) stays local. Each agent prompt must include this
-directive verbatim: "Route all cargo invocations through cloudbuild."
+**Cloudbuild (added 2026-06-07, HARDENED 2026-06-16).** All `cargo build`,
+`cargo test`, `cargo clippy`, and `cargo deny` invocations inside branch
+agents MUST route through cloudbuild. This is non-negotiable per explicit
+user instruction 2026-06-16: **local /autobuilder cargo execution is
+disabled**. Silent local fallback is not allowed — log it explicitly if
+cloudbuild is unavailable and only then proceed locally.
+
+Enforcement: every branch agent MUST export `AUTOBUILDER_CLOUD=1` before
+invoking /autobuilder (the autobuilder-cloud fork reads this to activate the
+`cargo-cloud` shim). For direct cloudbuild calls:
+`bash ~/.claude/skills/cloudbuild/cloudbuild.sh build <crate> -- <args>`.
+
+Before any cargo work: `bash ~/.claude/skills/cloudbuild/cloudbuild.sh status`
+— if RUNNING or can be brought up, use cloudbuild. Only skip if status returns
+error AND `cloudbuild up` fails after one retry; log "cloudbuild unavailable,
+building locally" in that case.
+
+This applies to both new-scaffold and rust-extend branches. Non-cargo work
+(Write/Edit, shell scripts, gh, git) stays local. Each agent prompt must
+include this directive verbatim: "Export AUTOBUILDER_CLOUD=1 and route all
+cargo invocations through cloudbuild. Do NOT run cargo directly on the laptop.
+Only fall back to local if cloudbuild.sh status errors AND cloudbuild up fails;
+log the fallback explicitly."
 
 Each agent prompt must include, self-contained:
 
+- Prepend the output of `inoculate-preamble` (if installed) to the agent's task prompt, so spawned agents carry the in-force strain.
 - The PRD's absolute path.
 - The PRD's slug.
 - "You are advancing ONE PRD as part of a parallel /build tick.
