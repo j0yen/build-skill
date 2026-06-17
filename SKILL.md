@@ -107,6 +107,29 @@ isolated via worktrees up to the ≤3 same-target sub-cap, ≤1 kernel-extend,
 whatever the queue admits after conflict-pruning. If the pool yields zero,
 exit clean.
 
+### Phase 2.5 — Session warm-up
+
+After selection (Phase 2) and before dispatching branches (Phase 4):
+
+1. **Count cargo-bound PRDs** in the selected set — any PRD whose
+   `build_target` is `rust-cli`, `rust-lib`, or `rust-extend` (i.e.,
+   it will invoke `cargo` via cloudbuild).
+2. **If ≥1 cargo-bound PRD exists**, start a cloudbuild session so all
+   branch agents reuse one warm server instead of each spinning up and
+   destroying their own:
+   ```
+   bash ~/.claude/skills/cloudbuild/cloudbuild.sh session-start
+   ```
+   Log the returned IP and record that the session is active for this tick.
+   The session lock at `~/.config/wm-burst/session.lock` causes every
+   subsequent `cloudbuild build/test` call in any branch to transparently
+   reuse the warm server — no branch-level change needed.
+3. **If 0 cargo-bound PRDs**, skip session-start — no server is needed.
+
+This is Phase 2.5 so it runs ONCE in the parent, before fan-out.
+The watchdog (`cloudbuild-watchdog.sh`) still kills any server older than 2h
+as a safety net if session-end is never reached (crash, OOM-kill, etc.).
+
 ### Phase 3 — Classify
 
 Read the PRD. Determine its implementation shape:
@@ -541,6 +564,14 @@ implementation (write-ahead intent file → block on the lock with a hard
   `state/intent/` is empty. This is the automatic version of the by-hand
   repair the parent did on 2026-06-02 when 2/6 branches dropped their
   writes under contention.
+- **Session teardown:** if Phase 2.5 started a session, tear it down now:
+  ```
+  bash ~/.claude/skills/cloudbuild/cloudbuild.sh session-end
+  ```
+  This destroys the builder server and stops billing. Run this even if some
+  branches failed — we want billing to stop regardless. If `session-end`
+  fails (network error, server already gone), log it but do not block
+  `tick.lock` release.
 - Then release `tick.lock`.
 
 This design (per-slug write-ahead intent + a blocking-with-ceiling lock +
@@ -667,7 +698,9 @@ This applies to both new-scaffold and rust-extend branches. Non-cargo work
 include this directive verbatim: "Export AUTOBUILDER_CLOUD=1 and route all
 cargo invocations through cloudbuild. Do NOT run cargo directly on the laptop.
 Only fall back to local if cloudbuild.sh status errors AND cloudbuild up fails;
-log the fallback explicitly."
+log the fallback explicitly. Do NOT call `cloudbuild session-start` or
+`cloudbuild session-end` — the parent tick manages the session lifecycle;
+branch agents only call `cloudbuild build` / `cloudbuild test`."
 
 Each agent prompt must include, self-contained:
 
