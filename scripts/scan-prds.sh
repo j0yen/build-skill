@@ -18,8 +18,35 @@ set -uo pipefail
 PRD_DIR="${PRD_DIR:-$HOME/wintermute/autobuilder}"
 
 # Fast path: use vellum if available (same output format, faster + more correct).
+# Emit BOTH top-level (buildable) and ARCHIVE/ (already-done) so Phase 1 diff
+# can distinguish archived from truly-vanished. Without this, PRDs moved to
+# ARCHIVE/ after shipping would be marked "vanished" on the next scan and
+# re-queued or lost — wasting cloud server time re-building done work.
 if command -v vellum >/dev/null 2>&1; then
-    exec vellum scan "${PRD_DIR}"
+    ARCHIVE_DIR="${PRD_DIR}/ARCHIVE"
+    if [ -d "$ARCHIVE_DIR" ]; then
+        # Merge top-level + ARCHIVE results into one JSON array.
+        # vellum emits pretty-printed JSON; use temp files so python3 parses
+        # each as a complete document rather than trying to split by line.
+        _tmp_top="$(mktemp)" _tmp_arc="$(mktemp)"
+        vellum scan "${PRD_DIR}"      >"$_tmp_top"
+        vellum scan "${ARCHIVE_DIR}"  >"$_tmp_arc"
+        python3 - "$_tmp_top" "$_tmp_arc" <<'PY'
+import json, sys
+merged = []
+for path in sys.argv[1:]:
+    try:
+        with open(path) as f:
+            merged.extend(json.load(f))
+    except Exception:
+        pass
+print(json.dumps(merged))
+PY
+        rm -f "$_tmp_top" "$_tmp_arc"
+    else
+        exec vellum scan "${PRD_DIR}"
+    fi
+    exit 0
 fi
 # Fallback: bash parser (used when vellum is absent or upgrading).
 JQ="${JQ:-$(command -v jq 2>/dev/null || echo /usr/bin/jq)}"
