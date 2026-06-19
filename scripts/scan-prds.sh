@@ -15,7 +15,7 @@
 
 set -uo pipefail
 
-PRD_DIR="${PRD_DIR:-$HOME/wintermute/autobuilder-cloud}"
+PRD_DIR="${PRD_DIR:-$HOME/wintermute/autobuilder}"
 
 # Fast path: use vellum if available (same output format, faster + more correct).
 if command -v vellum >/dev/null 2>&1; then
@@ -156,9 +156,16 @@ emit_one() {
     '{slug:$slug, path:$path, build_auto:$build_auto, build_target:$build_target, build_priority:$build_priority, build_into:$build_into, build_version_bump:$build_version_bump, deferred_acs:$deferred_acs, deferred_ac_reasons:$deferred_ac_reasons, status_line:$status_line, size_bytes:$size, mtime_iso:$mtime}'
 }
 
-# Use find -maxdepth 1 so PRDs-archive/ doesn't sneak in.
-find -L "$PRD_DIR" -maxdepth 1 -type f -name 'PRD-*.md' -print0 \
-  | sort -z \
+# Emit top-level PRDs (buildable) AND ARCHIVE/ PRDs (already done).
+# Phase 1 diff distinguishes them by path: contains "/ARCHIVE/" → treat as
+# "archived" if the manifest entry is currently "vanished", never re-queue.
+# This prevents the scan from declaring "vanished" for PRDs that were
+# legitimately archived (moved out of top-level after shipping).
+{
+  find -L "$PRD_DIR" -maxdepth 1 -type f -name 'PRD-*.md' -print0
+  [ -d "$PRD_DIR/ARCHIVE" ] && \
+    find -L "$PRD_DIR/ARCHIVE" -maxdepth 1 -type f -name 'PRD-*.md' -print0
+} | sort -z \
   | {
       first=true
       printf '['

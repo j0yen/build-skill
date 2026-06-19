@@ -46,7 +46,7 @@ set `next: publish-gated` or wait for confirmation.**):
 
 ## Inputs
 
-- **PRDs:** `~/wintermute/PRDs/PRD-*.md` (top-level only; `ARCHIVE/` is excluded by the scan's `-maxdepth 1`).
+- **PRDs:** `~/wintermute/PRDs/PRD-*.md` (top-level = buildable queue; `ARCHIVE/` entries are scanned but treated as already-done — never re-queued).
 - **Manifest:** `~/.claude/skills/build/state/manifest.json` — per-PRD
   status, last_action timestamp, blockers, output repo URL when published.
 - **Budget:** `~/.claude/skills/build/state/budget.json` — **all budget caps
@@ -81,8 +81,12 @@ Run `scripts/scan-prds.sh`. This emits a JSON list of
 - **new** PRDs → add to manifest with `status: queued`, log "discovered
   PRD-<slug>".
 - **modified** PRDs → reset `last_action` and bump `revision`.
-- **deleted** PRDs (file gone) → mark `status: vanished` in manifest;
-  don't actively clean up.
+- **deleted** PRDs (file gone from top-level AND gone from `ARCHIVE/`) → mark
+  `status: vanished` in manifest; don't actively clean up.
+- **archived** PRDs (file gone from top-level but present in `ARCHIVE/`) → mark
+  `status: archived`; **never re-queue**. scan-prds.sh now emits ARCHIVE/ entries
+  so Phase 1 can distinguish archived from truly-vanished. A manifest entry whose
+  scan path contains `/ARCHIVE/` is always treated as archived.
 
 ### Phase 2 — Select
 
@@ -93,6 +97,17 @@ Build a candidate pool in priority order:
 2. PRDs with `status: queued` (start new work; `build_auto` is no
    longer consulted).
 3. None → "nothing to do," log, exit.
+
+**Hard pre-filter (applied before the pool, removes entries that must not run):**
+- `status: archived` or `status: vanished` → never selectable; skip silently.
+- PRD file is absent from top-level AND present in `ARCHIVE/` → force `status:
+  archived` in the manifest right now and skip; do NOT dispatch a cloud agent.
+- PRD file is absent from top-level AND absent from `ARCHIVE/` → force `status:
+  vanished` and skip.
+- `status: queued` but `last_action` is within 24h with `action: verified-*` or
+  `action: already-*` → skip this tick (was just re-verified; don't spend another
+  cloud session re-confirming the same thing). Next tick it remains queued and
+  will be picked if nothing newer is available.
 
 Within both buckets, sort by `build_priority` descending
 (`high` > `normal` > `low`; null counts as `normal`), then by
