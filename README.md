@@ -1,15 +1,12 @@
 # build-skill
 
-Claude Code skill that continuously implements queued PRDs end-to-end —
-scans for new PRDs, builds them (delegating to `/autobuilder` for Rust),
-wires them into the system, publishes them as standalone GitHub repos,
-updates Abouts (per-repo READMEs + a `REPOS.md` index), and drafts
-follow-on PRDs that expand Claude's own capabilities.
+A Claude Code skill that walks a queue of PRDs from "drafted" to "shipped" on its own. Each PRD becomes a real GitHub repo — implemented (Rust via `/autobuilder`), wired into the system, documented, and indexed — and the experience of building it seeds the follow-on PRDs that grow the queue.
 
-Designed to run every 5 minutes via a systemd-user timer; one PRD-relevant
-action per tick at most. The skill is the autonomous self-extension loop
-that pairs with [`dream-skill`](https://github.com/j0yen/dream-skill) — where
-`/dream` walks ideas to PRDs, `/build` walks PRDs to shipped repos.
+This is the back half of a self-extension loop. `dream-skill` walks ideas to PRDs; `build-skill` walks PRDs to repos. Run them on a cadence and the system proposes its own next capability, then builds it. See [`j0yen/dream-skill`](https://github.com/j0yen/dream-skill) for the generative half.
+
+## What a tick does
+
+The skill runs every 5 minutes via a systemd-user timer. Per tick it advances up to 30 PRDs in parallel — at most **one action per PRD**, so a given PRD moves one phase per tick (scan → build → wire → publish → document → seed follow-ons) and never races itself. A `flock` guard keeps two ticks from overlapping. State lives under `state/` (per-PRD status in `manifest.json`, telemetry in `budget.json`) and is preserved across re-installs.
 
 ## Install
 
@@ -59,6 +56,10 @@ yourself, create a user unit that runs `claude` with a one-shot
   counterpart that drafts PRDs from vision
 - [j0yen/autobuilder](https://github.com/j0yen/autobuilder) — what `/build`
   delegates to for Rust crate/lib/CLI implementations
+
+## Scope
+
+This is the author's own self-extension loop, not a turnkey product. It reads PRDs from `~/wintermute/PRDs/`, publishes to specific GitHub orgs, and runs fully autonomously — no per-action confirmation gate. Read `SKILL.md` (the spec Claude loads) before pointing it at your own queue, and adjust the paths and publish targets to your setup.
 
 ## License
 
