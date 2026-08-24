@@ -1,0 +1,327 @@
+{
+  "total": 28,
+  "byStatus": [
+    {
+      "status": "in_progress",
+      "n": 5
+    },
+    {
+      "status": "new",
+      "n": 11
+    },
+    {
+      "status": "queued",
+      "n": 12
+    }
+  ],
+  "cands": [
+    {
+      "slug": "atlas-render",
+      "status": "queued",
+      "target": null,
+      "priority": null,
+      "into": null,
+      "mtime": "2026-05-29T10:05:39Z",
+      "last_action": null,
+      "ticks": 0,
+      "last_error": null
+    },
+    {
+      "slug": "brain-backend-ladder",
+      "status": "queued",
+      "target": null,
+      "priority": null,
+      "into": null,
+      "mtime": "2026-05-29T08:08:19Z",
+      "last_action": null,
+      "ticks": 0,
+      "last_error": null
+    },
+    {
+      "slug": "brain-prompt-cache",
+      "status": "in_progress",
+      "target": null,
+      "priority": null,
+      "into": null,
+      "mtime": "2026-05-29T07:32:53Z",
+      "last_action": "2026-05-30T07:03:46Z",
+      "ticks": 1,
+      "last_error": "merge-conflict"
+    },
+    {
+      "slug": "claude-agentns-wrap",
+      "status": "queued",
+      "target": "mixed",
+      "priority": null,
+      "into": "/home/jsy",
+      "mtime": "2026-05-27T15:09:03Z",
+      "last_action": "2026-05-27T15:11:00Z",
+      "ticks": 0,
+      "last_error": null
+    },
+    {
+      "slug": "cradle-bake-integration",
+      "status": "queued",
+      "target": null,
+      "priority": null,
+      "into": null,
+      "mtime": "2026-05-28T02:58:57Z",
+      "last_action": "2026-05-28T06:26:19Z",
+      "ticks": 0,
+      "last_error": null
+    },
+    {
+      "slug": "docket-self-review-bind",
+      "status": "queued",
+      "target": null,
+      "priority": null,
+      "into": null,
+      "mtime": "2026-05-29T07:35:54Z",
+      "last_action": null,
+      "ticks": 0,
+      "last_error": null
+    },
+    {
+      "slug": "hearth-first-contact-greeting",
+      "status": "queued",
+      "target": null,
+      "priority": null,
+      "into": null,
+      "mtime": "2026-05-29T08:05:59Z",
+      "last_action": null,
+      "ticks": 0,
+      "last_error": null
+    },
+    {
+      "slug": "hearth-persona-config",
+      "status": "in_progress",
+      "target": null,
+      "priority": null,
+      "into": null,
+      "mtime": "2026-05-29T08:05:21Z",
+      "last_action": "2026-05-30T07:00:04Z",
+      "ticks": 1,
+      "last_error": "target-dirty:Cargo.lock-in-main-repo"
+    },
+    {
+      "slug": "memlog-activation-self-review",
+      "status": "new",
+      "target": "shell",
+      "priority": null,
+      "into": null,
+      "mtime": "2026-05-30T05:06:10Z",
+      "last_action": null,
+      "ticks": 0,
+      "last_error": null
+    },
+    {
+      "slug": "memlog-group-autojoin",
+      "status": "new",
+      "target": "mixed",
+      "priority": null,
+      "into": "/home/jsy/wintermute/wintermute-kernel",
+      "mtime": "2026-05-30T05:05:33Z",
+      "last_action": null,
+      "ticks": 0,
+      "last_error": null
+    },
+    {
+      "slug": "memlog-precompact-witness",
+      "status": "new",
+      "target": "mixed",
+      "priority": null,
+      "into": "/home/jsy",
+      "mtime": "2026-05-30T05:06:47Z",
+      "last_action": null,
+      "ticks": 0,
+      "last_error": null
+    },
+    {
+      "slug": "provfs-comm-richer",
+      "status": "in_progress",
+      "target": "kernel-extend",
+      "priority": null,
+      "into": "/home/jsy/wintermute/provfs/lsm",
+      "mtime": "2026-05-27T15:10:16Z",
+      "last_action": "2026-05-30T06:50:23Z",
+      "ticks": 2,
+      "last_error": "ff-only-failed-main-diverged"
+    },
+    {
+      "slug": "rouse-voice-selftest",
+      "status": "new",
+      "target": "rust-extend",
+      "priority": null,
+      "into": "/home/jsy/wintermute/wintermute-audio",
+      "mtime": "2026-05-30T00:59:33Z",
+      "last_action": null,
+      "ticks": 0,
+      "last_error": null
+    },
+    {
+      "slug": "vigil-build-restart-wiring",
+      "status": "new",
+      "target": null,
+      "priority": null,
+      "into": null,
+      "mtime": "2026-05-30T04:05:36Z",
+      "last_action": null,
+      "ticks": 0,
+      "last_error": null
+    },
+    {
+      "slug": "vigil-install-restart",
+      "status": "new",
+      "target": null,
+      "priority": null,
+      "into": null,
+      "mtime": "2026-05-30T04:04:58Z",
+      "last_action": null,
+      "ticks": 0,
+      "last_error": null
+    },
+    {
+      "slug": "vigil-selfreview-concurrent-guard",
+      "status": "new",
+      "target": null,
+      "priority": null,
+      "into": null,
+      "mtime": "2026-05-30T04:06:10Z",
+      "last_action": null,
+      "ticks": 0,
+      "last_error": null
+    },
+    {
+      "slug": "warden-deadman",
+      "status": "new",
+      "target": null,
+      "priority": null,
+      "into": null,
+      "mtime": "2026-05-30T04:36:59Z",
+      "last_action": null,
+      "ticks": 0,
+      "last_error": null
+    },
+    {
+      "slug": "warden-home",
+      "status": "new",
+      "target": null,
+      "priority": null,
+      "into": null,
+      "mtime": "2026-05-30T04:35:26Z",
+      "last_action": null,
+      "ticks": 0,
+      "last_error": null
+    },
+    {
+      "slug": "warden-policy",
+      "status": "new",
+      "target": null,
+      "priority": null,
+      "into": null,
+      "mtime": "2026-05-30T04:36:14Z",
+      "last_action": null,
+      "ticks": 0,
+      "last_error": null
+    },
+    {
+      "slug": "warden-self-review",
+      "status": "new",
+      "target": null,
+      "priority": null,
+      "into": null,
+      "mtime": "2026-05-30T04:37:38Z",
+      "last_action": null,
+      "ticks": 0,
+      "last_error": null
+    },
+    {
+      "slug": "wintermute-brain-routing",
+      "status": "queued",
+      "target": null,
+      "priority": null,
+      "into": null,
+      "mtime": "2026-05-29T07:59:42Z",
+      "last_action": null,
+      "ticks": 0,
+      "last_error": null
+    },
+    {
+      "slug": "wintermute-family-enroll",
+      "status": "queued",
+      "target": null,
+      "priority": null,
+      "into": null,
+      "mtime": "2026-05-29T06:07:22Z",
+      "last_action": null,
+      "ticks": 0,
+      "last_error": null
+    },
+    {
+      "slug": "wintermute-presence",
+      "status": "queued",
+      "target": null,
+      "priority": null,
+      "into": null,
+      "mtime": "2026-05-29T06:06:32Z",
+      "last_action": null,
+      "ticks": 0,
+      "last_error": null
+    },
+    {
+      "slug": "wintermute-reach",
+      "status": "queued",
+      "target": null,
+      "priority": null,
+      "into": null,
+      "mtime": "2026-05-29T06:06:07Z",
+      "last_action": null,
+      "ticks": 0,
+      "last_error": null
+    },
+    {
+      "slug": "wintermute-stt-whisper-model",
+      "status": "queued",
+      "target": null,
+      "priority": null,
+      "into": null,
+      "mtime": "2026-05-29T02:25:20Z",
+      "last_action": "2026-05-29T02:52:19Z",
+      "ticks": 0,
+      "last_error": null
+    },
+    {
+      "slug": "wmd-repair-affordances",
+      "status": "queued",
+      "target": null,
+      "priority": null,
+      "into": null,
+      "mtime": "2026-05-29T04:04:45Z",
+      "last_action": null,
+      "ticks": 0,
+      "last_error": null
+    },
+    {
+      "slug": "wm-local-llm",
+      "status": "in_progress",
+      "target": null,
+      "priority": null,
+      "into": null,
+      "mtime": "2026-05-29T07:34:52Z",
+      "last_action": "2026-05-30T05:51:57Z",
+      "ticks": 1,
+      "last_error": null
+    },
+    {
+      "slug": "wm-semcache",
+      "status": "in_progress",
+      "target": null,
+      "priority": null,
+      "into": null,
+      "mtime": "2026-05-29T07:34:23Z",
+      "last_action": "2026-05-30T05:51:10Z",
+      "ticks": 1,
+      "last_error": null
+    }
+  ]
+}

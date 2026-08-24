@@ -1,16 +1,25 @@
 ---
 name: build
-description: Continuously implement queued PRDs end-to-end — scan for new PRDs, build them (delegating to /autobuilder for Rust, cargo via /cloudbuild), wire them into the system, publish them as standalone GitHub repos under j0yen, update Abouts (per-repo READMEs + wintermute REPOS.md), and draft follow-on PRDs that expand Claude's own capabilities. Runs every 5 minutes via systemd-user timer; up to 30 PRDs advanced in parallel per tick (one action per PRD). Use when the user says /build, when the SessionStart hook reports a queued PRD, or when the user asks Claude to "make progress on the queue" or "build the next thing."
+description: Continuously implement queued PRDs end-to-end — scan for new PRDs, build them (delegating to /autobuilder for Rust, cargo via /cloudbuild), wire them into the system, publish them as standalone private GitHub repos under joeyen-atscale (AtScale work — carbon's primary mode as of 2026-08-03), update Abouts (per-repo READMEs + wintermute REPOS.md), and draft follow-on PRDs that expand Claude's own capabilities. Personal wintermute PRDs (j0yen/public) are paused, not deleted — see the "Personal wintermute pipeline (paused)" note below. Runs on manual invocation or systemd-user timer when enabled; up to 30 PRDs advanced in parallel per tick (one action per PRD). Use when the user says /build, when the SessionStart hook reports a queued PRD, or when the user asks Claude to "make progress on the queue" or "build the next thing."
 model: sonnet
 ---
 
 # /build — continuous PRD implementation loop
 
-`/build` is the autonomous self-extension loop. It looks at the PRDs Claude
-and the user have written under `~/wintermute/PRDs/` and walks each
+`/build` is the autonomous self-extension loop. As of 2026-08-03, carbon's
+`/build` targets **AtScale work primarily**: it looks at the PRDs under
+`~/Documents/PRDs/` (a clone of `joeyen-atscale/atscale-prds`) and walks each
 one from "drafted" through "shipped" — implementing, wiring, publishing,
 documenting, then drafting whatever follow-on PRDs the experience made
 obvious.
+
+**Personal wintermute pipeline (paused, not deleted).** Carbon previously ran
+this same loop against `~/wintermute/PRDs/` (published under `j0yen/public`
+via `wm-publish`). That pipeline, its manifest, its 196 shipped + 72 archived
+PRDs, and `wm-publish` itself are all still intact — `/build` just no longer
+scans that directory for new work. To resume personal wintermute building,
+add `~/wintermute/PRDs/PRD-*.md` back to the Inputs scan below (or ask Claude
+to do it) — nothing was removed, only the scan target changed.
 
 Cadence is **every 5 minutes** (systemd-user timer `claude-build.timer`).
 Per tick, the skill advances **up to 30 PRDs in parallel** — one action
@@ -33,20 +42,33 @@ null (unlimited); `budget.json` still records `used[k]` counters as
 telemetry but never blocks an action.
 
 User explicitly authorized (2026-05-25, expanded 2026-05-27, reaffirmed
-2026-05-30 — **no operator-confirm gate: publish autonomously without review,
-including corporate-derived PRDs; private repos under `joeyen-atscale` are the
-pre-approved, appropriate home for AtScale-derived engineering tooling. Do NOT
-set `next: publish-gated` or wait for confirmation.**):
-- Private GitHub repos under `joeyen-atscale/<slug>`
+2026-05-30, re-scoped to AtScale-primary 2026-08-03 — **no operator-confirm
+gate: publish autonomously without review. Do NOT set `next: publish-gated`
+or wait for confirmation.**):
+- Private GitHub repos under `joeyen-atscale/<slug>` — AtScale/corporate work,
+  the default target as of 2026-08-03 (direct `gh repo create`, no wrapper
+  yet — see the publish phase below).
+- Public GitHub repos under `j0yen/<slug>` — personal wintermute work, the
+  original target (via `wm-publish`). **Paused, not revoked**: `/build`
+  doesn't scan `~/wintermute/PRDs/` for new work right now, so this path
+  won't be exercised, but the authorization and the wrapper both still
+  stand if personal building resumes.
 - `~/.local/bin/` binary install
 - `~/.claude/scripts/` hook symlinks
 - `~/.claude/settings.json` edits (with timestamped backups)
-- Follow-on PRD authorship into `~/wintermute/PRDs/`
+- Follow-on PRD authorship into `~/Documents/PRDs/` (current default) or
+  `~/wintermute/PRDs/` (if personal building resumes), matching the source
+  PRD's provenance
 - New tool/mechanism vectors as needed
 
 ## Inputs
 
-- **PRDs:** `~/wintermute/PRDs/PRD-*.md` (top-level = buildable queue; `ARCHIVE/` entries are scanned but treated as already-done — never re-queued).
+- **PRDs:** `~/Documents/PRDs/PRD-*.md` (top-level = buildable queue;
+  `ARCHIVE/` entries are scanned but treated as already-done — never
+  re-queued). This is a clone of `joeyen-atscale/atscale-prds`.
+  `~/wintermute/PRDs/PRD-*.md` (personal wintermute work, `j0yen`) is NOT
+  scanned as of 2026-08-03 — paused, see the note under Personal wintermute
+  pipeline above.
 - **Manifest:** `~/.claude/skills/build/state/manifest.json` — per-PRD
   status, last_action timestamp, blockers, output repo URL when published.
 - **Budget:** `~/.claude/skills/build/state/budget.json` — **all budget caps
@@ -74,9 +96,12 @@ set `next: publish-gated` or wait for confirmation.**):
 
 ### Phase 1 — Scan
 
-Run `scripts/scan-prds.sh`. This emits a JSON list of
+Run `PRD_DIR=~/Documents/PRDs scripts/scan-prds.sh` (the explicit `PRD_DIR`
+matters — the script's own internal default is `~/wintermute/autobuilder`,
+which is neither this path nor the paused personal path, and must never be
+relied on implicitly). This emits a JSON list of
 `{path, slug, status, build_auto, last_modified}` for every PRD under
-`~/wintermute/PRDs/` (top-level only). Diff against `manifest.json`:
+`~/Documents/PRDs/` (top-level only). Diff against `manifest.json`:
 
 - **new** PRDs → add to manifest with `status: queued`, log "discovered
   PRD-<slug>".
@@ -342,27 +367,46 @@ in this tick's selection run in parallel via Agent tool calls
   `manifest.<slug>.last_error`, and surface for the next reflect
   cycle. The watch state is cheap to keep across ticks; only `wchg
   reset` after the PRD ships.
-- **publish** [new-repo only — never for rust-extend]: Create the GitHub repo via the `wm-publish` wrapper:
-  ```
-  wm-publish --slug <slug> --description "<one line from the PRD>"
-  ```
-  `wm-publish` (installed at `~/.local/bin/wm-publish` per
-  PRD-build-publish-allowlist) wraps `gh repo create joeyen-atscale/<slug>
-  --private --source=. --remote=origin --push --description=…` with a
-  slug-regex + allow-list guard, and has a settings.json allow rule
-  (`Bash(wm-publish:*)`) so it doesn't trigger the auto-mode
-  classifier on every tick. **If `wm-publish` is not on `$PATH`, do NOT
-  skip — publish directly:** run `gh repo create joeyen-atscale/<slug> --private
-  --source=. --remote=origin --push --description="<one line from the
-  PRD>"`, and log `wm-publish-fallback-direct` to the journal. New slugs
-  need to be added to the `ALLOW` array near the top of `wm-publish` —
-  keep it in sync with `~/wintermute/REPOS.md`.
+- **publish** [new-repo only — never for rust-extend]: **Org depends on PRD
+  provenance — this is a hard safety boundary (guard ported 2026-08-03 from
+  ryzen7's build skill; re-scoped the same day when carbon went
+  AtScale-primary). The two must never cross.**
+  - **AtScale/corporate PRDs (default, sourced from `~/Documents/PRDs/`,
+    authored by `/dream-atscale`, or carrying a `build_target`/`build_into`
+    field pointing at AtScale work):** publish directly:
+    ```
+    gh repo create joeyen-atscale/<slug> --private --source=. --remote=origin --push --description="<one line from the PRD>"
+    ```
+    Log `atscale-publish-direct` to the journal. There's no allow-listed
+    wrapper for this path yet (low volume so far) — if it becomes routine,
+    build a `wm-publish-atscale` script mirroring `wm-publish`'s guard rails
+    (slug-regex, allow-list, origin-exists check) targeting
+    `joeyen-atscale --private`.
+  - **Personal wintermute PRDs (paused — only relevant if `~/wintermute/PRDs/`
+    scanning is re-enabled):** create the GitHub repo via the `wm-publish`
+    wrapper:
+    ```
+    wm-publish --slug <slug> --description "<one line from the PRD>"
+    ```
+    `wm-publish` (installed at `~/.local/bin/wm-publish`) wraps `gh repo
+    create j0yen/<slug> --public --source=. --remote=origin --push
+    --description=…` with a slug-regex + allow-list guard, and has a
+    settings.json allow rule (`Bash(wm-publish:*)`) so it doesn't trigger
+    the auto-mode classifier on every tick. New slugs need to be added to
+    the `ALLOW` array near the top of `wm-publish` — keep it in sync with
+    `~/wintermute/REPOS.md`.
+  - **The guard is bidirectional and must never be crossed**: AtScale PRDs
+    never go to `j0yen`; personal PRDs never go to `joeyen-atscale`. If
+    provenance is ambiguous, stop and ask rather than guessing. `wm-publish`
+    is `j0yen`/public-only — calling it on an AtScale PRD would leak private
+    work into a public personal repo.
 
   After the publish lands, write the initial `README.md` from the
   PRD's TL;DR + acceptance tests + an "Install" block. Update
   `~/wintermute/REPOS.md` with a one-line entry under the appropriate
-  category section. Bump `budget.used.repos_created`.
-  # After wm-publish succeeds: answerable-emit.sh publish joeyen-atscale/<slug> "PRD-<slug>: <one-line>" false
+  category section — this index tracks shipped repos regardless of target
+  org (ryzen7's build skill does the same, per its own SKILL.md). Bump
+  `budget.used.repos_created`.
 - **clerical-finalize**: When a candidate's archive gate fails on
   **only** clerical checks (C2 publish/push, C3 README/CHANGELOG, C4
   REPOS.md) while C1 (tests green) AND C5 (ACs paired/deferred) already
@@ -379,22 +423,59 @@ in this tick's selection run in parallel via Agent tool calls
   companion to `verified-completed.sh` (classifier) and `extend-handler.sh`
   (extend mechanics).
 - **archive**: When the PRD passes the **verified-completed** checklist (all
-  five must hold), update manifest to `status: shipped`, then move the PRD
-  file into `ARCHIVE/` and commit + push to j0yen/PRDs:
-  ```
-  cd ~/wintermute/PRDs
-  git -c user.name=j0yen -c user.email=jyen.tech@gmail.com mv PRD-<slug>.md ARCHIVE/
-  git -c user.name=j0yen -c user.email=jyen.tech@gmail.com commit -m "archive: <slug> shipped"
-  git push
-  ```
+  five must hold) **AND the rebuild gate passes**, update manifest to
+  `status: shipped`, then move the PRD file into `ARCHIVE/` and commit +
+  push. Path and identity depend on the same provenance guard as publish
+  above:
+  - **AtScale PRDs (default)** — push to `joeyen-atscale/atscale-prds`:
+    ```
+    cd ~/Documents/PRDs
+    git mv PRD-<slug>.md ARCHIVE/
+    git commit -m "archive: <slug> shipped"
+    git push
+    ```
+  - **Personal wintermute PRDs (paused)** — push to `j0yen/autobuilder-private`:
+    ```
+    cd ~/wintermute/PRDs
+    git -c user.name=j0yen -c user.email=jyen.tech@gmail.com mv PRD-<slug>.md ARCHIVE/
+    git -c user.name=j0yen -c user.email=jyen.tech@gmail.com commit -m "archive: <slug> shipped"
+    git push
+    ```
   Record the five passing checks in the manifest entry's `verified_completed` field.
+
+  **Rebuild gate (gap #68 — re-queues must prove they advanced the work;
+  ported from ryzen7 2026-08-03, applies to either path).** Before
+  archiving, if the manifest entry's `revision > 1` (this PRD was re-queued
+  after a prior ship — e.g. a dreamer reconciliation caught a false-ship),
+  run `scripts/archive-rebuild-gate.sh <slug>`. A non-zero exit **blocks
+  archive**: it means the re-queue did not (1) bump the crate to a version
+  strictly greater than `last_shipped_version`, (2) prepend a
+  `## v<new-version>` CHANGELOG section for *that* version, and (3) record
+  a non-empty `rebuild_reason` on the manifest entry. The legacy C2
+  (`commit-reachable`) and C3 (`changelog-v<X>-exists`) checks are
+  satisfiable by the *prior* ship's stale artifacts, so without this gate a
+  no-op rebuild self-satisfies the archive gate and "ships" nothing. The
+  re-queuer (the dreamer reconciliation tick, or the tick that bumps
+  `revision`) MUST set `rebuild_reason` to why it re-queued; a real rebuild
+  always has one, a no-op has nothing to say.
+
+  **On archive, also set `last_shipped_version`** in the manifest entry to
+  the crate version just shipped (`extend-handler.sh current-version
+  <build_into>` for cargo crates). This is the baseline the NEXT re-queue's
+  rebuild gate compares against — without it, "version advanced" is
+  unverifiable and the gate degrades to `ok-indeterminate` (still enforces
+  changelog + rebuild_reason, but cannot prove the version moved). Record
+  the rebuild-gate result as `verified_completed.c6` (`rebuild-gate-na` for
+  first builds, `rebuild-gate-ok`/`-indeterminate` for passing re-queues).
 
   **Verified-completed checklist (new-repo path):**
   1. `output_repo_path` exists locally AND `cargo test --release`
      (or the PRD's declared test command) exits 0.
-  2. `output_repo_url` is set in the manifest AND `gh repo view <slug>`
-     succeeds (i.e., the repo is on GitHub, public, with the latest
-     commits pushed).
+  2. `output_repo_url` is set in the manifest AND `gh repo view
+     joeyen-atscale/<slug>` (or `j0yen/<slug>` on the paused personal path)
+     succeeds — i.e., the repo is on GitHub, correct visibility for its org
+     (private for `joeyen-atscale`, public for `j0yen`), with the latest
+     commits pushed.
   3. README.md exists in the repo root, opens with the PRD's TL;DR,
      and contains an Install section.
   4. `~/wintermute/REPOS.md` lists this repo under its category with a
@@ -439,7 +520,7 @@ in this tick's selection run in parallel via Agent tool calls
     -e --skippgpcheck --noconfirm` exits 0 AND produces
     `linux-wintermute-*.pkg.tar.zst`. We do NOT require live boot/insmod
     validation — that's the user's call. Build-cleanliness is the gate.
-  - Check #2 becomes: if `<slug>` already has a joeyen-atscale repo
+  - Check #2 becomes: if `<slug>` already has a j0yen repo
     (agentns/memlog/provfs), the new commit is reachable from
     `origin/main`. Otherwise a fresh repo with the same shape as
     rust-cli.
@@ -964,9 +1045,20 @@ to 5" wording. The cap is a number in the doc, not in code.
   "output_repo_url": null,
   "version_bump": "patch|minor|major|null",
   "ticks_invested": 0,
-  "blockers": []
+  "blockers": [],
+  "last_shipped_version": null,
+  "rebuild_reason": null,
+  "verified_completed": { "c1": null, "c2": null, "c3": null, "c4": null, "c5": null, "c6": null }
 }
 ```
+
+`last_shipped_version` and `rebuild_reason` back the rebuild gate (see the
+`archive` action above) — both null until the first ship, then
+`last_shipped_version` is set on every archive and `rebuild_reason` is set
+by whatever re-queues a shipped PRD (dreamer reconciliation, manual
+re-queue). `verified_completed.c1`–`c5` record the five checklist checks;
+`c6` records the rebuild-gate verdict (`rebuild-gate-na` for first builds,
+`rebuild-gate-ok`/`-indeterminate` for passing re-queues).
 
 For `rust-extend` PRDs, `output_repo_path` is the validated `build_into`
 from the PRD, `output_repo_url` stays null (no new repo created), and
