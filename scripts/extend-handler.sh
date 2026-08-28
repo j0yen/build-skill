@@ -34,7 +34,7 @@
 set -uo pipefail
 
 JQ="${JQ:-/usr/sbin/jq}"
-PRD_DIR="${PRD_DIR:-$HOME/wintermute/PRDs}"
+PRD_DIR="${PRD_DIR:-$HOME/Documents/PRDs}"
 SCAN="${SCAN:-$(dirname "$0")/scan-prds.sh}"
 
 die() { printf 'extend-handler: %s\n' "$*" >&2; exit "${2:-1}"; }

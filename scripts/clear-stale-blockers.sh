@@ -19,7 +19,7 @@ set -uo pipefail
 
 MANIFEST="${MANIFEST:-$HOME/.claude/skills/build/state/manifest.json}"
 LOCK="${LOCK:-$HOME/.claude/skills/build/state/tick.lock}"
-PRD_DIR="${PRD_DIR:-$HOME/wintermute/PRDs}"
+PRD_DIR="${PRD_DIR:-$HOME/Documents/PRDs}"
 
 if [ ! -f "$MANIFEST" ]; then
   echo '{"error":"manifest not found","path":"'"$MANIFEST"'"}'

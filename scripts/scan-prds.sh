@@ -55,7 +55,7 @@ JQ="${JQ:-$(command -v jq 2>/dev/null || echo /usr/bin/jq)}"
 [ -x "$JQ" ] || { echo "jq not at $JQ" >&2; exit 1; }
 
 emit_one() {
-  local path="$1" slug status_line build_auto build_target build_priority build_into build_version_bump deferred_acs deferred_ac_reasons
+  local path="$1" slug status_line build_auto build_target build_priority build_into build_version_bump deferred_acs deferred_ac_reasons publish
   slug="$(basename "$path" .md)"
   slug="${slug#PRD-}"
 
@@ -68,6 +68,7 @@ emit_one() {
   build_priority=null
   build_into=null
   build_version_bump=null
+  publish=null
   # Per PRD-build-deferred-acs.md AC1: PRDs may declare ground-truth ACs
   # that /build cannot mechanically verify. Defaults are empty so all
   # existing PRDs behave unchanged (no-deferral path = current behavior).
@@ -120,6 +121,12 @@ emit_one() {
         v="$(strip_val "$(printf '%s' "$kline" | sed -E 's/^build_into[[:space:]]*:[[:space:]]*//')")"
         [ -n "$v" ] && build_into="\"$v\""
         seen_into=true
+        ;;
+      "publish:"*)
+        [ "${seen_publish:-false}" = true ] && continue
+        v="$(strip_val "$(printf '%s' "$kline" | sed -E 's/^publish[[:space:]]*:[[:space:]]*//')")"
+        [ -n "$v" ] && publish="\"$v\""
+        seen_publish=true
         ;;
       "build_version_bump:"*)
         [ "$seen_bump" = true ] && continue
@@ -175,12 +182,13 @@ emit_one() {
     --argjson build_priority "$build_priority" \
     --argjson build_into "$build_into" \
     --argjson build_version_bump "$build_version_bump" \
+    --argjson publish "$publish" \
     --argjson deferred_acs "$deferred_acs" \
     --argjson deferred_ac_reasons "$deferred_ac_reasons" \
     --arg status_line "$status_line" \
     --argjson size "$size" \
     --arg mtime "$mtime" \
-    '{slug:$slug, path:$path, build_auto:$build_auto, build_target:$build_target, build_priority:$build_priority, build_into:$build_into, build_version_bump:$build_version_bump, deferred_acs:$deferred_acs, deferred_ac_reasons:$deferred_ac_reasons, status_line:$status_line, size_bytes:$size, mtime_iso:$mtime}'
+    '{slug:$slug, path:$path, build_auto:$build_auto, build_target:$build_target, build_priority:$build_priority, build_into:$build_into, build_version_bump:$build_version_bump, publish:$publish, deferred_acs:$deferred_acs, deferred_ac_reasons:$deferred_ac_reasons, status_line:$status_line, size_bytes:$size, mtime_iso:$mtime}'
 }
 
 # Emit top-level PRDs (buildable) AND ARCHIVE/ PRDs (already done).
@@ -189,9 +197,20 @@ emit_one() {
 # This prevents the scan from declaring "vanished" for PRDs that were
 # legitimately archived (moved out of top-level after shipping).
 {
-  find -L "$PRD_DIR" -maxdepth 1 -type f -name 'PRD-*.md' -print0
-  [ -d "$PRD_DIR/ARCHIVE" ] && \
-    find -L "$PRD_DIR/ARCHIVE" -maxdepth 1 -type f -name 'PRD-*.md' -print0
+  # Queue: build-queue/ is canonical (j0yen/prds layout, 2026-08-27). A legacy
+  # workspace with no build-queue/ dir still scans its top level.
+  if [ -d "$PRD_DIR/build-queue" ]; then
+    find -L "$PRD_DIR/build-queue" -maxdepth 1 -type f -name 'PRD-*.md' -print0
+  else
+    find -L "$PRD_DIR" -maxdepth 1 -type f -name 'PRD-*.md' -print0
+  fi
+  # Done: built-prds/ is canonical; ARCHIVE/ and archive/ are legacy aliases.
+  # parked/ is deliberately NOT scanned.
+  for d in built-prds ARCHIVE archive; do
+    [ -d "$PRD_DIR/$d" ] || continue
+    case "$d" in archive) [ "$PRD_DIR/archive" -ef "$PRD_DIR/ARCHIVE" ] && continue;; esac
+    find -L "$PRD_DIR/$d" -maxdepth 1 -type f -name 'PRD-*.md' -print0
+  done
 } | sort -z \
   | {
       first=true
