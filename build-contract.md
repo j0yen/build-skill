@@ -49,8 +49,8 @@ space) — that regex is what `verified-completed.sh` counts. Write the level
 inline and keep Given/When/Then on that line:
 
 ```
-1. MUST — Given an empty document, When a viewer GETs it, Then 200 with empty body.
-2. SHOULD — Given 50 concurrent readers, When ..., Then p95 < 150 ms.
+1. P0 — Given an empty document, When a viewer GETs it, Then 200 with empty body.
+2. P1 — Given 50 concurrent readers, When ..., Then p95 < 150 ms.
 ```
 
 `AC-1:` prefixes, tables, or unnumbered prose are not counted; the C5 archive
