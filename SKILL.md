@@ -182,7 +182,7 @@ Read the PRD. Determine its implementation shape:
   project and the new-repo publish path applies. Capture the Stage 4 gate
   verdict (`ready` / `blocked`) and the receipt directory
   (`<project>/.pybuilder/`) into the manifest `verification` field. All
-  Python runs locally under `uv` — there is no cloudbuild leg for Python.
+  Python runs locally under `uv` — there is no remote leg for Python.
 - **Rust extend** (`build_target: rust-extend`) → the PRD declares an
   existing repo to extend, via `build_into: <abs-path>`. The skill
   validates the target with `scripts/extend-handler.sh validate <slug>`;
