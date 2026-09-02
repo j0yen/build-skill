@@ -73,7 +73,6 @@ One source per skill, enforced hourly by `fleet-sync` on every node:
 | build | j0yen/build-skill | main | `/` | `~/wintermute/build-skill` |
 | pybuild | j0yen/pybuild | main | `skill` | `~/wintermute/pybuild` |
 | rustbuild | j0yen/rustbuild | main | `skill` | `~/wintermute/rustbuild` |
-| cloudrustbuild | j0yen/rustbuild | main | `skills/cloudrustbuild` | same clone |
 | dream | j0yen/vibecode-kit | main | `skills/dream` | `~/wintermute/vibecode-kit` |
 | PRD workspace | j0yen/PRDs | main | `/` | `~/Documents/PRDs` |
 

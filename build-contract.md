@@ -58,7 +58,7 @@ gate then sees zero ACs.
 
 ## Language routing
 
-- `rust-*` → `/rustbuild`, all cargo through `/cloudrustbuild` (no local cargo).
+- `rust-*` → `/rustbuild` (cargo runs on RedBaron: locally there, remotely from every other node via the skill's cargo shim).
 - `python-*` → `/pybuild` (planned; today this skill has no python row).
 - `shell`/`hooks`/`config` → direct edits. `kernel-extend` → hand-written C.
 
