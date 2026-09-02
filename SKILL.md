@@ -767,21 +767,14 @@ in the skill frontmatter). **Escalate a branch to `model: "opus"`** when any of:
 Pass the chosen model via the Agent call's `model` field. When unsure,
 default to Sonnet; the escalation list is the only reason to go Opus.
 
-**Cloudbuild (added 2026-06-07, HARDENED 2026-06-16).** All `cargo build`,
-`cargo test`, `cargo clippy`, and `cargo deny` invocations inside branch
-agents MUST route through cloudbuild. This is non-negotiable per explicit
-user instruction 2026-06-16: **local /rustbuild cargo execution is
-disabled**. Silent local fallback is not allowed — log it explicitly if
-cloudbuild is unavailable and only then proceed locally.
-
-**RedBaron exception (2026-09-01, per user: "let's use redbaron for rust
-builds").** When `hostname` is `RedBaron`, the mandate above does NOT apply.
-RedBaron (i7-11700KF, 16 threads, 30 GB RAM, sccache + mold configured in
-`~/.cargo/config.toml`) is the designated Rust build machine: run `cargo`
-locally, do not start cloudbuild sessions, do not export `AUTOBUILDER_CLOUD=1`.
-Use /cloudrustbuild from RedBaron only when the user explicitly asks for it, or for
-`fleet` fan-out of many cold crates. (Measured 2026-09-01: a clean release
-build of `recall` took 79 s on RedBaron vs 92 s on a ccx53 burst box.)
+**Where cargo runs (2026-09-02).** RedBaron is the fleet's Rust build machine
+(i7-11700KF, 16 threads, 30 GB, sccache + mold in `~/.cargo/config.toml`).
+On RedBaron, branch agents run `cargo` locally. On carbon or ryzen7, every
+`cargo build`, `cargo test`, `cargo clippy` and `cargo deny` runs on RedBaron
+through /rustbuild's cargo shim; a silent local build is not allowed (user
+instruction 2026-06-16, reaffirmed 2026-09-02). Wintermute Hub, the Hetzner
+NATS box, builds nothing, and the Hetzner burst box was retired 2026-09-01.
+(Measured 2026-09-01: a clean release build of `recall` took 79 s on RedBaron.)
 
 Enforcement (carbon/ryzen7): every branch agent MUST run
 `export PATH="$HOME/.claude/skills/rustbuild/bin:$PATH"` before any cargo
