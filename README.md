@@ -1,7 +1,7 @@
 # build-skill
 
 Claude Code skill that continuously implements queued PRDs end-to-end —
-scans for new PRDs, builds them (delegating to `/autobuilder` for Rust),
+scans for new PRDs, builds them (delegating to `/rustbuild` for Rust),
 wires them into the system, publishes them as standalone GitHub repos,
 updates Abouts (per-repo READMEs + a `REPOS.md` index), and drafts
 follow-on PRDs that expand Claude's own capabilities.
@@ -71,9 +71,9 @@ One source per skill, enforced hourly by `fleet-sync` on every node:
 | skill | repository | branch | path in repo | clone |
 |---|---|---|---|---|
 | build | j0yen/build-skill | main | `/` | `~/wintermute/build-skill` |
-| pybuilder | j0yen/pybuilder | main | `skill` | `~/wintermute/pybuilder` |
-| autobuilder | j0yen/autobuilder-private | main | `skill` | `~/wintermute/autobuilder-private` |
-| cloudbuild | j0yen/autobuilder-private | main | `skills/cloudbuild` | same clone |
+| pybuilder | j0yen/pybuild | main | `skill` | `~/wintermute/pybuild` |
+| autobuilder | j0yen/rustbuild | main | `skill` | `~/wintermute/rustbuild` |
+| cloudbuild | j0yen/rustbuild | main | `skills/cloudrustbuild` | same clone |
 | dream | j0yen/vibecode-kit | main | `skills/dream` | `~/wintermute/vibecode-kit` |
 | PRD workspace | j0yen/PRDs | main | `/` | `~/Documents/PRDs` |
 

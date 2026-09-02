@@ -85,7 +85,7 @@ SKILL_DIR="${BUILD_SKILL_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 STATE_DIR="${BUILD_STATE_DIR:-$SKILL_DIR/state}"
 STREAKS_FILE="$STATE_DIR/conflict-streaks.json"
 # GOSSIP is read dynamically in cmd_log_flip so selftest overrides via BUILD_GOSSIP take effect.
-_DEFAULT_GOSSIP="$HOME/wintermute/autobuilder/notes/gossip.md"
+_DEFAULT_GOSSIP="$HOME/wintermute/rustbuild/notes/gossip.md"
 
 # Streak threshold for serial mode
 SERIAL_THRESHOLD=2

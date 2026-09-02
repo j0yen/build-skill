@@ -1,6 +1,6 @@
 ---
 name: build
-description: Continuously implement queued PRDs end-to-end — scan for new PRDs, build them (delegating to /autobuilder for Rust, cargo via /cloudbuild), wire them into the system, publish them as GitHub repos per the PRD's `publish:` key (default `j0yen/private`; the joeyen-atscale route was retired 2026-08-27), update Abouts (per-repo READMEs + wintermute REPOS.md), and draft follow-on PRDs that expand Claude's own capabilities. Rust routes to /autobuilder, Python (`python-*`) to /pybuilder. Personal wintermute PRDs under ~/wintermute/PRDs are paused, not deleted — see the note below. The parsed PRD contract is documented in build-contract.md. Runs on manual invocation or systemd-user timer when enabled; up to 30 PRDs advanced in parallel per tick (one action per PRD). Use when the user says /build, when the SessionStart hook reports a queued PRD, or when the user asks Claude to "make progress on the queue" or "build the next thing."
+description: Continuously implement queued PRDs end-to-end — scan for new PRDs, build them (delegating to /rustbuild for Rust, cargo via /cloudrustbuild), wire them into the system, publish them as GitHub repos per the PRD's `publish:` key (default `j0yen/private`; the joeyen-atscale route was retired 2026-08-27), update Abouts (per-repo READMEs + wintermute REPOS.md), and draft follow-on PRDs that expand Claude's own capabilities. Rust routes to /rustbuild, Python (`python-*`) to /pybuild. Personal wintermute PRDs under ~/wintermute/PRDs are paused, not deleted — see the note below. The parsed PRD contract is documented in build-contract.md. Runs on manual invocation or systemd-user timer when enabled; up to 30 PRDs advanced in parallel per tick (one action per PRD). Use when the user says /build, when the SessionStart hook reports a queued PRD, or when the user asks Claude to "make progress on the queue" or "build the next thing."
 model: sonnet
 ---
 
@@ -169,7 +169,7 @@ runs locally there (see the Cloudbuild section under model selection).
    branch agents reuse one warm server instead of each spinning up and
    destroying their own:
    ```
-   bash ~/.claude/skills/cloudbuild/cloudbuild.sh session-start
+   bash ~/.claude/skills/cloudrustbuild/cloudbuild.sh session-start
    ```
    Log the returned IP and record that the session is active for this tick.
    The session lock at `~/.config/wm-burst/session.lock` causes every
@@ -185,12 +185,12 @@ as a safety net if session-end is never reached (crash, OOM-kill, etc.).
 
 Read the PRD. Determine its implementation shape:
 
-- **Rust crate / lib / CLI** → delegate to `/autobuilder`. The PRD is
-  the input; the skill runs `/autobuilder` in this conversation with
+- **Rust crate / lib / CLI** → delegate to `/rustbuild`. The PRD is
+  the input; the skill runs `/rustbuild` in this conversation with
   the PRD path as the argument, then captures the result repo path and
   acceptance-test verdict.
 - **Python CLI / lib / agent** (`build_target: python-cli | python-lib |
-  python-agent`) → delegate to `/pybuilder` with the PRD path as the
+  python-agent`) → delegate to `/pybuild` with the PRD path as the
   argument and `--target cli|lib|agent` taken from the suffix. If the PRD
   sets `build_into: <abs-path>`, validate the path exists and is a git repo
   with a `pyproject.toml`, set `output_repo_path` to it and let pybuilder
@@ -208,7 +208,7 @@ Read the PRD. Determine its implementation shape:
   `gh repo create` for this target type — the repo already exists.
 - **Kernel extend** (`build_target: kernel-extend`) → the PRD extends
   one of `~/wintermute/{agentns,memlog,provfs/lsm}` or proposes a new
-  kernel feature. `/autobuilder` does NOT handle this — autobuilder is
+  kernel feature. `/rustbuild` does NOT handle this — autobuilder is
   Rust-only. The skill itself drops the new C file(s), Kconfig stanza,
   Makefile entry, and (if the change touches existing in-tree files)
   appends new anchor blocks to
@@ -244,7 +244,7 @@ Read the PRD. Determine its implementation shape:
 - **Doctrine / process / planning** (PRDs that have no concrete build,
   e.g. `PRD-serious-200.md`) → skip; mark `status: notebook` in manifest.
 - **Mixed** (Rust + hooks, or Rust + Python) → do the Rust portion via
-  `/autobuilder` this tick; queue the hook or Python portion for the next tick.
+  `/rustbuild` this tick; queue the hook or Python portion for the next tick.
 
 If classification is ambiguous, mark the PRD `status: needs_classification`
 and emit one line in the journal asking the user to add a hint to the PRD
@@ -257,12 +257,12 @@ whichever advances that PRD by one well-defined step. The 1..=30 PRDs
 in this tick's selection run in parallel via Agent tool calls
 (see "Parallelism" below). Each branch stops after its action.
 
-- **iter-1 (scaffold)**: For a Rust target, invoke `/autobuilder` with
+- **iter-1 (scaffold)**: For a Rust target, invoke `/rustbuild` with
   the PRD path. Let autobuilder run its own loop. Capture the result
   in the manifest as `output_repo_path`.
 - **iter-1 (extend-scaffold)** [rust-extend only]: invoke
-  `/autobuilder --extend <build_into>` with the PRD path. If
-  `/autobuilder` doesn't yet support `--extend`, fall back to running
+  `/rustbuild --extend <build_into>` with the PRD path. If
+  `/rustbuild` doesn't yet support `--extend`, fall back to running
   cargo + writing src/tests/ files directly with cwd = `build_into`.
   Do NOT init a new repo, do NOT overwrite existing src files (extend,
   don't replace). Record `output_repo_path` = `build_into` in the
@@ -291,7 +291,7 @@ in this tick's selection run in parallel via Agent tool calls
   isolation" for details. Do NOT use `wm-buildtree land` for
   shared-target branches; use `worktree-extend.sh integrate` + `cleanup`.
 - **iter-1 (kernel-extend)** [kernel-extend only]: do NOT call
-  `/autobuilder`. Hand-write the kernel C source per the PRD spec:
+  `/rustbuild`. Hand-write the kernel C source per the PRD spec:
   drop new C file(s) into `<build_into>/` (e.g.
   `~/wintermute/memlog/driver/foo.c`), update the local Kconfig stanza,
   add the obj line to the local Makefile. If the change requires
@@ -313,8 +313,8 @@ in this tick's selection run in parallel via Agent tool calls
   path. `wm-buildtree land` at verified-complete fast-forwards the
   `build_into` default branch exactly as for rust-extend. Main checkout
   of `build_into` is never left dirty between ticks.
-- **iter-2..N (continue)**: If `/autobuilder` left work, hand the same
-  PRD back to it. Each `/autobuilder` invocation IS one tick's action;
+- **iter-2..N (continue)**: If `/rustbuild` left work, hand the same
+  PRD back to it. Each `/rustbuild` invocation IS one tick's action;
   do not chain them within a single tick.
 - **bump-version & commit** [rust-extend only]: when implementation is
   locally green, run `scripts/extend-handler.sh bump-version <build_into>
@@ -344,7 +344,7 @@ in this tick's selection run in parallel via Agent tool calls
     unit through the safe path). Verdict: `rollout-install`.
   - If a unit is found AND `rollout` is NOT installed: falls back to
     `install -m755`, logs a WARNING to stderr, appends a Pending note to
-    `~/wintermute/autobuilder-private/notes/gossip.md` naming the unit that was
+    `~/wintermute/rustbuild/notes/gossip.md` naming the unit that was
     installed-but-not-restarted. Build still exits 0. Verdict:
     `install-m755-fallback`.
   - If no unit backs the dest: plain `install -m755`, unchanged
@@ -502,7 +502,7 @@ in this tick's selection run in parallel via Agent tool calls
      Any AC with none of the three remains a hard fail: the PRD is NOT
      verified-completed — leave `status: in_progress` and surface the
      gap in the next reflect cycle. This OR-clause pairs the
-     hardware-mock convention (see `~/.claude/skills/autobuilder/SKILL.md`
+     hardware-mock convention (see `~/.claude/skills/rustbuild/SKILL.md`
      "Hardware mock convention") with the older `deferred_acs:` escape
      hatch: deferring is honest, but a deferred AC must still take a
      mock-test path or carry a prose justification. It is back-compat —
@@ -615,7 +615,7 @@ differs for new-repo vs. rust-extend PRDs:
 
 At most ONCE PER DAY, write a follow-on PRD. Triggers:
 
-- A `/autobuilder` run blocked on a missing primitive → PRD for that
+- A `/rustbuild` run blocked on a missing primitive → PRD for that
   primitive ("autobuilder needs a JSON-stable receipt for X").
 - A wired feature exposed an obvious next step (the existing observer-
   correlation and daemon PRDs are exactly this shape — see them as the
@@ -680,7 +680,7 @@ implementation (write-ahead intent file → block on the lock with a hard
   writes under contention.
 - **Session teardown:** if Phase 2.5 started a session, tear it down now:
   ```
-  bash ~/.claude/skills/cloudbuild/cloudbuild.sh session-end
+  bash ~/.claude/skills/cloudrustbuild/cloudbuild.sh session-end
   ```
   This destroys the builder server and stops billing. Run this even if some
   branches failed — we want billing to stop regardless. If `session-end`
@@ -794,7 +794,7 @@ default to Sonnet; the escalation list is the only reason to go Opus.
 **Cloudbuild (added 2026-06-07, HARDENED 2026-06-16).** All `cargo build`,
 `cargo test`, `cargo clippy`, and `cargo deny` invocations inside branch
 agents MUST route through cloudbuild. This is non-negotiable per explicit
-user instruction 2026-06-16: **local /autobuilder cargo execution is
+user instruction 2026-06-16: **local /rustbuild cargo execution is
 disabled**. Silent local fallback is not allowed — log it explicitly if
 cloudbuild is unavailable and only then proceed locally.
 
@@ -803,16 +803,16 @@ builds").** When `hostname` is `RedBaron`, the mandate above does NOT apply.
 RedBaron (i7-11700KF, 16 threads, 30 GB RAM, sccache + mold configured in
 `~/.cargo/config.toml`) is the designated Rust build machine: run `cargo`
 locally, do not start cloudbuild sessions, do not export `AUTOBUILDER_CLOUD=1`.
-Use /cloudbuild from RedBaron only when the user explicitly asks for it, or for
+Use /cloudrustbuild from RedBaron only when the user explicitly asks for it, or for
 `fleet` fan-out of many cold crates. (Measured 2026-09-01: a clean release
 build of `recall` took 79 s on RedBaron vs 92 s on a ccx53 burst box.)
 
 Enforcement (carbon/ryzen7): every branch agent MUST export `AUTOBUILDER_CLOUD=1` before
-invoking /autobuilder (the autobuilder-cloud fork reads this to activate the
+invoking /rustbuild (the autobuilder-cloud fork reads this to activate the
 `cargo-cloud` shim). For direct cloudbuild calls:
-`bash ~/.claude/skills/cloudbuild/cloudbuild.sh build <crate> -- <args>`.
+`bash ~/.claude/skills/cloudrustbuild/cloudbuild.sh build <crate> -- <args>`.
 
-Before any cargo work: `bash ~/.claude/skills/cloudbuild/cloudbuild.sh status`
+Before any cargo work: `bash ~/.claude/skills/cloudrustbuild/cloudbuild.sh status`
 — if RUNNING or can be brought up, use cloudbuild. Only skip if status returns
 error AND `cloudbuild up` fails after one retry; log "cloudbuild unavailable,
 building locally" in that case.
@@ -1037,7 +1037,7 @@ branch that errored, journal `tick-branch-error  <slug>  <reason>`
 and leave that PRD's manifest entry unchanged. The next tick
 re-selects normally.
 
-If `/autobuilder` rate-limits parallel invocations (not currently
+If `/rustbuild` rate-limits parallel invocations (not currently
 observed), drop the per-tick cap to 3 by editing this section's "up
 to 5" wording. The cap is a number in the doc, not in code.
 
@@ -1063,7 +1063,7 @@ to 5" wording. The cap is a number in the doc, not in code.
 ```json
 {
   "slug": "recall-daemon",
-  "path": "/home/jsy/wintermute/autobuilder/PRD-recall-daemon.md",
+  "path": "/home/jsy/wintermute/rustbuild/PRD-recall-daemon.md",
   "status": "queued|in_progress|notebook|shipped|vanished|needs_classification",
   "build_auto": true,
   "build_target": "rust-cli|rust-lib|rust-extend|shell|hooks|config|notebook|mixed|null",
@@ -1218,7 +1218,7 @@ and self-review already understands their state files.
   that haven't been vetted yet (the PRD ships a `verification` field
   pointing at a shell command; first invocation should be sandboxed).
 - **`procstat snap`** — capture peak RSS / IO bytes against the
-  `/autobuilder` invocation PID for runaway-iteration receipts. Optional;
+  `/rustbuild` invocation PID for runaway-iteration receipts. Optional;
   useful when a tick advances the same PRD ≥3 times without progress.
 - **`ctrace query`** — for post-hoc forensics if a tick writes outside
   its scope-check and the wchg delta isn't enough to explain why.

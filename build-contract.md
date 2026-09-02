@@ -27,7 +27,7 @@ inside fenced code blocks are ignored; first match wins.
 | key | values | required | notes |
 |---|---|---|---|
 | `Status` | `queued` (dream) → `building` / `built` / `blocked` (build) | yes | display + lifecycle |
-| `build_target` | `rust-cli` `rust-lib` `rust-extend` `kernel-extend` `shell` `hooks` `config` `notebook` `mixed` — and `python-cli` `python-lib` `python-agent` (routes to `/pybuilder`; wiring pending in this skill, see Follow-ups) — `product` is skipped, not built | yes | anything else → `needs_classification` |
+| `build_target` | `rust-cli` `rust-lib` `rust-extend` `kernel-extend` `shell` `hooks` `config` `notebook` `mixed` — and `python-cli` `python-lib` `python-agent` (routes to `/pybuild`; wiring pending in this skill, see Follow-ups) — `product` is skipped, not built | yes | anything else → `needs_classification` |
 | `build_into` | absolute path of the repo to mutate | for `rust-extend`, `kernel-extend`, and any `python-*` that extends an existing repo | must exist locally at build time |
 | `build_priority` | `high` `normal` `low` | no | queue order; default `normal` |
 | `build_version_bump` | `patch` `minor` `major` | no | `rust-extend` only; default `minor` |
@@ -58,8 +58,8 @@ gate then sees zero ACs.
 
 ## Language routing
 
-- `rust-*` → `/autobuilder`, all cargo through `/cloudbuild` (no local cargo).
-- `python-*` → `/pybuilder` (planned; today this skill has no python row).
+- `rust-*` → `/rustbuild`, all cargo through `/cloudrustbuild` (no local cargo).
+- `python-*` → `/pybuild` (planned; today this skill has no python row).
 - `shell`/`hooks`/`config` → direct edits. `kernel-extend` → hand-written C.
 
 ## Publish
@@ -72,6 +72,6 @@ Keyed by the PRD's `publish` value (`j0yen/private` default, `j0yen/public`,
 
 1. Honour `publish:` in Phase 4 (default `j0yen/private`); retire the
    `joeyen-atscale` route (org access is gone).
-2. Add the `python-*` → `/pybuilder` routing row and C1–C5 substitutions.
+2. Add the `python-*` → `/pybuild` routing row and C1–C5 substitutions.
 3. Accept `archive/` as an alias of `ARCHIVE/` when reading, so kit-style
    workspaces scan cleanly.

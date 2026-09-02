@@ -2,7 +2,7 @@
 # extend-handler.sh — mechanical helpers for the rust-extend build path.
 #
 # The model orchestrates the extend tick (deciding which sub-action this
-# tick performs, invoking /autobuilder, verifying ACs). This script
+# tick performs, invoking /rustbuild, verifying ACs). This script
 # provides the deterministic, non-judgment-call pieces: parse PRD,
 # validate target, read/bump Cargo.toml version, prepend CHANGELOG,
 # install built binary.
@@ -156,7 +156,7 @@ cmd_install() {
         printf 'install-m755-fallback  %s  unit=%s  pending=daemon-installed-but-not-restarted\n' \
           "$dest" "$_backing_unit" >> "$_verdict_file"
         # Append a Pending note to gossip so self-review sees it.
-        local _gossip="$HOME/wintermute/autobuilder/notes/gossip.md"
+        local _gossip="$HOME/wintermute/rustbuild/notes/gossip.md"
         if [ -d "$(dirname "$_gossip")" ]; then
           printf '\n- [%s] Pending: daemon `%s` installed binary `%s` but NOT restarted — `rollout install` unavailable (install-m755-fallback)\n' \
             "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$_backing_unit" "$dest" \
