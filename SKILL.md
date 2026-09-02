@@ -155,14 +155,15 @@ isolated via worktrees up to the ≤3 same-target sub-cap, ≤1 kernel-extend,
 whatever the queue admits after conflict-pruning. If the pool yields zero,
 exit clean.
 
-### Phase 2.5 — Build-hub check
+### Phase 2.5 — RedBaron reachability check
 
 The Hetzner burst box was retired on 2026-09-01; there is no session to start.
-RedBaron is the Rust build hub and is always warm. If this tick selected any
-cargo-bound PRD (`rust-cli`, `rust-lib`, `rust-extend`) and `hostname` is not
-`RedBaron`, run `bash ~/.claude/skills/cloudrustbuild/cloudbuild.sh status`
-once; if the hub is unreachable, mark those PRDs `blocked: build hub
-unreachable` for this tick and dispatch only the non-cargo PRDs.
+RedBaron is the fleet's Rust build machine and is always on (Wintermute Hub is
+the Hetzner NATS box and builds nothing). If this tick selected any cargo-bound
+PRD (`rust-cli`, `rust-lib`, `rust-extend`) and `hostname` is not `RedBaron`,
+run `bash ~/.claude/skills/cloudrustbuild/cloudbuild.sh status` once; if
+RedBaron is unreachable, mark those PRDs `blocked: RedBaron unreachable` for
+this tick and dispatch only the non-cargo PRDs.
 
 ### Phase 3 — Classify
 
@@ -682,7 +683,7 @@ self-throttle below it.**
 **Fan out to the full cap by default — do NOT self-throttle below 30 on
 memory grounds.** Carbon has **15 GB RAM (0 swap), typically ~11 GB
 free** (RedBaron has 30 GB). On carbon/ryzen7 heavy cargo builds route
-to the RedBaron hub through /cloudrustbuild, so local memory pressure is minimal; on
+to RedBaron through /cloudrustbuild, so local memory pressure is minimal; on
 RedBaron they run locally, so honor the ≤3 same-target sub-cap strictly. The real OOM guard is the **≤3 same-target
 sub-cap** below (it bounds parallel cargo builds of ONE heavy crate like
 recall's fastembed); honoring that, total width 30 is safe. The **< 4 GB
@@ -785,17 +786,17 @@ build of `recall` took 79 s on RedBaron vs 92 s on a ccx53 burst box.)
 Enforcement (carbon/ryzen7): every branch agent MUST export `AUTOBUILDER_CLOUD=1`
 before invoking /rustbuild (its `cargo-cloud` shim then routes every cargo
 invocation through `bash ~/.claude/skills/cloudrustbuild/cloudbuild.sh build
-<crate> -- <args>`, which runs on the RedBaron hub). Before any cargo work:
-`bash ~/.claude/skills/cloudrustbuild/cloudbuild.sh status`. If the hub is
+<crate> -- <args>`, which runs on RedBaron). Before any cargo work:
+`bash ~/.claude/skills/cloudrustbuild/cloudbuild.sh status`. If RedBaron is
 unreachable, do NOT build locally and do NOT try to rent a server (the burst
-path is retired and exits 2): mark the PRD `blocked: build hub unreachable`,
+path is retired and exits 2): mark the PRD `blocked: RedBaron unreachable`,
 log it, and stop this branch.
 
 This applies to both new-scaffold and rust-extend branches. Non-cargo work
 (Write/Edit, shell scripts, gh, git) stays local. Each agent prompt must
 include this directive verbatim: "Export AUTOBUILDER_CLOUD=1 and route all
-cargo invocations through cloudbuild.sh build/test (the RedBaron hub). Do NOT
-run cargo directly on this machine. If cloudbuild.sh status reports the hub
+cargo invocations through cloudbuild.sh build/test (they run on RedBaron). Do NOT
+run cargo directly on this machine. If cloudbuild.sh status reports RedBaron
 unreachable, mark the PRD blocked and stop; never rent a server."
 
 Each agent prompt must include, self-contained:
