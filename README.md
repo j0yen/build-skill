@@ -71,7 +71,7 @@ One source per skill, enforced hourly by `fleet-sync` on every node:
 | skill | repository | branch | path in repo | clone |
 |---|---|---|---|---|
 | build | j0yen/build-skill | main | `/` | `~/wintermute/build-skill` |
-| pybuilder | j0yen/build-skill | main | `skills/pybuilder` | same clone |
+| pybuilder | j0yen/pybuilder | main | `skill` | `~/wintermute/pybuilder` |
 | autobuilder | j0yen/autobuilder-private | main | `skill` | `~/wintermute/autobuilder-private` |
 | cloudbuild | j0yen/autobuilder-private | main | `skills/cloudbuild` | same clone |
 | dream | j0yen/vibecode-kit | main | `skills/dream` | `~/wintermute/vibecode-kit` |
