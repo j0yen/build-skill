@@ -155,31 +155,14 @@ isolated via worktrees up to the ≤3 same-target sub-cap, ≤1 kernel-extend,
 whatever the queue admits after conflict-pruning. If the pool yields zero,
 exit clean.
 
-### Phase 2.5 — Session warm-up
+### Phase 2.5 — Build-hub check
 
-After selection (Phase 2) and before dispatching branches (Phase 4):
-
-**RedBaron exception:** if `hostname` is `RedBaron`, skip this phase — cargo
-runs locally there (see the Cloudbuild section under model selection).
-
-1. **Count cargo-bound PRDs** in the selected set — any PRD whose
-   `build_target` is `rust-cli`, `rust-lib`, or `rust-extend` (i.e.,
-   it will invoke `cargo` via cloudbuild).
-2. **If ≥1 cargo-bound PRD exists**, start a cloudbuild session so all
-   branch agents reuse one warm server instead of each spinning up and
-   destroying their own:
-   ```
-   bash ~/.claude/skills/cloudrustbuild/cloudbuild.sh session-start
-   ```
-   Log the returned IP and record that the session is active for this tick.
-   The session lock at `~/.config/wm-burst/session.lock` causes every
-   subsequent `cloudbuild build/test` call in any branch to transparently
-   reuse the warm server — no branch-level change needed.
-3. **If 0 cargo-bound PRDs**, skip session-start — no server is needed.
-
-This is Phase 2.5 so it runs ONCE in the parent, before fan-out.
-The watchdog (`cloudbuild-watchdog.sh`) still kills any server older than 2h
-as a safety net if session-end is never reached (crash, OOM-kill, etc.).
+The Hetzner burst box was retired on 2026-09-01; there is no session to start.
+RedBaron is the Rust build hub and is always warm. If this tick selected any
+cargo-bound PRD (`rust-cli`, `rust-lib`, `rust-extend`) and `hostname` is not
+`RedBaron`, run `bash ~/.claude/skills/cloudrustbuild/cloudbuild.sh status`
+once; if the hub is unreachable, mark those PRDs `blocked: build hub
+unreachable` for this tick and dispatch only the non-cargo PRDs.
 
 ### Phase 3 — Classify
 
@@ -678,14 +661,6 @@ implementation (write-ahead intent file → block on the lock with a hard
   `state/intent/` is empty. This is the automatic version of the by-hand
   repair the parent did on 2026-06-02 when 2/6 branches dropped their
   writes under contention.
-- **Session teardown:** if Phase 2.5 started a session, tear it down now:
-  ```
-  bash ~/.claude/skills/cloudrustbuild/cloudbuild.sh session-end
-  ```
-  This destroys the builder server and stops billing. Run this even if some
-  branches failed — we want billing to stop regardless. If `session-end`
-  fails (network error, server already gone), log it but do not block
-  `tick.lock` release.
 - Then release `tick.lock`.
 
 This design (per-slug write-ahead intent + a blocking-with-ceiling lock +
@@ -707,7 +682,7 @@ self-throttle below it.**
 **Fan out to the full cap by default — do NOT self-throttle below 30 on
 memory grounds.** Carbon has **15 GB RAM (0 swap), typically ~11 GB
 free** (RedBaron has 30 GB). On carbon/ryzen7 heavy cargo builds route
-through cloudbuild (Hetzner), so local memory pressure is minimal; on
+to the RedBaron hub through /cloudrustbuild, so local memory pressure is minimal; on
 RedBaron they run locally, so honor the ≤3 same-target sub-cap strictly. The real OOM guard is the **≤3 same-target
 sub-cap** below (it bounds parallel cargo builds of ONE heavy crate like
 recall's fastembed); honoring that, total width 30 is safe. The **< 4 GB
@@ -807,24 +782,21 @@ Use /cloudrustbuild from RedBaron only when the user explicitly asks for it, or 
 `fleet` fan-out of many cold crates. (Measured 2026-09-01: a clean release
 build of `recall` took 79 s on RedBaron vs 92 s on a ccx53 burst box.)
 
-Enforcement (carbon/ryzen7): every branch agent MUST export `AUTOBUILDER_CLOUD=1` before
-invoking /rustbuild (the autobuilder-cloud fork reads this to activate the
-`cargo-cloud` shim). For direct cloudbuild calls:
-`bash ~/.claude/skills/cloudrustbuild/cloudbuild.sh build <crate> -- <args>`.
-
-Before any cargo work: `bash ~/.claude/skills/cloudrustbuild/cloudbuild.sh status`
-— if RUNNING or can be brought up, use cloudbuild. Only skip if status returns
-error AND `cloudbuild up` fails after one retry; log "cloudbuild unavailable,
-building locally" in that case.
+Enforcement (carbon/ryzen7): every branch agent MUST export `AUTOBUILDER_CLOUD=1`
+before invoking /rustbuild (its `cargo-cloud` shim then routes every cargo
+invocation through `bash ~/.claude/skills/cloudrustbuild/cloudbuild.sh build
+<crate> -- <args>`, which runs on the RedBaron hub). Before any cargo work:
+`bash ~/.claude/skills/cloudrustbuild/cloudbuild.sh status`. If the hub is
+unreachable, do NOT build locally and do NOT try to rent a server (the burst
+path is retired and exits 2): mark the PRD `blocked: build hub unreachable`,
+log it, and stop this branch.
 
 This applies to both new-scaffold and rust-extend branches. Non-cargo work
 (Write/Edit, shell scripts, gh, git) stays local. Each agent prompt must
 include this directive verbatim: "Export AUTOBUILDER_CLOUD=1 and route all
-cargo invocations through cloudbuild. Do NOT run cargo directly on the laptop.
-Only fall back to local if cloudbuild.sh status errors AND cloudbuild up fails;
-log the fallback explicitly. Do NOT call `cloudbuild session-start` or
-`cloudbuild session-end` — the parent tick manages the session lifecycle;
-branch agents only call `cloudbuild build` / `cloudbuild test`."
+cargo invocations through cloudbuild.sh build/test (the RedBaron hub). Do NOT
+run cargo directly on this machine. If cloudbuild.sh status reports the hub
+unreachable, mark the PRD blocked and stop; never rent a server."
 
 Each agent prompt must include, self-contained:
 
