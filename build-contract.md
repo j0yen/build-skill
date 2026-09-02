@@ -62,12 +62,11 @@ gate then sees zero ACs.
 - `python-*` → `/pybuilder` (planned; today this skill has no python row).
 - `shell`/`hooks`/`config` → direct edits. `kernel-extend` → hand-written C.
 
-## Publish (current behaviour, to be changed)
+## Publish
 
-Directory-keyed: PRDs under `~/Documents/PRDs` publish to `joeyen-atscale`
-private; PRDs under `~/wintermute/PRDs` (scan paused) publish to `j0yen` public
-via `wm-publish`. Neither fits post-AtScale personal work; the `publish` key
-above is the intended replacement.
+Keyed by the PRD's `publish` value (`j0yen/private` default, `j0yen/public`,
+`none`). There is no directory-keyed routing any more (2026-09-02); the
+`joeyen-atscale` org is retired and `~/wintermute/PRDs` no longer exists.
 
 ## Follow-ups (tracked, not yet done — 2026-08-27)
 

@@ -20,13 +20,12 @@ that file at run start and writes to it — keep the two in step.
 is gone; every remaining AtScale-era PRD in this workspace is historical. Never
 publish, push, or `gh repo view` against that org.
 
-**Personal wintermute pipeline (paused, not deleted).** Carbon previously ran
-this same loop against `~/wintermute/PRDs/` (published under `j0yen/public`
-via `wm-publish`). That pipeline, its manifest, its 196 shipped + 72 archived
-PRDs, and `wm-publish` itself are all still intact — `/build` just no longer
-scans that directory for new work. To resume personal wintermute building,
-add `~/wintermute/PRDs/PRD-*.md` back to the Inputs scan below (or ask Claude
-to do it) — nothing was removed, only the scan target changed.
+**One workspace (2026-09-02).** Every PRD lives in the `j0yen/PRDs` clone at
+`~/Documents/PRDs` (`build-queue/`, `built-prds/`, `parked/`). The former
+`~/wintermute/PRDs` queue is gone; its shipped PRDs were folded into
+`built-prds/`. Shipped repos live at `~/wintermute/<slug>` (the fleet's repo
+root, indexed in `~/wintermute/REPOS.md`). Canonical skill sources are listed
+in `README.md` and enforced by `fleet-sync`.
 
 Cadence is **every 5 minutes** (systemd-user timer `claude-build.timer`).
 Per tick, the skill advances **up to 30 PRDs in parallel** — one action
@@ -55,17 +54,13 @@ or wait for confirmation.**):
 - GitHub repos under `j0yen/<slug>` — private by default (`publish: j0yen/private`), public only when the PRD says `publish: j0yen/public`,
   the default target as of 2026-08-03 (direct `gh repo create`, no wrapper
   yet — see the publish phase below).
-- Public GitHub repos under `j0yen/<slug>` — personal wintermute work, the
-  original target (via `wm-publish`). **Paused, not revoked**: `/build`
-  doesn't scan `~/wintermute/PRDs/` for new work right now, so this path
-  won't be exercised, but the authorization and the wrapper both still
-  stand if personal building resumes.
+- Public GitHub repos under `j0yen/<slug>` when the PRD says
+  `publish: j0yen/public` (via `wm-publish` where installed, else direct
+  `gh repo create`).
 - `~/.local/bin/` binary install
 - `~/.claude/scripts/` hook symlinks
 - `~/.claude/settings.json` edits (with timestamped backups)
-- Follow-on PRD authorship into `~/Documents/PRDs/build-queue/` (current default) or
-  `~/wintermute/PRDs/` (if personal building resumes), matching the source
-  PRD's provenance
+- Follow-on PRD authorship into `~/Documents/PRDs/build-queue/`
 - New tool/mechanism vectors as needed
 
 ## Inputs
@@ -79,9 +74,6 @@ or wait for confirmation.**):
   and are `/dream`'s input, not ours. **The PRD's frontmatter is the shared
   state** (`Status`, `Built`, `Blocked`, `Receipts`): any machine with the
   clone can continue; `manifest.json` below is a local cache rebuilt from it.
-  `~/wintermute/PRDs/PRD-*.md` (personal wintermute work, `j0yen`) is NOT
-  scanned as of 2026-08-03 — paused, see the note under Personal wintermute
-  pipeline above.
 - **Manifest:** `~/.claude/skills/build/state/manifest.json` — per-PRD
   status, last_action timestamp, blockers, output repo URL when published.
 - **Budget:** `~/.claude/skills/build/state/budget.json` — **all budget caps
@@ -109,11 +101,9 @@ or wait for confirmation.**):
 
 ### Phase 1 — Scan
 
-Run `PRD_DIR=~/Documents/PRDs scripts/scan-prds.sh` — it reads `build-queue/`
-and `built-prds/` under that root (the explicit `PRD_DIR`
-matters — the script's own internal default is `~/wintermute/autobuilder`,
-which is neither this path nor the paused personal path, and must never be
-relied on implicitly). This emits a JSON list of
+Run `scripts/scan-prds.sh` — it reads `build-queue/` and `built-prds/` under
+`$PRD_DIR`, which defaults to `~/Documents/PRDs` (2026-09-02; pass `PRD_DIR`
+only to scan a different workspace). This emits a JSON list of
 `{path, slug, status, build_auto, last_modified}` for every PRD under
 `~/Documents/PRDs/build-queue/` plus `built-prds/`. Diff against `manifest.json`
 (a local cache — if it is missing or older than the clone, rebuild it from the
@@ -354,7 +344,7 @@ in this tick's selection run in parallel via Agent tool calls
     unit through the safe path). Verdict: `rollout-install`.
   - If a unit is found AND `rollout` is NOT installed: falls back to
     `install -m755`, logs a WARNING to stderr, appends a Pending note to
-    `~/wintermute/autobuilder/notes/gossip.md` naming the unit that was
+    `~/wintermute/autobuilder-private/notes/gossip.md` naming the unit that was
     installed-but-not-restarted. Build still exits 0. Verdict:
     `install-m755-fallback`.
   - If no unit backs the dest: plain `install -m755`, unchanged
@@ -421,8 +411,6 @@ in this tick's selection run in parallel via Agent tool calls
     mark `needs_classification`, do not publish, ask. A PRD carrying a
     `publish:` value that contradicts its project profile's `Publish:` line
     (see `~/Documents/PRDs/projects/`) is likewise a stop-and-ask, not a guess.
-  - **Personal wintermute path (paused)**: `~/wintermute/PRDs/` is still not
-    scanned; when it is, its PRDs carry `publish: j0yen/public` explicitly.
 
   After the publish lands, write the initial `README.md` from the
   PRD's TL;DR + acceptance tests + an "Install" block. Update
@@ -457,13 +445,6 @@ in this tick's selection run in parallel via Agent tool calls
     cd ~/Documents/PRDs && git pull --rebase -q
     git mv build-queue/PRD-<slug>.md built-prds/
     git -c user.name="Joe Yen" -c user.email=jyen.tech@gmail.com commit -m "archive: <slug> shipped"
-    git push
-    ```
-  - **Personal wintermute PRDs (paused)** — push to `j0yen/autobuilder-private`:
-    ```
-    cd ~/wintermute/PRDs
-    git -c user.name=j0yen -c user.email=jyen.tech@gmail.com mv PRD-<slug>.md ARCHIVE/
-    git -c user.name=j0yen -c user.email=jyen.tech@gmail.com commit -m "archive: <slug> shipped"
     git push
     ```
   Record the five passing checks in the manifest entry's `verified_completed` field.
@@ -642,15 +623,15 @@ At most ONCE PER DAY, write a follow-on PRD. Triggers:
 - A repeated failure pattern across two or more ticks → a PRD
   proposing a guardrail or pattern that prevents it.
 
-Follow-on PRDs go in `~/wintermute/autobuilder/PRD-build-<topic>.md`
-with frontmatter `Status: Draft v0.1`. Omit `build_auto` (no longer
+Follow-on PRDs go in `~/Documents/PRDs/build-queue/PRD-build-<topic>.md`
+with frontmatter `Status: queued` and a `build_target`. Omit `build_auto` (no longer
 parsed). Bump `budget.used.prds_drafted` for telemetry.
 
 **Commit + push the drafted PRD as part of this same tick action.**
 Per user instruction 2026-05-27, generated work doesn't accumulate
 untracked. Steps:
 
-1. `cd ~/wintermute/autobuilder && git add PRD-build-<topic>.md`
+1. `cd ~/Documents/PRDs && git pull --rebase && git add build-queue/PRD-build-<topic>.md`
 2. `git -c user.email=jyen.tech@gmail.com -c user.name="Joe Yen" commit
    -m "build: draft PRD-build-<topic> (Phase 6 reflect)"` — include a
    one-paragraph body explaining what triggered the reflect.

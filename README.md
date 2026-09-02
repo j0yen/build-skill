@@ -63,3 +63,18 @@ yourself, create a user unit that runs `claude` with a one-shot
 ## License
 
 Dual-licensed: MIT or Apache-2.0 at your option.
+
+## Canonical sources (fleet)
+
+One source per skill, enforced hourly by `fleet-sync` on every node:
+
+| skill | repository | branch | path in repo | clone |
+|---|---|---|---|---|
+| build | j0yen/build-skill | main | `/` | `~/wintermute/build-skill` |
+| pybuilder | j0yen/build-skill | main | `skills/pybuilder` | same clone |
+| autobuilder | j0yen/autobuilder-private | main | `skill` | `~/wintermute/autobuilder-private` |
+| cloudbuild | j0yen/autobuilder-private | main | `skills/cloudbuild` | same clone |
+| dream | j0yen/vibecode-kit | main | `skills/dream` | `~/wintermute/vibecode-kit` |
+| PRD workspace | j0yen/PRDs | main | `/` | `~/Documents/PRDs` |
+
+`~/wintermute` is the repo root for everything the fleet ships or runs.

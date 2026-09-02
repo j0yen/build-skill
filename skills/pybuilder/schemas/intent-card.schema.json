@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/j0yen/pybuilder/schemas/intent-card.v1.json",
+  "title": "intent-card.v1",
+  "description": "The distilled intent of a PRD, produced by the 5-Whys intake. Read by every pipeline stage.",
+  "type": "object",
+  "required": ["slug", "root_motivation", "target", "acceptance_criteria"],
+  "additionalProperties": false,
+  "properties": {
+    "slug": {
+      "type": "string",
+      "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$",
+      "description": "kebab-case project identifier"
+    },
+    "root_motivation": {
+      "type": "string",
+      "minLength": 1,
+      "description": "the customer pain / job-to-be-done, in one paragraph"
+    },
+    "target": {
+      "enum": ["cli", "lib", "agent"],
+      "description": "build target; agent is the state-machine (LLM-bearing) target"
+    },
+    "schema_version": {
+      "const": "intent-card.v1"
+    },
+    "acceptance_criteria": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["id", "text", "level"],
+        "additionalProperties": false,
+        "properties": {
+          "id": { "type": "string", "description": "e.g. AC-1" },
+          "text": { "type": "string", "minLength": 1 },
+          "level": { "enum": ["MUST", "SHOULD", "MAY"] },
+          "judged": {
+            "type": "boolean",
+            "default": false,
+            "description": "true when the AC needs the eval harness (judge/fuzzy), not a bare assert"
+          }
+        }
+      }
+    }
+  },
+  "$comment": "At least one MUST-level acceptance criterion is required (nothing to prove otherwise); enforced by pybuilder.intent_card.IntentCard.validate, not expressible in plain JSON Schema."
+}

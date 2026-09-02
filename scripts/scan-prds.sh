@@ -15,7 +15,7 @@
 
 set -uo pipefail
 
-PRD_DIR="${PRD_DIR:-$HOME/wintermute/autobuilder}"
+PRD_DIR="${PRD_DIR:-$HOME/Documents/PRDs}"
 
 # Fast path: use vellum if available (same output format, faster + more correct).
 # Emit BOTH top-level (buildable) and ARCHIVE/ (already-done) so Phase 1 diff
