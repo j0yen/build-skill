@@ -123,6 +123,16 @@ scan and the PRDs' `Status` lines rather than trusting it):
 
 ### Phase 2 — Select
 
+**Depends-on gate (2026-09-02).** A queued PRD whose frontmatter `Depends-on:`
+names a PRD that is not yet in `built-prds/` is not selectable this tick.
+Log one line per skipped PRD (`waiting on PRD-<slug>`), do not mark it
+blocked, and re-check next tick. Resolve the name against
+`~/Documents/PRDs/built-prds/` (a PRD is "built" once its file is there);
+a name that matches neither `build-queue/` nor `built-prds/` is a typo — mark
+the dependent `needs_classification` and say which name failed. Ordering
+within a tick follows the same rule: never dispatch a dependent in the same
+tick as the PRD it waits on.
+
 Build a candidate pool in priority order:
 
 1. PRDs whose manifest `status` is `in_progress` and `last_action` is
