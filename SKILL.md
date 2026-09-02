@@ -126,6 +126,9 @@ exit clean.
 
 After selection (Phase 2) and before dispatching branches (Phase 4):
 
+**RedBaron exception:** if `hostname` is `RedBaron`, skip this phase — cargo
+runs locally there (see the Cloudbuild section under model selection).
+
 1. **Count cargo-bound PRDs** in the selected set — any PRD whose
    `build_target` is `rust-cli`, `rust-lib`, or `rust-extend` (i.e.,
    it will invoke `cargo` via cloudbuild).
@@ -606,9 +609,10 @@ raised 10 → 30 by user 2026-06-11 — **30 is the operative cap, do not
 self-throttle below it.**
 
 **Fan out to the full cap by default — do NOT self-throttle below 30 on
-memory grounds.** The box has **15 GB RAM (0 swap), typically ~11 GB
-free**. Heavy cargo builds route through cloudbuild (Hetzner), so local
-memory pressure is minimal. The real OOM guard is the **≤3 same-target
+memory grounds.** Carbon has **15 GB RAM (0 swap), typically ~11 GB
+free** (RedBaron has 30 GB). On carbon/ryzen7 heavy cargo builds route
+through cloudbuild (Hetzner), so local memory pressure is minimal; on
+RedBaron they run locally, so honor the ≤3 same-target sub-cap strictly. The real OOM guard is the **≤3 same-target
 sub-cap** below (it bounds parallel cargo builds of ONE heavy crate like
 recall's fastembed); honoring that, total width 30 is safe. The **< 4 GB
 available** check (at selection time) is the ONLY permitted reason to
@@ -698,7 +702,16 @@ user instruction 2026-06-16: **local /autobuilder cargo execution is
 disabled**. Silent local fallback is not allowed — log it explicitly if
 cloudbuild is unavailable and only then proceed locally.
 
-Enforcement: every branch agent MUST export `AUTOBUILDER_CLOUD=1` before
+**RedBaron exception (2026-09-01, per user: "let's use redbaron for rust
+builds").** When `hostname` is `RedBaron`, the mandate above does NOT apply.
+RedBaron (i7-11700KF, 16 threads, 30 GB RAM, sccache + mold configured in
+`~/.cargo/config.toml`) is the designated Rust build machine: run `cargo`
+locally, do not start cloudbuild sessions, do not export `AUTOBUILDER_CLOUD=1`.
+Use /cloudbuild from RedBaron only when the user explicitly asks for it, or for
+`fleet` fan-out of many cold crates. (Measured 2026-09-01: a clean release
+build of `recall` took 79 s on RedBaron vs 92 s on a ccx53 burst box.)
+
+Enforcement (carbon/ryzen7): every branch agent MUST export `AUTOBUILDER_CLOUD=1` before
 invoking /autobuilder (the autobuilder-cloud fork reads this to activate the
 `cargo-cloud` shim). For direct cloudbuild calls:
 `bash ~/.claude/skills/cloudbuild/cloudbuild.sh build <crate> -- <args>`.
