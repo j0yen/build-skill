@@ -94,7 +94,7 @@ cmd_add() {
   fi
   # Base the branch on main's HEAD (clean commit), ignoring any dirty files in
   # the main working tree.
-  base="$(git -C "$repo" rev-parse main 2>/dev/null || git -C "$repo" rev-parse HEAD)"
+  base="$(git -C "$repo" rev-parse --verify -q main 2>/dev/null || git -C "$repo" rev-parse HEAD)"
   if git -C "$repo" show-ref --verify --quiet "refs/heads/$branch"; then
     git -C "$repo" worktree add "$wt" "$branch" >&2 || die 2 "worktree add (existing branch) failed"
   else
