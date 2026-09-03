@@ -12,5 +12,5 @@ echo "$(ts) launcher: starting tick" >> "$LOG"
 exec systemd-run --user --unit=claude-build-work --collect --quiet \
   -p RuntimeMaxSec=1800 -p WorkingDirectory="$HOME" \
   -p StandardOutput="append:$LOG" -p StandardError="append:$LOG" \
-  --setenv=HOME="$HOME" --setenv=PATH="$HOME/.local/bin:$HOME/.cargo/bin:$HOME/.npm-global/bin:/usr/local/bin:/usr/bin:/bin" \
+  --setenv=HOME="$HOME" --setenv=CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0 --setenv=PATH="$HOME/.local/bin:$HOME/.cargo/bin:$HOME/.npm-global/bin:/usr/local/bin:/usr/bin:/bin" \
   "$HOME/.local/bin/claude" -p "/build" --model sonnet --dangerously-skip-permissions --output-format text
