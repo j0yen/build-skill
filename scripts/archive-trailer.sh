@@ -47,7 +47,7 @@ set -uo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 SCAN="$HERE/scan-prds.sh"
-JQ="${JQ:-/usr/sbin/jq}"
+JQ="${JQ:-$(command -v jq || echo /usr/sbin/jq)}"
 
 usage() {
   sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'

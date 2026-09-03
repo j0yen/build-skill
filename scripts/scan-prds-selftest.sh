@@ -7,7 +7,7 @@ set -uo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 SCAN="$HERE/scan-prds.sh"
-JQ="${JQ:-/usr/sbin/jq}"
+JQ="${JQ:-$(command -v jq || echo /usr/sbin/jq)}"
 [ -x "$JQ" ] || JQ="$(command -v jq)"
 
 tmp="$(mktemp -d)"
