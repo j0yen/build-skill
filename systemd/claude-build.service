@@ -1,0 +1,9 @@
+[Unit]
+Description=Launch one Claude /build tick as claude-build-work.service (overlap-guarded)
+
+[Service]
+Type=oneshot
+Environment=HOME=/home/jsy
+Environment=PATH=/home/jsy/.local/bin:/home/jsy/.cargo/bin:/home/jsy/.npm-global/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/home/jsy/.local/bin/claude-build-headless.sh
+TimeoutStartSec=60
