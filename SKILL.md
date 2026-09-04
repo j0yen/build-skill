@@ -101,6 +101,29 @@ or wait for confirmation.**):
 
 ### Phase 1 — Scan
 
+**Reconcile first (2026-09-04, PRD-build-manifest-reconcile).** Before
+diffing anything, run `scripts/manifest-reconcile.sh` (equivalently
+`scripts/scan-prds.sh --reconcile`, a passthrough to the same script).
+Frontmatter and directory placement are the shared state per the build
+contract; `manifest.json` is a local cache that tick branches write through
+`manifest-set.sh` and never re-derive on their own — left alone, the cache
+drifts (a PRD `built` in the file and `queued` in the cache; a PRD
+`shipped` in the cache while still sitting in `build-queue/`; an extend
+PRD with no `output_repo_path` because that field is normally set at
+publish time and an extend PRD publishes into a repo that already
+exists — each of these cost a cycle or a human on 2026-09-03). Reconcile
+patches the cache to match the files (through `manifest-set.sh`, same
+locked write path Phase 7 branches use — see that section for the
+patch-file-not-inline gotcha), backfills `output_repo_path` from
+`build_into` for `rust-extend`/`kernel-extend` PRDs, copies
+`build_target`/`build_into` onto entries that lack them, clears
+`blockers` once a file's `Blocked:` line is gone, and marks/drops
+`vanished` entries (7-day grace). Record `reconciled: n` (from the
+script's own summary line) in the tick's own summary. Only after this
+runs does Phase 1's scan-vs-manifest diff below execute — reconcile
+already resolved the disagreements it knows how to resolve, so the diff
+should normally be clean.
+
 Run `scripts/scan-prds.sh` — it reads `build-queue/` and `built-prds/` under
 `$PRD_DIR`, which defaults to `~/Documents/PRDs` (2026-09-02; pass `PRD_DIR`
 only to scan a different workspace). This emits a JSON list of
@@ -678,6 +701,13 @@ untracked. Steps:
 No caps block this action — `budget.caps` are all null.
 
 ### Phase 7 — Persist & log
+
+**Note on `manifest-set.sh`'s one gotcha** (see Phase 1's reconcile-first
+step, which hit this on 2026-09-03): its patch argument is always a PATH
+TO A JSON FILE, never an inline JSON string — `manifest-set.sh <slug>
+/tmp/<slug>.patch.json`, not `manifest-set.sh <slug> '{"status":...}'`.
+`scripts/manifest-reconcile.sh` writes a tempfile per slug for exactly
+this reason; do the same in any new caller.
 
 Each branch (per selected PRD) persists its own work through the shared
 **`scripts/manifest-set.sh`** helper (added 2026-06-02 — see

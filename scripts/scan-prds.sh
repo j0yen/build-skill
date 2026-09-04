@@ -12,8 +12,21 @@
 # Frontmatter detection: if the file opens with `---\n`, parse YAML up to
 # the next `---`. Otherwise, scan the first 40 lines for top-level keys
 # (`build_auto:`, `Status:`, etc.) which is how the existing PRDs encode them.
+#
+# `scan-prds.sh --reconcile [--dry-run] [--format table|json]` delegates
+# straight to manifest-reconcile.sh (same directory) — the "frontmatter +
+# directory beats the manifest cache" pass that PRD-build-manifest-reconcile
+# added. Kept as a passthrough (not a reimplementation) so a standalone
+# scan can never compute a different disagreement than the tick's own
+# reconcile-first step does.
 
 set -uo pipefail
+
+HERE0="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ "${1:-}" = "--reconcile" ]; then
+  shift
+  exec "$HERE0/manifest-reconcile.sh" "$@"
+fi
 
 PRD_DIR="${PRD_DIR:-$HOME/Documents/PRDs}"
 
