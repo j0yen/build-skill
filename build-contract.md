@@ -69,6 +69,20 @@ Keyed by the PRD's `publish` value (`j0yen/private` default, `j0yen/public`,
 `none`). There is no directory-keyed routing any more (2026-09-02); the
 `joeyen-atscale` org is retired and `~/wintermute/PRDs` no longer exists.
 
+## Lint gate (PRD-build-prd-lint, 2026-09-04)
+
+`scripts/scan-prds.sh` runs `scripts/prd-lint.sh` over every `build-queue/`
+PRD before emitting its scan. A PRD that fails a check (unparseable
+`deferred_acs`, a missing/cyclic `Depends-on`, a malformed `## Acceptance
+criteria` section, an unknown `build_target`, ...) is written into the
+manifest as `status: needs_classification` with the first failure's id and
+message in `needs_classification_reason`, so Phase 2 never selects it and no
+cycle is spent discovering a mechanical defect. Pattern checks (a pinned SHA
+in an extend PRD's AC, a possible `Depends-on` deadlock, a `/home/` path in
+an AC) are warnings and do not block selection. Run it standalone —
+`scripts/prd-lint.sh <file>... [--format text|json]` — before committing a
+new or edited PRD; exit 0 clean, 1 on any failure, 2 on usage error.
+
 ## Follow-ups (tracked, not yet done — 2026-08-27)
 
 1. Honour `publish:` in Phase 4 (default `j0yen/private`); retire the
