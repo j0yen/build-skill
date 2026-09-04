@@ -503,6 +503,49 @@ in this tick's selection run in parallel via Agent tool calls
      already-shipped PRDs whose deferred ACs gain a `mock_unjustified_for:`
      + justification backfill still pass.
 
+  **Check #5 is DERIVED, not asserted (`verified-completed.sh --derive`,
+  per PRD-build-archive-autopair).** The tick and `archive-finalize.sh`
+  both call `verified-completed.sh <prd> --derive` — this is also the
+  script's default whenever `--paired` is absent. Derivation scans the
+  build repo's `tests/` for every AC-naming convention the fleet actually
+  uses, in this order (first match wins; `--format table` shows which
+  rule fired and the matched path):
+  1. **prefix** — `tests/<p>_ac<N>_*.rs` or the bare `tests/<p>_ac<N>.rs`
+     (and `.py`), for a candidate prefix `<p>`: the PRD's `test_prefix:`
+     frontmatter key if declared (bare scalar or `[a, b]` list — see
+     build-contract.md), else a single guess derived from the slug
+     (strip the crate name + `-`, split the rest on `-`, take the last
+     token unless it's the generic word `tools`, in which case take the
+     second-to-last instead — `mcphost-rest-tools` on crate `mcphost` →
+     `rest`; `ac-judge-pluggable-backend` on crate `ac-judge` → `backend`).
+     Tried FIRST, ahead of the bare rule below, and once ANY of a PRD's
+     ACs match via a given prefix, the bare rule is disabled for the
+     REST of that PRD's ACs too — both exist specifically because a
+     shared crate's `tests/` holds bare `ac01_*.rs`..`ac19_*.rs` files
+     belonging to an entirely different PRD, and an extend PRD's own
+     un-prefixed leftover ACs (deferred ones, say) must not silently
+     false-pair to them.
+  2. **bare** — `tests/ac<N>_*.rs` / `tests/ac<NN>_*.rs` (and `.py`).
+  3. **acceptance_ac** — `tests/acceptance_ac<N>.rs` (and `.py`).
+  4. **mocks** — `tests/mocks/ac<N>.rs` (and `.py`).
+  5. **fn-scan** — a `#[test] fn ac<N>_...` or `def test_ac<N>_...` /
+     `def test_ac_<N>_...` anywhere under `tests/`. Last resort.
+
+  A guessed slug-derived prefix that doesn't match the crate's real
+  convention (e.g. `mcphost-rest-tools`'s tests are actually `http_ac*`,
+  not `rest_ac*`) simply finds nothing at that rule and falls through —
+  it never produces a wrong pairing, only a missed one, so **declare
+  `test_prefix:`** whenever the guess would be wrong. `--paired N,N,...`
+  still works and composes ADDITIVELY: it never overrides a derived
+  pairing, it only covers ACs the derivation didn't find (shown as rule
+  `asserted` in `--format table`/`json`). `deferred_acs:` in prose form
+  (not the `[N, N]` list) is reported once as `deferred_acs: unparsed —
+  use [N, N]` and treated as none — the ACs that would have deferred
+  land on MISSING instead of silently passing. P1: `--verify-run`
+  re-runs each derived (non-`asserted`) test and marks a failure
+  `PAIRED-FAILING` (still a gate failure) so a stale test file can't
+  pair.
+
   **Verified-completed checklist (rust-extend path):**
   Same as above with three substitutions:
   - Check #2 becomes: remote `origin` exists for `output_repo_path` AND

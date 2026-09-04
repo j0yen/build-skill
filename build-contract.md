@@ -31,7 +31,8 @@ inside fenced code blocks are ignored; first match wins.
 | `build_into` | absolute path of the repo to mutate | for `rust-extend`, `kernel-extend`, and any `python-*` that extends an existing repo | must exist locally at build time |
 | `build_priority` | `high` `normal` `low` | no | queue order; default `normal` |
 | `build_version_bump` | `patch` `minor` `major` | no | `rust-extend` only; default `minor` |
-| `deferred_acs` | inline list of bare integers, e.g. `[3, 4]` | no | block-list or `AC3` forms parse to `[]` silently |
+| `deferred_acs` | inline list of bare integers, e.g. `[3, 4]` | no | block-list form parses to `[]` silently (no key at all reads the same way); a PROSE value (e.g. `deferred_acs: see note below`) is flagged — `scan-prds.sh` emits `deferred_acs_unparsed: true` and `verified-completed.sh --derive` prints `deferred_acs: unparsed — use [N, N]` instead of silently treating it as "none declared" |
+| `test_prefix` | bare scalar (`test_prefix: http`) or inline list (`test_prefix: [http, https]`) | no | names the test-file prefix an extend PRD's ACs use on a shared crate, e.g. `mcphost`'s `http_ac01_*.rs` / `python_ac01_*.rs`. Read by `verified-completed.sh --derive`'s AC-pairing derivation (see SKILL.md "archive" / Verified-completed checklist). Without it, derivation guesses a prefix from the slug, which is often wrong for a crate whose PRDs don't name themselves after their test convention |
 | `mock_unjustified_for` / `mock_justifications` | see SKILL.md C5 | with deferred ACs | one sentence per deferred AC |
 | `publish` | `j0yen/private` `j0yen/public` `none` | recommended | new key — org + visibility for the shipped repo. Until Phase 4 honours it, `/build` still routes by directory (see Follow-ups) |
 | `Vision` | `visions/<slug>.md` | yes | |

@@ -25,10 +25,16 @@
 #   --dry-run              Print the planned steps and the would-be commit
 #                          pathspec; mutate nothing, push nothing, exit 0.
 #   --paired N,N,...       AC numbers asserted paired (forwarded to
-#                          verified-completed.sh for the C5 gate). If
-#                          omitted, derived from manifest verification keys;
-#                          if still empty, C5 will fail and the helper
-#                          refuses (safe default — never paper over).
+#                          verified-completed.sh's C5 gate ALONGSIDE
+#                          --derive, additively — see PRD-build-archive-
+#                          autopair). If omitted, derived from manifest
+#                          verification keys. Either way, verified-
+#                          completed.sh derives its own pairing from the
+#                          repo first (test_prefix / bare / acceptance_ac
+#                          / mocks / fn-scan conventions); --paired only
+#                          covers ACs the derivation didn't find. If C5
+#                          still fails, the helper refuses (safe default
+#                          — never paper over).
 #   --test-cmd '<cmd>'     C1 test command run in the repo (default:
 #                          `cargo test --release`).
 #   --c1-prechecked        Trust the caller that C1 already passed (the
@@ -141,7 +147,11 @@ if [ -z "$paired_csv" ] && [ "$verification" != "null" ]; then
     | sort -un | paste -sd, -)"
 fi
 
-if "$VC" "$prd_path" ${paired_csv:+--paired "$paired_csv"} >/dev/null 2>&1; then
+# --derive always (PRD-build-archive-autopair req. 4): the classifier
+# scans the repo for the AC-to-test pairing itself; --paired (derived
+# above from manifest verification keys, when present) only ADDS
+# coverage for ACs the derivation didn't find — it never replaces it.
+if "$VC" "$prd_path" --derive ${paired_csv:+--paired "$paired_csv"} >/dev/null 2>&1; then
   c5_ok=true
 else
   c5_ok=false

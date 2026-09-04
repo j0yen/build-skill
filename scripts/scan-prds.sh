@@ -55,7 +55,7 @@ JQ="${JQ:-$(command -v jq 2>/dev/null || echo /usr/bin/jq)}"
 [ -x "$JQ" ] || { echo "jq not at $JQ" >&2; exit 1; }
 
 emit_one() {
-  local path="$1" slug status_line build_auto build_target build_priority build_into build_version_bump deferred_acs deferred_ac_reasons publish
+  local path="$1" slug status_line build_auto build_target build_priority build_into build_version_bump deferred_acs deferred_ac_reasons publish test_prefix deferred_acs_unparsed
   slug="$(basename "$path" .md)"
   slug="${slug#PRD-}"
 
@@ -76,6 +76,17 @@ emit_one() {
   # block-list form lands with deferred_ac_reasons parsing in a later tick.
   deferred_acs="[]"
   deferred_ac_reasons="{}"
+  # Per PRD-build-archive-autopair AC3: a `deferred_acs:` line whose value
+  # isn't the bracket-list form (and isn't simply absent/block-form-empty)
+  # is prose the parser can't read. Distinguish that from "no deferred_acs
+  # key at all" so verified-completed.sh can name the failure instead of
+  # silently treating it the same as "none declared".
+  deferred_acs_unparsed=false
+  # Per PRD-build-archive-autopair AC1: a PRD on a shared crate may declare
+  # the test-file prefix its own ACs use (`test_prefix: http`, or a list
+  # `test_prefix: [http, https]`) so the archive gate's derivation doesn't
+  # have to guess. Always emitted as a JSON array (possibly empty).
+  test_prefix="[]"
   status_line=""
 
   # Look at the first 80 lines for the keys we care about. Tolerant of
@@ -84,7 +95,7 @@ emit_one() {
   # the parse. First-match-wins for build_* keys so real frontmatter
   # always beats later in-doc examples.
   local in_fence=false
-  local seen_target=false seen_priority=false seen_into=false seen_bump=false seen_deferred=false
+  local seen_target=false seen_priority=false seen_into=false seen_bump=false seen_deferred=false seen_test_prefix=false
   # strip leading ws, trailing ws, trailing inline-comment (` #...`), surrounding quotes
   strip_val() {
     printf '%s' "$1" | sed -E 's/^[[:space:]]*//;s/[[:space:]]+#.*$//;s/[[:space:]]*$//;s/^"//;s/"$//'
@@ -137,11 +148,15 @@ emit_one() {
       "deferred_acs:"*)
         # Inline-list form only: `deferred_acs: [1, 3, 5]`. Strip the
         # `deferred_acs:` prefix, then the surrounding brackets, split on
-        # commas, keep digits-only tokens, join into a JSON array. Anything
-        # not matching this shape parses to `[]` — same as absent.
+        # commas, keep digits-only tokens, join into a JSON array. An
+        # empty remainder (block-list form: `deferred_acs:` alone on its
+        # line, values on following `- N` lines — not parsed here, lands
+        # in a later tick) is a silent no-op, same as absent. Anything
+        # ELSE (prose — PRD-build-archive-autopair AC3) parses to `[]`
+        # too, but is flagged via deferred_acs_unparsed so the caller can
+        # name the failure instead of treating it as "none declared".
         [ "$seen_deferred" = true ] && continue
         v="$(strip_val "$(printf '%s' "$kline" | sed -E 's/^deferred_acs[[:space:]]*:[[:space:]]*//')")"
-        # require leading `[` and trailing `]` — otherwise treat as no-op
         case "$v" in
           '['*']')
             inner="${v#\[}"; inner="${inner%\]}"
@@ -156,8 +171,42 @@ emit_one() {
             done
             deferred_acs="[$csv]"
             ;;
+          '')
+            : # block-list form or bare `deferred_acs:` — no-op, not prose
+            ;;
+          *)
+            deferred_acs_unparsed=true
+            ;;
         esac
         seen_deferred=true
+        ;;
+      "test_prefix:"*)
+        # Bare scalar (`test_prefix: http`) or bracket-list (`test_prefix:
+        # [http, https]`) — always emitted as a JSON array of strings.
+        [ "$seen_test_prefix" = true ] && continue
+        v="$(strip_val "$(printf '%s' "$kline" | sed -E 's/^test_prefix[[:space:]]*:[[:space:]]*//')")"
+        case "$v" in
+          '['*']')
+            inner="${v#\[}"; inner="${inner%\]}"
+            arr=""
+            IFS=',' read -ra ptoks <<<"$inner"
+            for t in "${ptoks[@]}"; do
+              tt="$(printf '%s' "$t" | sed -E 's/^[[:space:]]+//;s/[[:space:]]+$//;s/^"//;s/"$//')"
+              [ -n "$tt" ] || continue
+              esc="$(printf '%s' "$tt" | sed 's/\\/\\\\/g;s/"/\\"/g')"
+              arr+="${arr:+,}\"$esc\""
+            done
+            test_prefix="[$arr]"
+            ;;
+          '')
+            : # nothing after the colon — no-op
+            ;;
+          *)
+            esc="$(printf '%s' "$v" | sed 's/\\/\\\\/g;s/"/\\"/g')"
+            test_prefix="[\"$esc\"]"
+            ;;
+        esac
+        seen_test_prefix=true
         ;;
       "**Status:**"*|"Status:"*|"**Status**"*|"## Status"*|"- Status:"*|"- **Status:**"*|"* Status:"*|"* **Status:**"*)
         # Strip a leading markdown list marker (`- ` / `* `) first, then the
@@ -184,11 +233,13 @@ emit_one() {
     --argjson build_version_bump "$build_version_bump" \
     --argjson publish "$publish" \
     --argjson deferred_acs "$deferred_acs" \
+    --argjson deferred_acs_unparsed "$deferred_acs_unparsed" \
     --argjson deferred_ac_reasons "$deferred_ac_reasons" \
+    --argjson test_prefix "$test_prefix" \
     --arg status_line "$status_line" \
     --argjson size "$size" \
     --arg mtime "$mtime" \
-    '{slug:$slug, path:$path, build_auto:$build_auto, build_target:$build_target, build_priority:$build_priority, build_into:$build_into, build_version_bump:$build_version_bump, publish:$publish, deferred_acs:$deferred_acs, deferred_ac_reasons:$deferred_ac_reasons, status_line:$status_line, size_bytes:$size, mtime_iso:$mtime}'
+    '{slug:$slug, path:$path, build_auto:$build_auto, build_target:$build_target, build_priority:$build_priority, build_into:$build_into, build_version_bump:$build_version_bump, publish:$publish, deferred_acs:$deferred_acs, deferred_acs_unparsed:$deferred_acs_unparsed, deferred_ac_reasons:$deferred_ac_reasons, test_prefix:$test_prefix, status_line:$status_line, size_bytes:$size, mtime_iso:$mtime}'
 }
 
 # Emit top-level PRDs (buildable) AND ARCHIVE/ PRDs (already done).
