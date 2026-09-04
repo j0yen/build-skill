@@ -17,6 +17,69 @@ set -uo pipefail
 
 PRD_DIR="${PRD_DIR:-$HOME/Documents/PRDs}"
 
+# --- PRD-build-prd-lint: contract-shape lint gate ---------------------------
+# Before anything else, run scripts/prd-lint.sh over every build-queue/ PRD.
+# A PRD that fails is written into the manifest as `needs_classification`
+# with the first failure's id and message, so Phase 2 never selects it --
+# without a model spending a cycle discovering a mechanical defect (prose
+# deferred_acs, a Depends-on cycle, a fixed-SHA rollback base, ...).
+# Best-effort and silent on stdout: any lint/manifest error is logged to
+# stderr and never blocks or alters the scan's own JSON output. Only PRDs
+# whose current manifest status is empty, `queued`, or already
+# `needs_classification` are touched -- an in-progress/built/shipped/blocked
+# PRD is left alone even if its frontmatter would now fail lint.
+SCAN_HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+run_lint_pass() {
+  local qdir="$PRD_DIR/build-queue" lint_sh="$SCAN_HERE/prd-lint.sh" set_sh="$SCAN_HERE/manifest-set.sh"
+  [ -d "$qdir" ] || return 0
+  [ -x "$lint_sh" ] || return 0
+  [ -x "$set_sh" ] || return 0
+  local manifest="${BUILD_MANIFEST:-${BUILD_STATE_DIR:-$SCAN_HERE/../state}/manifest.json}"
+  local f slug status result line id msg tmp
+  for f in "$qdir"/PRD-*.md; do
+    [ -f "$f" ] || continue
+    slug="$(basename "$f" .md)"; slug="${slug#PRD-}"
+    status="$(MANIFEST="$manifest" python3 -c '
+import json, os, sys
+slug = sys.argv[1]
+try:
+    m = json.load(open(os.environ["MANIFEST"]))
+except Exception:
+    print(""); sys.exit()
+prds = m.get("prds", {})
+if isinstance(prds, dict):
+    entry = prds.get(slug)
+else:
+    entry = next((p for p in prds if isinstance(p, dict) and p.get("slug") == slug), None)
+print((entry or {}).get("status") or "")
+' "$slug" 2>/dev/null)"
+    case "$status" in
+      ""|queued|needs_classification) ;;
+      *) continue ;;
+    esac
+    result="$("$lint_sh" "$f" --format json 2>/dev/null)"
+    line="$(printf '%s' "$result" | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)[0]
+except Exception:
+    sys.exit(0)
+fails = d.get("failures") or []
+if fails:
+    print(fails[0]["id"] + "\t" + fails[0]["message"])
+' 2>/dev/null)"
+    [ -n "$line" ] || continue
+    id="${line%%$'\t'*}"
+    msg="${line#*$'\t'}"
+    tmp="$(mktemp)" || continue
+    python3 -c 'import json,sys; print(json.dumps({"status":"needs_classification","needs_classification_reason": sys.argv[1]+": "+sys.argv[2]}))' "$id" "$msg" >"$tmp" 2>/dev/null
+    "$set_sh" "$slug" "$tmp" 1>&2 || echo "scan-prds: lint-gate manifest write failed for $slug" >&2
+    rm -f "$tmp"
+  done
+  return 0
+}
+run_lint_pass || true
+
 # Fast path: use vellum if available (same output format, faster + more correct).
 # Emit BOTH top-level (buildable) and ARCHIVE/ (already-done) so Phase 1 diff
 # can distinguish archived from truly-vanished. Without this, PRDs moved to

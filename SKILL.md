@@ -121,6 +121,16 @@ scan and the PRDs' `Status` lines rather than trusting it):
   entry whose scan path contains `/built-prds/` (or legacy `/ARCHIVE/`) is
   always treated as archived.
 
+**Lint gate (PRD-build-prd-lint, 2026-09-04).** Before the diff above,
+`scan-prds.sh` runs `scripts/prd-lint.sh` over every `build-queue/` PRD; a
+PRD that fails a contract-shape check (unparseable `deferred_acs`, a
+missing/cyclic `Depends-on`, a malformed AC section, an unknown
+`build_target`, ...) is written into the manifest as `status:
+needs_classification` with the failure's id and message, so it never enters
+the Phase 2 candidate pool. See build-contract.md's "Lint gate" section and
+run `scripts/prd-lint.sh <file> [--format text|json]` standalone to check a
+PRD before committing it.
+
 ### Phase 2 — Select
 
 **Depends-on gate (2026-09-02).** A queued PRD whose frontmatter `Depends-on:`
