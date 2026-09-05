@@ -161,6 +161,15 @@ fi
 # Same lock file/convention as `worktree-extend.sh integrate`
 # (<repo>/.git/autobuilder-integrate.lock via flock), so a gate run and an
 # integrate on the same crate — or two gate runs — never overlap.
+#
+# PRD-extend-gate-lock-cloexec (2026-09-05 incident class): every producer
+# subshell below closes fd 9 (`9>&-`) before exec'ing its child. Without
+# this, a child that outlives the script — cargo autostarting the
+# long-lived sccache daemon, or mcphost's bwrap warm-pool sandboxes leaking
+# past `cargo test` — inherits fd 9 and keeps the lock held after this
+# script exits, timing out the NEXT gate run (exit 4, 120s wait) even
+# though the process that opened the lock is long gone. Do not remove the
+# `9>&-` from a producer invocation without re-reading this comment.
 exec 9>"$repo/.git/autobuilder-integrate.lock"
 flock -w 120 9 || die 4 "could not acquire integration lock for $repo (another integrate/gate is running)"
 
@@ -185,28 +194,28 @@ echo "extend-gate: $repo head=$head_now base=$base_ref parallelism=$parallelism"
 #    non-zero exit here is logged but does not abort the run — the final
 #    `autobuilder gate` is authoritative (see file header).
 if [ -x "$repo/scripts/audit.sh" ]; then
-  ( cd "$repo" && ./scripts/audit.sh ) || note_block "risk-gate — scripts/audit.sh exited non-zero (see risk-gate receipt for detail)"
+  ( cd "$repo" && ./scripts/audit.sh ) 9>&- || note_block "risk-gate — scripts/audit.sh exited non-zero (see risk-gate receipt for detail)"
 else
   echo "extend-gate: no scripts/audit.sh in $repo — skipping"
 fi
 
 # 2. proof receipt + session trace.
-( cd "$repo" && autobuilder loop --project . --iteration 0 --head-sha "$head_now" --trace ) \
+( cd "$repo" && autobuilder loop --project . --iteration 0 --head-sha "$head_now" --trace ) 9>&- \
   || note_block "proof-receipt — autobuilder loop --iteration 0 exited non-zero"
 
 # 3. vti-plan.
-( cd "$repo" && autobuilder vti-plan --project . ) \
+( cd "$repo" && autobuilder vti-plan --project . ) 9>&- \
   || note_block "vti-plan — autobuilder vti-plan exited non-zero"
 
 # 4. rollback-plan over <base>..HEAD.
-( cd "$repo" && autobuilder rollback-plan --project . --base "$base_ref" ) \
+( cd "$repo" && autobuilder rollback-plan --project . --base "$base_ref" ) 9>&- \
   || note_block "rollback-plan — commits since $base_ref are not all revert-clean (see target/autobuilder/rollback.md); fix forward, or a human rewrites history and says so — this script never edits history to force a pass"
 
 # 5. reviewer-agent: prepare, spawn the independent review headlessly via
 #    `claude -p --model sonnet` (same tier /rustbuild routes it to; the
 #    autobuilder binary cannot spawn a Claude subagent itself), finalize.
 run_reviewer() {
-  ( cd "$repo" && autobuilder reviewer-agent prepare --project . --base "$base_ref" ) \
+  ( cd "$repo" && autobuilder reviewer-agent prepare --project . --base "$base_ref" ) 9>&- \
     || { note_block "reviewer-agent — prepare exited non-zero"; return 1; }
   local req="$repo/target/autobuilder/review-request.json"
   [ -f "$req" ] || { note_block "reviewer-agent — prepare did not write $req"; return 1; }
@@ -228,7 +237,7 @@ Reply with ONLY one JSON object, no prose, no markdown fences, matching
 schema autobuilder.reviewer_agent_receipt.v1:
 {\"schema\":\"autobuilder.reviewer_agent_receipt.v1\",\"head_sha\":\"...\",\"intent_card_sha\":\"...\",\"decision\":\"pass|concern|block\",\"block_reasons\":[...],\"concern_reasons\":[{\"id\":\"...\",\"note\":\"...\"}],\"falsification\":{\"test_audit\":\"...\",\"panic_audit\":\"...\",\"unsafe_audit\":\"...\",\"public_api_audit\":\"...\",\"deps_audit\":\"...\",\"drift_audit\":\"...\",\"counter_attack\":{\"description\":\"...\",\"test_skeleton\":\"...\"}}}"
 
-  if ! ( cd "$repo" && claude -p "$prompt" --model sonnet --permission-mode bypassPermissions --output-format text ) >"$raw" 2>"$raw.err"; then
+  if ! ( cd "$repo" && claude -p "$prompt" --model sonnet --permission-mode bypassPermissions --output-format text ) 9>&- >"$raw" 2>"$raw.err"; then
     note_block "reviewer-agent — claude -p subagent invocation failed (see $raw.err)"
     return 1
   fi
@@ -244,7 +253,7 @@ json.dump(obj, open('$out', 'w'))
     note_block "reviewer-agent — subagent did not return valid JSON (see $raw)"
     return 1
   fi
-  ( cd "$repo" && autobuilder reviewer-agent finalize --project . --input "$out" ) \
+  ( cd "$repo" && autobuilder reviewer-agent finalize --project . --input "$out" ) 9>&- \
     || { note_block "reviewer-agent — finalize rejected the subagent's output"; return 1; }
 }
 run_reviewer || true
@@ -255,16 +264,18 @@ if ! command -v gh >/dev/null 2>&1; then
 elif ! gh auth status >/dev/null 2>&1; then
   note_block "ci-checks — gh not authenticated: run 'gh auth login'"
 else
-  ( cd "$repo" && autobuilder ci-checks --project . ) \
+  ( cd "$repo" && autobuilder ci-checks --project . ) 9>&- \
     || note_block "ci-checks — workflow(s) on HEAD are not green, or still pending (the next tick retries)"
 fi
 
 # 7. the 17 extended-gates producers, in parallel.
-"$RUSTBUILD_SCRIPTS/extended-receipts.sh" "$repo" "$parallelism" \
+# subshell wraps the direct exec so 9>&- has a scope to apply to — this
+# call is not otherwise inside a `( ... )` group.
+( "$RUSTBUILD_SCRIPTS/extended-receipts.sh" "$repo" "$parallelism" ) 9>&- \
   || note_block "extended-receipts — one or more extended producers did not pass|skip (see output above)"
 
 # 8. the risk gate itself — authoritative pass/block, reads all 25 receipts.
-gate_out="$( cd "$repo" && autobuilder gate --project . 2>&1 )"
+gate_out="$(exec 9>&-; cd "$repo" && autobuilder gate --project . 2>&1)"
 gate_rc=$?
 printf '%s\n' "$gate_out"
 summary="$(printf '%s\n' "$gate_out" | grep -m1 '^gate: ' || true)"

@@ -66,17 +66,23 @@ lock_merge_setup() {
 # genuinely new (uncached) dep needs the network, do NOT commit a stale lock:
 # signal the caller (return 7) so integrate records lockfile-regen-needs-net.
 # No-op (return 0) for repos without a Cargo.toml or Cargo.lock churn.
+#
+# PRD-extend-gate-lock-cloexec (2026-09-05 incident class): called from
+# cmd_integrate while fd 9 holds the integration lock. Both cargo
+# invocations below close fd 9 (`9>&-`) in their subshell before exec'ing
+# cargo, so an autostarted sccache daemon never inherits the lock fd and
+# outlives this script holding it hostage for the next gate/integrate run.
 lock_regen() {
   local repo="$1"
   [ -f "$repo/Cargo.toml" ] || return 0          # not a cargo repo: no-op
   [ -f "$repo/Cargo.lock" ] || return 0          # no lockfile to regenerate
   command -v cargo >/dev/null 2>&1 || return 0   # no cargo: leave as merged
-  if ( cd "$repo" && cargo generate-lockfile --offline >/dev/null 2>&1 ); then
+  if ( cd "$repo" && cargo generate-lockfile --offline >/dev/null 2>&1 ) 9>&-; then
     return 0
   fi
   # --offline could not satisfy the merged Cargo.toml from cache. Try an
   # offline build as a fallback (resolves via the cache without re-fetching).
-  if ( cd "$repo" && cargo build --offline --quiet >/dev/null 2>&1 ); then
+  if ( cd "$repo" && cargo build --offline --quiet >/dev/null 2>&1 ) 9>&-; then
     return 0
   fi
   # Genuinely needs network for a new/uncached dependency: do not commit stale.
@@ -118,6 +124,11 @@ cmd_integrate() {
   need "$repo" "usage: integrate [--no-rebase] [--ensure-main] <repo> <slug> <bump> <tldr-file>"; need "$slug" "missing slug"
   local branch="autobuilder/$slug"
   local wt; wt="$(wt_path "$repo" "$slug")"
+  # PRD-extend-gate-lock-cloexec (2026-09-05 incident class): every cargo
+  # invocation below (lock_regen, the post-rebase `cargo check` guard)
+  # closes fd 9 (`9>&-`) in its own subshell before exec'ing cargo, so an
+  # autostarted sccache daemon never inherits this lock fd and holds it
+  # past this script's exit. Same convention as extend-gate.sh.
   exec 9>"$repo/.git/autobuilder-integrate.lock"
   flock -w 120 9 || die 5 "could not acquire integration lock for $repo"
 
@@ -164,9 +175,12 @@ cmd_integrate() {
       die 4 "rebase conflict integrating $slug; aborted (branch kept for next tick)"
     fi
     # Rebase succeeded. Cheap post-rebase guard: cargo check to catch auto-resolved
-    # edits that reference each other in a non-compiling way.
+    # edits that reference each other in a non-compiling way. fd 9 (the
+    # integration lock, held since cmd_integrate started — see
+    # PRD-extend-gate-lock-cloexec) is closed in the subshell so an
+    # autostarted sccache daemon cannot inherit and outlive it.
     if [ -f "$wt/Cargo.toml" ] && command -v cargo >/dev/null 2>&1; then
-      if ! ( cd "$wt" && cargo check --offline --quiet 2>&1 ); then
+      if ! ( cd "$wt" && cargo check --offline --quiet 2>&1 ) 9>&-; then
         git -C "$wt" rebase --abort 2>/dev/null || true
         [ -x "$SIDECAR" ] && "$SIDECAR" write "$slug" "last_error=rebase-broke-build" >&2 || true
         [ -x "$SERIAL_FALLBACK" ] && "$SERIAL_FALLBACK" streak-record "$repo" "rebase-broke-build" >&2 || true
