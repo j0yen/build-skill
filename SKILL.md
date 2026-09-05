@@ -380,6 +380,38 @@ in this tick's selection run in parallel via Agent tool calls
   per-tick log. Non-daemon-backed CLIs, libs, hooks, and config targets
   are entirely unaffected — no `rollout` invocation, no behavioural diff.
 
+- **intent card refresh** [rust-extend only]: after changelog & install,
+  before push — PRD-build-intent-card-refresh: an extend ship that never
+  touches `agent/intent-card.json` leaves it describing whatever PRD last
+  refreshed it, so the reviewer-agent's scope check eventually blocks a
+  routinely-shipped head with `intent-card-diff-scope-mismatch` against a
+  diff the card never described (mcphost, 2026-09-05: two blocks in one
+  night from a card frozen since v0.5.x while six PRDs and eight version
+  bumps landed). Run:
+
+  ```
+  scripts/intent-card-refresh.sh <build_into> <prd-path>
+  ```
+
+  This regenerates `<build_into>/agent/intent-card.json` from the PRD that
+  just landed (schema, prd_source, intent_slug, root_motivation, and
+  acceptance_criteria are sourced from the PRD; every other required field
+  — user_persona, unfakeable_metric, scope, non_goals, hard_constraints,
+  five_whys_trace — carries forward unchanged from the existing card,
+  marked in the card's `carried_forward` object, never fabricated) and, in
+  the same pass, removes `agent/intent_card_amendment_request.json` when
+  every one of its `scope_additions` entries is now covered by the
+  refreshed card. On a malformed PRD (no parseable AC lines) the script
+  exits 3 and writes nothing — treat that as a `gate-red`-shaped stop
+  (`next: investigate-prd-ac-format`), the same as any other pre-gate
+  failure, rather than shipping a card that doesn't match the diff.
+  Commit the result with the Joe Yen identity, subject `"agent: refresh
+  intent card for <slug>"`, before the `push` step below — the gate must
+  review a head whose card is already true. Counts as one tick action.
+  Shared-target branches: run this at `worktree-extend.sh integrate` time
+  (same serial per-repo lock), immediately after that step's version-bump
+  commit and before its own push, for the same reason.
+
 - **push** [rust-extend only]: `wm-push --slug <slug>` from inside
   `<build_into>`. `wm-push` (installed at `~/.local/bin/wm-push` per
   PRD-build-push-allowlist) wraps `git push origin <branch>` with a
@@ -1061,12 +1093,23 @@ changelog) is serial. Mechanics live in `scripts/worktree-extend.sh`:
    genuinely new uncached dep needs the network, integrate skips with
    `last_error=lockfile-regen-needs-net` rather than committing a stale
    lock — the source merge lands but is flagged.
-4. **push + cleanup** — after a successful integrate, `wm-push --slug
+4. **intent card refresh (serial, locked)** — PRD-build-intent-card-refresh:
+   immediately after `integrate`'s bump commit, still under the same
+   per-repo integration lock, run
+   `scripts/intent-card-refresh.sh <repo> <prd-path>` and commit its
+   result (Joe Yen identity, subject `"agent: refresh intent card for
+   <slug>"`) before `push` — same reasoning as the non-shared rust-extend
+   path: a card that always names the newest landed PRD instead of
+   whichever PRD refreshed it last. Exit 3 (malformed PRD, no parseable
+   AC lines) is treated the same as a `target-dirty`/conflict defer:
+   leave the PRD `in_progress`, do not push a card-stale head.
+5. **push + cleanup** — after a successful integrate (and intent card
+   refresh), `wm-push --slug
    <repo>` once, then `worktree-extend.sh cleanup <repo> <slug>
    --drop-branch`. On a deferred branch (dirty target / conflict / red
    gate) run `cleanup` WITHOUT `--drop-branch` so the next tick resumes
    the same branch via `add`.
-5. **gate** — same `gate` action as the non-shared rust-extend path (see
+6. **gate** — same `gate` action as the non-shared rust-extend path (see
    above): `scripts/extend-gate.sh <repo> --head <landed sha>` after this
    push, before the PRD reads `built`. On pass, `ship-tag.sh` tags the
    integrated HEAD (not any individual branch's commit — main's HEAD after
