@@ -397,7 +397,9 @@ in this tick's selection run in parallel via Agent tool calls
   — keep it in sync with `wm-publish`'s ALLOW and `~/wintermute/REPOS.md`.
   Counts as one tick action.
   # After wm-push succeeds: answerable-emit.sh push <repo> "v<ver> — <one-line>" false
-- **gate** [rust-extend only, and the kernel-extend equivalent below] —
+- **gate** [rust-extend only — the PRD's non-goals exclude python-* (already
+  gated by `pybuilder gate ready`) and kernel-extend (gated by `makepkg`,
+  no autobuilder receipts)] —
   after `push` and before anything reads `built`, on EITHER landing path
   (`wm-buildtree land` + `wm-push`, or the shared-target `worktree-extend.sh
   integrate` + `wm-push` + `cleanup`). PRD-build-extend-gate-receipts: the
