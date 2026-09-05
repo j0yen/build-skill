@@ -164,6 +164,7 @@ emit_one() {
   # have to guess. Always emitted as a JSON array (possibly empty).
   test_prefix="[]"
   status_line=""
+  gate_stale=false
 
   # Look at the first 80 lines for the keys we care about. Tolerant of
   # both YAML frontmatter and plain `**Status:**` markdown headers.
@@ -293,6 +294,24 @@ emit_one() {
     esac
   done < <(head -n 80 "$path")
 
+  # PRD-build-extend-gate-receipts AC14: a rust-extend PRD whose build_into
+  # HEAD has moved past the receipts' head_sha is gate-stale — the deploy
+  # gate at that HEAD is unproven until the next `gate` tick action reruns
+  # extend-gate.sh. Warning only (never needs_classification, never touches
+  # status): scan-prds is read-only diagnostics here, not an enforcement gate.
+  if [ "$build_target" = '"rust-extend"' ] && [ "$build_into" != "null" ]; then
+    local bi_path vti_json head_now vti_sha
+    bi_path="$(strip_val "$build_into")"
+    if git -C "$bi_path" rev-parse --git-dir >/dev/null 2>&1; then
+      vti_json="$bi_path/target/autobuilder/receipts/vti-plan.json"
+      head_now="$(git -C "$bi_path" rev-parse HEAD 2>/dev/null || true)"
+      if [ -n "$head_now" ] && [ -f "$vti_json" ]; then
+        vti_sha="$("$JQ" -r '.head_sha // empty' "$vti_json" 2>/dev/null || true)"
+        [ -n "$vti_sha" ] && [ "$vti_sha" != "$head_now" ] && gate_stale=true
+      fi
+    fi
+  fi
+
   local size mtime
   size="$(stat -c%s "$path" 2>/dev/null || stat -f%z "$path" 2>/dev/null || echo 0)"
   mtime="$(date -u -r "$path" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
@@ -315,7 +334,8 @@ emit_one() {
     --arg status_line "$status_line" \
     --argjson size "$size" \
     --arg mtime "$mtime" \
-    '{slug:$slug, path:$path, build_auto:$build_auto, build_target:$build_target, build_priority:$build_priority, build_into:$build_into, build_version_bump:$build_version_bump, publish:$publish, deferred_acs:$deferred_acs, deferred_acs_unparsed:$deferred_acs_unparsed, deferred_ac_reasons:$deferred_ac_reasons, test_prefix:$test_prefix, status_line:$status_line, size_bytes:$size, mtime_iso:$mtime}'
+    --argjson gate_stale "$gate_stale" \
+    '{slug:$slug, path:$path, build_auto:$build_auto, build_target:$build_target, build_priority:$build_priority, build_into:$build_into, build_version_bump:$build_version_bump, publish:$publish, deferred_acs:$deferred_acs, deferred_acs_unparsed:$deferred_acs_unparsed, deferred_ac_reasons:$deferred_ac_reasons, test_prefix:$test_prefix, status_line:$status_line, size_bytes:$size, mtime_iso:$mtime, gate_stale:$gate_stale}'
 }
 
 # Emit top-level PRDs (buildable) AND ARCHIVE/ PRDs (already done).

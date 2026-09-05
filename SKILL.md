@@ -397,6 +397,48 @@ in this tick's selection run in parallel via Agent tool calls
   — keep it in sync with `wm-publish`'s ALLOW and `~/wintermute/REPOS.md`.
   Counts as one tick action.
   # After wm-push succeeds: answerable-emit.sh push <repo> "v<ver> — <one-line>" false
+- **gate** [rust-extend only, and the kernel-extend equivalent below] —
+  after `push` and before anything reads `built`, on EITHER landing path
+  (`wm-buildtree land` + `wm-push`, or the shared-target `worktree-extend.sh
+  integrate` + `wm-push` + `cleanup`). PRD-build-extend-gate-receipts: the
+  extend path lands, bumps and pushes on the default branch without ever
+  regenerating autobuilder's 25 receipts, so every ship since the last
+  human-run regeneration is gate-red at the landed commit — this action
+  closes that gap. Run:
+
+  ```
+  scripts/extend-gate.sh <build_into> --head <landed sha>
+  ```
+
+  `<landed sha>` is the bump commit's sha on `origin/<default>` right after
+  the push above (`git -C <build_into> rev-parse HEAD`). `extend-gate.sh`
+  regenerates all 25 receipts at that HEAD on the main checkout (never in a
+  worktree — the worktree's `target/` holds none of the crate's real
+  receipts) and runs `autobuilder gate --project .` as the single verdict.
+  Counts as one tick action.
+
+  - **On pass** (`pass=25 block=0`): tag the shipped commit —
+    `~/.claude/skills/rustbuild/scripts/ship-tag.sh <build_into> <slug>`
+    (tags `v<version>` at HEAD, pushes `--follow-tags`; a second run is a
+    no-op) — then write the PRD's `Receipts:` line:
+
+    ```
+    Receipts: <build_into>/target/autobuilder/receipts (gate: pass=25 block=0 verdict=pass at <sha>, tag v<version>; rollback base <tag> at <sha>)
+    ```
+
+    (`<tag>` and its `<sha>` come from `target/autobuilder/receipts/rollback-plan.json`'s `base_tag`/`base_sha` — when `base_tag` is `null`, write `rollback base initial (no tags) at <base_sha>` instead.) Then proceed to the verified-completed checklist (check #6 below).
+  - **On block**: the manifest entry's `blockers` gains one
+    `gate: <receipt> — <message>` line per blocking receipt (the receipt
+    names and messages `extend-gate.sh` printed and journaled), `next:
+    gate-red`, the PRD's `Status:` stays `in_progress` — **do NOT tag,
+    archive, or write a passing `Receipts:` line.** The journal already has
+    one line naming the blocking receipts (written by `extend-gate.sh`
+    itself); no separate journal write is needed here.
+  - `extend-gate.sh` takes the crate's own integration lock, so a `gate`
+    action never races a same-crate `integrate` or another `gate` run.
+    Resumable: if a tick ends mid-gate, the next tick's `gate` action reruns
+    `extend-gate.sh` from the start — a partial receipt set is never read
+    as green.
 - **install / wire** [new-repo only]: When implementation is locally
   green (tests pass, `cargo test --release` ok), install built binaries
   to `~/.local/bin/` via `install -Dm755`. If the PRD includes hooks,
@@ -461,7 +503,8 @@ in this tick's selection run in parallel via Agent tool calls
   companion to `verified-completed.sh` (classifier) and `extend-handler.sh`
   (extend mechanics).
 - **archive**: When the PRD passes the **verified-completed** checklist (all
-  five must hold) **AND the rebuild gate passes**, update manifest to
+  checks must hold — five for new-repo/python-*/kernel-extend, six for
+  rust-extend, see check #6 below) **AND the rebuild gate passes**, update manifest to
   `status: shipped`, set the PRD's own `Status:` line to `built` (+ `Built:
   <date>` and `Receipts: <path>` lines), then move the file into `built-prds/`
   and commit +
@@ -580,7 +623,8 @@ in this tick's selection run in parallel via Agent tool calls
   pair.
 
   **Verified-completed checklist (rust-extend path):**
-  Same as above with three substitutions:
+  Same as above with three substitutions, plus a sixth check
+  (PRD-build-extend-gate-receipts):
   - Check #2 becomes: remote `origin` exists for `output_repo_path` AND
     the new version-bumped commit is reachable from `origin/main` (or
     the repo's default branch). No `gh repo view` because no new repo
@@ -590,6 +634,16 @@ in this tick's selection run in parallel via Agent tool calls
     The repo's existing README.md is NOT required to be regenerated.
   - Check #4 becomes: `~/wintermute/REPOS.md` is unchanged by this
     PRD's tick history (negative AC — the extended repo is already listed).
+  - **Check #6 (new)**: `autobuilder gate --project <build_into>` at a
+    HEAD equal to `origin/<default>` reports `pass=25 block=0`. This is
+    what the `gate` ship action (above) already established and recorded
+    in the `Receipts:` line — archive re-checks it rather than trusting a
+    stale line. **The archive gate refuses otherwise, naming check #6** —
+    a PRD whose `gate` action last blocked, or whose `build_into` HEAD has
+    since moved (another PRD landed on the same crate without a fresh
+    `gate` run), fails archive here and stays in `build-queue/` with
+    `Status: in_progress`, not silently treated as shipped on the strength
+    of checks #1/#5 alone.
 
   **Verified-completed checklist (python-* path):**
   Same as the new-repo checklist with these substitutions:
@@ -1010,6 +1064,17 @@ changelog) is serial. Mechanics live in `scripts/worktree-extend.sh`:
    --drop-branch`. On a deferred branch (dirty target / conflict / red
    gate) run `cleanup` WITHOUT `--drop-branch` so the next tick resumes
    the same branch via `add`.
+5. **gate** — same `gate` action as the non-shared rust-extend path (see
+   above): `scripts/extend-gate.sh <repo> --head <landed sha>` after this
+   push, before the PRD reads `built`. On pass, `ship-tag.sh` tags the
+   integrated HEAD (not any individual branch's commit — main's HEAD after
+   `integrate` + `wm-push` is what's shipped) and the `Receipts:` line is
+   written; on block, `blockers` + `next: gate-red` as above. With ≥2
+   integrates landing on one crate this tick, the receipts on main after
+   all of them carry only the LAST-landed HEAD — earlier integrates' `gate`
+   actions see their receipts superseded by the next integrate before their
+   own `gate` runs; only the PRD whose integrate was actually last should
+   expect its `gate` action to find HEAD unchanged underneath it.
 
 **Dispatch additions for shared-target branches.** Each such branch's
 agent prompt must also include: its `build_into` repo, that it shares the
