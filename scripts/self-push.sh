@@ -18,7 +18,7 @@
 #             | 5 not fast-forward (diverged) | 6 push failed
 set -uo pipefail
 
-REPO="${BUILD_SKILL_REPO:-$HOME/.local/share/build-skill}"
+REPO="${BUILD_SKILL_REPO:-$(readlink -f "$HOME/.claude/skills/build" 2>/dev/null || echo "$HOME/.local/share/build-skill")}"
 BRANCH="${BUILD_SKILL_BRANCH:-main}"
 # Accept either the canonical j0yen remote or a joeyen-atscale fork.
 EXPECTED_REMOTE_RE='github\.com[:/](j0yen|joeyen-atscale)/build-skill(\.git)?$'
