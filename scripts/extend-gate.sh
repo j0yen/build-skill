@@ -7,7 +7,7 @@
 #
 # On a clean main checkout, at HEAD, in this order:
 #   scripts/audit.sh                         (if the crate has one)
-#   autobuilder loop --project . --iteration 0 --head-sha <HEAD> --trace
+#   autobuilder loop --project <root> --iteration 0 --head-sha <HEAD> --trace
 #   autobuilder vti-plan
 #   autobuilder rollback-plan --base <base>
 #   autobuilder reviewer-agent prepare --base <base>, then finalize
@@ -15,14 +15,31 @@
 #     autobuilder/src/reviewer.rs — so this script spawns a headless
 #     sonnet review via `claude -p` and feeds its JSON to finalize)
 #   autobuilder ci-checks
-#   ~/.claude/skills/rustbuild/scripts/extended-receipts.sh <repo> [parallelism]
-#   autobuilder gate --project .
+#   ~/.claude/skills/rustbuild/scripts/extended-receipts.sh <root> [parallelism]
+#   autobuilder gate --project <root>
+# <root> is normally <build_into> itself, but is resolved to the nearest
+# subdirectory containing Cargo.toml when <build_into> has none at its own
+# root (see "cargo project root resolution" below).
 # <base> defaults to the newest `v<major>.<minor>.<patch>` tag reachable
 # from HEAD by first-parent (autobuilder's own rollback-plan convention),
 # falling back to the crate's initial commit when no such tag exists.
 #
 # Prints the gate's own summary line (`gate: head=... pass=N block=M
 # verdict=...`) and exits with the gate's verdict.
+#
+# <build_into> is normally both the git repo root and the Cargo project
+# root (mcphost, wm-node, adopt) — but that's not universal. When the repo
+# root has no Cargo.toml (rustbuild's has always lived one level down, at
+# autobuilder/Cargo.toml), immediate subdirectories are searched (depth 1,
+# then depth 2 if depth 1 finds nothing — never descending into target/ or
+# .git/) for exactly one Cargo.toml, and THAT resolved path is passed to
+# every producer below (including extended-receipts.sh's 17) instead of
+# the repo root, so cargo-invoking producers stop exiting 101 for "could
+# not find Cargo.toml" against a directory that was never the actual
+# crate. A repo with a root Cargo.toml AND a nested one keeps the root,
+# unchanged (no search triggered). Ambiguous (>1 candidate) or absent (0
+# candidates) fails loudly (exit 6) naming what was searched, before any
+# producer runs — never a silent 101. PRD-build-extend-gate-nested-crate-project.
 #
 # Exit codes:
 #   0  gate verdict pass (pass=25 block=0)
@@ -34,6 +51,9 @@
 #      target/autobuilder/ changed
 #   4  could not acquire the per-repo integration lock within 120s
 #   5  --head <sha> does not match actual HEAD — refused before any
+#      producer ran
+#   6  could not resolve a unique Cargo project root under <build_into>
+#      (none found, or more than one candidate) — refused before any
 #      producer ran
 #
 # Never runs `cargo clean` in the crate's own target/ (determinism and
@@ -74,13 +94,13 @@ EOF
 producers_desc() {
   cat <<'EOF'
 scripts/audit.sh (if present)
-autobuilder loop --project . --iteration 0 --head-sha <HEAD> --trace
+autobuilder loop --project <root> --iteration 0 --head-sha <HEAD> --trace
 autobuilder vti-plan
 autobuilder rollback-plan --base <base>
 autobuilder reviewer-agent prepare --base <base> ; claude -p (headless sonnet review) ; autobuilder reviewer-agent finalize
 autobuilder ci-checks
-extended-receipts.sh <repo> [parallelism]  (17 extended producers)
-autobuilder gate --project .
+extended-receipts.sh <root> [parallelism]  (17 extended producers)
+autobuilder gate --project <root>
 EOF
 }
 
@@ -108,6 +128,62 @@ git -C "$repo" rev-parse --git-dir >/dev/null 2>&1 || die 1 "not a git repo: $re
 command -v autobuilder >/dev/null 2>&1 || die 2 "autobuilder not on \$PATH (cargo install --path ~/wintermute/rustbuild/autobuilder --locked)"
 [ -x "$RUSTBUILD_SCRIPTS/extended-receipts.sh" ] || die 2 "missing $RUSTBUILD_SCRIPTS/extended-receipts.sh"
 [ -x "$RUSTBUILD_SCRIPTS/ship-tag.sh" ] || die 2 "missing $RUSTBUILD_SCRIPTS/ship-tag.sh"
+
+# --- cargo project root resolution (PRD-build-extend-gate-nested-crate-project) ---
+# $repo itself wins immediately if it has a Cargo.toml (the common case,
+# and the edge case of a repo with both a root AND a nested Cargo.toml —
+# root wins, no search performed at all, so byte-identical behavior for
+# every already-onboarded crate). Otherwise search one level down, then
+# two, for exactly one Cargo.toml, skipping target/ and .git/ at every
+# level. Prints the resolved path on success; prints a human-readable
+# reason (ambiguous / absent, naming what was searched) on failure.
+find_cargo_root() {
+  local base="$1"
+  if [ -f "$base/Cargo.toml" ]; then
+    printf '%s\n' "$base"
+    return 0
+  fi
+  local d b
+  local -a d1=()
+  for d in "$base"/*/; do
+    [ -d "$d" ] || continue
+    b="$(basename "$d")"
+    case "$b" in target|.git) continue ;; esac
+    [ -f "$d/Cargo.toml" ] && d1+=("${d%/}")
+  done
+  if [ "${#d1[@]}" -eq 1 ]; then
+    printf '%s\n' "${d1[0]}"
+    return 0
+  elif [ "${#d1[@]}" -gt 1 ]; then
+    printf 'ambiguous — multiple Cargo.toml found one level under %s: %s' "$base" "${d1[*]}"
+    return 1
+  fi
+  local d1dir b1 d2dir b2
+  local -a d2=()
+  for d1dir in "$base"/*/; do
+    [ -d "$d1dir" ] || continue
+    b1="$(basename "$d1dir")"
+    case "$b1" in target|.git) continue ;; esac
+    for d2dir in "$d1dir"*/; do
+      [ -d "$d2dir" ] || continue
+      b2="$(basename "$d2dir")"
+      case "$b2" in target|.git) continue ;; esac
+      [ -f "$d2dir/Cargo.toml" ] && d2+=("${d2dir%/}")
+    done
+  done
+  if [ "${#d2[@]}" -eq 1 ]; then
+    printf '%s\n' "${d2[0]}"
+    return 0
+  elif [ "${#d2[@]}" -gt 1 ]; then
+    printf 'ambiguous — multiple Cargo.toml found two levels under %s: %s' "$base" "${d2[*]}"
+    return 1
+  fi
+  printf 'no Cargo.toml found at %s, in its immediate subdirectories, or two levels down (searched depth-1 and depth-2, excluding target/ and .git/)' "$base"
+  return 1
+}
+
+project_abs="$(find_cargo_root "$repo")" || die 6 "$project_abs"
+project_rel="$(realpath --relative-to="$repo" "$project_abs")"
 
 # --- base resolution ---------------------------------------------------
 # Mirrors autobuilder rollback-plan's own default exactly (see
@@ -149,6 +225,11 @@ base_ref="$(resolve_base)"
 
 if $dry_run; then
   echo "extend-gate: dry-run for $repo"
+  if [ "$project_rel" = "." ]; then
+    echo "  project-root: . (repo root)"
+  else
+    echo "  project-root: $project_rel (resolved from repo root)"
+  fi
   echo "  HEAD: $head_now"
   echo "  base: $base_ref"
   echo "  parallelism: $parallelism"
@@ -189,6 +270,11 @@ blocking_notes=()
 note_block() { blocking_notes+=("$1"); echo "extend-gate: $1" >&2; }
 
 echo "extend-gate: $repo head=$head_now base=$base_ref parallelism=$parallelism"
+if [ "$project_rel" = "." ]; then
+  echo "extend-gate: project-root: . (repo root)"
+else
+  echo "extend-gate: project-root: $project_rel (resolved from repo root)"
+fi
 
 # 1. audit.sh, when the crate has one. Feeds the risk-gate receipt; a
 #    non-zero exit here is logged but does not abort the run — the final
@@ -200,32 +286,32 @@ else
 fi
 
 # 2. proof receipt + session trace.
-( cd "$repo" && autobuilder loop --project . --iteration 0 --head-sha "$head_now" --trace ) 9>&- \
+( cd "$repo" && autobuilder loop --project "$project_rel" --iteration 0 --head-sha "$head_now" --trace ) 9>&- \
   || note_block "proof-receipt — autobuilder loop --iteration 0 exited non-zero"
 
 # 3. vti-plan.
-( cd "$repo" && autobuilder vti-plan --project . --base "$base_ref" ) 9>&- \
+( cd "$repo" && autobuilder vti-plan --project "$project_rel" --base "$base_ref" ) 9>&- \
   || note_block "vti-plan — autobuilder vti-plan exited non-zero"
 
 # 4. rollback-plan over <base>..HEAD.
-( cd "$repo" && autobuilder rollback-plan --project . --base "$base_ref" ) 9>&- \
+( cd "$repo" && autobuilder rollback-plan --project "$project_rel" --base "$base_ref" ) 9>&- \
   || note_block "rollback-plan — commits since $base_ref are not all revert-clean (see target/autobuilder/rollback.md); fix forward, or a human rewrites history and says so — this script never edits history to force a pass"
 
 # 5. reviewer-agent: prepare, spawn the independent review headlessly via
 #    `claude -p --model sonnet` (same tier /rustbuild routes it to; the
 #    autobuilder binary cannot spawn a Claude subagent itself), finalize.
 run_reviewer() {
-  ( cd "$repo" && autobuilder reviewer-agent prepare --project . --base "$base_ref" ) 9>&- \
+  ( cd "$repo" && autobuilder reviewer-agent prepare --project "$project_rel" --base "$base_ref" ) 9>&- \
     || { note_block "reviewer-agent — prepare exited non-zero"; return 1; }
-  local req="$repo/target/autobuilder/review-request.json"
+  local req="$project_abs/target/autobuilder/review-request.json"
   [ -f "$req" ] || { note_block "reviewer-agent — prepare did not write $req"; return 1; }
   command -v claude >/dev/null 2>&1 \
     || { note_block "reviewer-agent — claude CLI not on \$PATH (needed to spawn the independent review subagent)"; return 1; }
   [ -f "$REVIEWER_PROMPT" ] \
     || { note_block "reviewer-agent — missing prompt $REVIEWER_PROMPT"; return 1; }
 
-  local out="$repo/target/autobuilder/review-output.json"
-  local raw="$repo/target/autobuilder/review-output.raw.txt"
+  local out="$project_abs/target/autobuilder/review-output.json"
+  local raw="$project_abs/target/autobuilder/review-output.raw.txt"
   local prompt
   prompt="$(cat "$REVIEWER_PROMPT")
 ---
@@ -253,7 +339,7 @@ json.dump(obj, open('$out', 'w'))
     note_block "reviewer-agent — subagent did not return valid JSON (see $raw)"
     return 1
   fi
-  ( cd "$repo" && autobuilder reviewer-agent finalize --project . --input "$out" ) 9>&- \
+  ( cd "$repo" && autobuilder reviewer-agent finalize --project "$project_rel" --input "$out" ) 9>&- \
     || { note_block "reviewer-agent — finalize rejected the subagent's output"; return 1; }
 }
 run_reviewer || true
@@ -264,18 +350,21 @@ if ! command -v gh >/dev/null 2>&1; then
 elif ! gh auth status >/dev/null 2>&1; then
   note_block "ci-checks — gh not authenticated: run 'gh auth login'"
 else
-  ( cd "$repo" && autobuilder ci-checks --project . ) 9>&- \
+  ( cd "$repo" && autobuilder ci-checks --project "$project_rel" ) 9>&- \
     || note_block "ci-checks — workflow(s) on HEAD are not green, or still pending (the next tick retries)"
 fi
 
-# 7. the 17 extended-gates producers, in parallel.
+# 7. the 17 extended-gates producers, in parallel. Passed the RESOLVED
+# project path (not $repo) so their receipts land in the same
+# target/autobuilder/receipts/ the rest of this script's producers and
+# the final `autobuilder gate` read from.
 # subshell wraps the direct exec so 9>&- has a scope to apply to — this
 # call is not otherwise inside a `( ... )` group.
-( "$RUSTBUILD_SCRIPTS/extended-receipts.sh" "$repo" "$parallelism" ) 9>&- \
+( "$RUSTBUILD_SCRIPTS/extended-receipts.sh" "$project_abs" "$parallelism" ) 9>&- \
   || note_block "extended-receipts — one or more extended producers did not pass|skip (see output above)"
 
 # 8. the risk gate itself — authoritative pass/block, reads all 25 receipts.
-gate_out="$(exec 9>&-; cd "$repo" && autobuilder gate --project . 2>&1)"
+gate_out="$(exec 9>&-; cd "$repo" && autobuilder gate --project "$project_rel" 2>&1)"
 gate_rc=$?
 printf '%s\n' "$gate_out"
 summary="$(printf '%s\n' "$gate_out" | grep -m1 '^gate: ' || true)"

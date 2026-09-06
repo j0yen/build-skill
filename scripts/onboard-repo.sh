@@ -46,13 +46,19 @@
 #
 # Never overwrites an existing agent/ file — re-running on an onboarded
 # repo is a no-op (all-kept, exit 0). Refuses on a dirty working tree
-# before writing anything (same convention as extend-gate.sh). A directory
-# with no Cargo.toml at its root exits 2 naming the expectation.
+# before writing anything (same convention as extend-gate.sh). <repo> need
+# not have its own Cargo.toml at the root: if it doesn't, immediate
+# subdirectories are searched (depth 1, then depth 2), skipping target/
+# and .git/, for exactly one Cargo.toml (same resolver extend-gate.sh
+# uses — PRD-build-extend-gate-nested-crate-project); ambiguous or absent
+# still exits 2, naming what was searched. agent/ files are always
+# generated at <repo>/agent regardless of where Cargo.toml resolved to.
 #
 # Exit codes:
 #   0  ok (including --check and idempotent no-op re-runs)
 #   1  usage error
-#   2  no Cargo.toml at <repo> (or <repo> not found) — not a Rust crate/workspace root
+#   2  no unique Cargo.toml found at <repo>, in its immediate
+#      subdirectories, or two levels down (or <repo> not found)
 #   3  dirty working tree — refused before writing anything
 #   4  repo is not a git repository
 #
@@ -139,15 +145,76 @@ done
 # ---------------------------------------------------------------------------
 [ -d "$repo_arg" ] || die 2 "no such directory: $repo_arg"
 repo="$(cd "$repo_arg" && pwd)"
-[ -f "$repo/Cargo.toml" ] || die 2 "no Cargo.toml at $repo — expected a Rust crate or workspace root"
 command -v python3 >/dev/null 2>&1 || die 1 "python3 not found"
 git -C "$repo" rev-parse --git-dir >/dev/null 2>&1 || die 4 "not a git repo: $repo"
+
+# ---------------------------------------------------------------------------
+# Cargo project root resolution (PRD-build-extend-gate-nested-crate-project).
+# $repo wins immediately if it has its own Cargo.toml (the common case, and
+# the edge case of a repo with both a root AND a nested Cargo.toml — root
+# wins, no search performed, byte-identical to pre-change behavior for
+# every already-onboarded crate: mcphost, wm-node, adopt). Otherwise search
+# one level down, then two, for exactly one Cargo.toml, skipping target/
+# and .git/ at every level — same resolver extend-gate.sh uses, so a repo
+# either script can act on resolves to the same project root. agent/ files
+# are still generated/read at $repo/agent (repo root), never under the
+# resolved subdirectory; only the Cargo introspection and the generated
+# globs/build-commands are relative to the resolved root.
+find_cargo_root() {
+  local base="$1"
+  if [ -f "$base/Cargo.toml" ]; then
+    printf '%s\n' "$base"
+    return 0
+  fi
+  local d b
+  local -a d1=()
+  for d in "$base"/*/; do
+    [ -d "$d" ] || continue
+    b="$(basename "$d")"
+    case "$b" in target|.git) continue ;; esac
+    [ -f "$d/Cargo.toml" ] && d1+=("${d%/}")
+  done
+  if [ "${#d1[@]}" -eq 1 ]; then
+    printf '%s\n' "${d1[0]}"
+    return 0
+  elif [ "${#d1[@]}" -gt 1 ]; then
+    printf 'ambiguous — multiple Cargo.toml found one level under %s: %s' "$base" "${d1[*]}"
+    return 1
+  fi
+  local d1dir b1 d2dir b2
+  local -a d2=()
+  for d1dir in "$base"/*/; do
+    [ -d "$d1dir" ] || continue
+    b1="$(basename "$d1dir")"
+    case "$b1" in target|.git) continue ;; esac
+    for d2dir in "$d1dir"*/; do
+      [ -d "$d2dir" ] || continue
+      b2="$(basename "$d2dir")"
+      case "$b2" in target|.git) continue ;; esac
+      [ -f "$d2dir/Cargo.toml" ] && d2+=("${d2dir%/}")
+    done
+  done
+  if [ "${#d2[@]}" -eq 1 ]; then
+    printf '%s\n' "${d2[0]}"
+    return 0
+  elif [ "${#d2[@]}" -gt 1 ]; then
+    printf 'ambiguous — multiple Cargo.toml found two levels under %s: %s' "$base" "${d2[*]}"
+    return 1
+  fi
+  printf 'no Cargo.toml found at %s, in its immediate subdirectories, or two levels down (searched depth-1 and depth-2, excluding target/ and .git/)' "$base"
+  return 1
+}
+
+project_abs="$(find_cargo_root "$repo")" || die 2 "$project_abs"
+project_rel="$(realpath --relative-to="$repo" "$project_abs")"
+project_prefix=""
+[ "$project_rel" = "." ] || project_prefix="$project_rel/"
 
 # ---------------------------------------------------------------------------
 # Introspect the crate (name, version, target_kind, workspace members) via
 # tomllib — one python3 call, JSON out, sourced into shell variables.
 # ---------------------------------------------------------------------------
-introspect_json="$(python3 - "$repo" <<'PY'
+introspect_json="$(python3 - "$project_abs" <<'PY'
 import json, sys, tomllib, os
 
 repo = sys.argv[1]
@@ -213,7 +280,7 @@ print(json.dumps({
     "has_workflows": os.path.isdir(os.path.join(repo, ".github", "workflows")),
 }))
 PY
-)" || die 1 "failed to introspect $repo/Cargo.toml"
+)" || die 1 "failed to introspect $project_abs/Cargo.toml"
 
 crate_name="$(python3 -c "import json,sys; print(json.loads(sys.argv[1])['name'])" "$introspect_json")"
 crate_version="$(python3 -c "import json,sys; print(json.loads(sys.argv[1])['version'])" "$introspect_json")"
@@ -304,6 +371,17 @@ fi
 # ---------------------------------------------------------------------------
 if $check_mode; then
   echo "onboard-repo --check: $repo (crate=$crate_name version=$crate_version)"
+  if [ "$project_rel" != "." ]; then
+    echo "  project-root: $project_rel (resolved from repo root)"
+    nested_agent="$project_abs/agent"
+    if [ -L "$nested_agent" ]; then
+      echo "  agent/ symlink: kept ($project_rel/agent -> $(readlink "$nested_agent"))"
+    elif [ -e "$nested_agent" ]; then
+      echo "  agent/ symlink: CONFLICT — $nested_agent exists and is not a symlink"
+    else
+      echo "  agent/ symlink: create ($project_rel/agent -> ../agent)"
+    fi
+  fi
   for f in "${AGENT_FILES[@]}"; do
     if [ "$f" = "intent-card.json" ] && [ "${plan[$f]}" = "create" ]; then
       echo "  agent/$f: create ($intent_source_desc)"
@@ -423,16 +501,27 @@ fi
 # --- proof-lanes.toml, owner-map.json, test-map.json, AUTOBUILDER_PROGRAM.md
 python3 - "$repo" "$crate_name" "$crate_version" "$rollback_model" "$introspect_json" \
   "${plan[proof-lanes.toml]}" "${plan[owner-map.json]}" "${plan[test-map.json]}" \
-  "${plan[AUTOBUILDER_PROGRAM.md]}" <<'PY'
+  "${plan[AUTOBUILDER_PROGRAM.md]}" "$project_rel" "$project_prefix" <<'PY' \
+  || die 1 "failed to generate agent/ scaffolding files (proof-lanes.toml/owner-map.json/test-map.json/AUTOBUILDER_PROGRAM.md)"
 import json, os, re, sys
 
 (repo, crate_name, crate_version, rollback_model, introspect_json,
- plan_lanes, plan_owner, plan_testmap, plan_program) = sys.argv[1:10]
+ plan_lanes, plan_owner, plan_testmap, plan_program,
+ project_rel, project_prefix) = sys.argv[1:12]
 
 meta = json.loads(introspect_json)
 members = meta["members"]
 has_tests_dir = meta["has_tests_dir"]
 has_workflows = meta["has_workflows"]
+nested = project_rel != "."
+# When Cargo.toml resolved to a subdirectory (rustbuild's autobuilder/, the
+# only case in the fleet so far), every generated glob is prefixed with
+# that subdirectory (globs are matched against `git diff --name-only`
+# output, which is always repo-root-relative) and every generated cargo
+# command is prefixed `cd <project_rel> && ` so it runs against the real
+# crate. Root-Cargo.toml repos (project_rel == ".") get project_prefix =
+# "" and no `cd` wrapper — byte-identical to pre-change output.
+cd_prefix = f"cd {project_rel} && " if nested else ""
 
 agent_dir = os.path.join(repo, "agent")
 os.makedirs(agent_dir, exist_ok=True)
@@ -449,8 +538,8 @@ created = []
 
 # --- proof-lanes.toml ------------------------------------------------------
 if plan_lanes == "create":
-    src_globs = ["src/**/*.rs"] + [f"{m}/src/**/*.rs" for m in members]
-    dep_globs = ["Cargo.toml", "Cargo.lock"] + [f"{m}/Cargo.toml" for m in members]
+    src_globs = [f"{project_prefix}src/**/*.rs"] + [f"{project_prefix}{m}/src/**/*.rs" for m in members]
+    dep_globs = [f"{project_prefix}Cargo.toml", f"{project_prefix}Cargo.lock"] + [f"{project_prefix}{m}/Cargo.toml" for m in members]
     src_globs_str = ", ".join(f'"{g}"' for g in src_globs)
     dep_globs_str = ", ".join(f'"{g}"' for g in dep_globs)
 
@@ -460,20 +549,20 @@ id = "rust-source"
 description = "Behavior changes in src/ (generated by onboard-repo.sh from the repo's actual layout)"
 globs = [{src_globs_str}]
 required_commands = [
-  "cargo check --workspace",
-  "cargo clippy --workspace -- -D warnings",
-  "cargo test --workspace",
+  "{cd_prefix}cargo check --workspace",
+  "{cd_prefix}cargo clippy --workspace -- -D warnings",
+  "{cd_prefix}cargo test --workspace",
 ]
 ''')
     if has_tests_dir:
-        test_globs = ["tests/**/*.rs"] + [f"{m}/tests/**/*.rs" for m in members]
+        test_globs = [f"{project_prefix}tests/**/*.rs"] + [f"{project_prefix}{m}/tests/**/*.rs" for m in members]
         test_globs_str = ", ".join(f'"{g}"' for g in test_globs)
         lanes.append(f'''[[lane]]
 id = "rust-tests"
 description = "Test-only changes"
 globs = [{test_globs_str}]
 required_commands = [
-  "cargo test --workspace",
+  "{cd_prefix}cargo test --workspace",
 ]
 ''')
     lanes.append(f'''[[lane]]
@@ -481,16 +570,16 @@ id = "deps"
 description = "Cargo.toml / Cargo.lock changes"
 globs = [{dep_globs_str}]
 required_commands = [
-  "cargo check --workspace",
+  "{cd_prefix}cargo check --workspace",
 ]
 ''')
     if has_workflows:
-        lanes.append('''[[lane]]
+        lanes.append(f'''[[lane]]
 id = "ci"
 description = "GitHub Actions workflow changes"
 globs = [".github/workflows/**"]
 required_commands = [
-  "cargo check --workspace",
+  "{cd_prefix}cargo check --workspace",
 ]
 ''')
     lanes.append('''[[lane]]
@@ -515,14 +604,14 @@ required_commands = [
 
 # --- owner-map.json ----------------------------------------------------------
 if plan_owner == "create":
-    routes = [{"glob": "src/**", "owner": "edit-agent"}]
+    routes = [{"glob": f"{project_prefix}src/**", "owner": "edit-agent"}]
     for m in members:
-        routes.append({"glob": f"{m}/src/**", "owner": "edit-agent"})
+        routes.append({"glob": f"{project_prefix}{m}/src/**", "owner": "edit-agent"})
     if has_tests_dir:
-        routes.append({"glob": "tests/**", "owner": "edit-agent"})
+        routes.append({"glob": f"{project_prefix}tests/**", "owner": "edit-agent"})
     routes.append({"glob": "agent/**", "owner": "orchestrator"})
-    routes.append({"glob": "Cargo.toml", "owner": "edit-agent (dependency additions only)"})
-    routes.append({"glob": "Cargo.lock", "owner": "edit-agent (deps-only iterations)"})
+    routes.append({"glob": f"{project_prefix}Cargo.toml", "owner": "edit-agent (dependency additions only)"})
+    routes.append({"glob": f"{project_prefix}Cargo.lock", "owner": "edit-agent (deps-only iterations)"})
     owner_map = {
         "schema": "autobuilder.owner_map.v1",
         "default_owner": "autobuilder",
@@ -542,17 +631,17 @@ if plan_testmap == "create":
     # no single fixed prefix convention across crates.
     ac_re = re.compile(r"ac0*([0-9]+)(?=[_.])", re.IGNORECASE)
     if has_tests_dir:
-        tests_dir = os.path.join(repo, "tests")
+        tests_dir = os.path.join(repo, project_prefix, "tests") if nested else os.path.join(repo, "tests")
         for fname in sorted(os.listdir(tests_dir)):
             if not fname.endswith((".rs", ".py")):
                 continue
             m = ac_re.search(fname)
             if m:
                 ac_id = f"AC{int(m.group(1))}"
-                ac_test_map.setdefault(ac_id, f"tests/{fname}")
+                ac_test_map.setdefault(ac_id, f"{project_prefix}tests/{fname}")
     routes = [
-        {"glob": "src/**", "required_proof": ["cargo test --workspace"]},
-        {"glob": "Cargo.toml", "required_proof": ["cargo check --workspace"]},
+        {"glob": f"{project_prefix}src/**", "required_proof": [f"{cd_prefix}cargo test --workspace"]},
+        {"glob": f"{project_prefix}Cargo.toml", "required_proof": [f"{cd_prefix}cargo check --workspace"]},
     ]
     test_map = {
         "schema": "autobuilder.test_map.v1",
@@ -571,10 +660,17 @@ if plan_testmap == "create":
 # --- AUTOBUILDER_PROGRAM.md ---------------------------------------------------
 if plan_program == "create":
     build_cmds = "\n".join([
-        "- `cargo check --workspace`",
-        "- `cargo test --workspace`",
-        "- `cargo clippy --workspace -- -D warnings`",
+        f"- `{cd_prefix}cargo check --workspace`",
+        f"- `{cd_prefix}cargo test --workspace`",
+        f"- `{cd_prefix}cargo clippy --workspace -- -D warnings`",
     ])
+    project_root_note = (
+        f"Cargo project resolved at `{project_rel}` (this repo's root has no "
+        "Cargo.toml of its own — extend-gate.sh and onboard-repo.sh both "
+        "resolve it by searching immediate subdirectories; "
+        "PRD-build-extend-gate-nested-crate-project).\n\n"
+        if nested else ""
+    )
     body = f"""# {crate_name} — autobuilder program (onboarded)
 
 Generated by `scripts/onboard-repo.sh` (PRD-build-repo-onboard) — **not**
@@ -591,7 +687,7 @@ under them from day one.
 - Crate: `{crate_name}`
 - Cargo.toml version at onboarding: `{crate_version}`
 
-## PRD workspace
+{project_root_note}## PRD workspace
 
 PRDs for this fleet live at `~/Documents/PRDs` (`build-queue/` = queued,
 `built-prds/` = shipped, `parked/` = parked) — not in this repo's own
@@ -632,6 +728,37 @@ for f in proof-lanes.toml owner-map.json test-map.json AUTOBUILDER_PROGRAM.md; d
   fi
 done
 
+# --- nested-crate agent/ symlink ---------------------------------------------
+# autobuilder's own binary reads agent/intent-card.json, agent/proof-lanes.toml,
+# etc. relative to whatever --project path it's given. This PRD's fix keeps
+# agent/ scaffolding at the repo root even when Cargo.toml resolves to a
+# subdirectory (requirement: "generated at repo root, not autobuilder/, ...").
+# Bridge the two with a relative symlink <project>/agent -> <repo>/agent,
+# created once (idempotent — re-running is a no-op) and committed like any
+# other repo file. Refuses loudly instead of ever clobbering a real
+# (non-symlink) agent/ directory that happens to already exist under the
+# resolved project path.
+symlink_note=""
+if [ "$project_rel" != "." ]; then
+  nested_agent="$project_abs/agent"
+  depth=$(( $(printf '%s' "$project_rel" | tr -cd '/' | wc -c) + 1 ))
+  up=""
+  for ((i = 0; i < depth; i++)); do up="../$up"; done
+  link_target="${up}agent"
+  if [ -L "$nested_agent" ]; then
+    current_target="$(readlink "$nested_agent")"
+    if [ "$current_target" != "$link_target" ]; then
+      die 1 "$nested_agent is a symlink to '$current_target', expected '$link_target' — refusing to overwrite"
+    fi
+    symlink_note="kept ($project_rel/agent -> $link_target)"
+  elif [ -e "$nested_agent" ]; then
+    die 1 "$nested_agent already exists and is not a symlink — refusing to overwrite (expected a symlink to $link_target so autobuilder's --project $project_rel reads the repo-root agent/ scaffolding)"
+  else
+    ln -s "$link_target" "$nested_agent" || die 1 "failed to symlink $nested_agent -> $link_target"
+    symlink_note="created ($project_rel/agent -> $link_target)"
+  fi
+fi
+
 # --- tag ---------------------------------------------------------------------
 tag_created=false
 if [ -z "$existing_tags" ]; then
@@ -645,6 +772,10 @@ fi
 # Summary — what should now be unblocked vs. what still needs real content.
 # ---------------------------------------------------------------------------
 echo "onboard-repo: $repo (crate=$crate_name version=$crate_version)"
+if [ "$project_rel" != "." ]; then
+  echo "  project-root: $project_rel (resolved from repo root)"
+  echo "  agent/ symlink: $symlink_note"
+fi
 if [ "${#created[@]}" -gt 0 ]; then
   echo "  created: ${created[*]}"
 else
