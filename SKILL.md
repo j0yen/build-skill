@@ -198,6 +198,46 @@ isolated via worktrees up to the ≤3 same-target sub-cap, ≤1 kernel-extend,
 whatever the queue admits after conflict-pruning. If the pool yields zero,
 exit clean.
 
+**Lane predicate (2026-09-06, PRD-build-second-lane-carbon).** Before
+admitting a candidate, run `scripts/lane-predicate.sh select <prd-path>`
+(lane defaults to `hostname`, so RedBaron and carbon both use the same
+script and the same tick logic — no fork, no env drop-in). Exit 0 ("ok: ...")
+admits the candidate to the pool; exit 1 ("skip: ...") drops it silently
+from this tick's selection (log the reason, do not mark it blocked — the
+other lane, or this lane next tick, may still take it). Two things gate a
+candidate:
+- **Cargo-free filter, carbon only.** On any lane whose hostname is not
+  `RedBaron`, only `build_target` ∈ {`python-cli`, `python-lib`,
+  `python-agent`, `shell`, `hooks`, `config`, `notebook`} is selectable.
+  RedBaron itself is unrestricted (the filter is an optimization on
+  carbon, never a partition — RedBaron may still take cargo-free PRDs).
+- **Target-repo exclusivity, every lane.** A PRD whose `build_into` repo
+  is named in another lane's live (non-stale) claim — per
+  `scripts/lane-claim.sh target-busy` — is skipped by this lane this tick,
+  regardless of which lane is doing the selecting.
+
+Before a lane's tick may CLAIM (not merely select) a PRD it runs
+`scripts/lane-claim.sh claim <prd-path> [lane-name]` — push-wins: it
+writes `Status: building` + `Lane: <hostname> <ISO-ts>` into the PRD's own
+frontmatter, commits (one PRD per commit), and pushes; a rejected push
+means rebase-and-reread — if the PRD now carries another lane's fresher
+claim, this lane skips it this tick (exit 2, `held: ...`/`lost-race: ...`).
+A claim ≥3h old with no subsequent commit touching that PRD is stale and
+reclaimable (`reclaim-receipt: ...` printed on exit 0) — see
+`scripts/lane-claim.sh`'s own header for the full exit-code contract and
+`scripts/lane-claim-selftest.sh` / `scripts/lane-predicate-selftest.sh`
+for the race/exclusivity/reclaim scenarios exercised offline. `Lane:` is a
+display-only key to the rest of this parser (see build-contract.md);
+archived PRDs keep it as inert history.
+
+**Carbon-lane origin check.** Before a non-RedBaron lane assembles its
+candidate pool at all, run `scripts/lane-predicate.sh reachable` once
+(mirrors Phase 2.5's RedBaron check below, but for the PRD clone's own
+origin rather than the Rust build machine). If it reports `unreachable`,
+build nothing this tick, journal the reason, and exit cleanly — an
+unpushed claim is invisible to the other lane, so a lane that cannot push
+must idle rather than build unclaimed.
+
 ### Phase 2.5 — RedBaron reachability check
 
 The Hetzner burst box was retired on 2026-09-01; there is no session to start.
@@ -207,6 +247,32 @@ PRD (`rust-cli`, `rust-lib`, `rust-extend`) and `hostname` is not `RedBaron`,
 run `bash ~/.claude/skills/rustbuild/scripts/cargo-on-redbaron.sh status` once; if
 RedBaron is unreachable, mark those PRDs `blocked: RedBaron unreachable` for
 this tick and dispatch only the non-cargo PRDs.
+
+### Second lane setup (carbon, PRD-build-second-lane-carbon)
+
+Carbon runs the same tick scripts as RedBaron unmodified (the lane comes
+from `hostname`, not a fork) — enabling the second lane is purely a
+carbon-local systemd install, done once:
+
+```
+bash ~/.claude/skills/build/scripts/carbon-lane-install.sh        # dry-run: append --dry-run
+systemctl --user daemon-reload
+systemctl --user enable --now claude-build.path prd-sync.timer
+```
+
+`carbon-lane-install.sh` symlinks `systemd/carbon/*` (this repo's versioned
+mirror of RedBaron's proven unit set: `claude-build.path` +
+`claude-build.path.d/nolimit.conf`, `claude-build.service` +
+`claude-build.service.d/pacing.conf` — `TimeoutStartSec=400` sized above
+the 300s `ExecStartPost` sleep, the 20:12 lesson pre-fixed here —
+`claude-build.timer`, `prd-sync.{service,timer}`) into
+`~/.config/systemd/user/`. It only links files; it never enables, starts,
+or `daemon-reload`s anything, and it is a no-op when already in sync — the
+enable/disable state stays carbon-local by design (this repo's clone
+travels to every box; the systemd install does not). With the units
+disabled, carbon's behavior is byte-identical to today (idle). RedBaron
+needs no equivalent step — its units already live in `~/dotfiles` and are
+unaffected by any of this.
 
 ### Phase 3 — Classify
 
@@ -833,8 +899,26 @@ implementation (write-ahead intent file → block on the lock with a hard
 - Append a one-line summary to `~/brain/journal/build/YYYY-MM-DD.md`:
   `<ISO-ts>  <slug>  <action>  <outcome>  (<key=value...>)`. The journal
   append is naturally serial — each branch appends its own line. Use `>>`
-  to avoid clobbering.
+  to avoid clobbering. **Lane-tagged journaling (2026-09-06,
+  PRD-build-second-lane-carbon):** the `key=value` tail MUST include
+  `lane=<hostname>` — this is the existing journal path gaining a field,
+  not a second journal file, so "who built this" always has an answer
+  across two lanes sharing one clone. Any archive commit this branch makes
+  (see the `archive` action) likewise names its lane in the commit body or
+  the journal line covering it — the git history alone should never leave
+  it ambiguous which box shipped a given PRD.
 - Release this branch's `state/prd-<slug>.lock`.
+
+**Lane health line (P1, PRD-build-second-lane-carbon).** Once all branches
+for this tick have returned, the parent (whichever lane is running this
+tick) runs `scripts/lane-status.sh tick-summary <lane> <claimed> <skipped>`
+— `<claimed>` and `<skipped>` are the tick's own counts (PRDs this lane
+actually claimed and advanced vs. PRDs skipped via the lane predicate's
+cargo-free filter or target-busy exclusivity). This appends one line to
+today's journal so `/self-review` and a human reading the journal can see
+both lanes' contribution without cross-referencing every branch line.
+Read both lanes' status (last tick, live claims, stale claims) at any time
+with `scripts/lane-status.sh report`.
 
 **Parent step (after all branches return, before releasing `tick.lock`):**
 - Run `scripts/manifest-set.sh --replay-orphans`. For every
@@ -1032,6 +1116,9 @@ Each agent prompt must include, self-contained:
   context)."
 - "Return a one-line summary of what you did: `<slug>: <action>
   <outcome>` so the parent's journal sees it."
+- "Your Phase 7 journal line's `key=value` tail MUST include `lane=<hostname>`
+  (PRD-build-second-lane-carbon lane-tagged journaling) — run `hostname` if
+  unsure which lane you're running as."
 
 Issue all calls in a single message — that's what makes them
 parallel. Do not chain follow-up Agent calls in the same tick.

@@ -1,0 +1,7 @@
+[Unit]
+Description=Pull PRD queue repo (carbon lane)
+
+[Service]
+Type=oneshot
+Environment=HOME=/home/jsy
+ExecStart=/bin/sh -c '/usr/bin/git -C %h/Documents/PRDs pull --rebase --autostash -q || true'

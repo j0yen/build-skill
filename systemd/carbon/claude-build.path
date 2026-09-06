@@ -1,0 +1,9 @@
+[Unit]
+Description=Fire /build tick when PRDs are queued (carbon lane)
+
+[Path]
+DirectoryNotEmpty=%h/Documents/PRDs/build-queue
+Unit=claude-build.service
+
+[Install]
+WantedBy=default.target
