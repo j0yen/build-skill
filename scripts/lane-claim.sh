@@ -86,6 +86,13 @@ is_stale() {
 
 slug_of() { basename "$1" .md | sed -E 's/^PRD-//'; }
 
+# Lane names are compared case-insensitively (RedBaron == redbaron == REDBARON)
+# so a claim written under one casing of `hostname` is still recognized as the
+# same lane later — `hostname` itself is lowercase on this box while historical
+# claims were written capitalized, and a case-sensitive compare here treated
+# every self-reclaim as "held by another lane", deadlocking the whole queue.
+same_lane() { [ "${1,,}" = "${2,,}" ]; }
+
 git_repo_root() { git -C "$(dirname "$1")" rev-parse --show-toplevel 2>/dev/null; }
 
 git_pull_or_die() {
@@ -228,11 +235,11 @@ cmd_claim() {
   if [ -n "$existing" ]; then
     host=$(lane_host_of "$existing"); ts=$(lane_ts_of "$existing")
     age=$(age_seconds "$ts")
-    if [ "$host" != "$lane" ] && ! is_stale "$age"; then
+    if ! same_lane "$host" "$lane" && ! is_stale "$age"; then
       echo "held: $host $ts age=${age}s"
       exit 2
     fi
-    if [ "$host" != "$lane" ] && is_stale "$age"; then
+    if ! same_lane "$host" "$lane" && is_stale "$age"; then
       # Stale-claim recovery receipt: age, and a best-effort probe of the
       # claiming host (only meaningful for a fleet hostname on the same
       # tailnet; failure is expected and just means "unreachable", not an
