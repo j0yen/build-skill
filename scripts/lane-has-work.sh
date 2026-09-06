@@ -17,6 +17,10 @@ LOG="${CLAUDE_BUILD_LOG:-$HOME/brain/journal/build-auto.log}"
 me="$(hostname)"
 ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 logline() { echo "$(ts) lane-has-work: $*" >> "$LOG"; }
+# See lane-defer.sh: an unpaced ExecCondition skip loops the path unit once
+# per second. Sleep inside the condition (only when the drop-in sets
+# LANE_SKIP_PACE) so the unit holds "activating (condition)" for the window.
+pace() { [ -z "${LANE_SKIP_PACE:-}" ] || sleep "$LANE_SKIP_PACE"; }
 
 [ "$me" = "RedBaron" ] && exit 0
 
@@ -43,4 +47,5 @@ if [ "$selectable" -gt 0 ]; then
   exit 0
 fi
 logline "skip: 0 of $total queued PRD(s) selectable on $me (cargo-free filter / exclusivity); no tick launched"
+pace
 exit 1

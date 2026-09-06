@@ -18,6 +18,13 @@ LOG="${CLAUDE_BUILD_LOG:-$HOME/brain/journal/build-auto.log}"
 me="$(hostname)"
 ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 logline() { echo "$(ts) lane-defer: $*" >> "$LOG"; }
+# ExecCondition exit 1 skips the unit BEFORE ExecStartPost pacing can run,
+# and the path unit's DirectoryNotEmpty is level-triggered — an unpaced skip
+# loops once per second. Sleeping here keeps the unit in "activating
+# (condition)" for the pace window, which blocks re-triggering. Must stay
+# under TimeoutStartSec. Set only by the systemd drop-in; interactive runs
+# skip instantly.
+pace() { [ -z "${LANE_SKIP_PACE:-}" ] || sleep "$LANE_SKIP_PACE"; }
 
 [ "$me" = "RedBaron" ] && exit 0
 for lane in $PREFER; do
@@ -29,6 +36,7 @@ for lane in $PREFER; do
     'systemctl --user is-active claude-build.path 2>/dev/null' 2>/dev/null)"
   if [ "$state" = "active" ]; then
     logline "defer: $lane lane is up (claude-build.path active); $me stays idle"
+    pace
     exit 1
   fi
 done
