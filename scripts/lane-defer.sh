@@ -26,9 +26,9 @@ logline() { echo "$(ts) lane-defer: $*" >> "$LOG"; }
 # skip instantly.
 pace() { [ -z "${LANE_SKIP_PACE:-}" ] || sleep "$LANE_SKIP_PACE"; }
 
-[ "$me" = "RedBaron" ] && exit 0
+[ "${me,,}" = "redbaron" ] && exit 0
 for lane in $PREFER; do
-  [ "$lane" = "$me" ] && exit 0
+  [ "${lane,,}" = "${me,,}" ] && exit 0
 done
 
 for lane in $PREFER; do

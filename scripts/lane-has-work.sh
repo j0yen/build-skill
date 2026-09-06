@@ -22,7 +22,7 @@ logline() { echo "$(ts) lane-has-work: $*" >> "$LOG"; }
 # LANE_SKIP_PACE) so the unit holds "activating (condition)" for the window.
 pace() { [ -z "${LANE_SKIP_PACE:-}" ] || sleep "$LANE_SKIP_PACE"; }
 
-[ "$me" = "RedBaron" ] && exit 0
+[ "${me,,}" = "redbaron" ] && exit 0
 
 status_of() {
   head -n 80 "$1" | grep -E '^(- *Status:|Status:|\*\*Status:\*\*)' | head -n1 \

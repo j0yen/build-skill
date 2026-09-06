@@ -58,7 +58,7 @@ cmd_select() {
   [ -f "$prd" ] || die "no such file: $prd" 4
 
   local bt; bt=$(read_field "$prd" build_target)
-  if [ "$lane" != "RedBaron" ] && ! is_cargo_free "$bt"; then
+  if [ "${lane,,}" != "redbaron" ] && ! is_cargo_free "$bt"; then
     echo "skip: cargo-bound build_target=${bt:-<none>} (lane $lane restricted to cargo-free)"
     exit 1
   fi
