@@ -38,6 +38,7 @@ inside fenced code blocks are ignored; first match wins.
 | `Vision` | `visions/<slug>.md` | yes | |
 | `Depends-on` | `PRD-<slug>.md`, comma-separated | no | reconciler resolves against git |
 | `Loop` | `<loop-name>: <metric it moves>` | for loop-ready fleets | read by the buildloop's digest/dream phases, ignored here |
+| `Lane` | `<hostname> <ISO-ts>` | no | PRD-build-second-lane-carbon claim-protocol field, written by `scripts/lane-claim.sh claim` when a build lane (RedBaron/carbon) takes a PRD for this tick; a claim older than 3h with no subsequent commit is stale and reclaimable. Display-only to `/build`'s own parser today — lane-aware Phase 2 selection is a follow-on step |
 
 Keys `PM`, `Drafted`, `Owner`, `Date`, `Relates`, `Engineering target`, `Jira`,
 `Epic` are display-only.
