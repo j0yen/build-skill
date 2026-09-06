@@ -412,7 +412,23 @@ carried_forward = {}
 
 def carry(field, default_factory):
     if existing is not None and field in existing:
-        carried_forward[field] = True
+        # Propagate the PRIOR card's own carried_forward marker for this
+        # field when it recorded one (i.e. the "existing" card is itself
+        # a product of a previous intent-card-refresh.sh run). Without
+        # this, a cold-start repo breaks idempotency (AC3): run 1 mints a
+        # placeholder and honestly marks it False (nothing to carry
+        # forward from), but run 2 finds that placeholder sitting in the
+        # now-existing card and would mark it True — changing the byte
+        # content of the card on the second run even though nothing
+        # about the PRD or repo changed. Sticking to the prior marker
+        # (False stays False, True stays True) makes the field's
+        # provenance monotonic across repeated runs. When the existing
+        # card carries NO marker at all for this field, it predates this
+        # tool (a genuinely human-authored card, e.g. from the full
+        # autobuilder 5-whys flow) — that first refresh over it legitimately
+        # marks the field True, same as before.
+        prior_marker = (existing.get("carried_forward") or {}).get(field)
+        carried_forward[field] = True if prior_marker is None else bool(prior_marker)
         return existing[field]
     carried_forward[field] = False
     return default_factory()

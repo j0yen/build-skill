@@ -31,7 +31,9 @@
 #   --verify-run           For each AC paired to a real file (not an
 #                          `asserted` pairing), run just that test
 #                          (`cargo test --test <stem> [<fn>]` for .rs,
-#                          `python3 -m pytest <path>[::<fn>]` for .py).
+#                          `python3 -m pytest <path>[::<fn>]` for .py,
+#                          `bash <path>` for .sh — the script itself is
+#                          the test unit, so `[<fn>]` does not apply).
 #                          A non-zero exit marks the AC PAIRED-FAILING
 #                          (still shown as such in all formats) and the
 #                          script exits non-zero, so a stale test file
@@ -81,7 +83,7 @@
 #   3. For each AC 1..N, try rules in this order, first match wins (the
 #      `rule` column names which one fired):
 #        a. `prefix:<p>`  — `tests/<p>_ac<N>_*.rs` or `_ac<NN>_*.rs` (and
-#           `.py`), for each candidate prefix `<p>` in order. Tried BEFORE
+#           `.py`, `.sh`), for each candidate prefix `<p>` in order. Tried BEFORE
 #           the bare rule below — deliberately, and NOT the literal order
 #           the PRD prose lists them in. Rationale: on a shared crate,
 #           tests/ can hold a bare `ac01_*.rs`..`ac19_*.rs` series that
@@ -93,9 +95,9 @@
 #           whole point of this PRD's TL;DR ("a per-PRD prefix for shared
 #           crates") and is what AC1 (mcphost-rest-tools, `http_` prefix)
 #           requires in practice.
-#        b. `bare`        — `tests/ac<N>_*.rs` / `ac<NN>_*.rs` (and .py).
-#        c. `acceptance_ac` — `tests/acceptance_ac<N>.rs` (and .py).
-#        d. `mocks`       — `tests/mocks/ac<N>.rs` (and .py).
+#        b. `bare`        — `tests/ac<N>_*.rs` / `ac<NN>_*.rs` (and .py, .sh).
+#        c. `acceptance_ac` — `tests/acceptance_ac<N>.rs` (and .py, .sh).
+#        d. `mocks`       — `tests/mocks/ac<N>.rs` (and .py, .sh).
 #        e. `fn-scan`     — a `#[test]` Rust fn whose name starts with
 #           `ac<N>_` or `ac0<N>_`, or a `def test_ac<N>_...` / `def
 #           test_ac_<N>_...` (both separator styles observed in the
@@ -300,7 +302,7 @@ collision_owner() {
     for numform in "$n" "$padded"; do
       [ -n "$numform" ] || continue
       case "$base" in
-        "${p}_ac${numform}_"*.rs|"${p}_ac${numform}_"*.py|"${p}_ac${numform}.rs"|"${p}_ac${numform}.py")
+        "${p}_ac${numform}_"*.rs|"${p}_ac${numform}_"*.py|"${p}_ac${numform}_"*.sh|"${p}_ac${numform}.rs"|"${p}_ac${numform}.py"|"${p}_ac${numform}.sh")
           printf '%s\n' "${sib_prefix_owner[$p]}"
           return 0
           ;;
@@ -334,12 +336,15 @@ find_collision() {
     [ "$mine" = 1 ] && continue
     for numform in "$n" "$padded"; do
       [ -n "$numform" ] || continue
-      matches=( "$repo/tests/${p}_ac${numform}_"*.rs "$repo/tests/${p}_ac${numform}_"*.py )
+      matches=( "$repo/tests/${p}_ac${numform}_"*.rs "$repo/tests/${p}_ac${numform}_"*.py "$repo/tests/${p}_ac${numform}_"*.sh )
       if [ "${#matches[@]}" -eq 0 ]; then
         [ -f "$repo/tests/${p}_ac${numform}.rs" ] && matches=( "$repo/tests/${p}_ac${numform}.rs" )
       fi
       if [ "${#matches[@]}" -eq 0 ]; then
         [ -f "$repo/tests/${p}_ac${numform}.py" ] && matches=( "$repo/tests/${p}_ac${numform}.py" )
+      fi
+      if [ "${#matches[@]}" -eq 0 ]; then
+        [ -f "$repo/tests/${p}_ac${numform}.sh" ] && matches=( "$repo/tests/${p}_ac${numform}.sh" )
       fi
       if [ "${#matches[@]}" -gt 0 ]; then
         f="${matches[0]#"$repo"/}"
@@ -371,12 +376,15 @@ classify_ac() {
       # (no-wildcard) forms are checked with `-f` since nullglob only
       # elides patterns that contain glob metacharacters and would leave
       # a literal nonexistent path in the array untouched otherwise.
-      matches=( "$repo_tests/${p}_ac${numform}_"*.rs "$repo_tests/${p}_ac${numform}_"*.py )
+      matches=( "$repo_tests/${p}_ac${numform}_"*.rs "$repo_tests/${p}_ac${numform}_"*.py "$repo_tests/${p}_ac${numform}_"*.sh )
       if [ "${#matches[@]}" -eq 0 ]; then
         [ -f "$repo_tests/${p}_ac${numform}.rs" ] && matches=( "$repo_tests/${p}_ac${numform}.rs" )
       fi
       if [ "${#matches[@]}" -eq 0 ]; then
         [ -f "$repo_tests/${p}_ac${numform}.py" ] && matches=( "$repo_tests/${p}_ac${numform}.py" )
+      fi
+      if [ "${#matches[@]}" -eq 0 ]; then
+        [ -f "$repo_tests/${p}_ac${numform}.sh" ] && matches=( "$repo_tests/${p}_ac${numform}.sh" )
       fi
       if [ "${#matches[@]}" -gt 0 ]; then
         f="${matches[0]#"$repo"/}"
@@ -417,12 +425,15 @@ classify_ac() {
   if [ "${prefix_rule_active:-0}" != 1 ]; then
   for numform in "$n" "$padded"; do
     [ -n "$numform" ] || continue
-    matches=( "$repo_tests/ac${numform}_"*.rs "$repo_tests/ac${numform}_"*.py )
+    matches=( "$repo_tests/ac${numform}_"*.rs "$repo_tests/ac${numform}_"*.py "$repo_tests/ac${numform}_"*.sh )
     if [ "${#matches[@]}" -eq 0 ]; then
       [ -f "$repo_tests/ac${numform}.rs" ] && matches=( "$repo_tests/ac${numform}.rs" )
     fi
     if [ "${#matches[@]}" -eq 0 ]; then
       [ -f "$repo_tests/ac${numform}.py" ] && matches=( "$repo_tests/ac${numform}.py" )
+    fi
+    if [ "${#matches[@]}" -eq 0 ]; then
+      [ -f "$repo_tests/ac${numform}.sh" ] && matches=( "$repo_tests/ac${numform}.sh" )
     fi
     if [ "${#matches[@]}" -gt 0 ]; then
       f="${matches[0]#"$repo"/}"
@@ -439,12 +450,12 @@ classify_ac() {
   fi
   shopt -u nullglob
   # c. acceptance_ac<N>
-  for ext in rs py; do
+  for ext in rs py sh; do
     f="$repo_tests/acceptance_ac${n}.${ext}"
     if [ -f "$f" ]; then printf 'PAIRED|acceptance_ac|%s|\n' "${f#"$repo"/}"; return; fi
   done
   # d. mocks/ac<N>
-  for ext in rs py; do
+  for ext in rs py sh; do
     f="$repo_tests/mocks/ac${n}.${ext}"
     if [ -f "$f" ]; then printf 'PAIRED|mocks|%s|\n' "${f#"$repo"/}"; return; fi
   done
@@ -502,7 +513,7 @@ if [ "$derive_mode" = on ]; then
     shopt -s nullglob
     for p in "${prefix_candidates[@]}"; do
       [ -n "$p" ] || continue
-      any=( "$repo/tests/${p}_ac"*.rs "$repo/tests/${p}_ac"*.py )
+      any=( "$repo/tests/${p}_ac"*.rs "$repo/tests/${p}_ac"*.py "$repo/tests/${p}_ac"*.sh )
       if [ "${#any[@]}" -gt 0 ]; then prefix_rule_active=1; break; fi
     done
     shopt -u nullglob
@@ -590,6 +601,12 @@ if [ "$verify_run" = true ]; then
         else
           ( cd "$repo" && python3 -m pytest "$filepart" -q ) >/dev/null 2>&1 || rc=$?
         fi
+        ;;
+      *.sh)
+        # Shell test convention has no sub-function invocation analogue to
+        # cargo/pytest node ids — the script itself IS the test unit, run
+        # standalone (`funcpart`, if any, is ignored for this extension).
+        ( cd "$repo" && bash "$filepart" ) >/dev/null 2>&1 || rc=$?
         ;;
       *) rc=0 ;;
     esac

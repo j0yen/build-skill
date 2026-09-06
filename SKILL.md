@@ -621,7 +621,10 @@ in this tick's selection run in parallel via Agent tool calls
   uses, in this order (first match wins; `--format table` shows which
   rule fired and the matched path):
   1. **prefix** — `tests/<p>_ac<N>_*.rs` or the bare `tests/<p>_ac<N>.rs`
-     (and `.py`), for a candidate prefix `<p>`: the PRD's `test_prefix:`
+     (and `.py`, `.sh` — PRD-build-intent-card-refresh added `.sh` so
+     shell-target PRDs, this repo's own build shape, can derive-pair
+     instead of always falling back to `deferred_acs`), for a candidate
+     prefix `<p>`: the PRD's `test_prefix:`
      frontmatter key if declared (bare scalar or `[a, b]` list — see
      build-contract.md), else a single guess derived from the slug
      (strip the crate name + `-`, split the rest on `-`, take the last
@@ -635,9 +638,9 @@ in this tick's selection run in parallel via Agent tool calls
      belonging to an entirely different PRD, and an extend PRD's own
      un-prefixed leftover ACs (deferred ones, say) must not silently
      false-pair to them.
-  2. **bare** — `tests/ac<N>_*.rs` / `tests/ac<NN>_*.rs` (and `.py`).
-  3. **acceptance_ac** — `tests/acceptance_ac<N>.rs` (and `.py`).
-  4. **mocks** — `tests/mocks/ac<N>.rs` (and `.py`).
+  2. **bare** — `tests/ac<N>_*.rs` / `tests/ac<NN>_*.rs` (and `.py`, `.sh`).
+  3. **acceptance_ac** — `tests/acceptance_ac<N>.rs` (and `.py`, `.sh`).
+  4. **mocks** — `tests/mocks/ac<N>.rs` (and `.py`, `.sh`).
   5. **fn-scan** — a `#[test] fn ac<N>_...` or `def test_ac<N>_...` /
      `def test_ac_<N>_...` anywhere under `tests/`. Last resort.
 
