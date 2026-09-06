@@ -106,6 +106,33 @@
 #      would have been deferred fall through to MISSING instead of being
 #      silently swallowed.
 #
+# No-match / cross-PRD-collision guards (PRD-build-verified-completed-no-
+# match-mispair, closing two false-PASS defects hand-caught 2026-09-06):
+#   5. A DECLARED `test_prefix:` (non-empty frontmatter, as opposed to the
+#      slug-derived GUESS used when the PRD has none) is treated as an
+#      author assertion of this PRD's own naming convention. If rule (a)
+#      finds no match under any declared prefix, the AC is MISSING —
+#      rules (b)-(e) never run for that PRD. A guessed prefix keeps the
+#      old fallback behavior (no author signal to trust instead). Without
+#      this, a declared-but-wrong-or-absent prefix silently fell through
+#      to `bare`/`fn-scan` and could pair to a different PRD's tests
+#      sharing the same crate's tests/ directory (observed: mcphost-ci-
+#      sandbox-coverage's declared `ci_sandbox` prefix had zero matches
+#      and `bare`-paired all 7 ACs to the unrelated base PRD's ac01-07).
+#   6. `bare` and `fn-scan` matches are scoped against sibling PRDs in the
+#      same repo (any other PRD, built or queued, whose `build_into`
+#      resolves to this repo) that themselves DECLARE a `test_prefix`: if
+#      the matched file's basename fits `<sibling-prefix>_ac<N>[_...].{rs,
+#      py}` for a prefix that isn't one of this PRD's own candidates, that
+#      file is disqualified as THIS PRD's pairing — it is surfaced as
+#      classification `ac-number-collision` (naming the file and the
+#      other PRD, in text/table/json/doctor output) instead of a silent
+#      pair or a silent MISSING (observed: `fn-scan` paired mcphost-
+#      harness-judge-calibration's AC6 to mcphost-harness-live-gold's own
+#      `live_gold_ac6_*` file purely because both happened to number an
+#      unrelated requirement "6"). `ac-number-collision` counts as a
+#      failure for exit-code purposes, same as MISSING.
+#
 # Behavior (unchanged from prior versions):
 #   1. Counts ACs by scanning the PRD's `## Acceptance` (or
 #      `## Acceptance criteria` / `## Acceptance tests`) section for
@@ -212,6 +239,7 @@ fi
 declare -A is_paired is_deferred reason_for paired_evidence
 declare -A derived_rule derived_path is_failing
 declare -A fnscan_path
+declare -A collision_rule collision_path collision_owner_slug
 
 # ---- --derive: resolve repo + prefix candidates, classify each AC -----
 resolve_repo() {
@@ -252,10 +280,83 @@ derive_prefix_candidates() {
   esac
 }
 
-classify_ac() {
-  local n="$1" padded="" repo_tests="$repo/tests" f p numform matches ext
+# collision_owner <relpath> <n> — does <relpath>'s basename fit a SIBLING
+# PRD's own DECLARED test_prefix naming convention for AC<n> (see header
+# guard 6)? Prints the owning sibling's slug and returns 0 if so; prints
+# nothing and returns 1 otherwise. A sibling prefix that's also one of
+# THIS PRD's own prefix_candidates is never a collision (that's just this
+# PRD legitimately using the same convention).
+collision_owner() {
+  local relpath="$1" n="$2" padded="" base p numform mine mp
   [ "$n" -lt 10 ] && padded="0$n"
-  if [ ! -d "$repo_tests" ]; then printf 'MISSING||\n'; return; fi
+  base="$(basename "$relpath")"
+  for p in "${!sib_prefix_owner[@]}"; do
+    [ -n "$p" ] || continue
+    mine=0
+    for mp in "${prefix_candidates[@]:-}"; do
+      [ "$mp" = "$p" ] && { mine=1; break; }
+    done
+    [ "$mine" = 1 ] && continue
+    for numform in "$n" "$padded"; do
+      [ -n "$numform" ] || continue
+      case "$base" in
+        "${p}_ac${numform}_"*.rs|"${p}_ac${numform}_"*.py|"${p}_ac${numform}.rs"|"${p}_ac${numform}.py")
+          printf '%s\n' "${sib_prefix_owner[$p]}"
+          return 0
+          ;;
+      esac
+    done
+  done
+  return 1
+}
+
+# find_collision <n> — is there ANY file in tests/ that fits a SIBLING
+# PRD's own declared test_prefix convention for AC<n>? Unlike
+# collision_owner (which validates a file THIS PRD's own rules already
+# matched), this actively searches — used when this PRD's own declared
+# prefix found nothing at all, to tell "genuinely no test exists yet"
+# apart from "the test exists, but under a different PRD's number-sharing
+# convention" (see header guard 6; this is what closes the judge-
+# calibration/live-gold AC6 collision, where the declared-prefix-zero-
+# match short-circuit below would otherwise report a bare MISSING and
+# never even look at fn-scan's index). Prints "<owner-slug>\t<relpath>"
+# and returns 0 on a hit; nothing and returns 1 otherwise.
+find_collision() {
+  local n="$1" padded="" p numform matches f mine mp
+  [ "$n" -lt 10 ] && padded="0$n"
+  shopt -s nullglob
+  for p in "${!sib_prefix_owner[@]}"; do
+    [ -n "$p" ] || continue
+    mine=0
+    for mp in "${prefix_candidates[@]:-}"; do
+      [ "$mp" = "$p" ] && { mine=1; break; }
+    done
+    [ "$mine" = 1 ] && continue
+    for numform in "$n" "$padded"; do
+      [ -n "$numform" ] || continue
+      matches=( "$repo/tests/${p}_ac${numform}_"*.rs "$repo/tests/${p}_ac${numform}_"*.py )
+      if [ "${#matches[@]}" -eq 0 ]; then
+        [ -f "$repo/tests/${p}_ac${numform}.rs" ] && matches=( "$repo/tests/${p}_ac${numform}.rs" )
+      fi
+      if [ "${#matches[@]}" -eq 0 ]; then
+        [ -f "$repo/tests/${p}_ac${numform}.py" ] && matches=( "$repo/tests/${p}_ac${numform}.py" )
+      fi
+      if [ "${#matches[@]}" -gt 0 ]; then
+        f="${matches[0]#"$repo"/}"
+        shopt -u nullglob
+        printf '%s\t%s\n' "${sib_prefix_owner[$p]}" "$f"
+        return 0
+      fi
+    done
+  done
+  shopt -u nullglob
+  return 1
+}
+
+classify_ac() {
+  local n="$1" padded="" repo_tests="$repo/tests" f p numform matches ext other
+  [ "$n" -lt 10 ] && padded="0$n"
+  if [ ! -d "$repo_tests" ]; then printf 'MISSING|||\n'; return; fi
 
   shopt -s nullglob
   # a. prefix rule — tried first; see header "Derivation" step 3a.
@@ -280,15 +381,31 @@ classify_ac() {
       if [ "${#matches[@]}" -gt 0 ]; then
         f="${matches[0]#"$repo"/}"
         shopt -u nullglob
-        printf 'PAIRED|prefix:%s|%s\n' "$p" "$f"
+        printf 'PAIRED|prefix:%s|%s|\n' "$p" "$f"
         return
       fi
     done
   done
-  # b. bare ac<N> — SKIPPED when this PRD has a working prefix (see
-  # prefix_rule_active, set by a pre-pass before this function is called
-  # per-AC). Rationale: on a shared crate, a PRD that pairs MOST of its
-  # ACs via `<prefix>_ac<N>` (e.g. python_ac01..14) but has a few
+  # A DECLARED test_prefix with no match under it is MISSING, full stop —
+  # never falls through to (b)-(e). See header guard 5. A GUESSED prefix
+  # (declared_prefix=0) still falls through, matching prior behavior. One
+  # exception: check find_collision first, so a real file that exists
+  # only under a SIBLING PRD's own declared prefix is reported as a
+  # collision, not a bare MISSING (header guard 6 / bug #2).
+  if [ "${declared_prefix:-0}" = 1 ]; then
+    shopt -u nullglob
+    if hit="$(find_collision "$n")"; then
+      other="${hit%%$'\t'*}"; f="${hit#*$'\t'}"
+      printf 'COLLISION|declared-prefix-no-match|%s|%s\n' "$f" "$other"
+      return
+    fi
+    printf 'MISSING|||\n'
+    return
+  fi
+  # b. bare ac<N> — SKIPPED when this PRD has a working (guessed) prefix
+  # (see prefix_rule_active, set by a pre-pass before this function is
+  # called per-AC). Rationale: on a shared crate, a PRD that pairs MOST of
+  # its ACs via `<prefix>_ac<N>` (e.g. python_ac01..14) but has a few
   # deferred/leftover ACs the prefix rule didn't cover (e.g. 15, 16) must
   # NOT let those leftovers fall through to the bare rule — tests/ac15_
   # *.rs / ac16_*.rs almost certainly belong to a DIFFERENT PRD on the
@@ -309,8 +426,13 @@ classify_ac() {
     fi
     if [ "${#matches[@]}" -gt 0 ]; then
       f="${matches[0]#"$repo"/}"
+      if other="$(collision_owner "$f" "$n")"; then
+        shopt -u nullglob
+        printf 'COLLISION|bare|%s|%s\n' "$f" "$other"
+        return
+      fi
       shopt -u nullglob
-      printf 'PAIRED|bare|%s\n' "$f"
+      printf 'PAIRED|bare|%s|\n' "$f"
       return
     fi
   done
@@ -319,22 +441,28 @@ classify_ac() {
   # c. acceptance_ac<N>
   for ext in rs py; do
     f="$repo_tests/acceptance_ac${n}.${ext}"
-    if [ -f "$f" ]; then printf 'PAIRED|acceptance_ac|%s\n' "${f#"$repo"/}"; return; fi
+    if [ -f "$f" ]; then printf 'PAIRED|acceptance_ac|%s|\n' "${f#"$repo"/}"; return; fi
   done
   # d. mocks/ac<N>
   for ext in rs py; do
     f="$repo_tests/mocks/ac${n}.${ext}"
-    if [ -f "$f" ]; then printf 'PAIRED|mocks|%s\n' "${f#"$repo"/}"; return; fi
+    if [ -f "$f" ]; then printf 'PAIRED|mocks|%s|\n' "${f#"$repo"/}"; return; fi
   done
   # e. fn-scan — last resort. Looked up from a whole-tree index built ONCE
   # (see build_fnscan_index below), not re-grepped per AC: re-scanning the
   # full tests/ tree per AC blew the "<2s for 100 files" NFR once several
-  # ACs all fell through to this rule.
+  # ACs all fell through to this rule. Scoped against sibling PRDs' own
+  # declared prefixes (header guard 6) before being accepted as PAIRED.
   if [ -n "${fnscan_path[$n]:-}" ]; then
-    printf 'PAIRED|fn-scan|%s\n' "${fnscan_path[$n]}"
+    f="${fnscan_path[$n]%%::*}"
+    if other="$(collision_owner "$f" "$n")"; then
+      printf 'COLLISION|fn-scan|%s|%s\n' "${fnscan_path[$n]}" "$other"
+      return
+    fi
+    printf 'PAIRED|fn-scan|%s|\n' "${fnscan_path[$n]}"
     return
   fi
-  printf 'MISSING||\n'
+  printf 'MISSING|||\n'
 }
 
 # One-time whole-tree scan for rule (e), building n -> "relpath::fnname".
@@ -379,13 +507,35 @@ if [ "$derive_mode" = on ]; then
     done
     shopt -u nullglob
   fi
+  # declared_prefix: did THIS PRD's own frontmatter declare test_prefix at
+  # all (vs. prefix_candidates being a slug-derived GUESS)? See header
+  # guard 5 — a declared prefix disables the (b)-(e) fallback entirely.
+  declared_prefix=0
+  own_tp_n="$("$JQ" -r --arg s "$slug" '.[] | select(.slug==$s) | (.test_prefix // [] | length)' <<<"$json" 2>/dev/null)"
+  case "${own_tp_n:-}" in ''|*[!0-9]*) own_tp_n=0 ;; esac
+  [ "$own_tp_n" -gt 0 ] && declared_prefix=1
+  # sib_prefix_owner: prefix -> owning sibling slug, for every OTHER PRD
+  # (built or queued) whose build_into resolves to this same repo and
+  # which itself declares a test_prefix. See header guard 6.
+  declare -A sib_prefix_owner=()
+  while IFS=$'\t' read -r p s; do
+    [ -n "$p" ] || continue
+    [ -n "${sib_prefix_owner[$p]:-}" ] || sib_prefix_owner["$p"]="$s"
+  done < <("$JQ" -r --arg s "$slug" --arg r "$repo" '
+      .[] | select(.slug != $s) | select((.build_into // "") == $r) |
+      .slug as $sl | (.test_prefix // [])[] | "\(.)\t\($sl)"
+    ' <<<"$json" 2>/dev/null)
   build_fnscan_index
   for ((i=1; i<=num_acs; i++)); do
-    IFS='|' read -r cls rule path <<<"$(classify_ac "$i")"
+    IFS='|' read -r cls rule path other <<<"$(classify_ac "$i")"
     if [ "$cls" = PAIRED ]; then
       is_paired[$i]=1
       derived_rule[$i]="$rule"
       derived_path[$i]="$path"
+    elif [ "$cls" = COLLISION ]; then
+      collision_rule[$i]="$rule"
+      collision_path[$i]="$path"
+      collision_owner_slug[$i]="$other"
     fi
   done
 fi
@@ -467,6 +617,7 @@ fi
 
 missing=()
 failing=()
+collisions=()
 results=()
 for ((i=1; i<=num_acs; i++)); do
   if [ -n "${is_paired[$i]:-}" ]; then
@@ -478,6 +629,9 @@ for ((i=1; i<=num_acs; i++)); do
     fi
   elif [ -n "${is_deferred[$i]:-}" ]; then
     cls=DEFERRED
+  elif [ -n "${collision_owner_slug[$i]:-}" ]; then
+    cls=ac-number-collision
+    collisions+=("$i")
   else
     cls=MISSING
     missing+=("$i")
@@ -496,23 +650,34 @@ if [ "$format" = json ]; then
         '[inputs | split(" ") | {ac:(.[0]|tonumber), status:.[1]}]
          | {slug:$slug, num_acs:$num, classifications:.,
             missing:[.[]|select(.status=="MISSING")|.ac],
+            collisions:[.[]|select(.status=="ac-number-collision")|.ac],
             deferred_acs_unparsed:$unparsed}')"
-  # Splice in rule/path per AC (derive mode only; empty for legacy).
+  # Splice in rule/path (+ collision detail) per AC (derive mode only;
+  # empty/null for legacy or non-collision ACs).
   for ((i=1; i<=num_acs; i++)); do
     rule="${derived_rule[$i]:-}"
     path="${derived_path[$i]:-}"
+    crule="${collision_rule[$i]:-}"
+    cpath="${collision_path[$i]:-}"
+    cowner="${collision_owner_slug[$i]:-}"
     payload="$("$JQ" -c --argjson i "$i" --arg rule "$rule" --arg path "$path" \
-      '.classifications |= map(if .ac == $i then . + {rule: (if $rule=="" then null else $rule end), path: (if $path=="" then null else $path end)} else . end)' \
+      --arg crule "$crule" --arg cpath "$cpath" --arg cowner "$cowner" \
+      '.classifications |= map(if .ac == $i then . + {
+          rule: (if $rule=="" then null else $rule end),
+          path: (if $path=="" then null else $path end),
+          collision: (if $cowner=="" then null else {other_prd:$cowner, path:$cpath, rule:$crule} end)
+        } else . end)' \
       <<<"$payload")"
   done
   printf '%s\n' "$payload"
 elif [ "$format" = table ]; then
-  printf '%s\t%s\t%s\t%s\n' AC RULE PATH CLASSIFICATION
+  printf '%s\t%s\t%s\t%s\t%s\n' AC RULE PATH CLASSIFICATION OTHER_PRD
   for line in "${results[@]}"; do
     n="${line%% *}"; cls="${line#* }"
-    rule="${derived_rule[$n]:-}"; [ -n "$rule" ] || rule="-"
-    path="${derived_path[$n]:-}"; [ -n "$path" ] || path="-"
-    printf '%s\t%s\t%s\t%s\n' "$n" "$rule" "$path" "$cls"
+    rule="${derived_rule[$n]:-}"; [ -n "$rule" ] || rule="${collision_rule[$n]:-}"; [ -n "$rule" ] || rule="-"
+    path="${derived_path[$n]:-}"; [ -n "$path" ] || path="${collision_path[$n]:-}"; [ -n "$path" ] || path="-"
+    other="${collision_owner_slug[$n]:-}"; [ -n "$other" ] || other="-"
+    printf '%s\t%s\t%s\t%s\t%s\n' "$n" "$rule" "$path" "$cls" "$other"
   done
 elif [ "$doctor" = true ]; then
   # Padded width = 8 (DEFERRED is widest). Right-pad with spaces so the
@@ -533,6 +698,10 @@ elif [ "$doctor" = true ]; then
         [ -n "$r" ] || r="(no reason given)"
         printf 'AC%s: %-8s — %s\n' "$n" "$cls" "$r"
         ;;
+      ac-number-collision)
+        printf 'AC%s: %-8s — matched %s, which belongs to PRD %s\n' "$n" "$cls" \
+          "${collision_path[$n]:-(unknown)}" "${collision_owner_slug[$n]:-(unknown)}"
+        ;;
       MISSING)
         printf 'AC%s: %-8s — %s\n' "$n" "$cls" "(not paired, not deferred)"
         ;;
@@ -541,16 +710,23 @@ elif [ "$doctor" = true ]; then
 else
   for line in "${results[@]}"; do
     n="${line%% *}"; cls="${line#* }"
-    echo "AC$n: $cls"
+    if [ "$cls" = "ac-number-collision" ]; then
+      echo "AC$n: $cls (matched ${collision_path[$n]:-?}, which belongs to PRD ${collision_owner_slug[$n]:-?})"
+    else
+      echo "AC$n: $cls"
+    fi
   done
 fi
 
-if [ "${#missing[@]}" -gt 0 ] || [ "${#failing[@]}" -gt 0 ]; then
+if [ "${#missing[@]}" -gt 0 ] || [ "${#failing[@]}" -gt 0 ] || [ "${#collisions[@]}" -gt 0 ]; then
   for n in "${missing[@]}"; do
     echo "AC$n: not paired (and not declared deferred)" >&2
   done
   for n in "${failing[@]}"; do
     echo "AC$n: PAIRED-FAILING (test ${derived_path[$n]:-} failed under --verify-run)" >&2
+  done
+  for n in "${collisions[@]}"; do
+    echo "AC$n: ac-number-collision (matched ${collision_path[$n]:-} via ${collision_rule[$n]:-}, which belongs to PRD ${collision_owner_slug[$n]:-})" >&2
   done
   exit 1
 fi

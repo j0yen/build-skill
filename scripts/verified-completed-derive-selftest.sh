@@ -3,7 +3,9 @@
 # `verified-completed.sh --derive` (PRD-build-archive-autopair). Builds
 # throwaway fixture repos + PRDs + a scratch manifest.json under a
 # tempdir (fully hermetic — never touches a real ~/wintermute repo or
-# the live state/manifest.json) and asserts AC1-AC7 from the PRD.
+# the live state/manifest.json) and asserts AC1-AC7 from PRD-build-
+# archive-autopair plus AC8-AC10 from PRD-build-verified-completed-no-
+# match-mispair (declared-prefix zero-match MISSING + ac-number-collision).
 #
 # Run: bash scripts/verified-completed-derive-selftest.sh   (exit 0 = all pass)
 
@@ -218,6 +220,101 @@ out="$("$VC" "$T/prds/PRD-vrfix.md" --derive --verify-run --format table 2>/dev/
 ck "AC7 exit 1" '[ "$rc" -eq 1 ]'
 ck "AC7 AC2 PAIRED-FAILING" 'printf "%s\n" "$out" | awk -F"\t" "\$1==2{print \$4}" | grep -qx PAIRED-FAILING'
 ck "AC7 AC1 still PAIRED" 'printf "%s\n" "$out" | awk -F"\t" "\$1==1{print \$4}" | grep -qx PAIRED'
+
+# ---- AC8/AC9 (PRD-build-verified-completed-no-match-mispair): declared
+# test_prefix + zero matches must MISSING, not fall through to a sibling
+# PRD's bare files in the same repo; the sibling itself is unaffected. ----
+mkdir -p "$T/nomatch-repo/tests"
+: > "$T/nomatch-repo/tests/ac01_bar.rs"   # bare, belongs to PRD-nomatch-b (no declared prefix)
+
+cat > "$T/prds/PRD-nomatch-a.md" <<EOF
+# PRD: nomatch-a fixture (declared prefix foo, zero foo_ac* files anywhere)
+Status: Draft v0.1
+build_target: rust-extend
+build_into: $T/nomatch-repo
+test_prefix: foo
+
+## Acceptance
+
+1. an AC whose declared prefix has no matching file anywhere in the repo.
+EOF
+
+cat > "$T/prds/PRD-nomatch-b.md" <<EOF
+# PRD: nomatch-b fixture (no declared prefix; owns the bare ac01 file)
+Status: Draft v0.1
+build_target: rust-extend
+build_into: $T/nomatch-repo
+
+## Acceptance
+
+1. an AC legitimately paired via the bare rule to its own file.
+EOF
+
+out="$("$VC" "$T/prds/PRD-nomatch-a.md" --derive --format table 2>/dev/null)"
+"$VC" "$T/prds/PRD-nomatch-a.md" --derive >/dev/null 2>&1; rc=$?
+ck "AC8 declared-prefix-zero-match exit 1 (not bare-paired)" '[ "$rc" -eq 1 ]'
+ck "AC8 AC1 classification MISSING" \
+  'printf "%s\n" "$out" | awk -F"\t" "\$1==1{print \$4}" | grep -qx MISSING'
+
+out="$("$VC" "$T/prds/PRD-nomatch-b.md" --derive --format table 2>/dev/null)"
+"$VC" "$T/prds/PRD-nomatch-b.md" --derive >/dev/null 2>&1; rc=$?
+ck "AC9 sibling with no declared prefix unaffected, exit 0" '[ "$rc" -eq 0 ]'
+ck "AC9 AC1 still PAIRED via bare (no regression)" \
+  'printf "%s\n" "$out" | awk -F"\t" "\$1==1{print \$4}" | grep -qx PAIRED'
+
+# ---- AC10 (PRD-build-verified-completed-no-match-mispair): two PRDs in
+# one repo both declare the same AC number under different prefixes; only
+# the OTHER PRD's file exists -> ac-number-collision, never a silent
+# fn-scan pair. ------------------------------------------------------------
+mkdir -p "$T/collide-repo/tests"
+printf 'def test_ac6_publish_failure_detail():\n    assert True\n' \
+  > "$T/collide-repo/tests/live_gold_ac6_publish_failure_detail_test.py"
+
+cat > "$T/prds/PRD-judge-calibration.md" <<EOF
+# PRD: judge-calibration fixture (declares AC6 under prefix judge; no judge_ac6 file exists)
+Status: Draft v0.1
+build_target: rust-extend
+build_into: $T/collide-repo
+test_prefix: judge
+
+## Acceptance
+
+1. a.
+2. b.
+3. c.
+4. d.
+5. e.
+6. a kappa/MAE bar this PRD's own AC6 -- no judge_ac6 file exists anywhere.
+EOF
+
+cat > "$T/prds/PRD-live-gold.md" <<EOF
+# PRD: live-gold fixture (declares its OWN AC6 under prefix live_gold; this is the file that exists)
+Status: Draft v0.1
+build_target: rust-extend
+build_into: $T/collide-repo
+test_prefix: live_gold
+
+## Acceptance
+
+1. a.
+2. b.
+3. c.
+4. d.
+5. e.
+6. an unrelated publish-failure-detail requirement, also numbered 6.
+EOF
+
+out="$("$VC" "$T/prds/PRD-judge-calibration.md" --derive --format table 2>/dev/null)"
+"$VC" "$T/prds/PRD-judge-calibration.md" --derive >/dev/null 2>&1; rc=$?
+ck "AC10 exit 1 (collision, not silent pass)" '[ "$rc" -eq 1 ]'
+ck "AC10 AC6 classification ac-number-collision" \
+  'printf "%s\n" "$out" | awk -F"\t" "\$1==6{print \$4}" | grep -qx ac-number-collision'
+ck "AC10 AC6 names the matched file" \
+  'printf "%s\n" "$out" | awk -F"\t" "\$1==6{print \$3}" | grep -q "live_gold_ac6_publish_failure_detail_test.py"'
+ck "AC10 AC6 names the other PRD (live-gold)" \
+  'printf "%s\n" "$out" | awk -F"\t" "\$1==6{print \$5}" | grep -qx live-gold'
+ck "AC10 AC1-5 still MISSING (declared judge prefix, no files at all)" \
+  '[ "$(printf "%s\n" "$out" | awk -F"\t" "\$1<=5{print \$4}" | grep -c "^MISSING$")" -eq 5 ]'
 
 echo "----"
 echo "verified-completed-derive-selftest: pass=$PASS fail=$FAIL"
