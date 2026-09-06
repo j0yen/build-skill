@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Fake rsync for gate-burst.sh offline tests: real local `cp` between the
+# last two path-like args (src/dst may carry a "user@host:" prefix, which
+# is stripped since our "remote" is a local scratch path). FAKE_RSYNC_FAIL=1
+# simulates a network/rsync failure.
+set -uo pipefail
+[ "${FAKE_RSYNC_FAIL:-0}" = "1" ] && exit 23
+src="${*: -2:1}"
+dst="${*: -1:1}"
+local_dst="${dst#*:}"
+local_src="${src#*:}"
+mkdir -p "$(dirname "$local_dst")" 2>/dev/null || true
+mkdir -p "$local_dst" 2>/dev/null || true
+cp -a "$local_src"/. "$local_dst"/ 2>/dev/null || true
+exit 0

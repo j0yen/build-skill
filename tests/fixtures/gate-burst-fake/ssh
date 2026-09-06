@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Fake ssh for gate-burst.sh offline tests. Last arg is the remote command
+# ("true" for reachability probes, "hostname" for the receipt-equivalence
+# host stamp, otherwise "cd <remote_path> && RUSTC_WRAPPER=sccache <cmd>",
+# eval'd locally since our "remote" is really the local filesystem under
+# GATE_BURST_REMOTE_ROOT). FAKE_SSH_REMOTE_FAIL=<n> makes the remote
+# command "fail" with exit code n instead of running it.
+set -uo pipefail
+args=("$@")
+cmd="${args[-1]}"
+if [ "$cmd" = true ]; then exit 0; fi
+if [ "$cmd" = hostname ]; then echo "fake-burst-host"; exit 0; fi
+if [ "${FAKE_SSH_REMOTE_FAIL:-0}" != "0" ]; then exit "${FAKE_SSH_REMOTE_FAIL}"; fi
+eval "$cmd"

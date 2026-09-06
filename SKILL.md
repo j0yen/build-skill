@@ -517,6 +517,39 @@ in this tick's selection run in parallel via Agent tool calls
   receipts) and runs `autobuilder gate --project .` as the single verdict.
   Counts as one tick action.
 
+  **Mixed-tick burst routing (2026-09-06, PRD-build-gate-cloudburst).**
+  Heavy cargo (this gate's 25-receipt regeneration) sharing a box with a
+  timing-sensitive Python suite can flip the suite's verdict under load
+  (observed 2026-09-06: a 444s mcphost gate beside a synthorg suite that
+  went red at an unchanged green commit). Before invoking `extend-gate.sh`,
+  the tick consults the mixed-tick predicate with this tick's own dispatch
+  counts:
+  ```
+  scripts/gate-burst.sh should-route --rust <n_rust_gate_prds> --python <n_python_prds>
+  ```
+  Exit 0 (both counts > 0) routes the ENTIRE `extend-gate.sh` invocation
+  through the burst manager instead of running it locally:
+  ```
+  scripts/gate-burst.sh run <build_into> -- scripts/extend-gate.sh <build_into> --head <landed sha>
+  ```
+  Exit 3 from `gate-burst.sh run` (or `should-route` reporting `local`)
+  means: run `extend-gate.sh` locally exactly as written above — today's
+  behavior, unchanged. `gate-burst.sh run`'s own fallback covers every
+  burst failure mode (precondition absent, boot failure, rsync/ssh
+  failure) by printing `fallback: <cause>` and exiting 3 — the tick must
+  treat that exit code as "fall back to local", never as a gate block.
+  **Precondition, verified 2026-09-06:** no `/cloudbuild` skill exists on
+  this machine (checked directly — not under a renamed pre-fleet-sync
+  backup either) and `hcloud` itself is not on `$PATH`, so
+  `scripts/gate-burst.sh precondition` currently fails closed for real;
+  bursting stays off until a Hetzner-capable box runs `hcloud` setup +
+  `~/.config/wm-burst/.env`'s `SNAPSHOT_ID` — see the script's own header
+  for exactly what it checks. At tick end (Phase 7 parent step, after all
+  branches return), call `scripts/gate-burst.sh down` (add
+  `--more-work-queued` when the next tick's candidate pool already shows
+  pending rust-extend gates) so a box never survives into a second billed
+  hour idle.
+
   - **On pass** (`pass=25 block=0`): tag the shipped commit —
     `~/.claude/skills/rustbuild/scripts/ship-tag.sh <build_into> <slug>`
     (tags `v<version>` at HEAD, pushes `--follow-tags`; a second run is a

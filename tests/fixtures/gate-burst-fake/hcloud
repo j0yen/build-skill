@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# Fake hcloud CLI for gate-burst.sh offline tests. State: a flat file of
+# "id alive" lines under $FAKE_HCLOUD_STATE (default /tmp/gb-fake-hcloud.state).
+# Failure-injection env vars (all default off): FAKE_HCLOUD_AUTH_FAIL,
+# FAKE_HCLOUD_CREATE_FAIL, FAKE_HCLOUD_DELETE_FAIL.
+set -uo pipefail
+STATE="${FAKE_HCLOUD_STATE:-/tmp/gb-fake-hcloud.state}"
+touch "$STATE"
+case "${1:-}" in
+  server-type)
+    [ "${2:-}" = "list" ] || exit 2
+    [ "${FAKE_HCLOUD_AUTH_FAIL:-0}" = "1" ] && { echo "unauthorized" >&2; exit 1; }
+    echo "ccx23"
+    exit 0
+    ;;
+  server)
+    case "${2:-}" in
+      create)
+        [ "${FAKE_HCLOUD_CREATE_FAIL:-0}" = "1" ] && { echo "create failed" >&2; exit 1; }
+        id=$((RANDOM % 900000 + 100000))
+        echo "$id alive" >> "$STATE"
+        printf '{"id":%s,"ip":"127.0.0.1"}\n' "$id"
+        exit 0
+        ;;
+      describe)
+        id="$3"
+        grep -q "^$id alive\$" "$STATE" && exit 0
+        exit 1
+        ;;
+      delete)
+        id="$3"
+        [ "${FAKE_HCLOUD_DELETE_FAIL:-0}" = "1" ] && exit 1
+        sed -i "/^$id alive\$/d" "$STATE"
+        exit 0
+        ;;
+      *) exit 2 ;;
+    esac
+    ;;
+  *) exit 2 ;;
+esac
