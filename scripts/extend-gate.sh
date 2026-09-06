@@ -204,7 +204,7 @@ fi
   || note_block "proof-receipt — autobuilder loop --iteration 0 exited non-zero"
 
 # 3. vti-plan.
-( cd "$repo" && autobuilder vti-plan --project . ) 9>&- \
+( cd "$repo" && autobuilder vti-plan --project . --base "$base_ref" ) 9>&- \
   || note_block "vti-plan — autobuilder vti-plan exited non-zero"
 
 # 4. rollback-plan over <base>..HEAD.
