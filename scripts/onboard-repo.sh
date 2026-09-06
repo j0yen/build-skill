@@ -662,7 +662,7 @@ echo
 echo "  should now be unblocked (scaffolding-dependent receipts): intake, vti-plan, rollback-plan (has a real tag base), reviewer-agent, ci-checks, session-trace, proof-lane routing"
 echo "  still needs real per-repo content this script cannot fabricate:"
 echo "    - ac-traceability: needs an actual PRD-*.md at $repo's root (or extended-gates.toml prd_path) — see agent/AUTOBUILDER_PROGRAM.md's 'PRD workspace' section"
-if [ -z "$prd_path" ]; then
+if [ -z "$prd_path" ] && [ "${plan[intent-card.json]}" = "create" ]; then
   echo "    - intent-card.json was generated onboarded-without-prd (no built/archived PRD names this repo) — a real 5-Whys card should replace it once one does"
 fi
 echo "    - any reviewer-agent or risk-gate block that describes something true about the code is unaffected by onboarding and stays real"
