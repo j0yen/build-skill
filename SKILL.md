@@ -843,6 +843,15 @@ implementation (write-ahead intent file → block on the lock with a hard
   `state/intent/` is empty. This is the automatic version of the by-hand
   repair the parent did on 2026-06-02 when 2/6 branches dropped their
   writes under contention.
+- Run `scripts/verdict-receipts.sh postflight ~/brain/journal/build/<today>.md`
+  (PRD-build-verdict-receipts). This scans the tick's own journal for the
+  reserved-word verdicts branches just appended and, if any lack their
+  required receipt(s), appends ONE flag line to that same journal naming
+  them — belt and braces alongside the branch-prompt prose contract
+  above, since prose alone already let an unreceipted "bisected
+  regression" and an unretried "unreachable" block ship in one evening.
+  Never fails the tick (always exits 0); a flagged verdict is Phase 6's
+  reflect-phase input, not a reason to block this tick's own exit.
 - Then release `tick.lock`.
 
 This design (per-slug write-ahead intent + a blocking-with-ceiling lock +
@@ -994,6 +1003,30 @@ Each agent prompt must include, self-contained:
   per-slug RMW. A non-zero exit means your write did not land (the parent's
   `--replay-orphans` pass will recover it from your intent file); say so in
   your summary."
+- "Verdict-receipt protocol (PRD-build-verdict-receipts): before writing
+  any NOT-ARCHIVED or blocking verdict that cites test failures, re-run
+  the failing subset (or the full suite) once more in a fresh process
+  before you commit to the claim — a scheduler hiccup should cost one
+  re-run, not a blocked PRD and a human escalation. Record BOTH runs
+  (the original red run and the re-run) as receipts via
+  `scripts/verdict-receipts.sh record <kind> <slug> [--timeout <secs>]
+  -- <command...>` — each call prints a receipt path; reference every
+  receipt from your journal line as `receipt: <path>` (one label per
+  path). A green re-run means the verdict is `flaky-infra` (both
+  receipts referenced, the PRD is NOT blocked on it — journal it for the
+  reflect phase); a repeated red means `reproducible` (both receipts
+  referenced) and the PRD may block. The words `bisected`,
+  `reproducible`, `flaky-infra`, `unreachable`, and `SSH timeout` are
+  reserved: use them in a journal line or a PRD `Blocked:` value ONLY
+  when the matching receipt(s) exist and are referenced —
+  `scripts/verdict-receipts.sh scan <file>` enforces exactly this and is
+  what the tick's postflight replays your journal line against.
+  `bisected` needs a receipt whose command names `git bisect` and whose
+  output names the guilty commit; `unreachable`/`SSH timeout` in a
+  `Blocked:` value needs >=2 probe receipts >=60s apart PLUS a
+  crosscheck receipt against a second target (a sandboxed shell cannot
+  brand a healthy host unreachable off one probe from a degraded
+  context)."
 - "Return a one-line summary of what you did: `<slug>: <action>
   <outcome>` so the parent's journal sees it."
 
