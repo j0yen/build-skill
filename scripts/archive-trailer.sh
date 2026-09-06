@@ -6,7 +6,8 @@
 # Usage:
 #   archive-trailer.sh <PRD-path> \
 #     [--paired N=<evidence>]... [--paired-json '{"2":"...","4":"..."}'] \
-#     [--reasons-json '{"1":"...","3":"..."}']
+#     [--reasons-json '{"1":"...","3":"..."}'] \
+#     [--inherited-blocks name1,name2,...]
 #
 # Inputs:
 #   <PRD-path>            absolute or relative path to a PRD-*.md file.
@@ -23,6 +24,14 @@
 #                         empty stub `{}` since the block-list YAML
 #                         dict isn't parsed yet; this flag lets callers
 #                         inject reasons until that lands).
+#   --inherited-blocks name1,name2,...  optional
+#                         (PRD-build-gate-delta-baseline): the receipt
+#                         names a `delta-pass` gate verdict named as
+#                         baseline-covered debt — see extend-gate.sh's
+#                         `inherited_blocks=` summary field. Comma-
+#                         separated, empty/absent omits the block below
+#                         entirely (a plain `pass` ship has nothing to
+#                         report here).
 #
 # Output (stdout):
 #   Verified-completed:
@@ -33,9 +42,13 @@
 #     AC1 — <reason or "(no reason given)">
 #     AC3 — <reason or "(no reason given)">
 #
+#   inherited_blocks=[name1, name2]
+#
 # When `deferred_acs` is empty, the `Deferred:` block is omitted entirely.
 # When no ACs are paired, the `Verified-completed:` block is still
 # emitted with no body lines (so the gate caller's intent stays visible).
+# The `inherited_blocks=[...]` line is emitted only when
+# `--inherited-blocks` is given a non-empty value.
 #
 # Exit codes:
 #   0  trailer emitted; every AC is paired-or-deferred.
@@ -50,13 +63,14 @@ SCAN="$HERE/scan-prds.sh"
 JQ="${JQ:-$(command -v jq || echo /usr/sbin/jq)}"
 
 usage() {
-  sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,58p' "$0" | sed 's/^# \{0,1\}//'
   exit 2
 }
 
 prd=""
 paired_json="{}"
 reasons_json=""
+inherited_blocks=""
 declare -a paired_kv=()
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -66,6 +80,8 @@ while [ "$#" -gt 0 ]; do
     --paired-json=*) paired_json="${1#--paired-json=}"; shift ;;
     --reasons-json) reasons_json="${2:-}"; shift 2 ;;
     --reasons-json=*) reasons_json="${1#--reasons-json=}"; shift ;;
+    --inherited-blocks) inherited_blocks="${2:-}"; shift 2 ;;
+    --inherited-blocks=*) inherited_blocks="${1#--inherited-blocks=}"; shift ;;
     -h|--help) usage ;;
     --) shift; break ;;
     -*) echo "archive-trailer: unknown flag $1" >&2; exit 2 ;;
@@ -170,6 +186,11 @@ if [ "${#deferred_lines[@]}" -gt 0 ]; then
   for line in "${deferred_lines[@]}"; do
     printf '%s\n' "$line"
   done
+fi
+
+if [ -n "$inherited_blocks" ]; then
+  echo
+  echo "inherited_blocks=[${inherited_blocks//,/, }]"
 fi
 
 exit 0

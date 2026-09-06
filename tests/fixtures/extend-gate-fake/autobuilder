@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# Fake `autobuilder` for extend-gate.sh integration tests
+# (PRD-build-gate-delta-baseline). Every subcommand extend-gate.sh calls
+# before `gate` is a no-op success EXCEPT `reviewer-agent`, which fails at
+# `prepare` on purpose so the real flow never reaches a `claude -p`
+# subagent spawn from inside a test. `gate` is the one subcommand that
+# matters: it emits the SAME line shapes as the real
+# autobuilder/src/gate.rs (checked against that file directly), driven by
+# env vars so tests can script exact pass/block sets without hand-echoing
+# a verdict conclusion.
+#
+# Env vars read by the `gate` subcommand:
+#   FAKE_GATE_PASS_NAMES     comma-separated passing receipt names
+#                             (default: audit,vti-plan,rollback-plan,proof-receipt)
+#   FAKE_GATE_BLOCKING_FILE  path to a file of "<name><TAB><note>" lines,
+#                             one per blocking receipt (note may be empty)
+#   FAKE_GATE_CALL_COUNTER   path to a file this script appends one byte
+#                             to every time `gate` actually runs — tests
+#                             use this to prove a cache hit skipped the
+#                             gate call entirely.
+set -uo pipefail
+
+sub="${1:-}"
+[ $# -ge 1 ] && shift
+
+case "$sub" in
+  loop|vti-plan|rollback-plan|ci-checks)
+    exit 0
+    ;;
+  reviewer-agent)
+    # Always fail at prepare — extend-gate.sh's run_reviewer treats this
+    # as a note_block and continues; it never reaches `claude -p`.
+    exit 1
+    ;;
+  gate)
+    [ -n "${FAKE_GATE_CALL_COUNTER:-}" ] && printf 'x' >> "$FAKE_GATE_CALL_COUNTER"
+    head_sha="$(git rev-parse HEAD 2>/dev/null || echo unknown)"
+    IFS=',' read -r -a pass_names <<< "${FAKE_GATE_PASS_NAMES:-audit,vti-plan,rollback-plan,proof-receipt}"
+    declare -a block_names=() block_notes=()
+    if [ -n "${FAKE_GATE_BLOCKING_FILE:-}" ] && [ -f "$FAKE_GATE_BLOCKING_FILE" ]; then
+      while IFS=$'\t' read -r n note || [ -n "$n" ]; do
+        [ -n "$n" ] || continue
+        block_names+=("$n")
+        block_notes+=("$note")
+      done < "$FAKE_GATE_BLOCKING_FILE"
+    fi
+    pass_count=${#pass_names[@]}
+    block_count=${#block_names[@]}
+    total=$((pass_count + block_count))
+    verdict="pass"; [ "$block_count" -eq 0 ] || verdict="block"
+    echo "gate: head=$head_sha receipts=$total pass=$pass_count block=$block_count verdict=$verdict"
+    for n in "${pass_names[@]}"; do
+      echo "  ✓ $n"
+    done
+    for i in "${!block_names[@]}"; do
+      if [ -n "${block_notes[$i]}" ]; then
+        echo "  ✗ ${block_names[$i]} — ${block_notes[$i]}"
+      else
+        echo "  ✗ ${block_names[$i]}"
+      fi
+    done
+    [ "$block_count" -eq 0 ] && exit 0 || exit 1
+    ;;
+  *)
+    exit 0
+    ;;
+esac

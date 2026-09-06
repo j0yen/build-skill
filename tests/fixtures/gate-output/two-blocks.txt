@@ -1,0 +1,32 @@
+extend-gate: /repo head=e16403917137073381f78bddb293f9bd6fd25c3c base=e16403917137073381f78bddb293f9bd6fd25c3c parallelism=6
+extend-gate: project-root: . (repo root)
+extend-gate: no scripts/audit.sh in /repo — skipping
+extend-gate: reviewer-agent — prepare exited non-zero
+extend-gate: ci-checks — gh not authenticated: run 'gh auth login'
+gate: head=e16403917137073381f78bddb293f9bd6fd25c3c receipts=25 pass=23 block=2 verdict=block
+  ✓ intake
+  ✓ vti-plan
+  ✓ proof-receipt
+  ✓ risk-gate
+  ✗ reviewer-agent — prepare exited non-zero (see target/autobuilder/review-request.json)
+  ✓ rollback-plan
+  ✗ ci-checks — gh not authenticated: run 'gh auth login'
+  ✓ session-trace
+  ✓ supply-audit
+  ✓ license-audit
+  ✓ secrets-scan
+  ✓ sbom
+  ✓ determinism
+  ✓ hermetic-build
+  ✓ msrv-verify
+  ✓ binary-size
+  ✓ cold-build-time
+  ✓ bench-delta
+  ✓ semver-check
+  ✓ cli-surface
+  ✓ schema-compat
+  ✓ ac-traceability
+  ✓ mutation-kill
+  ✓ flake-audit
+  ✓ experiment
+Error: 2 of 25 receipts failed; see /repo/target/autobuilder/release-receipt.json

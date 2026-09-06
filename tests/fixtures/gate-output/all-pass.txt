@@ -1,0 +1,29 @@
+extend-gate: /repo head=abc123abc123abc123abc123abc123abc123abcd base=abc123abc123abc123abc123abc123abc123abcd parallelism=6
+extend-gate: project-root: . (repo root)
+extend-gate: no scripts/audit.sh in /repo — skipping
+gate: head=abc123abc123abc123abc123abc123abc123abcd receipts=25 pass=25 block=0 verdict=pass
+  ✓ intake
+  ✓ vti-plan
+  ✓ proof-receipt
+  ✓ risk-gate
+  ✓ reviewer-agent
+  ✓ rollback-plan
+  ✓ ci-checks
+  ✓ session-trace
+  ✓ supply-audit
+  ✓ license-audit
+  ✓ secrets-scan
+  ✓ sbom
+  ✓ determinism
+  ✓ hermetic-build
+  ✓ msrv-verify
+  ✓ binary-size
+  ✓ cold-build-time
+  ✓ bench-delta
+  ✓ semver-check
+  ✓ cli-surface
+  ✓ schema-compat
+  ✓ ac-traceability
+  ✓ mutation-kill
+  ✓ flake-audit
+  ✓ experiment

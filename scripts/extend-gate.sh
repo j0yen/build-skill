@@ -3,7 +3,8 @@
 # rust-extend crate's main checkout, so the deploy gate a rust-extend ship
 # reads is never bound to a stale commit. PRD-build-extend-gate-receipts.
 #
-# usage: extend-gate.sh <build_into> [--base <tag>] [--head <sha>] [--dry-run] [--parallelism N]
+# usage: extend-gate.sh <build_into> [--base <tag>] [--head <sha>] [--dry-run]
+#                        [--parallelism N] [--record-baseline] [--force]
 #
 # On a clean main checkout, at HEAD, in this order:
 #   scripts/audit.sh                         (if the crate has one)
@@ -27,6 +28,23 @@
 # Prints the gate's own summary line (`gate: head=... pass=N block=M
 # verdict=...`) and exits with the gate's verdict.
 #
+# Delta verdict against a committed baseline (PRD-build-gate-delta-baseline).
+# `autobuilder gate`'s own pass/block is not the final word: this script
+# additionally diffs the blocking receipt set against
+# `<build_into>/agent/gate-baseline.json` AT HEAD (a working-tree-only copy
+# never counts — fail closed) via `scripts/gate-delta.sh verdict`, and
+# prints its own summary line:
+#   extend-gate: delta verdict=pass|delta-pass|block baseline=present|absent new_blocks=<...> inherited_blocks=<...>
+# `delta-pass` means block>0 but every blocking receipt name is already in
+# the baseline — this script then exits 0 (shippable), same as a plain
+# `pass`. `block` means at least one blocking receipt is NOT in the
+# baseline (or there is no committed baseline at all — today's behavior,
+# preserved byte-for-byte: no baseline means this new summary line and the
+# exit code are unaffected by anything above). `--record-baseline` writes
+# the baseline from the CURRENT run's blocking set instead of computing a
+# verdict against one — see that flag's own note below. A verdict run
+# never writes or widens the baseline itself.
+#
 # <build_into> is normally both the git repo root and the Cargo project
 # root (mcphost, wm-node, adopt) — but that's not universal. When the repo
 # root has no Cargo.toml (rustbuild's has always lived one level down, at
@@ -42,11 +60,16 @@
 # producer runs — never a silent 101. PRD-build-extend-gate-nested-crate-project.
 #
 # Exit codes:
-#   0  gate verdict pass (pass=25 block=0)
-#   1  gate verdict block (one or more receipts failed)
+#   0  gate verdict pass (pass=25 block=0) OR delta-pass (block>0 but every
+#      blocking receipt is in the committed baseline) OR a successful
+#      `--record-baseline` write (that mode's exit code reports the write,
+#      not the underlying pass/block)
+#   1  gate verdict block (one or more receipts failed, and at least one
+#      of them is not in the committed baseline — or there is no committed
+#      baseline at all)
 #   1  usage error (bad/missing arguments)
 #   2  a required binary is missing from $PATH (autobuilder, extended-receipts.sh,
-#      ship-tag.sh) — cannot even attempt a run
+#      ship-tag.sh, gate-delta.sh, jq) — cannot even attempt a run
 #   3  dirty tree — refused before any producer ran, nothing under
 #      target/autobuilder/ changed
 #   4  could not acquire the per-repo integration lock within 120s
@@ -55,6 +78,24 @@
 #   6  could not resolve a unique Cargo project root under <build_into>
 #      (none found, or more than one candidate) — refused before any
 #      producer ran
+#
+# --record-baseline: runs the full producer sequence exactly as a normal
+# invocation, then instead of computing a delta verdict, writes
+# `<build_into>/agent/gate-baseline.json` from THIS run's blocking receipt
+# set (`scripts/gate-delta.sh record`) and prints the recorded document.
+# Meant to be committed by the caller (a human, or an explicit gate-debt
+# PRD) — this script never commits, and a plain verdict run never widens
+# or auto-records a baseline on its own. Bypasses the verdict cache below
+# (a recording always reflects a fresh run). Exits 0 on a successful
+# write regardless of the underlying pass/block count.
+#
+# Verdict cache: on a successful (non-dry-run, non-record-baseline) run,
+# the computed verdict is cached at
+# `<project>/target/autobuilder/last-verdict.json` keyed on (HEAD sha,
+# this script's own sha256). A later invocation at the SAME head with an
+# UNCHANGED script replays the cached verdict (`extend-gate: verdict=...
+# (cached)`, same exit code) instead of regenerating all 25 receipts.
+# `--force` bypasses the cache and always runs the full sequence.
 #
 # Never runs `cargo clean` in the crate's own target/ (determinism and
 # cold-build-time already build in their own temp target dirs — memory
@@ -80,14 +121,19 @@
 set -uo pipefail
 export PATH="$HOME/.cargo/bin:$HOME/.local/bin:$PATH"
 
-RUSTBUILD_SCRIPTS="$HOME/.claude/skills/rustbuild/scripts"
-REVIEWER_PROMPT="$HOME/.claude/skills/rustbuild/prompts/reviewer-agent.md"
+# Overridable so tests/ can point at a fixture dir of fake binaries
+# without touching production behavior (default unchanged).
+RUSTBUILD_SCRIPTS="${RUSTBUILD_SCRIPTS:-$HOME/.claude/skills/rustbuild/scripts}"
+REVIEWER_PROMPT="${REVIEWER_PROMPT:-$HOME/.claude/skills/rustbuild/prompts/reviewer-agent.md}"
+BUILD_SCRIPTS="$(cd "$(dirname "$0")" && pwd)"
+GATE_DELTA="$BUILD_SCRIPTS/gate-delta.sh"
 
 die() { echo "extend-gate: $2" >&2; exit "$1"; }
 
 usage() {
   cat <<'EOF'
-usage: extend-gate.sh <build_into> [--base <tag>] [--head <sha>] [--dry-run] [--parallelism N]
+usage: extend-gate.sh <build_into> [--base <tag>] [--head <sha>] [--dry-run]
+                       [--parallelism N] [--record-baseline] [--force]
 EOF
 }
 
@@ -112,13 +158,17 @@ base_override=""
 head_want=""
 dry_run=false
 parallelism=6
+record_baseline=false
+force=false
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --base)        base_override="${2:?extend-gate: --base needs a value}"; shift 2 ;;
-    --head)        head_want="${2:?extend-gate: --head needs a value}"; shift 2 ;;
-    --dry-run)     dry_run=true; shift ;;
-    --parallelism) parallelism="${2:?extend-gate: --parallelism needs a value}"; shift 2 ;;
+    --base)             base_override="${2:?extend-gate: --base needs a value}"; shift 2 ;;
+    --head)             head_want="${2:?extend-gate: --head needs a value}"; shift 2 ;;
+    --dry-run)          dry_run=true; shift ;;
+    --parallelism)      parallelism="${2:?extend-gate: --parallelism needs a value}"; shift 2 ;;
+    --record-baseline)  record_baseline=true; shift ;;
+    --force)            force=true; shift ;;
     *) die 1 "unknown argument: $1 (see --help)" ;;
   esac
 done
@@ -128,6 +178,8 @@ git -C "$repo" rev-parse --git-dir >/dev/null 2>&1 || die 1 "not a git repo: $re
 command -v autobuilder >/dev/null 2>&1 || die 2 "autobuilder not on \$PATH (cargo install --path ~/wintermute/rustbuild/autobuilder --locked)"
 [ -x "$RUSTBUILD_SCRIPTS/extended-receipts.sh" ] || die 2 "missing $RUSTBUILD_SCRIPTS/extended-receipts.sh"
 [ -x "$RUSTBUILD_SCRIPTS/ship-tag.sh" ] || die 2 "missing $RUSTBUILD_SCRIPTS/ship-tag.sh"
+[ -x "$GATE_DELTA" ] || die 2 "missing $GATE_DELTA"
+command -v jq >/dev/null 2>&1 || die 2 "jq not on \$PATH (needed by gate-delta.sh)"
 
 # --- cargo project root resolution (PRD-build-extend-gate-nested-crate-project) ---
 # $repo itself wins immediately if it has a Cargo.toml (the common case,
@@ -265,6 +317,31 @@ if [ -n "$head_want" ] && [ "$head_want" != "$head_now" ]; then
   die 5 "refusing — HEAD is $head_now, --head asked for $head_want"
 fi
 
+# --- verdict cache (PRD-build-gate-delta-baseline P1) --------------------
+# Keyed on (HEAD sha, this script's own sha256) so an edit to extend-gate.sh
+# itself (a new producer, a bugfix) always invalidates a stale cached
+# verdict even at an unchanged HEAD. `--record-baseline` always runs the
+# full sequence (a recording must reflect a fresh run, never a cache);
+# `--force` always bypasses the cache. A cache hit never regenerates
+# receipts and never re-takes the integration lock's expensive path —
+# checked here, after the (cheap) dirty-tree/head-mismatch refusals above,
+# so those refusals still apply to a would-be cache hit exactly as they do
+# to a full run.
+self_hash="$(sha256sum "$0" 2>/dev/null | awk '{print $1}')"
+cache_file="$project_abs/target/autobuilder/last-verdict.json"
+if ! $record_baseline && ! $force && [ -f "$cache_file" ]; then
+  cached_head="$(jq -r '.head_sha // empty' "$cache_file" 2>/dev/null || true)"
+  cached_hash="$(jq -r '.script_sha256 // empty' "$cache_file" 2>/dev/null || true)"
+  if [ -n "$cached_head" ] && [ "$cached_head" = "$head_now" ] && [ -n "$cached_hash" ] && [ "$cached_hash" = "$self_hash" ]; then
+    cached_verdict="$(jq -r '.verdict // empty' "$cache_file" 2>/dev/null || true)"
+    cached_rc="$(jq -r '.exit_code // empty' "$cache_file" 2>/dev/null || true)"
+    if [ -n "$cached_verdict" ] && [ -n "$cached_rc" ]; then
+      echo "extend-gate: verdict=$cached_verdict (cached)"
+      exit "$cached_rc"
+    fi
+  fi
+fi
+
 t0=$(date +%s)
 blocking_notes=()
 note_block() { blocking_notes+=("$1"); echo "extend-gate: $1" >&2; }
@@ -371,18 +448,79 @@ summary="$(printf '%s\n' "$gate_out" | grep -m1 '^gate: ' || true)"
 
 wall=$(( $(date +%s) - t0 ))
 crate_name="$(basename "$repo")"
-outcome="pass"; [ "$gate_rc" -eq 0 ] || outcome="block"
 blockers_csv=""
 if [ "${#blocking_notes[@]}" -gt 0 ]; then
   blockers_csv="$(IFS='|'; echo "${blocking_notes[*]}")"
 fi
+# Overridable so tests/ never writes into the real journal (default unchanged).
+journal="${EXTEND_GATE_JOURNAL:-$HOME/brain/journal/build/$(date -u +%Y-%m-%d).md}"
+mkdir -p "$(dirname "$journal")"
+
+# --- record-baseline: write agent/gate-baseline.json from THIS run's
+# blocking set, print it, done. Never computes or acts on a delta verdict
+# — recording and shipping are separate, deliberate acts (design note:
+# "the gate never auto-widens a baseline"). ---------------------------
+gate_out_file="$(mktemp "${TMPDIR:-/tmp}/extend-gate-out.XXXXXX")"
+printf '%s\n' "$gate_out" > "$gate_out_file"
+
+if $record_baseline; then
+  recorded="$("$GATE_DELTA" record "$repo" "$gate_out_file")" || { rm -f "$gate_out_file"; die 2 "gate-delta.sh record failed"; }
+  rm -f "$gate_out_file"
+  echo "extend-gate: recorded baseline to $repo/agent/gate-baseline.json"
+  printf '%s\n' "$recorded"
+  printf '%s  gate  %s  record-baseline  (head=%s base=%s %s wall=%ss)\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$crate_name" "$head_now" "$base_ref" \
+    "${summary:-gate: no-summary-line}" "$wall" >>"$journal"
+  exit 0
+fi
+
+# --- delta verdict against the committed baseline (PRD-build-gate-delta-baseline) ---
+# `gate-delta.sh verdict`'s own exit code already mirrors <gate_rc>
+# byte-for-byte whenever there is no committed baseline (see that
+# script's header) — using it unconditionally as this script's final
+# exit code is what makes the absent-baseline path identical to the
+# pre-this-PRD behavior. Only the PRESENT-baseline path prints or
+# journals anything new.
+delta_out="$("$GATE_DELTA" verdict "$repo" "$gate_out_file" "$gate_rc")"
+delta_rc=$?
+rm -f "$gate_out_file"
+baseline_state="$(printf '%s\n' "$delta_out" | sed -n 's/^baseline=//p')"
+delta_verdict="$(printf '%s\n' "$delta_out" | sed -n 's/^verdict=//p')"
+new_blocks="$(printf '%s\n' "$delta_out" | sed -n 's/^new_blocks=//p')"
+inherited_blocks="$(printf '%s\n' "$delta_out" | sed -n 's/^inherited_blocks=//p')"
+
+final_rc="$delta_rc"
+outcome="pass"; [ "$gate_rc" -eq 0 ] || outcome="block"
+journal_suffix=""
+if [ "$baseline_state" = "present" ]; then
+  echo "extend-gate: delta verdict=$delta_verdict baseline=present new_blocks=${new_blocks:-none} inherited_blocks=${inherited_blocks:-none}"
+  outcome="$delta_verdict"
+  journal_suffix=" verdict=$delta_verdict inherited_blocks=[${inherited_blocks}]"
+fi
 
 # One journal line per gate run (requirement 8 / AC13): crate, HEAD, base
-# tag, pass/block counts, blocking receipt names, wall seconds.
-journal="$HOME/brain/journal/build/$(date -u +%Y-%m-%d).md"
-mkdir -p "$(dirname "$journal")"
-printf '%s  gate  %s  %s  (head=%s base=%s %s blocking=%s wall=%ss)\n' \
+# tag, pass/block counts, blocking receipt names, wall seconds. Absent a
+# committed baseline, journal_suffix is empty and this line is
+# byte-for-byte what it was before this PRD (AC4).
+printf '%s  gate  %s  %s  (head=%s base=%s %s blocking=%s wall=%ss)%s\n' \
   "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$crate_name" "$outcome" "$head_now" "$base_ref" \
-  "${summary:-gate: no-summary-line}" "${blockers_csv:-none}" "$wall" >>"$journal"
+  "${summary:-gate: no-summary-line}" "${blockers_csv:-none}" "$wall" "$journal_suffix" >>"$journal"
 
-exit "$gate_rc"
+# --- write the verdict cache (P1) — every full run, pass/delta-pass/block
+# alike, so a repeat invocation at the same head + same script replays
+# instead of regenerating. ------------------------------------------------
+cache_verdict_val="$outcome"
+mkdir -p "$(dirname "$cache_file")"
+jq -n --arg head "$head_now" --arg hash "$self_hash" --arg verdict "$cache_verdict_val" \
+     --argjson rc "$final_rc" --arg new "$new_blocks" --arg inh "$inherited_blocks" '
+  {
+    head_sha: $head,
+    script_sha256: $hash,
+    verdict: $verdict,
+    exit_code: $rc,
+    new_blocks: ($new | if . == "" then [] else split(",") end),
+    inherited_blocks: ($inh | if . == "" then [] else split(",") end)
+  }
+' > "$cache_file" 2>/dev/null || true
+
+exit "$final_rc"

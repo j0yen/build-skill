@@ -550,7 +550,24 @@ in this tick's selection run in parallel via Agent tool calls
   pending rust-extend gates) so a box never survives into a second billed
   hour idle.
 
-  - **On pass** (`pass=25 block=0`): tag the shipped commit —
+  **Ship rule (updated 2026-09-06, PRD-build-gate-delta-baseline): `pass`
+  OR `delta-pass` ships — not just absolute `block=0`.** `extend-gate.sh`
+  additionally diffs the blocking receipt set against a committed
+  per-repo baseline (`<build_into>/agent/gate-baseline.json`, written only
+  by an explicit `extend-gate.sh <build_into> --record-baseline` — see
+  Deploy notes / gate-debt PRDs, never auto-widened) and prints its own
+  `extend-gate: delta verdict=pass|delta-pass|block baseline=present|absent
+  new_blocks=<...> inherited_blocks=<...>` line on top of the raw
+  `pass=N block=M` summary. `delta-pass` means block>0 but every blocking
+  receipt is already named in the baseline — chronic, pre-existing debt on
+  a shared repo (summa, rustbuild, adopt) no longer holds an unrelated
+  PRD's finished work `in_progress` forever. A repo with no committed
+  baseline behaves exactly as before this PRD (fail closed to absolute
+  block-zero) — `extend-gate.sh`'s own exit code is the single thing to
+  branch on below; it is 0 for pass or delta-pass, 1 for block, in every
+  case (baselined or not).
+
+  - **On pass or delta-pass** (exit 0): tag the shipped commit —
     `~/.claude/skills/rustbuild/scripts/ship-tag.sh <build_into> <slug>`
     (tags `v<version>` at HEAD, pushes `--follow-tags`; a second run is a
     no-op) — then write the PRD's `Receipts:` line:
@@ -559,19 +576,39 @@ in this tick's selection run in parallel via Agent tool calls
     Receipts: <build_into>/target/autobuilder/receipts (gate: pass=25 block=0 verdict=pass at <sha>, tag v<version>; rollback base <tag> at <sha>)
     ```
 
-    (`<tag>` and its `<sha>` come from `target/autobuilder/receipts/rollback-plan.json`'s `base_tag`/`base_sha` — when `base_tag` is `null`, write `rollback base initial (no tags) at <base_sha>` instead.) Then proceed to the verified-completed checklist (check #6 below).
-  - **On block**: the manifest entry's `blockers` gains one
-    `gate: <receipt> — <message>` line per blocking receipt (the receipt
-    names and messages `extend-gate.sh` printed and journaled), `next:
-    gate-red`, the PRD's `Status:` stays `in_progress` — **do NOT tag,
-    archive, or write a passing `Receipts:` line.** The journal already has
-    one line naming the blocking receipts (written by `extend-gate.sh`
-    itself); no separate journal write is needed here.
+    On a `delta-pass` (block>0, all baselined), write the block/verdict
+    counts and `verdict=delta-pass` from `extend-gate.sh`'s own summary
+    line instead of `pass=25 block=0 verdict=pass`, and pass the
+    `inherited_blocks` names it printed to `scripts/archive-trailer.sh`
+    via `--inherited-blocks name1,name2,...` so the archive commit's
+    trailer carries an `inherited_blocks=[...]` line naming the baseline
+    debt still outstanding — debt stays visible on every shipped PRD, not
+    silently absorbed. (`<tag>` and its `<sha>` come from
+    `target/autobuilder/receipts/rollback-plan.json`'s
+    `base_tag`/`base_sha` — when `base_tag` is `null`, write `rollback base
+    initial (no tags) at <base_sha>` instead.) Then proceed to the
+    verified-completed checklist (check #6 below).
+  - **On block** (exit 1 — no committed baseline covers everything
+    currently blocking, or there's no baseline at all): the manifest
+    entry's `blockers` gains one `gate: <receipt> — <message>` line per
+    blocking receipt (the receipt names and messages `extend-gate.sh`
+    printed and journaled — for a baselined repo this is just the
+    `new_blocks` names, not the inherited ones), `next: gate-red`, the
+    PRD's `Status:` stays `in_progress` — **do NOT tag, archive, or write
+    a passing `Receipts:` line.** The journal already has one line naming
+    the blocking receipts (written by `extend-gate.sh` itself); no
+    separate journal write is needed here.
   - `extend-gate.sh` takes the crate's own integration lock, so a `gate`
     action never races a same-crate `integrate` or another `gate` run.
     Resumable: if a tick ends mid-gate, the next tick's `gate` action reruns
     `extend-gate.sh` from the start — a partial receipt set is never read
     as green.
+  - **Verdict cache (P1).** A `gate` action at an unchanged HEAD with an
+    unchanged `extend-gate.sh` replays its prior verdict from
+    `target/autobuilder/last-verdict.json` (`extend-gate: verdict=...
+    (cached)`, same exit code) instead of re-running all 25 receipts — the
+    common case of a tick re-selecting a PRD whose gate already ran this
+    HEAD. Pass `--force` to bypass the cache and always regenerate.
 - **install / wire** [new-repo only]: When implementation is locally
   green (tests pass, `cargo test --release` ok), install built binaries
   to `~/.local/bin/` via `install -Dm755`. If the PRD includes hooks,
@@ -770,16 +807,20 @@ in this tick's selection run in parallel via Agent tool calls
     The repo's existing README.md is NOT required to be regenerated.
   - Check #4 becomes: `~/wintermute/REPOS.md` is unchanged by this
     PRD's tick history (negative AC — the extended repo is already listed).
-  - **Check #6 (new)**: `autobuilder gate --project <build_into>` at a
-    HEAD equal to `origin/<default>` reports `pass=25 block=0`. This is
-    what the `gate` ship action (above) already established and recorded
-    in the `Receipts:` line — archive re-checks it rather than trusting a
-    stale line. **The archive gate refuses otherwise, naming check #6** —
-    a PRD whose `gate` action last blocked, or whose `build_into` HEAD has
-    since moved (another PRD landed on the same crate without a fresh
-    `gate` run), fails archive here and stays in `build-queue/` with
-    `Status: in_progress`, not silently treated as shipped on the strength
-    of checks #1/#5 alone.
+  - **Check #6 (new; updated 2026-09-06 for PRD-build-gate-delta-baseline)**:
+    `scripts/extend-gate.sh <build_into> --head <HEAD>` at a HEAD equal to
+    `origin/<default>` exits 0 — `pass` (`block=0`) OR `delta-pass` (block>0
+    but every blocking receipt is named in the committed
+    `agent/gate-baseline.json`) both satisfy this check; only `verdict=block`
+    (exit 1) fails it. This is what the `gate` ship action (above) already
+    established and recorded in the `Receipts:` line — archive re-checks it
+    (via the verdict cache, so re-checking a HEAD the same tick's `gate`
+    action just verified is cheap) rather than trusting a stale line.
+    **The archive gate refuses otherwise, naming check #6** — a PRD whose
+    `gate` action last blocked, or whose `build_into` HEAD has since moved
+    (another PRD landed on the same crate without a fresh `gate` run), fails
+    archive here and stays in `build-queue/` with `Status: in_progress`, not
+    silently treated as shipped on the strength of checks #1/#5 alone.
 
   **Verified-completed checklist (python-* path):**
   Same as the new-repo checklist with these substitutions:
