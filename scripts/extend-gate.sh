@@ -212,6 +212,22 @@ find_cargo_root() {
     printf '%s\n' "${d1[0]}"
     return 0
   elif [ "${#d1[@]}" -gt 1 ]; then
+    # Disambiguate the common <repo>/<repo>/Cargo.toml nesting pattern: if
+    # exactly one candidate's basename matches the repo's own basename,
+    # prefer it over unrelated sibling dirs (e.g. a "tools/" cargo
+    # workspace). Only fires inside this already-ambiguous branch, so
+    # repos without this exact collision are unaffected.
+    local base_name="$(basename "$base")" self_match="" self_count=0 cand
+    for cand in "${d1[@]}"; do
+      if [ "$(basename "$cand")" = "$base_name" ]; then
+        self_match="$cand"
+        self_count=$((self_count + 1))
+      fi
+    done
+    if [ "$self_count" -eq 1 ]; then
+      printf '%s\n' "$self_match"
+      return 0
+    fi
     printf 'ambiguous — multiple Cargo.toml found one level under %s: %s' "$base" "${d1[*]}"
     return 1
   fi
@@ -232,6 +248,20 @@ find_cargo_root() {
     printf '%s\n' "${d2[0]}"
     return 0
   elif [ "${#d2[@]}" -gt 1 ]; then
+    # Same repo-basename tie-break as the one-level-down case, mirrored
+    # for consistency (untested pattern — the one-level case above is the
+    # one actually observed).
+    local base_name2="$(basename "$base")" self_match2="" self_count2=0 cand2
+    for cand2 in "${d2[@]}"; do
+      if [ "$(basename "$cand2")" = "$base_name2" ]; then
+        self_match2="$cand2"
+        self_count2=$((self_count2 + 1))
+      fi
+    done
+    if [ "$self_count2" -eq 1 ]; then
+      printf '%s\n' "$self_match2"
+      return 0
+    fi
     printf 'ambiguous — multiple Cargo.toml found two levels under %s: %s' "$base" "${d2[*]}"
     return 1
   fi
