@@ -464,8 +464,12 @@ in this tick's selection run in parallel via Agent tool calls
   acceptance_criteria are sourced from the PRD; every other required field
   — user_persona, unfakeable_metric, scope, non_goals, hard_constraints,
   five_whys_trace — carries forward unchanged from the existing card,
-  marked in the card's `carried_forward` object, never fabricated) and, in
-  the same pass, removes `agent/intent_card_amendment_request.json` when
+  marked in the sidecar `agent/intent-card.carried.json`, never fabricated
+  or embedded in the card itself — PRD-build-intent-card-schema:
+  `intake.rs`'s validator rejects any key it doesn't list, and
+  `carried_forward` was never one of them; see
+  `docs/intent-card-schema.md`) and, in the same pass, removes
+  `agent/intent_card_amendment_request.json` when
   every one of its `scope_additions` entries is now covered by the
   refreshed card. On a malformed PRD (no parseable AC lines) the script
   exits 3 and writes nothing — treat that as a `gate-red`-shaped stop

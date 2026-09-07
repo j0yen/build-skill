@@ -508,11 +508,18 @@ card = {
         }
     ],
     "created_at": now,
-    "carried_forward": {k: False for k in (
-        "user_persona", "unfakeable_metric", "scope", "non_goals",
-        "hard_constraints", "five_whys_trace", "created_at",
-    )},
 }
+
+# carried_forward lives in the sidecar, not the card (PRD-build-intent-
+# card-schema — intake.rs's ALLOWED_TOP never included `carried_forward`,
+# so embedding it here fails schema validation on every real card; see
+# docs/intent-card-schema.md). Every field in this minimal card is a
+# structural placeholder (nothing to carry forward from — no PRD, no
+# prior card), so every marker is False.
+carried_forward = {k: False for k in (
+    "user_persona", "unfakeable_metric", "scope", "non_goals",
+    "hard_constraints", "five_whys_trace", "created_at",
+)}
 
 os.makedirs(os.path.join(repo, "agent"), exist_ok=True)
 dest = os.path.join(repo, "agent", "intent-card.json")
@@ -520,6 +527,12 @@ tmp = dest + ".tmp"
 with open(tmp, "w", encoding="utf-8") as fh:
     fh.write(json.dumps(card, indent=2) + "\n")
 os.replace(tmp, dest)
+
+carried_dest = os.path.join(repo, "agent", "intent-card.carried.json")
+carried_tmp = carried_dest + ".tmp"
+with open(carried_tmp, "w", encoding="utf-8") as fh:
+    fh.write(json.dumps(carried_forward, indent=2, sort_keys=True) + "\n")
+os.replace(carried_tmp, carried_dest)
 PY
   fi
   created+=("intent-card.json")

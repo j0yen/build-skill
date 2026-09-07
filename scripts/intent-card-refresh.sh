@@ -27,9 +27,15 @@
 #              PRD-sourceable — carried forward byte-for-byte from the
 #              existing card when one exists, else filled with an honest
 #              structural placeholder (never a fabricated metric). Every
-#              such field is named in the top-level `carried_forward`
-#              object with a boolean. Write is atomic (temp + rename);
-#              agent/ is created if missing.
+#              such field is named, with a boolean, in the SIDECAR file
+#              agent/intent-card.carried.json — NOT inside the card itself
+#              (PRD-build-intent-card-schema: intake.rs's validator has
+#              `additionalProperties: false` at the top level and never
+#              allowed `carried_forward`, so embedding it there failed
+#              every real card's schema validation; see
+#              docs/intent-card-schema.md for the accepted shape). Both
+#              files are written atomically (temp + rename); agent/ is
+#              created if missing.
 #              When agent/intent_card_amendment_request.json exists and
 #              every one of its scope_additions entries is "covered" —
 #              either it names no prd_source (a bare non-PRD note, e.g. a
@@ -406,15 +412,17 @@ if not acceptance_criteria:
     die(3, f"no parseable `N. P[0-2] — Given/When/Then` acceptance-criterion lines found in {prd_path}")
 
 existing = load_json(os.path.join(repo, "agent", "intent-card.json"))
+carried_sidecar_path = os.path.join(repo, "agent", "intent-card.carried.json")
+existing_carried_sidecar = load_json(carried_sidecar_path)
 
 carried_forward = {}
 
 
 def carry(field, default_factory):
     if existing is not None and field in existing:
-        # Propagate the PRIOR card's own carried_forward marker for this
-        # field when it recorded one (i.e. the "existing" card is itself
-        # a product of a previous intent-card-refresh.sh run). Without
+        # Propagate the PRIOR run's carried_forward marker for this field
+        # when one was recorded (i.e. the "existing" card is itself a
+        # product of a previous intent-card-refresh.sh run). Without
         # this, a cold-start repo breaks idempotency (AC3): run 1 mints a
         # placeholder and honestly marks it False (nothing to carry
         # forward from), but run 2 finds that placeholder sitting in the
@@ -422,12 +430,25 @@ def carry(field, default_factory):
         # content of the card on the second run even though nothing
         # about the PRD or repo changed. Sticking to the prior marker
         # (False stays False, True stays True) makes the field's
-        # provenance monotonic across repeated runs. When the existing
-        # card carries NO marker at all for this field, it predates this
-        # tool (a genuinely human-authored card, e.g. from the full
-        # autobuilder 5-whys flow) — that first refresh over it legitimately
-        # marks the field True, same as before.
-        prior_marker = (existing.get("carried_forward") or {}).get(field)
+        # provenance monotonic across repeated runs. When neither the
+        # sidecar nor a legacy embedded marker exists for this field, it
+        # predates this tool (a genuinely human-authored card, e.g. from
+        # the full autobuilder 5-whys flow, or a pre-PRD-build-intent-
+        # card-schema card that has not been refreshed yet) — that first
+        # refresh over it legitimately marks the field True, same as
+        # before.
+        #
+        # Sidecar (agent/intent-card.carried.json) is the current home
+        # for this bookkeeping (PRD-build-intent-card-schema — intake.rs
+        # rejects a `carried_forward` key inside the card itself). Fall
+        # back to a legacy embedded `carried_forward` object inside the
+        # existing card only when no sidecar exists yet, so a repo that
+        # has not been migrated still gets correct idempotency on its
+        # first post-migration refresh.
+        if isinstance(existing_carried_sidecar, dict):
+            prior_marker = existing_carried_sidecar.get(field)
+        else:
+            prior_marker = (existing.get("carried_forward") or {}).get(field)
         carried_forward[field] = True if prior_marker is None else bool(prior_marker)
         return existing[field]
     carried_forward[field] = False
@@ -458,7 +479,6 @@ new_card = {
     "hard_constraints": hard_constraints,
     "five_whys_trace": five_whys_trace,
     "created_at": created_at,
-    "carried_forward": carried_forward,
 }
 if existing is not None and "ambiguities_resolved" in existing:
     new_card["ambiguities_resolved"] = existing["ambiguities_resolved"]
@@ -477,6 +497,15 @@ tmp_path = card_path + ".tmp"
 with open(tmp_path, "w", encoding="utf-8") as fh:
     fh.write(card_text)
 os.replace(tmp_path, card_path)
+
+# carried_forward lives in the sidecar, not the card (PRD-build-intent-
+# card-schema — intake.rs rejects the extra key in the card). Written
+# atomically, same as the card, right next to it.
+carried_text = json.dumps(carried_forward, indent=2, sort_keys=True) + "\n"
+carried_tmp_path = carried_sidecar_path + ".tmp"
+with open(carried_tmp_path, "w", encoding="utf-8") as fh:
+    fh.write(carried_text)
+os.replace(carried_tmp_path, carried_sidecar_path)
 
 amendment_path = os.path.join(agent_dir, "intent_card_amendment_request.json")
 amendment_removed = False
@@ -497,6 +526,7 @@ if os.path.isfile(amendment_path):
 
 print(json.dumps({
     "written": card_path,
+    "carried_forward_sidecar": carried_sidecar_path,
     "intent_slug": slug,
     "ac_count": len(acceptance_criteria),
     "amendment_removed": amendment_removed,

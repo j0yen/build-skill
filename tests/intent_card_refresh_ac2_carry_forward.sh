@@ -52,10 +52,20 @@ rc=$?
 expect "exit 0" "0" "$rc"
 
 card="$repo/agent/intent-card.json"
+sidecar="$repo/agent/intent-card.carried.json"
+
+expect "card has no carried_forward key" "false" "$("$JQ" -r 'has("carried_forward")' "$card")"
+if [ -f "$sidecar" ]; then
+  echo "ok  sidecar written at $sidecar"
+else
+  echo "FAIL sidecar not written at $sidecar" >&2
+  fail=1
+fi
+
 expect "user_persona carried"          "A fleet operator shipping rust-extend PRDs." "$("$JQ" -r '.user_persona' "$card")"
-expect "user_persona carried_forward"  "true"   "$("$JQ" -r '.carried_forward.user_persona' "$card")"
+expect "user_persona carried_forward"  "true"   "$("$JQ" -r '.user_persona' "$sidecar")"
 expect "unfakeable_metric name kept"   "custom_metric" "$("$JQ" -r '.unfakeable_metric.name' "$card")"
-expect "unfakeable_metric carried_forward" "true" "$("$JQ" -r '.carried_forward.unfakeable_metric' "$card")"
+expect "unfakeable_metric carried_forward" "true" "$("$JQ" -r '.unfakeable_metric' "$sidecar")"
 expect "scope carried"                 '["stale scope item"]' "$("$JQ" -c '.scope' "$card")"
 expect "created_at carried"            "2020-01-01T00:00:00Z" "$("$JQ" -r '.created_at' "$card")"
 # Fields the refresh DOES source must not claim carried_forward.
