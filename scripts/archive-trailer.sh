@@ -76,7 +76,7 @@ while [ "$#" -gt 0 ]; do
   case "$1" in
     --paired) paired_kv+=("${2:-}"); shift 2 ;;
     --paired=*) paired_kv+=("${1#--paired=}"); shift ;;
-    --paired-json) paired_json="${2:-{}}"; shift 2 ;;
+    --paired-json) paired_json="${2:-"{}"}"; shift 2 ;;
     --paired-json=*) paired_json="${1#--paired-json=}"; shift ;;
     --reasons-json) reasons_json="${2:-}"; shift 2 ;;
     --reasons-json=*) reasons_json="${1#--reasons-json=}"; shift ;;
@@ -100,7 +100,7 @@ paired_merged="$(
   printf '%s\n' "${paired_kv[@]+"${paired_kv[@]}"}" \
     | "$JQ" -Rn --argjson seed "$paired_json" '
         reduce inputs as $line ($seed;
-          ($line | capture("^(?<k>[0-9]+)=(?<v>.*)$")) as $m
+          ([$line | capture("^(?<k>[0-9]+)=(?<v>.*)$")] | first) as $m
           | if $m then . + {($m.k): $m.v} else . end)' 2>/dev/null
 )" || {
   echo "archive-trailer: --paired-json is not valid JSON" >&2; exit 2; }
