@@ -26,10 +26,16 @@
 #       Print the current claim: free, or `<lane> <iso-ts> age=<s>s
 #       stale=<yes|no>` (stale threshold 3h, matching the PRD's
 #       stale-claim-recovery rule). Exit 0 always (read-only).
-#   lane-claim.sh target-busy <build_into-path> [--exclude-prd <path>] [--prd-dir <dir>]
+#   lane-claim.sh target-busy <build_into-path> [--lane <name>] [--exclude-prd <path>] [--prd-dir <dir>]
 #       Scan build-queue/*.md for a live (non-stale) claim whose build_into
-#       matches. Exit 0 + "free" if none; exit 1 + "busy: <slug> <lane>
-#       age=<s>s" if one is found. Read-only.
+#       matches. A claim held by a DIFFERENT lane than --lane (default
+#       `hostname`) blocks immediately: exit 1 + "busy: <slug> <lane>
+#       age=<s>s" (cross-lane exclusivity, unconditional). A claim held by
+#       the SAME lane does not block on its own — same-lane claims fall
+#       through to the ≤3 same-target sub-cap (SKILL.md Selection rules #1):
+#       once SAME_LANE_SUBCAP live same-lane claims are found, exit 1 +
+#       "sub-cap: <N> same-lane claims already live on <target> (lane=<l>)".
+#       Exit 0 + "free" if neither condition trips. Read-only.
 #
 # Frontmatter forms read/written follow build-contract.md: bullet
 # (`- key: value`), bare (`key: value`), bold (`**key:** value`), first 80
@@ -41,6 +47,9 @@
 set -uo pipefail
 
 STALE_SECS=$((3 * 3600))
+# Max same-lane live claims on one build_into repo before target-busy blocks
+# a further same-lane candidate (SKILL.md Selection rules #1 worktree cap).
+SAME_LANE_SUBCAP=3
 
 die() { echo "lane-claim: $*" >&2; exit "${2:-4}"; }
 
@@ -286,15 +295,17 @@ cmd_release() {
 
 cmd_target_busy() {
   local target="$1"; shift
-  local exclude="" prd_dir="$HOME/Documents/PRDs"
+  local exclude="" prd_dir="$HOME/Documents/PRDs" query_lane
+  query_lane=$(hostname)
   while [ $# -gt 0 ]; do
     case "$1" in
       --exclude-prd) exclude="$2"; shift 2 ;;
       --prd-dir) prd_dir="$2"; shift 2 ;;
+      --lane) query_lane="$2"; shift 2 ;;
       *) shift ;;
     esac
   done
-  local f bi lane_val host ts age
+  local f bi lane_val host ts age same_count=0
   for f in "$prd_dir"/build-queue/PRD-*.md; do
     [ -f "$f" ] || continue
     [ -n "$exclude" ] && [ "$(cd "$(dirname "$f")" && pwd)/$(basename "$f")" = "$(cd "$(dirname "$exclude")" && pwd)/$(basename "$exclude")" ] && continue
@@ -304,8 +315,18 @@ cmd_target_busy() {
     [ -z "$lane_val" ] && continue
     host=$(lane_host_of "$lane_val"); ts=$(lane_ts_of "$lane_val")
     age=$(age_seconds "$ts")
-    if ! is_stale "$age"; then
+    is_stale "$age" && continue
+    if ! same_lane "$host" "$query_lane"; then
+      # Foreign-lane claim: unconditional block, exactly as before
+      # (cross-lane exclusivity is never relaxed).
       echo "busy: $(slug_of "$f") $host age=${age}s"
+      exit 1
+    fi
+    # Same-lane claim: don't block outright — count it toward the
+    # ≤SAME_LANE_SUBCAP same-target worktree fan-out cap instead.
+    same_count=$((same_count + 1))
+    if [ "$same_count" -ge "$SAME_LANE_SUBCAP" ]; then
+      echo "sub-cap: $SAME_LANE_SUBCAP same-lane claims already live on $target (lane=$query_lane)"
       exit 1
     fi
   done

@@ -80,6 +80,65 @@ set -e
 echo "$out" | grep -q '^skip: busy:' || { echo "FAIL busy msg: $out"; exit 1; }
 echo ok
 
+echo "== same-lane sub-cap: 1-2 live same-lane claims admit the candidate; a 3rd is skipped naming the sub-cap, not generic busy (AC3) =="
+cat > "$ROOT/clone/build-queue/PRD-cap-a.md" <<EOF
+# PRD: cap-a
+
+- Status: queued
+- build_target: shell
+- build_into: /tmp/target-repo-c
+EOF
+cat > "$ROOT/clone/build-queue/PRD-cap-b.md" <<EOF
+# PRD: cap-b
+
+- Status: queued
+- build_target: shell
+- build_into: /tmp/target-repo-c
+EOF
+cat > "$ROOT/clone/build-queue/PRD-cap-c.md" <<EOF
+# PRD: cap-c
+
+- Status: queued
+- build_target: shell
+- build_into: /tmp/target-repo-c
+EOF
+git -C "$ROOT/clone" add -A
+git -C "$ROOT/clone" -c user.name=t -c user.email=t@t commit -q -m add-cap-prds
+git -C "$ROOT/clone" push -q origin "$(git -C "$ROOT/clone" symbolic-ref --short HEAD)"
+
+CAP_A="$ROOT/clone/build-queue/PRD-cap-a.md"
+CAP_B="$ROOT/clone/build-queue/PRD-cap-b.md"
+CAP_C="$ROOT/clone/build-queue/PRD-cap-c.md"
+
+"$LC" claim "$CAP_A" RedBaron >/dev/null
+out=$("$LP" select "$CAP_B" RedBaron "$ROOT/clone")
+echo "$out" | grep -q '^ok:' || { echo "FAIL expected ok with 1 same-lane claim live, got: $out"; exit 1; }
+echo ok
+
+"$LC" claim "$CAP_B" RedBaron >/dev/null
+out=$("$LP" select "$CAP_C" RedBaron "$ROOT/clone")
+echo "$out" | grep -q '^ok:' || { echo "FAIL expected ok with 2 same-lane claims live, got: $out"; exit 1; }
+echo ok
+
+"$LC" claim "$CAP_C" RedBaron >/dev/null
+cat > "$ROOT/clone/build-queue/PRD-cap-d.md" <<EOF
+# PRD: cap-d
+
+- Status: queued
+- build_target: shell
+- build_into: /tmp/target-repo-c
+EOF
+git -C "$ROOT/clone" add -A
+git -C "$ROOT/clone" -c user.name=t -c user.email=t@t commit -q -m add-cap-d
+git -C "$ROOT/clone" push -q origin "$(git -C "$ROOT/clone" symbolic-ref --short HEAD)"
+CAP_D="$ROOT/clone/build-queue/PRD-cap-d.md"
+set +e
+out=$("$LP" select "$CAP_D" RedBaron "$ROOT/clone" 2>&1); rc=$?
+set -e
+[ "$rc" -eq 1 ] || { echo "FAIL expected exit 1 (sub-cap), got $rc: $out"; exit 1; }
+echo "$out" | grep -q '^skip: sub-cap:' || { echo "FAIL expected sub-cap skip msg, got: $out"; exit 1; }
+echo ok
+
 echo "== reachable: valid origin =="
 out=$("$LP" reachable "$ROOT/clone")
 [ "$out" = "reachable" ] || { echo "FAIL: $out"; exit 1; }

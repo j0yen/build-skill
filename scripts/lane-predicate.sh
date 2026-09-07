@@ -12,9 +12,13 @@
 # Subcommands:
 #   lane-predicate.sh select <prd-path> [lane-name] [prd-dir]
 #       Exit 0 + "ok: <reason>"   if this lane may select the PRD this tick.
-#       Exit 1 + "skip: <reason>" if it must not (cargo-bound on carbon, or
+#       Exit 1 + "skip: <reason>" if it must not (cargo-bound on carbon,
 #                                  another lane holds a live claim on the
-#                                  same build_into).
+#                                  same build_into — "skip: busy: ..." — or
+#                                  this lane's own same-target worktree
+#                                  fan-out is already at the sub-cap —
+#                                  "skip: sub-cap: ..."; see lane-claim.sh
+#                                  target-busy).
 #       Exit 4                    usage / missing file.
 #   lane-predicate.sh reachable [repo-path]
 #       Exit 0 + "reachable"      origin answers `git ls-remote`.
@@ -67,7 +71,7 @@ cmd_select() {
   local bi; bi=$(read_field "$prd" build_into)
   if [ -n "$bi" ] && [ -x "$LANE_CLAIM" ]; then
     local busy_out
-    if ! busy_out=$("$LANE_CLAIM" target-busy "$bi" --exclude-prd "$prd" --prd-dir "$prd_dir" 2>&1); then
+    if ! busy_out=$("$LANE_CLAIM" target-busy "$bi" --lane "$lane" --exclude-prd "$prd" --prd-dir "$prd_dir" 2>&1); then
       echo "skip: $busy_out"
       exit 1
     fi
