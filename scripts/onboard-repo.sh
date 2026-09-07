@@ -16,6 +16,7 @@
 #
 # Usage:
 #   onboard-repo.sh <repo> [--check] [--rollback-model revert-commits|redeploy-tag]
+#                          [--project-root <rel>]
 #   onboard-repo.sh --list
 #
 # Modes:
@@ -138,6 +139,8 @@ repo_arg="$1"; shift
 check_mode=false
 rollback_model="revert-commits"
 
+project_root_override=""
+
 while [ $# -gt 0 ]; do
   case "$1" in
     --check) check_mode=true; shift ;;
@@ -148,6 +151,7 @@ while [ $# -gt 0 ]; do
         *) die 1 "--rollback-model must be revert-commits or redeploy-tag, got $rollback_model" ;;
       esac
       shift 2 ;;
+    --project-root)     project_root_override="${2:?onboard-repo: --project-root needs a value}"; shift 2 ;;
     *) die 1 "unknown argument: $1 (see --help)" ;;
   esac
 done
@@ -217,7 +221,15 @@ find_cargo_root() {
   return 1
 }
 
-project_abs="$(find_cargo_root "$repo")" || die 2 "$project_abs"
+# --project-root <rel>: explicit disambiguation when find_cargo_root's
+# one-crate rule can't decide (e.g. sibling crates one level down, like
+# autobuilder/ + tools/). Relative to the repo; must contain a Cargo.toml.
+if [ -n "$project_root_override" ]; then
+  project_abs="$repo/$project_root_override"
+  [ -f "$project_abs/Cargo.toml" ] || die 2 "no Cargo.toml at --project-root $project_root_override (looked in $project_abs)"
+else
+  project_abs="$(find_cargo_root "$repo")" || die 2 "$project_abs"
+fi
 project_rel="$(realpath --relative-to="$repo" "$project_abs")"
 project_prefix=""
 [ "$project_rel" = "." ] || project_prefix="$project_rel/"
