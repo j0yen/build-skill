@@ -83,6 +83,16 @@
 #   6  could not resolve a unique Cargo project root under <build_into>
 #      (none found, or more than one candidate) — refused before any
 #      producer ran
+#   7  installed `autobuilder` binary is STALE — its `--version` is older
+#      than the canonical crate's `[package] version` in
+#      $AUTOBUILDER_CANONICAL_CARGO_TOML — refused before any producer ran
+#      (AC4, PRD-autobuilder-source-unify). The message names the
+#      installed version, the expected (canonical) version, and the exact
+#      `cargo install --path <canonical-crate-dir> --locked` fix. Skipped
+#      (not an error) when the canonical Cargo.toml itself is absent —
+#      e.g. a test HOME with no checked-out canonical crate — since this
+#      guard is about staleness, not about requiring the canonical source
+#      to exist on every box that runs a gate.
 #
 # --record-baseline: runs the full producer sequence exactly as a normal
 # invocation, then instead of computing a delta verdict, writes
@@ -130,6 +140,14 @@ export PATH="$HOME/.cargo/bin:$HOME/.local/bin:$PATH"
 # without touching production behavior (default unchanged).
 RUSTBUILD_SCRIPTS="${RUSTBUILD_SCRIPTS:-$HOME/.claude/skills/rustbuild/scripts}"
 REVIEWER_PROMPT="${REVIEWER_PROMPT:-$HOME/.claude/skills/rustbuild/prompts/reviewer-agent.md}"
+# Canonical autobuilder crate Cargo.toml — the install-freshness guard
+# (AC4, PRD-autobuilder-source-unify, exit 7 below) reads its
+# `[package] version` and compares it to the installed `autobuilder
+# --version`. Overridable so tests/ can point at a fixture Cargo.toml
+# without touching production behavior (default unchanged: the split
+# repo's nested crate root, matching this fleet's `--project-root
+# autobuilder` convention).
+AUTOBUILDER_CANONICAL_CARGO_TOML="${AUTOBUILDER_CANONICAL_CARGO_TOML:-$HOME/wintermute/autobuilder/autobuilder/Cargo.toml}"
 BUILD_SCRIPTS="$(cd "$(dirname "$0")" && pwd)"
 GATE_DELTA="$BUILD_SCRIPTS/gate-delta.sh"
 
@@ -188,6 +206,55 @@ command -v autobuilder >/dev/null 2>&1 || die 2 "autobuilder not on \$PATH (carg
 [ -x "$RUSTBUILD_SCRIPTS/ship-tag.sh" ] || die 2 "missing $RUSTBUILD_SCRIPTS/ship-tag.sh"
 [ -x "$GATE_DELTA" ] || die 2 "missing $GATE_DELTA"
 command -v jq >/dev/null 2>&1 || die 2 "jq not on \$PATH (needed by gate-delta.sh)"
+
+# --- install-freshness guard (AC4, PRD-autobuilder-source-unify) --------
+# The installed `autobuilder` binary is the tool every producer below
+# shells out to (intake, loop, vti-plan, rollback-plan, reviewer-agent,
+# ci-checks, gate) — ITS OWN crate version, not $repo's, is what matters
+# here: a binary older than the canonical crate silently runs
+# feature-incomplete checks (e.g. an old rollback model) and produces
+# receipts that look green but aren't. Refused before any producer runs,
+# and before the project-root search / integration lock below, since
+# neither needs to happen for a run this guard is about to block anyway.
+# See exit code 7 above for the absent-canonical-Cargo.toml skip case.
+canonical_crate_version() {
+  local toml="$1" in_pkg=0 line
+  [ -f "$toml" ] || return 1
+  while IFS= read -r line; do
+    case "$line" in
+      '[package]') in_pkg=1; continue ;;
+      '['*)        in_pkg=0; continue ;;
+    esac
+    if [ "$in_pkg" -eq 1 ]; then
+      case "$line" in
+        version\ =\ \"*\"|version=\"*\")
+          line="${line#*\"}"
+          printf '%s\n' "${line%%\"*}"
+          return 0
+          ;;
+      esac
+    fi
+  done < "$toml"
+  return 1
+}
+
+version_lt() {
+  [ "$1" = "$2" ] && return 1
+  local lowest
+  lowest="$(printf '%s\n%s\n' "$1" "$2" | sort -t. -k1,1n -k2,2n -k3,3n | head -1)"
+  [ "$lowest" = "$1" ]
+}
+
+if canonical_version="$(canonical_crate_version "$AUTOBUILDER_CANONICAL_CARGO_TOML")" && [ -n "$canonical_version" ]; then
+  installed_version="$(autobuilder --version 2>/dev/null | awk '{print $NF}')"
+  [ -n "$installed_version" ] || die 2 "could not parse 'autobuilder --version' output to determine the installed version (canonical crate expects $canonical_version at $AUTOBUILDER_CANONICAL_CARGO_TOML)"
+  if version_lt "$installed_version" "$canonical_version"; then
+    canonical_dir="$(dirname "$AUTOBUILDER_CANONICAL_CARGO_TOML")"
+    die 7 "installed autobuilder binary is STALE — installed=$installed_version expected=$canonical_version (canonical crate: $AUTOBUILDER_CANONICAL_CARGO_TOML) — fix: cargo install --path $canonical_dir --locked"
+  fi
+else
+  echo "extend-gate: no canonical crate Cargo.toml at $AUTOBUILDER_CANONICAL_CARGO_TOML — skipping install-freshness guard" >&2
+fi
 
 # --- cargo project root resolution (PRD-build-extend-gate-nested-crate-project) ---
 # $repo itself wins immediately if it has a Cargo.toml (the common case,
