@@ -4,6 +4,7 @@
 # reads is never bound to a stale commit. PRD-build-extend-gate-receipts.
 #
 # usage: extend-gate.sh <build_into> [--base <tag>] [--head <sha>] [--dry-run]
+#                        [--project-root <rel>]
 #                        [--parallelism N] [--record-baseline] [--force]
 #
 # On a clean main checkout, at HEAD, in this order:
@@ -165,6 +166,7 @@ dry_run=false
 parallelism=6
 record_baseline=false
 force=false
+project_root_override=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -174,6 +176,7 @@ while [ $# -gt 0 ]; do
     --parallelism)      parallelism="${2:?extend-gate: --parallelism needs a value}"; shift 2 ;;
     --record-baseline)  record_baseline=true; shift ;;
     --force)            force=true; shift ;;
+    --project-root)     project_root_override="${2:?extend-gate: --project-root needs a value}"; shift 2 ;;
     *) die 1 "unknown argument: $1 (see --help)" ;;
   esac
 done
@@ -269,7 +272,15 @@ find_cargo_root() {
   return 1
 }
 
-project_abs="$(find_cargo_root "$repo")" || die 6 "$project_abs"
+# --project-root <rel>: explicit disambiguation when find_cargo_root's
+# one-crate rule can't decide (e.g. sibling crates one level down, like
+# autobuilder/ + tools/). Relative to the repo; must contain a Cargo.toml.
+if [ -n "$project_root_override" ]; then
+  project_abs="$repo/$project_root_override"
+  [ -f "$project_abs/Cargo.toml" ] || die 6 "no Cargo.toml at --project-root $project_root_override (looked in $project_abs)"
+else
+  project_abs="$(find_cargo_root "$repo")" || die 6 "$project_abs"
+fi
 project_rel="$(realpath --relative-to="$repo" "$project_abs")"
 
 # --- base resolution ---------------------------------------------------
