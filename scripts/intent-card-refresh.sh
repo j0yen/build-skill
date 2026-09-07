@@ -8,8 +8,16 @@
 # frozen at the original protocol-compat scope).
 #
 # Usage:
-#   intent-card-refresh.sh <repo> <prd-path> [--dry-run]
+#   intent-card-refresh.sh <repo> <prd-path> [--dry-run] [--project-root <rel>]
 #   intent-card-refresh.sh --check <repo>
+#
+# --project-root <rel>: relative path (from <repo>) to the Cargo project
+#   root, for a repo whose crate lives below the repo root (e.g.
+#   autobuilder's own nested crate at autobuilder/) — passed through to
+#   card-lint.sh's own --project-root so the post-write validation resolves
+#   against the right project. Omit for a repo whose crate lives at its own
+#   root (the common case). Same convention as extend-gate.sh's flag of the
+#   same name.
 #
 # Modes:
 #   default    Regenerate <repo>/agent/intent-card.json from <prd-path>.
@@ -36,6 +44,14 @@
 #              docs/intent-card-schema.md for the accepted shape). Both
 #              files are written atomically (temp + rename); agent/ is
 #              created if missing.
+#              After writing, the card is validated by card-lint.sh
+#              (write-to-temp, validate, rename — PRD-fleet-intent-card-
+#              conformance) before it becomes the real agent/intent-
+#              card.json: on a lint failure the temp file is discarded, the
+#              previous card is left byte-for-byte unchanged, and this
+#              script exits 5 with card-lint's own message (names the
+#              violated field). Only on a lint pass does the card get
+#              renamed into place and the sidecar/amendment steps below run.
 #              When agent/intent_card_amendment_request.json exists and
 #              every one of its scope_additions entries is "covered" —
 #              either it names no prd_source (a bare non-PRD note, e.g. a
@@ -72,7 +88,8 @@
 #
 # Exit: 0 ok | 1 --check mismatch | 2 usage | 3 malformed PRD (no parseable
 #       AC lines, or no Problem-statement/TL;DR paragraph to source
-#       root_motivation from) | 4 repo or PRD path not found
+#       root_motivation from) | 4 repo or PRD path not found | 5 generated
+#       card failed card-lint.sh validation (previous card left intact)
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -80,7 +97,7 @@ SKILL_DIR="$(cd "$HERE/.." && pwd)"
 MANIFEST="${MANIFEST:-$SKILL_DIR/state/manifest.json}"
 
 usage() {
-  echo "usage: intent-card-refresh.sh <repo> <prd-path> [--dry-run]" >&2
+  echo "usage: intent-card-refresh.sh <repo> <prd-path> [--dry-run] [--project-root <rel>]" >&2
   echo "       intent-card-refresh.sh --check <repo>" >&2
 }
 
@@ -90,6 +107,7 @@ mode=refresh
 dry_run=false
 repo=""
 prd=""
+project_root_rel=""
 
 if [ "${1:-}" = "--check" ]; then
   mode=check
@@ -100,6 +118,7 @@ else
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --dry-run) dry_run=true; shift ;;
+      --project-root) project_root_rel="${2:?intent-card-refresh: --project-root needs a value}"; shift 2 ;;
       -h|--help) usage; exit 0 ;;
       --) shift ;;
       -*) echo "intent-card-refresh: unknown flag $1" >&2; usage; exit 2 ;;
@@ -184,7 +203,7 @@ fi
 
 [ -r "$prd" ] || { echo "intent-card-refresh: PRD not readable: $prd" >&2; exit 4; }
 
-python3 - "$repo" "$prd" "$dry_run" <<'PY'
+stage1_out="$(python3 - "$repo" "$prd" "$dry_run" <<'PY'
 import json, os, re, sys
 
 repo, prd_path, dry_run_str = sys.argv[1], sys.argv[2], sys.argv[3]
@@ -490,29 +509,85 @@ if dry_run:
     sys.stdout.write(card_text)
     sys.exit(0)
 
+# Stage 1 stops at "write the candidate card to a temp file" — the rename
+# over the real card_path, the sidecar write, and the amendment cleanup are
+# all deferred to stage 2 below, which the bash driver only runs after
+# card-lint.sh has validated THIS tmp file. That ordering (write-to-temp,
+# validate, only then rename) is what keeps a lint failure from ever
+# touching the previous, still-valid card (PRD-fleet-intent-card-
+# conformance AC3).
 agent_dir = os.path.join(repo, "agent")
 os.makedirs(agent_dir, exist_ok=True)
 card_path = os.path.join(agent_dir, "intent-card.json")
 tmp_path = card_path + ".tmp"
 with open(tmp_path, "w", encoding="utf-8") as fh:
     fh.write(card_text)
-os.replace(tmp_path, card_path)
+
+plan_path = os.path.join(agent_dir, ".intent-card-refresh.plan.json")
+plan = {
+    "tmp_path": tmp_path,
+    "card_path": card_path,
+    "carried_sidecar_path": carried_sidecar_path,
+    "carried_forward": carried_forward,
+    "amendment_path": os.path.join(agent_dir, "intent_card_amendment_request.json"),
+    "prd_path": prd_path,
+    "intent_slug": slug,
+    "ac_count": len(acceptance_criteria),
+}
+with open(plan_path, "w", encoding="utf-8") as fh:
+    fh.write(json.dumps(plan))
+print(plan_path)
+PY
+)"
+stage1_rc=$?
+
+if [ "$dry_run" = "true" ]; then
+  printf '%s\n' "$stage1_out"
+  exit "$stage1_rc"
+fi
+[ "$stage1_rc" -eq 0 ] || { printf '%s\n' "$stage1_out" >&2; exit "$stage1_rc"; }
+
+plan_path="$stage1_out"
+tmp_path="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["tmp_path"])' "$plan_path")"
+
+lint_args=("$repo" --card "$tmp_path")
+[ -n "$project_root_rel" ] && lint_args+=(--project-root "$project_root_rel")
+if ! lint_out="$("$HERE/card-lint.sh" "${lint_args[@]}" 2>&1)"; then
+  rm -f "$tmp_path" "$plan_path"
+  echo "intent-card-refresh: generated card failed card-lint validation; previous card left intact" >&2
+  echo "$lint_out" >&2
+  exit 5
+fi
+
+python3 - "$plan_path" <<'PY'
+import json, os, sys
+
+plan_path = sys.argv[1]
+with open(plan_path, encoding="utf-8") as fh:
+    plan = json.load(fh)
+
+os.replace(plan["tmp_path"], plan["card_path"])
 
 # carried_forward lives in the sidecar, not the card (PRD-build-intent-
 # card-schema — intake.rs rejects the extra key in the card). Written
 # atomically, same as the card, right next to it.
-carried_text = json.dumps(carried_forward, indent=2, sort_keys=True) + "\n"
-carried_tmp_path = carried_sidecar_path + ".tmp"
+carried_text = json.dumps(plan["carried_forward"], indent=2, sort_keys=True) + "\n"
+carried_tmp_path = plan["carried_sidecar_path"] + ".tmp"
 with open(carried_tmp_path, "w", encoding="utf-8") as fh:
     fh.write(carried_text)
-os.replace(carried_tmp_path, carried_sidecar_path)
+os.replace(carried_tmp_path, plan["carried_sidecar_path"])
 
-amendment_path = os.path.join(agent_dir, "intent_card_amendment_request.json")
+amendment_path = plan["amendment_path"]
 amendment_removed = False
 if os.path.isfile(amendment_path):
-    amendment = load_json(amendment_path)
+    try:
+        with open(amendment_path, encoding="utf-8") as fh:
+            amendment = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        amendment = None
     scope_additions = (amendment or {}).get("scope_additions", [])
     covered = True
+    prd_path = plan["prd_path"]
     for entry in scope_additions:
         entry_prd = entry.get("prd_source")
         if not entry_prd:
@@ -525,11 +600,13 @@ if os.path.isfile(amendment_path):
         amendment_removed = True
 
 print(json.dumps({
-    "written": card_path,
-    "carried_forward_sidecar": carried_sidecar_path,
-    "intent_slug": slug,
-    "ac_count": len(acceptance_criteria),
+    "written": plan["card_path"],
+    "carried_forward_sidecar": plan["carried_sidecar_path"],
+    "intent_slug": plan["intent_slug"],
+    "ac_count": plan["ac_count"],
     "amendment_removed": amendment_removed,
 }))
 PY
-exit $?
+stage2_rc=$?
+rm -f "$plan_path"
+exit "$stage2_rc"

@@ -29,7 +29,7 @@ cat > "$repo/agent/intent-card.json" <<'JSON'
   "acceptance_criteria": [],
   "scope": ["stale scope item"],
   "non_goals": ["stale non-goal"],
-  "hard_constraints": {"rust_edition": "2021"},
+  "hard_constraints": {"rust_edition": "2021", "target_kind": "cli", "deny_unsafe": true},
   "five_whys_trace": [{"why": 1, "q": "stale?", "a": "yes"}],
   "created_at": "2020-01-01T00:00:00Z",
   "carried_forward": {}

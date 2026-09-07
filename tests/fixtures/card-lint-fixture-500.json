@@ -1,0 +1,36 @@
+{
+  "schema": "autobuilder.intent_card.v1",
+  "prd_source": "tests/fixtures/PRD-fixture-card-lint.md",
+  "intent_slug": "fixture-card-lint",
+  "root_motivation": "Fixture card for card-lint.sh's P1 regression test (PRD-fleet-intent-card-conformance AC6): exercises the exact 500/501-byte boundary intake.rs enforces on acceptance_criteria[].description.",
+  "user_persona": "A regression test asserting card-lint.sh's exit code at the schema's length boundary.",
+  "unfakeable_metric": {
+    "name": "acceptance_tests_passing_count",
+    "lower_is_better": false,
+    "harness_command": "scripts/run-metrics.sh",
+    "target": null
+  },
+  "acceptance_criteria": [
+    {
+      "id": "AC1",
+      "level": "MUST",
+      "description": "Given a fixture description that is exactly the schema's maximum allowed length for an acceptance_criteria description field, When card-lint.sh validates this card, Then intake accepts it at the boundary. Padding to reach exactly five hundred characters for this regression fixture follows here: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx.xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "test": "tests/acceptance_ac1.rs"
+    }
+  ],
+  "scope": [],
+  "non_goals": [],
+  "hard_constraints": {
+    "rust_edition": "2024",
+    "target_kind": "cli",
+    "deny_unsafe": true
+  },
+  "five_whys_trace": [
+    {
+      "why": 1,
+      "q": "q",
+      "a": "a"
+    }
+  ],
+  "created_at": "2026-09-07T00:00:00Z"
+}

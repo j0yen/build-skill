@@ -450,10 +450,12 @@ if [ "${plan[intent-card.json]}" = "kept" ]; then
   kept+=("intent-card.json")
 else
   if [ -n "$prd_path" ]; then
-    "$HERE/intent-card-refresh.sh" "$repo" "$prd_path" \
-      || die 1 "intent-card-refresh.sh failed to generate agent/intent-card.json from $prd_path"
+    refresh_args=("$repo" "$prd_path")
+    [ "$project_rel" = "." ] || refresh_args+=(--project-root "$project_rel")
+    "$HERE/intent-card-refresh.sh" "${refresh_args[@]}" \
+      || die 1 "intent-card-refresh.sh failed to generate agent/intent-card.json from $prd_path (or the generated card failed card-lint — see its output above)"
   else
-    python3 - "$repo" "$crate_name" <<'PY'
+    onboard_card_tmp="$(python3 - "$repo" "$crate_name" <<'PY'
 import json, os, re, sys, datetime
 
 repo, crate_name = sys.argv[1], sys.argv[2]
@@ -533,19 +535,40 @@ carried_forward = {k: False for k in (
     "hard_constraints", "five_whys_trace", "created_at",
 )}
 
+# Stop at "write the candidate card to a temp file" — the bash driver below
+# validates this tmp file with card-lint.sh BEFORE renaming it over the
+# real card_path (write-to-temp, validate, rename — PRD-fleet-intent-card-
+# conformance), so a lint failure on a freshly-generated card never leaves
+# a half-written or invalid agent/intent-card.json behind. The sidecar
+# (never itself schema-validated) is written only after that rename
+# succeeds, alongside it, in the bash block below.
 os.makedirs(os.path.join(repo, "agent"), exist_ok=True)
 dest = os.path.join(repo, "agent", "intent-card.json")
 tmp = dest + ".tmp"
 with open(tmp, "w", encoding="utf-8") as fh:
     fh.write(json.dumps(card, indent=2) + "\n")
-os.replace(tmp, dest)
 
 carried_dest = os.path.join(repo, "agent", "intent-card.carried.json")
 carried_tmp = carried_dest + ".tmp"
 with open(carried_tmp, "w", encoding="utf-8") as fh:
     fh.write(json.dumps(carried_forward, indent=2, sort_keys=True) + "\n")
-os.replace(carried_tmp, carried_dest)
+
+print(tmp)
 PY
+)"
+    onboard_card_rc=$?
+    [ "$onboard_card_rc" -eq 0 ] || die 1 "failed to generate a candidate agent/intent-card.json"
+
+    onboard_lint_args=("$repo" --card "$onboard_card_tmp")
+    [ "$project_rel" = "." ] || onboard_lint_args+=(--project-root "$project_rel")
+    if ! onboard_lint_out="$("$HERE/card-lint.sh" "${onboard_lint_args[@]}" 2>&1)"; then
+      rm -f "$onboard_card_tmp" "$repo/agent/intent-card.carried.json.tmp"
+      die 1 "generated agent/intent-card.json failed card-lint validation:
+$onboard_lint_out"
+    fi
+
+    mv "$onboard_card_tmp" "$repo/agent/intent-card.json"
+    mv "$repo/agent/intent-card.carried.json.tmp" "$repo/agent/intent-card.carried.json"
   fi
   created+=("intent-card.json")
 fi
