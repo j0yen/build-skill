@@ -1278,6 +1278,23 @@ changelog) is serial. Mechanics live in `scripts/worktree-extend.sh`:
    (`git commit` inside the worktree). Do **not** bump the version or
    touch `CHANGELOG.md` here — that is deferred to integration so stacked
    branches don't collide on the same version number.
+
+   **Cargo target-dir off the root filesystem (PRD-build-worktree-targets-off-root,
+   2026-09-08).** A rust worktree's `target/` can be 50G+; `add` writes
+   `<worktree>/.cargo/config.toml` with `[build] target-dir =
+   "<root>/<repo>-<slug>"`, where `<root>` is `$BUILD_TARGET_ROOT` if set,
+   else `/mnt/data/jsy/cargo-targets` when `/mnt/data` exists, else
+   `$HOME/.cache/cargo-targets`. `.cargo/` is excluded from the branch via
+   the repo's `.git/info/exclude` (shared across worktrees, never
+   committed). Two landed-but-uncleaned worktrees filling `WT_ROOT` (root
+   filesystem) to 100% killed two truth-tier measure runs on 2026-09-08 —
+   `cleanup`, `integrate` (which now calls `cleanup` on success, keeping the
+   branch), and the new `prune-landed <repo>` subcommand (removes every
+   worktree of `<repo>` whose branch tip is already an ancestor of
+   `origin/main`, worktree + target dir both) all remove that target
+   directory along with the worktree. `scripts/extend-gate.sh` calls
+   `prune-landed` for its repo before producing receipts, so a gate never
+   starts on a disk full of landed worktrees.
 3. **integrate (serial, locked)** — `worktree-extend.sh integrate [--no-rebase] <repo>
    <slug> <bump> <tldr-file>` takes the per-repo integration lock,
    **refuses if the target's main tree is dirty (exit 3 → leave PRD

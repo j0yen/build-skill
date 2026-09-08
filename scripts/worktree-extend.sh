@@ -24,6 +24,10 @@
 #       (<bump>) and prepends the CHANGELOG from <tldr-file> via
 #       extend-handler.sh, committing the bump with the Joe Yen identity.
 #       Exit 4 on merge conflict (merge aborted; branch left for next tick).
+#       On success, runs `cleanup` (branch kept) so the worktree and its
+#       cargo target-dir are freed the moment the branch lands — the freed
+#       path is named in stderr (stdout stays the bare new version, for
+#       existing `newver=$(...)` callers).
 #       --project-root <rel>: for repos whose Cargo.toml lives under a
 #       subdirectory of <repo> (nested crate root, e.g. post-source-unify
 #       split repos) — passed through to extend-handler.sh's bump-version
@@ -32,14 +36,35 @@
 #       common case (Cargo.toml at repo root); behavior is unchanged.
 #
 #   cleanup <repo> <slug>
-#       Remove the worktree dir. Keeps the branch unless --drop-branch given
-#       (branch is kept when integration was deferred, so work resumes).
+#       Remove the worktree dir AND its cargo target-dir (named by the
+#       worktree's `.cargo/config.toml`, or recomputed from the current
+#       target-root convention if that file is gone). Keeps the branch
+#       unless --drop-branch given (branch is kept when integration was
+#       deferred, so work resumes).
+#
+#   prune-landed <repo>
+#       For every autobuilder/<slug> worktree of <repo> whose branch tip is
+#       an ancestor of origin/main, run `cleanup` (worktree + target dir).
+#       Branches not yet merged are left untouched. PRD-build-worktree-targets-off-root:
+#       run this before a gate/build tick opens a new worktree on a repo
+#       that's been accumulating landed-but-uncleaned worktrees.
 #
 #   list <repo>
 #       Show this repo's autobuilder worktrees.
 #
 # All paths absolute. Identity for the bump commit is Joe Yen (wintermute repo
 # convention). Worktrees live under $WT_ROOT (default ~/.cache/build-worktrees).
+#
+# Cargo target-dir isolation (PRD-build-worktree-targets-off-root, 2026-09-08):
+# a rust worktree's `target/` can be 50G+, and worktrees live under $WT_ROOT
+# (root filesystem by default) — two landed-but-uncleaned worktrees filled
+# root to 100% and killed a truth-tier measure run. `add` now writes
+# `<worktree>/.cargo/config.toml` pointing `target-dir` at
+# $BUILD_TARGET_ROOT/<repo>-<slug> (default /mnt/data/jsy/cargo-targets when
+# /mnt/data exists, else ~/.cache/cargo-targets — see target_root() below),
+# and excludes `.cargo/` from the branch via the repo's (shared,
+# never-committed) `.git/info/exclude`. `cleanup`/`integrate`/`prune-landed`
+# all remove that directory along with the worktree.
 set -uo pipefail
 
 WT_ROOT="${BUILD_WT_ROOT:-$HOME/.cache/build-worktrees}"
@@ -52,6 +77,57 @@ die() { echo "worktree-extend: $2" >&2; exit "$1"; }
 need() { [ -n "${1:-}" ] || die 1 "$2"; }
 
 wt_path() { echo "$WT_ROOT/$(basename "$1")-$2"; }
+
+# Root for worktree cargo target-dirs. $BUILD_TARGET_ROOT wins when set;
+# otherwise /mnt/data/jsy/cargo-targets when the data drive is mounted here,
+# else $HOME/.cache/cargo-targets (root filesystem, but at least a fresh box
+# with no /mnt/data still works). Kept in sync with
+# ~/dotfiles/.local/lib/vibeloop-target-root.sh's cargo_target_root() for the
+# measure loop's tag build — same convention, separate repo.
+target_root() {
+  if [ -n "${BUILD_TARGET_ROOT:-}" ]; then
+    printf '%s\n' "$BUILD_TARGET_ROOT"
+  elif [ -d /mnt/data ]; then
+    printf '%s\n' /mnt/data/jsy/cargo-targets
+  else
+    printf '%s\n' "$HOME/.cache/cargo-targets"
+  fi
+}
+
+target_dir_for() { echo "$(target_root)/$(basename "$1")-$2"; }
+
+# Write <worktree>/.cargo/config.toml pointing target-dir at
+# target_dir_for(repo,slug), creating the target dir, and exclude `.cargo/`
+# from the branch via the repo's info/exclude (shared across worktrees;
+# `git -C <worktree> rev-parse --git-path` resolves it correctly even though
+# a worktree's own `.git` is a file, not a directory — info/exclude is not
+# per-worktree). Idempotent: safe to call again on an existing worktree.
+write_target_config() {
+  local wt="$1" repo="$2" slug="$3" tdir
+  tdir="$(target_dir_for "$repo" "$slug")"
+  mkdir -p "$tdir" || die 2 "could not create cargo target dir: $tdir"
+  mkdir -p "$wt/.cargo" || die 2 "could not create $wt/.cargo"
+  printf '[build]\ntarget-dir = "%s"\n' "$tdir" > "$wt/.cargo/config.toml"
+  local gp; gp="$(git -C "$wt" rev-parse --git-path info/exclude 2>/dev/null)"
+  if [ -n "$gp" ]; then
+    mkdir -p "$(dirname "$gp")"
+    grep -qxF '.cargo/' "$gp" 2>/dev/null || printf '%s\n' '.cargo/' >> "$gp"
+  fi
+}
+
+# Read the target-dir a worktree's own .cargo/config.toml names (empty if the
+# worktree or file is gone). Preferred over recomputing from the CURRENT
+# target_root(), since $BUILD_TARGET_ROOT may have changed since `add`.
+read_target_dir() {
+  local f="$1/.cargo/config.toml" line
+  [ -f "$f" ] || return 0
+  while IFS= read -r line; do
+    case "$line" in
+      *target-dir*=*\"*\"*)
+        line="${line#*\"}"; printf '%s\n' "${line%%\"*}"; return 0 ;;
+    esac
+  done < "$f"
+}
 
 # Treat Cargo.lock as a generated artifact, not a hand-merged file. The `ours`
 # built-in merge driver keeps main's side instead of conflicting; the lockfile
@@ -102,6 +178,7 @@ cmd_add() {
   mkdir -p "$WT_ROOT"
   # Resume if the worktree already exists (multi-tick build).
   if git -C "$repo" worktree list --porcelain | grep -qxF "worktree $wt"; then
+    write_target_config "$wt" "$repo" "$slug"
     echo "$wt"; return 0
   fi
   # Base the branch on main's HEAD (clean commit), ignoring any dirty files in
@@ -112,6 +189,7 @@ cmd_add() {
   else
     git -C "$repo" worktree add -b "$branch" "$wt" "$base" >&2 || die 2 "worktree add (new branch) failed"
   fi
+  write_target_config "$wt" "$repo" "$slug"
   echo "$wt"
 }
 
@@ -227,25 +305,73 @@ cmd_integrate() {
     || die 6 "version-bump commit failed"
   # Clean integrate: reset conflict streak for this repo so parallel fan-out resumes.
   [ -x "$SERIAL_FALLBACK" ] && "$SERIAL_FALLBACK" streak-reset "$repo" >&2 || true
+  # PRD-build-worktree-targets-off-root: the branch is merged, its worktree
+  # (and 50G+ cargo target) has served its purpose — free it now rather than
+  # waiting on a caller-remembered `cleanup` or a later `prune-landed` sweep.
+  # Keep the branch (no --drop-branch): that decision stays with the caller's
+  # own cleanup/--drop-branch step, same as the non-parallel path.
+  local cleanup_out; cleanup_out="$(cmd_cleanup "$repo" "$slug")"
+  echo "worktree-extend: $slug: integrate: $cleanup_out" >&2
   echo "$newver"
 }
 
 cmd_cleanup() {
   local repo="${1:-}" slug="${2:-}" drop=""; need "$repo" "usage: cleanup <repo> <slug> [--drop-branch]"; need "$slug" "missing slug"
   [ "${3:-}" = "--drop-branch" ] && drop=1
-  local wt branch; wt="$(wt_path "$repo" "$slug")"; branch="autobuilder/$slug"
+  local wt branch tdir; wt="$(wt_path "$repo" "$slug")"; branch="autobuilder/$slug"
+  # Prefer the target-dir the worktree's own config names (read BEFORE
+  # removing the worktree); fall back to recomputing it if the worktree/file
+  # is already gone (e.g. re-running cleanup, or a worktree that pre-dates
+  # this config).
+  tdir="$(read_target_dir "$wt")"
+  [ -n "$tdir" ] || tdir="$(target_dir_for "$repo" "$slug")"
   git -C "$repo" worktree remove --force "$wt" 2>/dev/null
   git -C "$repo" worktree prune 2>/dev/null
+  [ -n "$tdir" ] && rm -rf "$tdir"
   [ -n "$drop" ] && git -C "$repo" branch -D "$branch" 2>/dev/null
-  echo "cleaned $wt${drop:+ (+branch)}"
+  echo "cleaned $wt${drop:+ (+branch)}; freed target $tdir"
+}
+
+# For each autobuilder/<slug> worktree of <repo> whose branch tip is an
+# ancestor of origin/main, run cleanup (worktree + target dir; branch is left
+# alone — it's already merged, dropping it is a separate/optional step).
+# Unmerged sibling worktrees are untouched.
+cmd_prune_landed() {
+  local repo="${1:-}"; need "$repo" "usage: prune-landed <repo>"
+  [ -d "$repo/.git" ] || git -C "$repo" rev-parse --git-dir >/dev/null 2>&1 || die 2 "not a git repo: $repo"
+  git -C "$repo" fetch -q origin >/dev/null 2>&1 || true
+  if ! git -C "$repo" show-ref --verify --quiet refs/remotes/origin/main; then
+    echo "worktree-extend: prune-landed: no origin/main in $repo, nothing to compare against" >&2
+    return 0
+  fi
+  local prefix="$WT_ROOT/$(basename "$repo")-"
+  local wt="" branch="" line
+  while IFS= read -r line; do
+    case "$line" in
+      worktree\ *) wt="${line#worktree }"; branch="" ;;
+      branch\ *)   branch="${line#branch }"; branch="${branch#refs/heads/}" ;;
+      '')
+        if [ -n "$wt" ] && [ -n "$branch" ] && [ "${wt#"$prefix"}" != "$wt" ]; then
+          local tip; tip="$(git -C "$repo" rev-parse --verify -q "refs/heads/$branch" 2>/dev/null)"
+          if [ -n "$tip" ] && git -C "$repo" merge-base --is-ancestor "$tip" refs/remotes/origin/main 2>/dev/null; then
+            local slug="${branch#autobuilder/}"
+            echo "worktree-extend: prune-landed: $branch landed on origin/main, cleaning $slug" >&2
+            cmd_cleanup "$repo" "$slug" >&2
+          fi
+        fi
+        wt=""; branch=""
+        ;;
+    esac
+  done < <(git -C "$repo" worktree list --porcelain; echo)
 }
 
 cmd_list() { local repo="${1:-}"; need "$repo" "usage: list <repo>"; git -C "$repo" worktree list | grep -F "$WT_ROOT/$(basename "$repo")-" || echo "(no autobuilder worktrees)"; }
 
 case "${1:-}" in
-  add)       shift; cmd_add "$@" ;;
-  integrate) shift; cmd_integrate "$@" ;;
-  cleanup)   shift; cmd_cleanup "$@" ;;
-  list)      shift; cmd_list "$@" ;;
-  *) echo "usage: worktree-extend.sh {add|integrate|cleanup|list} ..." >&2; exit 1 ;;
+  add)          shift; cmd_add "$@" ;;
+  integrate)    shift; cmd_integrate "$@" ;;
+  cleanup)      shift; cmd_cleanup "$@" ;;
+  prune-landed) shift; cmd_prune_landed "$@" ;;
+  list)         shift; cmd_list "$@" ;;
+  *) echo "usage: worktree-extend.sh {add|integrate|cleanup|prune-landed|list} ..." >&2; exit 1 ;;
 esac

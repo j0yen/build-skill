@@ -419,6 +419,14 @@ fi
 exec 9>"$repo/.git/autobuilder-integrate.lock"
 flock -w 120 9 || die 4 "could not acquire integration lock for $repo (another integrate/gate is running)"
 
+# --- prune landed worktrees before producing receipts (PRD-build-worktree-targets-off-root) --
+# A gate must never start on a disk full of worktrees whose branches already
+# landed on origin/main (two truth-tier measure runs died to ENOSPC on
+# 2026-09-08 from exactly this). Best-effort: a missing worktree-extend.sh or
+# a prune failure never blocks the gate itself.
+WORKTREE_EXTEND="$BUILD_SCRIPTS/worktree-extend.sh"
+[ -x "$WORKTREE_EXTEND" ] && "$WORKTREE_EXTEND" prune-landed "$repo" >&2
+
 # --- refuse a dirty tree before any producer runs (AC2) ------------------
 if [ -n "$(git -C "$repo" status --porcelain)" ]; then
   die 3 "refusing — working tree at $repo is dirty"
