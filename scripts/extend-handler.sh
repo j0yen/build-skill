@@ -12,18 +12,27 @@
 #                                      build_into rust repo; print JSON
 #                                      { slug, build_into, version,
 #                                        bump, bin_name|null } to stdout.
-#   current-version <build_into>     — print the Cargo.toml [package].version
+#   current-version <build_into> [--project-root <rel>]
+#                                    — print the Cargo.toml [package].version
 #                                      of that repo to stdout. Exit 1 if missing.
-#   bump-version <build_into> <bump> — rewrite Cargo.toml version per
+#   bump-version <build_into> <bump> [--project-root <rel>]
+#                                    — rewrite Cargo.toml version per
 #                                      patch|minor|major. Print "<old> <new>".
 #                                      No git ops.
 #   install <build_into>             — `cargo build --release` then install
 #                                      every [[bin]] target into ~/.local/bin.
 #                                      Print the installed paths.
-#   changelog-prepend <build_into> <version> <tldr_file>
+#   changelog-prepend <build_into> <version> <tldr_file> [--project-root <rel>]
 #                                    — prepend a `## v<version>` section to
 #                                      CHANGELOG.md with the TL;DR content.
 #                                      Creates CHANGELOG.md if missing.
+#
+# --project-root <rel>: for repos whose Cargo.toml (and, per the same
+# nesting, CHANGELOG.md) live under a subdirectory of <build_into> rather
+# than at its root (e.g. a post-source-unify split repo). Same flag shape
+# and resolution as extend-gate.sh's / intent-card-refresh.sh's own
+# --project-root: <build_into>/<rel> must exist; omit for the common case
+# (root-level Cargo.toml/CHANGELOG.md) and behavior is unchanged.
 #
 # Identity for any git commit is the model's job (use
 #   git -c user.email=jyen.tech@gmail.com -c user.name="Joe Yen" commit ...
@@ -89,16 +98,41 @@ cmd_validate() {
 }
 
 cmd_current_version() {
-  [ -n "${1:-}" ] || die "usage: current-version <build_into>" 1
-  read_cargo_version "$1" || die "could not read version" 2
+  local target="" project_root=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --project-root) project_root="${2:?extend-handler: --project-root needs a value}"; shift 2 ;;
+      *) [ -z "$target" ] && target="$1"; shift ;;
+    esac
+  done
+  [ -n "$target" ] || die "usage: current-version <build_into> [--project-root <rel>]" 1
+  local root="$target"
+  if [ -n "$project_root" ]; then
+    root="$target/$project_root"
+    [ -f "$root/Cargo.toml" ] || die "no Cargo.toml at --project-root $project_root (looked in $root)" 2
+  fi
+  read_cargo_version "$root" || die "could not read version" 2
 }
 
 cmd_bump_version() {
-  local target="${1:-}" kind="${2:-minor}"
-  [ -n "$target" ] || die "usage: bump-version <build_into> <patch|minor|major>" 1
-  local cargo="$target/Cargo.toml"
+  local target="" kind="minor" project_root=""
+  local -a pos=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --project-root) project_root="${2:?extend-handler: --project-root needs a value}"; shift 2 ;;
+      *) pos+=("$1"); shift ;;
+    esac
+  done
+  target="${pos[0]:-}"; kind="${pos[1]:-minor}"
+  [ -n "$target" ] || die "usage: bump-version <build_into> <patch|minor|major> [--project-root <rel>]" 1
+  local root="$target"
+  if [ -n "$project_root" ]; then
+    root="$target/$project_root"
+    [ -f "$root/Cargo.toml" ] || die "no Cargo.toml at --project-root $project_root (looked in $root)" 2
+  fi
+  local cargo="$root/Cargo.toml"
   local old new maj mi pa
-  old="$(read_cargo_version "$target")" || die "version read failed" 2
+  old="$(read_cargo_version "$root")" || die "version read failed" 2
   IFS='.' read -r maj mi pa <<<"$old"
   case "$kind" in
     patch) pa=$((pa+1)) ;;
@@ -208,11 +242,24 @@ cmd_install() {
 }
 
 cmd_changelog_prepend() {
-  local target="${1:-}" version="${2:-}" tldr_file="${3:-}"
+  local target="" version="" tldr_file="" project_root=""
+  local -a pos=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --project-root) project_root="${2:?extend-handler: --project-root needs a value}"; shift 2 ;;
+      *) pos+=("$1"); shift ;;
+    esac
+  done
+  target="${pos[0]:-}"; version="${pos[1]:-}"; tldr_file="${pos[2]:-}"
   [ -n "$target" ] && [ -n "$version" ] && [ -n "$tldr_file" ] \
-    || die "usage: changelog-prepend <build_into> <version> <tldr_file>" 1
+    || die "usage: changelog-prepend <build_into> <version> <tldr_file> [--project-root <rel>]" 1
   [ -f "$tldr_file" ] || die "tldr file not found: $tldr_file" 2
-  local clog="$target/CHANGELOG.md"
+  local root="$target"
+  if [ -n "$project_root" ]; then
+    root="$target/$project_root"
+    [ -d "$root" ] || die "no directory at --project-root $project_root (looked in $root)" 2
+  fi
+  local clog="$root/CHANGELOG.md"
   local date_today tldr_body
   date_today="$(date -u +%Y-%m-%d)"
   tldr_body="$(cat "$tldr_file")"
@@ -261,10 +308,10 @@ case "${1:-}" in
     cat <<'EOF'
 extend-handler.sh — rust-extend mechanical helpers
   validate <slug>
-  current-version <build_into>
-  bump-version <build_into> <patch|minor|major>
+  current-version <build_into> [--project-root <rel>]
+  bump-version <build_into> <patch|minor|major> [--project-root <rel>]
   install <build_into>
-  changelog-prepend <build_into> <version> <tldr_file>
+  changelog-prepend <build_into> <version> <tldr_file> [--project-root <rel>]
 EOF
     ;;
   *) die "unknown subcommand: $1 (try --help)" 1 ;;

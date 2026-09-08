@@ -17,13 +17,19 @@
 #       gate, and commits its IMPLEMENTATION there (no version bump — that
 #       happens at integration). Prints the worktree path on stdout.
 #
-#   integrate <repo> <slug> <bump> <tldr-file>
+#   integrate [--project-root <rel>] <repo> <slug> <bump> <tldr-file>
 #       SERIAL. Takes the per-repo integration lock. Refuses if <repo>'s main
 #       working tree is dirty (exit 3) — never merges into a dirty tree.
 #       Merges autobuilder/<slug> into main (--no-ff), then bumps the version
 #       (<bump>) and prepends the CHANGELOG from <tldr-file> via
 #       extend-handler.sh, committing the bump with the Joe Yen identity.
 #       Exit 4 on merge conflict (merge aborted; branch left for next tick).
+#       --project-root <rel>: for repos whose Cargo.toml lives under a
+#       subdirectory of <repo> (nested crate root, e.g. post-source-unify
+#       split repos) — passed through to extend-handler.sh's bump-version
+#       and current-version calls, same flag/semantics as extend-gate.sh's
+#       and intent-card-refresh.sh's own --project-root. Omit for the
+#       common case (Cargo.toml at repo root); behavior is unchanged.
 #
 #   cleanup <repo> <slug>
 #       Remove the worktree dir. Keeps the branch unless --drop-branch given
@@ -110,18 +116,23 @@ cmd_add() {
 }
 
 cmd_integrate() {
-  local no_rebase="" ensure_main=""
+  local no_rebase="" ensure_main="" project_root=""
   # --no-rebase: skip rebase-retry, reproduce old abort-immediately behaviour.
   # --ensure-main: if main branch is absent, create it from the default branch HEAD.
+  # --project-root <rel>: nested crate root, passed through to extend-handler.sh
+  # (see the subcommand doc comment above).
   while true; do
     case "${1:-}" in
       --no-rebase)    no_rebase=1; shift ;;
       --ensure-main)  ensure_main=1; shift ;;
+      --project-root) project_root="${2:?worktree-extend: --project-root needs a value}"; shift 2 ;;
       *) break ;;
     esac
   done
+  local -a project_root_args=()
+  [ -n "$project_root" ] && project_root_args=(--project-root "$project_root")
   local repo="${1:-}" slug="${2:-}" bump="${3:-minor}" tldr="${4:-}"
-  need "$repo" "usage: integrate [--no-rebase] [--ensure-main] <repo> <slug> <bump> <tldr-file>"; need "$slug" "missing slug"
+  need "$repo" "usage: integrate [--no-rebase] [--ensure-main] [--project-root <rel>] <repo> <slug> <bump> <tldr-file>"; need "$slug" "missing slug"
   local branch="autobuilder/$slug"
   local wt; wt="$(wt_path "$repo" "$slug")"
   # PRD-extend-gate-lock-cloexec (2026-09-05 incident class): every cargo
@@ -206,10 +217,10 @@ cmd_integrate() {
     [ -x "$SIDECAR" ] && "$SIDECAR" write "$slug" last_error=lockfile-regen-needs-net >&2 || true
   fi
   # Serial version bump + changelog so stacked branches increment cleanly.
-  "$EXTEND" bump-version "$repo" "$bump" >&2 || die 6 "bump-version failed"
-  local newver; newver="$("$EXTEND" current-version "$repo")"
+  "$EXTEND" bump-version "$repo" "$bump" "${project_root_args[@]}" >&2 || die 6 "bump-version failed"
+  local newver; newver="$("$EXTEND" current-version "$repo" "${project_root_args[@]}")"
   if [ -n "$tldr" ] && [ -f "$tldr" ]; then
-    "$EXTEND" changelog-prepend "$repo" "$newver" "$tldr" >&2 || die 6 "changelog-prepend failed"
+    "$EXTEND" changelog-prepend "$repo" "$newver" "$tldr" "${project_root_args[@]}" >&2 || die 6 "changelog-prepend failed"
   fi
   git -C "$repo" add -A >&2
   git -C "$repo" "${GIT_ID[@]}" commit -q -m "$(basename "$repo"): v$newver — $slug (parallel integrate)" >&2 \
