@@ -43,6 +43,18 @@ inside fenced code blocks are ignored; first match wins.
 Keys `PM`, `Drafted`, `Owner`, `Date`, `Relates`, `Engineering target`, `Jira`,
 `Epic` are display-only.
 
+**Autobuilder-crate routing (PRD-autobuilder-source-unify, 2026-09-08):** an
+autobuilder-crate PRD (one that changes the `autobuilder` companion binary
+or its `crates/gate` / `crates/extended-gates`) must use
+`build_into: /home/jsy/wintermute/autobuilder` with
+`Engineering target: --project-root autobuilder` — that is the sole
+canonical source, versioned above every other copy so "the canonical
+install" is checkable by `autobuilder --version` alone.
+`~/wintermute/rustbuild/autobuilder` is frozen / ported-from (see its
+`PORTED.md`); it is invalid as `build_into` for new autobuilder-feature
+work — rustbuild's own harness keeps building its frozen copy unaffected,
+but no new feature PRD should target it.
+
 ## Acceptance criteria
 
 Section heading `## Acceptance criteria` (also accepted: `## Acceptance`,
