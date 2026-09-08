@@ -303,8 +303,28 @@ def extract_root_motivation(all_lines):
         text = first_paragraph_after(all_lines, TLDR_HEADING_RE)
     if not text:
         return None
-    if len(text) > 1000:
-        text = text[:997].rstrip() + "..."
+    # PRD-mcphost-first-call-reliability incidental fix: the schema's 1000
+    # limit is validated as UTF-8 BYTE length (intake.rs), but this used to
+    # truncate by codepoint count -- a paragraph with em-dashes/ellipses/
+    # curly quotes (each 3 bytes in UTF-8, 1 codepoint in Python's len())
+    # near the boundary truncated to <=1000 codepoints yet still exceeded
+    # 1000 bytes, so card-lint rejected the generated card and the refresh
+    # silently no-opped (previous card left stale). Truncate by encoded
+    # byte length instead, leaving room for the trailing "...".
+    encoded = text.encode("utf-8")
+    if len(encoded) > 1000:
+        truncated = encoded[:997]
+        # Never split a multi-byte UTF-8 sequence: drop trailing bytes
+        # until what's left decodes cleanly.
+        while truncated:
+            try:
+                text = truncated.decode("utf-8")
+                break
+            except UnicodeDecodeError:
+                truncated = truncated[:-1]
+        else:
+            text = ""
+        text = text.rstrip() + "..."
     return text
 
 
