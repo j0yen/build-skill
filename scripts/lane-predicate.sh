@@ -2,12 +2,14 @@
 # lane-predicate.sh — Phase 2 lane-aware selection predicate (PRD-build-
 # second-lane-carbon P0 "Lane predicate" + "Target-repo exclusivity").
 #
-# Two /build lanes share one PRD clone: RedBaron (unrestricted — the
-# filter below is an optimization on carbon, never a partition that
-# strands work) and carbon (cargo-free only). The lane is taken from
-# hostname by default so the tick scripts need no fork or env drop-in
-# (Technical considerations: "must take the lane predicate from hostname
-# or an env drop-in rather than a fork of the script").
+# Lanes share one PRD clone: RedBaron is always unrestricted. Every other
+# lane is cargo-capable by default (cargo itself still runs on RedBaron
+# through the shim — see SKILL.md's "Where cargo runs") UNLESS it is
+# named in CARGO_FREE_LANES below, in which case it is cargo-free only
+# (today: carbon, 15 GB RAM / 0 swap). The lane is taken from hostname by
+# default so the tick scripts need no fork or env drop-in (Technical
+# considerations: "must take the lane predicate from hostname or an env
+# drop-in rather than a fork of the script").
 #
 # Subcommands:
 #   lane-predicate.sh select <prd-path> [lane-name] [prd-dir]
@@ -38,6 +40,12 @@ LANE_CLAIM="$HERE/lane-claim.sh"
 # build_target values PRD-build-second-lane-carbon P0 declares cargo-free.
 CARGO_FREE_TARGETS="python-cli python-lib python-agent shell hooks config notebook"
 
+# Lanes restricted to CARGO_FREE_TARGETS (PRD-build-lane-roster-ryzen7).
+# A lane not in this roster and not "redbaron" is cargo-capable by
+# default — matching the "every non-RedBaron lane shims cargo to
+# RedBaron" architecture, rather than assuming it's RAM-constrained.
+CARGO_FREE_LANES="carbon"
+
 die() { echo "lane-predicate: $*" >&2; exit "${2:-4}"; }
 usage() { echo "usage: lane-predicate.sh {select|reachable} ..." >&2; exit 4; }
 
@@ -57,12 +65,18 @@ is_cargo_free() {
   return 1
 }
 
+is_cargo_free_lane() {
+  local l="$1" x
+  for x in $CARGO_FREE_LANES; do [ "$x" = "${l,,}" ] && return 0; done
+  return 1
+}
+
 cmd_select() {
   local prd="$1" lane="${2:-$(hostname)}" prd_dir="${3:-$HOME/Documents/PRDs}"
   [ -f "$prd" ] || die "no such file: $prd" 4
 
   local bt; bt=$(read_field "$prd" build_target)
-  if [ "${lane,,}" != "redbaron" ] && ! is_cargo_free "$bt"; then
+  if is_cargo_free_lane "$lane" && ! is_cargo_free "$bt"; then
     echo "skip: cargo-bound build_target=${bt:-<none>} (lane $lane restricted to cargo-free)"
     exit 1
   fi

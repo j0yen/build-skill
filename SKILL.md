@@ -206,11 +206,15 @@ admits the candidate to the pool; exit 1 ("skip: ...") drops it silently
 from this tick's selection (log the reason, do not mark it blocked — the
 other lane, or this lane next tick, may still take it). Two things gate a
 candidate:
-- **Cargo-free filter, carbon only.** On any lane whose hostname is not
-  `RedBaron`, only `build_target` ∈ {`python-cli`, `python-lib`,
-  `python-agent`, `shell`, `hooks`, `config`, `notebook`} is selectable.
-  RedBaron itself is unrestricted (the filter is an optimization on
-  carbon, never a partition — RedBaron may still take cargo-free PRDs).
+- **Cargo-free filter, roster-based (2026-09-08, PRD-build-lane-roster-ryzen7).**
+  Only lanes named in `lane-predicate.sh`'s `CARGO_FREE_LANES` roster
+  (today: `carbon` alone, 15 GB RAM / 0 swap) are restricted to
+  `build_target` ∈ {`python-cli`, `python-lib`, `python-agent`, `shell`,
+  `hooks`, `config`, `notebook`}. Every other lane — RedBaron, ryzen7, and
+  any future lane not added to the roster — is cargo-capable by default
+  (cargo itself still runs on RedBaron through the shim; see "Where cargo
+  runs" below). The filter is an optimization on the lanes it names, never
+  a partition that strands work on the rest.
 - **Target-repo exclusivity, every lane.** A PRD whose `build_into` repo
   is named in another lane's live (non-stale) claim — per
   `scripts/lane-claim.sh target-busy` — is skipped by this lane this tick,

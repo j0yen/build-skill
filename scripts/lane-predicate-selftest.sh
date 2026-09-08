@@ -54,6 +54,19 @@ out=$("$LP" select "$RUST_PRD" RedBaron)
 echo "$out" | grep -q '^ok: lane=RedBaron build_target=rust-extend' || { echo "FAIL: $out"; exit 1; }
 echo ok
 
+echo "== ryzen7 lane: cargo-bound PRD selectable (not in CARGO_FREE_LANES roster) =="
+out=$("$LP" select "$RUST_PRD" ryzen7)
+echo "$out" | grep -q '^ok: lane=ryzen7 build_target=rust-extend' || { echo "FAIL: $out"; exit 1; }
+echo ok
+
+echo "== carbon lane: still rejected for the same rust-extend PRD (roster unchanged) =="
+set +e
+out=$("$LP" select "$RUST_PRD" carbon 2>&1); rc=$?
+set -e
+[ "$rc" -eq 1 ] || { echo "FAIL expected exit 1, got $rc: $out"; exit 1; }
+echo "$out" | grep -q '^skip: cargo-bound build_target=rust-extend' || { echo "FAIL msg: $out"; exit 1; }
+echo ok
+
 echo "== target exclusivity: a live claim on build_into blocks the other lane =="
 LC="$HERE/lane-claim.sh"
 "$LC" claim "$RUST_PRD" RedBaron >/dev/null
