@@ -1198,6 +1198,26 @@ Each agent prompt must include, self-contained:
   (PRD-build-second-lane-carbon lane-tagged journaling) — run `hostname` if
   unsure which lane you're running as."
 
+**Required dispatch-boundary guard (2026-09-08, PRD-build-select-target-busy-unskippable).**
+Immediately before issuing the Agent/Task calls below — for every selected
+PRD, fan-out or single ad-hoc pick, automated timer or manual invocation —
+run:
+
+```
+scripts/select-guard.sh <slug>
+```
+
+Exit 0 (`ok: <slug>: ...`) means dispatch may proceed. Exit 1
+(`blocked: <slug>: ...`) means dispatch MUST NOT happen this tick — drop
+that PRD from the batch, log the reported reason, and do not open an Agent
+call for it; the next tick re-checks normally. `select-guard.sh` composes
+`lane-predicate.sh select` (cargo-free filter + target-busy) unchanged — it
+adds this call site, not new busy-detection logic — so the earlier Phase 2
+prose describing the same check is not a substitute for actually calling
+this script here, at the boundary where a skipped check would otherwise let
+a branch land on a `build_into` another lane already holds live (the
+2026-09-08 `autobuilder-gate-debt` collision this PRD is named for).
+
 Issue all calls in a single message — that's what makes them
 parallel. Do not chain follow-up Agent calls in the same tick.
 
