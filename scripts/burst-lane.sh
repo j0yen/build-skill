@@ -534,7 +534,11 @@ cmd_run() {
   # meaningless on the box. Route by bare name; the remote PATH below finds it.
   local first="$1"; shift
   case "$first" in */cargo) first=cargo ;; */uv) first=uv ;; esac
-  local remote_cmd="cd $remote_path && export PATH=/root/.cargo/bin:/root/.local/bin:\$PATH CARGO_HOME=\${CARGO_HOME:-\$HOME/.cargo} RUSTC_WRAPPER=sccache SCCACHE_DIR=/root/.sccache; $first $*"
+  # CARGO_TARGET_DIR pins the remote build into $remote_path/target no matter
+  # what .cargo/config.toml the worktree synced up (an off-root target-dir
+  # override in that file sent remote builds to a box-local absolute path the
+  # pull could never find — 2026-09-09 21:38Z; env beats config in cargo).
+  local remote_cmd="cd $remote_path && export PATH=/root/.cargo/bin:/root/.local/bin:\$PATH CARGO_HOME=\${CARGO_HOME:-\$HOME/.cargo} CARGO_TARGET_DIR=$remote_path/target RUSTC_WRAPPER=sccache SCCACHE_DIR=/root/.sccache; $first $*"
   local rc=0
   "$SSH_BIN" -o StrictHostKeyChecking=no -i "$SSH_KEY" "$REMOTE_USER@$ip" "$remote_cmd" || rc=$?
 
