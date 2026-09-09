@@ -609,7 +609,10 @@ rust_work_remains() {
   for f in "$dir"/PRD-*.md; do
     [ -f "$f" ] || continue
     bt="$(grep -m1 -oE '^-[[:space:]]*build_target:[[:space:]]*[A-Za-z0-9_-]+' "$f" 2>/dev/null | sed -E 's/^-[[:space:]]*build_target:[[:space:]]*//')"
-    case "$bt" in rust-cli|rust-lib|rust-extend) ;; *) continue ;; esac
+    # Operator (2026-09-09): the box serves python work too (req 12 / BURST_PY)
+    # — keep it up while EITHER kind remains, matching the tick wrapper's `up`
+    # predicate; a rust-only scan tore the box down under queued python PRDs.
+    case "$bt" in rust-cli|rust-lib|rust-extend|python-cli|python-lib|python-agent) ;; *) continue ;; esac
     st="$(grep -m1 -oE '^-[[:space:]]*Status:[[:space:]]*[A-Za-z0-9_-]+' "$f" 2>/dev/null | sed -E 's/^-[[:space:]]*Status:[[:space:]]*//')"
     case "$st" in queued|building|in_progress) return 0 ;; esac
   done
