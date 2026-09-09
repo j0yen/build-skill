@@ -3,6 +3,7 @@
 # paths (cargo-free pass, cargo-bound skip on carbon, RedBaron unrestricted,
 # target-busy skip, unreachable origin) against scratch repos under /tmp/.
 # Never touches the real ~/Documents/PRDs clone.
+export SAME_LANE_SUBCAP=3  # pin: these fixtures test the sub-cap mechanism at 3
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LP="$HERE/lane-predicate.sh"

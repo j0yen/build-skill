@@ -8,6 +8,7 @@
 # an unbounded free-for-all — it exempts only the claims that already
 # exist, not new ones).
 
+export SAME_LANE_SUBCAP=3  # pin: these fixtures test the sub-cap mechanism at 3
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 LC="$HERE/../scripts/lane-claim.sh"

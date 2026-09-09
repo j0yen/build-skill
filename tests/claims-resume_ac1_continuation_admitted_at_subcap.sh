@@ -7,6 +7,7 @@
 # ("resume=own-claim" / "resume: own claim ..." — the 06:23Z OOM shape:
 # a dead coordinator's own claims must never block one another).
 
+export SAME_LANE_SUBCAP=3  # pin: these fixtures test the sub-cap mechanism at 3
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 LC="$HERE/../scripts/lane-claim.sh"

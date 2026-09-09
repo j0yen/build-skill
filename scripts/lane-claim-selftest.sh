@@ -2,6 +2,7 @@
 # lane-claim-selftest.sh — exercises lane-claim.sh's claim/status/release/
 # target-busy paths (free, held, race, stale-reclaim) against a scratch git
 # repo under /tmp/. Never touches the real ~/Documents/PRDs clone.
+export SAME_LANE_SUBCAP=3  # pin: these fixtures test the sub-cap mechanism at 3
 set -euo pipefail
 LC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lane-claim.sh"
 ROOT=$(mktemp -d /tmp/lane-claim-selftest.XXXXXX)

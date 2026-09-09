@@ -73,7 +73,7 @@ set -uo pipefail
 STALE_SECS=$((3 * 3600))
 # Max same-lane live claims on one build_into repo before target-busy blocks
 # a further same-lane candidate (SKILL.md Selection rules #1 worktree cap).
-SAME_LANE_SUBCAP=3
+SAME_LANE_SUBCAP="${SAME_LANE_SUBCAP:-5}"
 
 die() { echo "lane-claim: $*" >&2; exit "${2:-4}"; }
 

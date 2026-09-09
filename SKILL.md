@@ -193,7 +193,7 @@ picked before their normal-priority siblings.
 
 Then pick **up to 30 PRDs** from the pool that mutually satisfy the
 parallel-dispatch rules in the "Parallelism" section (shared `build_into`
-isolated via worktrees up to the ≤3 same-target sub-cap, ≤1 kernel-extend,
+isolated via worktrees up to the ≤5 same-target sub-cap, ≤1 kernel-extend,
 ≤1 reflect-eligible). Fewer than 30 is fine; the cap is 30, the floor is
 whatever the queue admits after conflict-pruning. If the pool yields zero,
 exit clean.
@@ -229,7 +229,7 @@ returns `ok: ... resume=own-claim` (via `lane-claim.sh target-busy`'s
 own-claim exemption): a continuation is never skipped `sub-cap-blocked`
 by the count of this lane's OTHER live claims on the same `build_into` —
 that count still governs whether a genuinely NEW (not-yet-claimed)
-candidate on that repo gets admitted (≤3 same-lane claims live still
+candidate on that repo gets admitted (≤5 same-lane claims live still
 leaves no slot for a 4th new one), it just no longer blocks the candidate
 that already owns the claim. Journal one `resume own-claim slug=<slug>
 age=<s>s` line per continuation admitted this tick, and fold the count
@@ -1090,9 +1090,12 @@ self-throttle below it.**
 memory grounds.** Carbon has **15 GB RAM (0 swap), typically ~11 GB
 free** (RedBaron has 30 GB). On carbon/ryzen7 heavy cargo builds route
 to RedBaron through /rustbuild's cargo shim, so local memory pressure is minimal; on
-RedBaron they run locally, so honor the ≤3 same-target sub-cap strictly. The real OOM guard is the **≤3 same-target
-sub-cap** below (it bounds parallel cargo builds of ONE heavy crate like
-recall's fastembed); honoring that, total width 30 is safe. The **< 4 GB
+RedBaron they run locally, so honor the ≤5 same-target sub-cap strictly. The real OOM guard is **cargo-budget.sh**
+(host-wide cargo concurrency budget: MemAvailable ≥ 6 GB + load cap — see
+PRD-build-cargo-concurrency-budget; the 2026-09-09 OOM happened at 3-wide
+because unbudgeted `cargo test` fan-out under the sub-cap stacked 95 test
+binaries + sandboxes). The ≤5 same-target sub-cap bounds selection width on
+one heavy crate; with the budget live, total width 30 is safe. The **< 4 GB
 available** check (at selection time) is the ONLY permitted reason to
 reduce width — and it must be logged with the measured number.
 
@@ -1114,7 +1117,7 @@ satisfy:
    `build_into`, each runs in its own git worktree (separate index, tree,
    and `target/`) — see "Worktree isolation" below. This is the fix for
    the recall/agorabus/episodic-observer clusters that used to serialize
-   one-per-tick behind a single repo. **Sub-cap: ≤3 same-target branches
+   one-per-tick behind a single repo. **Sub-cap: ≤5 same-target branches
    per tick** — parallel cargo builds of a heavy-dep crate (e.g. recall's
    fastembed) are memory-hungry (operator decision 2026-09-09 after RedBaron OOMed at 3 with a gate overlapping, load 21k). Kernel-extend
    targets are exempt from worktree fan-out (rule 2 already caps them).
@@ -1141,7 +1144,7 @@ satisfy:
    ```
    Exit 0 = serial mode active → admit **at most 1** branch for that repo this
    tick (call `serial-gate <repo> <count>` per candidate to enforce the cap).
-   Exit 1 = normal parallel → apply the ≤3 sub-cap as usual.
+   Exit 1 = normal parallel → apply the ≤5 sub-cap as usual.
    Fail-open: any error or absent streak file → exit 1 (no serialization).
    When serial mode is active, pick the **oldest-deferred branch first**
    (sort by `last_action` ascending, then `first_deferred_at` if present) so
