@@ -127,6 +127,9 @@ load_env() {
   fi
   SNAPSHOT_ID="${SNAPSHOT_ID:-$DEFAULT_SNAPSHOT_ID}"
   LOCATION="${BUILDER_LOC:-$LOCATION}"
+  # BURST_SERVER_TYPE from the env file must win over the pre-source default
+  # (SERVER_TYPE is assigned before load_env runs).
+  SERVER_TYPE="${BURST_SERVER_TYPE:-$SERVER_TYPE}"
 }
 load_env
 
