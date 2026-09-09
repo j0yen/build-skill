@@ -17,19 +17,34 @@ set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 WRAPPER="$HERE/../burst-lane.sh"
 
-# Find the next cargo behind this shim on PATH (skip only this shim's own
-# directory, so a chained shim like cargo-budget-bin still gets a turn on
-# local fallback — same pattern as cargo-budget-bin/cargo's own real_cargo()).
+# Find the next real cargo behind this shim on PATH: skip this shim's own
+# directory *and every other known cargo shim directory* (currently just
+# cargo-budget-bin — see PRD-build-cargo-shim-reexec-loop). Previously this
+# only skipped its own directory, which meant with both shim dirs on PATH
+# each shim's real_cargo() would resolve straight into the *other* shim,
+# which resolved back into this one, forever — a silent hang with no
+# error, no exit. Skipping the whole shared shim set (regardless of PATH
+# order or duplicate entries) guarantees this always lands on the real
+# cargo (or a legitimate non-shim cargo further down PATH) in one pass.
+SHIM_DIRS=(
+  "$HERE"
+  "$(cd "$HERE/../cargo-budget-bin" 2>/dev/null && pwd -P || true)"
+)
 real_cargo() {
-  local dir bin
+  local dir bin resolved shim skip
   local saved_ifs="$IFS"
   IFS=:
   for dir in $PATH; do
     IFS="$saved_ifs"
     [ -n "$dir" ] || continue
-    case "$(cd "$dir" 2>/dev/null && pwd -P || true)" in
-      "$HERE") continue ;;
-    esac
+    resolved="$(cd "$dir" 2>/dev/null && pwd -P || true)"
+    [ -n "$resolved" ] || continue
+    skip=0
+    for shim in "${SHIM_DIRS[@]}"; do
+      [ -n "$shim" ] || continue
+      if [ "$resolved" = "$shim" ]; then skip=1; break; fi
+    done
+    [ "$skip" -eq 1 ] && continue
     bin="$dir/cargo"
     if [ -x "$bin" ]; then
       printf '%s\n' "$bin"

@@ -18,20 +18,33 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 WRAPPER="$HERE/../cargo-budget.sh"
 
 # Find the real cargo: walk $PATH entries in order, skip this shim's own
-# directory (and any other cargo-budget-bin dir, in case PATH has it
-# twice), take the first match. Falls back to `command -v cargo` outside
-# this process's PATH-search loop only if nothing else was found (should
-# not happen in practice — that would mean no real cargo is installed).
+# directory *and every other known cargo shim directory* (currently just
+# burst-lane-bin — see PRD-build-cargo-shim-reexec-loop), so that when both
+# shim dirs are on PATH they don't resolve into each other and mutually
+# re-exec forever. Any dir in PATH matching a shim dir is skipped
+# regardless of how many times it appears. Falls back to `command -v
+# cargo` outside this process's PATH-search loop only if nothing else was
+# found (should not happen in practice — that would mean no real cargo is
+# installed).
+SHIM_DIRS=(
+  "$HERE"
+  "$(cd "$HERE/../burst-lane-bin" 2>/dev/null && pwd -P || true)"
+)
 real_cargo() {
-  local dir bin
+  local dir bin resolved shim skip
   local saved_ifs="$IFS"
   IFS=:
   for dir in $PATH; do
     IFS="$saved_ifs"
     [ -n "$dir" ] || continue
-    case "$(cd "$dir" 2>/dev/null && pwd -P || true)" in
-      "$HERE") continue ;;
-    esac
+    resolved="$(cd "$dir" 2>/dev/null && pwd -P || true)"
+    [ -n "$resolved" ] || continue
+    skip=0
+    for shim in "${SHIM_DIRS[@]}"; do
+      [ -n "$shim" ] || continue
+      if [ "$resolved" = "$shim" ]; then skip=1; break; fi
+    done
+    [ "$skip" -eq 1 ] && continue
     bin="$dir/cargo"
     if [ -x "$bin" ]; then
       printf '%s\n' "$bin"
