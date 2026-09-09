@@ -1124,6 +1124,24 @@ loss under fan-out (observed 2026-05-30 9-way, 2026-06-02 6-way). The
 legacy "acquire the lock yourself + direct RMW with a 5s give-up" pattern
 is REMOVED; do not reintroduce it in branch agents.
 
+## Shipping contract & real-environment ACs (2026-09-09)
+
+**`scripts/ship-postconditions.sh <repo>` is the executable definition of "a
+version is shipped"** — version↔tag placement, changelog entry, lock sync, clean
+tree. `worktree-extend.sh integrate` runs it after every bump (loud warn +
+sidecar); `extend-gate.sh` runs it before base resolution and hard-fails on any
+FAIL line. Any new path that lands a version MUST call it before declaring
+success; new shipping responsibilities are added THERE, never re-enumerated in
+per-path code. (5-whys origin: parallel-integrate shipped v0.32.0–v0.36.1
+untagged because "shipped" was prose each path re-listed by hand.)
+
+**Real-environment AC rule:** a PRD that integrates with external infrastructure
+(a rented box, a deployed service, an MCP endpoint, a systemd unit) must carry at
+least one acceptance criterion that executes against the REAL environment and
+asserts the real side effect (exit=0, bytes moved, artifact present, row written)
+— never only that the code path was traversed. Fixture-only ACs on infra are the
+2026-09-09 burst-lane failure class: 14 "routed" runs, all exit=127, all green.
+
 ## Parallelism (per-tick fan-out, added 2026-05-28)
 
 Each tick advances **up to 30 PRDs in parallel**. The per-tick fan-out

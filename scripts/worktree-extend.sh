@@ -352,6 +352,13 @@ cmd_integrate() {
     || echo "worktree-extend: $slug: tag v$newver already exists (ok)" >&2
   git -C "$repo" push origin "refs/tags/v$newver" >/dev/null 2>&1 \
     || echo "worktree-extend: $slug: tag push deferred (offline?) — gate self-heal will push it" >&2
+  # Executable "shipped" contract (see scripts/ship-postconditions.sh header for
+  # the 5-whys). Non-fatal here — the bump commit already exists and the gate
+  # hard-fails on the same contract — but loud and sidecar-recorded.
+  if ! "$(dirname "$0")/ship-postconditions.sh" "$repo" >&2; then
+    echo "worktree-extend: $slug: SHIP-POSTCONDITIONS FAILED after integrate — gate will block until healed" >&2
+    [ -x "$SIDECAR" ] && "$SIDECAR" write "$slug" last_error=ship-postconditions-failed >&2 || true
+  fi
   # Clean integrate: reset conflict streak for this repo so parallel fan-out resumes.
   [ -x "$SERIAL_FALLBACK" ] && "$SERIAL_FALLBACK" streak-reset "$repo" >&2 || true
   # PRD-build-worktree-targets-off-root: the branch is merged, its worktree

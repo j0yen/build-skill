@@ -433,6 +433,12 @@ backfill_version_tags() {
 }
 backfill_version_tags
 
+# Executable "shipped" contract — hard enforcement point. backfill above heals
+# the mechanical (tag) case; anything still failing is a real shipping defect.
+if ! "$BUILD_SCRIPTS/ship-postconditions.sh" "$repo" --project-root "$project_rel"; then
+  die 1 "ship-postconditions failed for $repo (project-root $project_rel) — see FAIL lines above"
+fi
+
 head_now="$(git -C "$repo" rev-parse HEAD 2>/dev/null)"
 base_ref="$(resolve_base)"
 
