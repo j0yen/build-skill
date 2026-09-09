@@ -447,10 +447,16 @@ pull_target_incremental() {  # $1=worktree $2=ip -> stdout: bytes transferred; r
   local worktree="$1" ip="$2" remote_path stats local_target remote_target override
   remote_path="$REMOTE_ROOT/$(basename "$worktree")"
   override="$(cargo_target_dir_for "$worktree")"
+  # The BOX always builds into $remote_path/target (cmd_run sets no remote
+  # CARGO_TARGET_DIR); only the LOCAL side honors the off-root override.
+  # Mirroring the override to the remote side (req-10 first cut) pointed the
+  # pull at a path that never exists on the box — every override worktree's
+  # pull failed rsync-down (2026-09-09 21:03Z).
+  remote_target="$remote_path/target"
   if [ -n "$override" ]; then
-    local_target="$override"; remote_target="$override"
+    local_target="$override"
   else
-    local_target="$worktree/target"; remote_target="$remote_path/target"
+    local_target="$worktree/target"
   fi
   mkdir -p "$local_target" 2>/dev/null || true
   if ! stats="$("$RSYNC_BIN" -az --delete --stats -e "$SSH_BIN -o StrictHostKeyChecking=no -i $SSH_KEY" \
