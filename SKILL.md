@@ -1124,6 +1124,22 @@ loss under fan-out (observed 2026-05-30 9-way, 2026-06-02 6-way). The
 legacy "acquire the lock yourself + direct RMW with a 5s give-up" pattern
 is REMOVED; do not reintroduce it in branch agents.
 
+## Diagnosis doctrine: five whys before any fix (2026-09-09)
+
+When a branch agent, gate, or tick hits a failure it intends to remedy, it MUST
+write the why-chain before choosing the fix: why did this fail? why did that
+precursor hold? — five levels (or until the level is outside this system's
+control), recorded in the iter_log entry / journal line for that action, each
+why backed by an observation (a command output, a receipt, a log line), not
+narrative. Then implement at the DEEPEST actionable level; a shallow fix is
+allowed only as an explicit guard alongside it, never alone. Worked example:
+2026-09-09 burst-lane — runs failed → rsync mkdir failed → /root/build never
+created → nothing ever called `up` → ACs passed without a real run → fixtures
+asserted plumbing, not outcomes. The level-1 fix (mkdir) would have left seven
+sibling faults live; the level-5 fix (verify + fail-closed + outcome ACs)
+closed the class. Operator rule (Joe): "always fix the source of the problem
+and not symptoms."
+
 ## Shipping contract & real-environment ACs (2026-09-09)
 
 **`scripts/ship-postconditions.sh <repo>` is the executable definition of "a
