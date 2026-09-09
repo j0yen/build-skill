@@ -2,6 +2,14 @@
 # clear-stale-blockers.sh — detect and clear /build manifest blockers
 # whose stated condition no longer holds in the PRD source of truth.
 #
+# SUPERSEDED for the tick's own purposes (PRD-build-manifest-invariants,
+# 2026-09-09): this script's exact condition (below) now also runs every
+# tick, under tick.lock, as part of `scripts/manifest-invariants.sh`'s
+# `stale-version-collision-blocker` heal — see docs/manifest-transitions.md
+# "Absorbed scripts". Left in place, unremoved, so a direct/manual
+# invocation (e.g. from an older `/self-review` note) still works; the
+# tick no longer needs to call it separately.
+#
 # Conservative: only auto-clears version-collision blockers of the form
 #   "vX.Y.Z collision with <other-slug>"
 # when at most ONE of the two PRDs still declares vX.Y.Z as a phasing

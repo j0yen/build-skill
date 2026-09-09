@@ -172,6 +172,33 @@ the Phase 2 candidate pool. See build-contract.md's "Lint gate" section and
 run `scripts/prd-lint.sh <file> [--format text|json]` standalone to check a
 PRD before committing it.
 
+**Invariants audit (PRD-build-manifest-invariants, 2026-09-09).** After the
+reconcile-first step and the lint gate above, and still under this tick's
+`tick.lock`, run `scripts/manifest-invariants.sh --prd-dir "$PRD_DIR"` once.
+It audits every manifest entry against the transition table in
+`docs/manifest-transitions.md` (the full predecessor/successor/writer/inverse
+story for every status this manifest can hold): mechanical violations are
+healed in place — `blocked` with empty `blockers[]` and empty `iter_log` back
+to `queued`, `needs_classification` back to `queued` once the file passes
+`prd-lint.sh` again (this is the automated version of the 2026-09-09 1e9af92
+one-off fix; it no longer needs a human to notice), and stale
+version-collision blockers cleared (absorbed from `clear-stale-blockers.sh` —
+see docs/manifest-transitions.md's "Absorbed scripts" section; the older
+script is left in place, unharmed by the duplication, rather than cut over
+in the same change) — each heal recorded in that entry's `invariants_audit_log`.
+Judgment-requiring cases are alarmed instead (journal line + `docket report
+--key manifest-invariant-<class> ...` when `docket` is on `$PATH`, fail-open
+otherwise): a stale claim with a dead coordinator, `shipped`/`built` not yet
+archived past `SHIPPED_NOT_ARCHIVED_MINUTES` (default 20), any status not in
+the table, or `building`/`in_progress` with no activity for 24h. A `parked`
+entry is never inspected in either direction (a human's decision, frozen).
+Record `healed: n alarmed: n` (the script's own summary line) in the tick's
+own summary, same as `reconciled: n` above. Run
+`scripts/manifest-invariants.sh --report` (read-only, never mutates the
+manifest) for a standalone audit — this is what `/self-review` Phase A now
+reads instead of the two retired trap playbooks (`build_stale_blockers` and
+the mis-park prose) it used to run by hand.
+
 ### Phase 2 — Select
 
 **Depends-on gate (2026-09-02).** A queued PRD whose frontmatter `Depends-on:`
