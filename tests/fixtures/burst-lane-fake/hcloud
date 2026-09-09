@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# Fake hcloud CLI for burst-lane.sh offline tests. State: a flat file of
+# "id|name|alive" lines under $FAKE_HCLOUD_STATE (default
+# /tmp/bl-fake-hcloud.state). Supports `server describe <id-or-name>` so
+# burst-lane.sh's name-based adoption path (AC1) can be exercised without a
+# real Hetzner account. Failure-injection env vars (all default off):
+# FAKE_HCLOUD_AUTH_FAIL, FAKE_HCLOUD_CREATE_FAIL, FAKE_HCLOUD_DELETE_FAIL.
+# Asserts the never-poweroff/shutdown/stop/reboot invariant (AC14) by
+# hard-failing if any such subcommand is ever invoked.
+set -uo pipefail
+STATE="${FAKE_HCLOUD_STATE:-/tmp/bl-fake-hcloud.state}"
+CALLLOG="${FAKE_HCLOUD_CALLLOG:-}"
+touch "$STATE"
+[ -n "$CALLLOG" ] && printf '%s\n' "$*" >> "$CALLLOG"
+
+case "${1:-}" in
+  server-type)
+    [ "${2:-}" = "list" ] || exit 2
+    [ "${FAKE_HCLOUD_AUTH_FAIL:-0}" = "1" ] && { echo "unauthorized" >&2; exit 1; }
+    echo "ccx53"
+    exit 0
+    ;;
+  server)
+    case "${2:-}" in
+      create)
+        [ "${FAKE_HCLOUD_CREATE_FAIL:-0}" = "1" ] && { echo "create failed" >&2; exit 1; }
+        # parse --name from the argv
+        name=""
+        shift 2
+        while [ $# -gt 0 ]; do
+          if [ "$1" = "--name" ]; then name="$2"; fi
+          shift
+        done
+        id=$((RANDOM % 900000 + 100000))
+        echo "$id|$name|alive" >> "$STATE"
+        printf '{"server":{"id":%s,"name":"%s","public_net":{"ipv4":{"ip":"127.0.0.1"}}}}\n' "$id" "$name"
+        exit 0
+        ;;
+      describe)
+        key="$3"
+        line="$(grep -E "^$key\|" "$STATE" 2>/dev/null | head -n1)"
+        [ -z "$line" ] && line="$(awk -F'|' -v k="$key" '$2==k' "$STATE" 2>/dev/null | head -n1)"
+        [ -z "$line" ] && exit 1
+        IFS='|' read -r id name alive <<<"$line"
+        [ "$alive" = "alive" ] || exit 1
+        printf '{"server":{"id":%s,"name":"%s","public_net":{"ipv4":{"ip":"127.0.0.1"}}}}\n' "$id" "$name"
+        exit 0
+        ;;
+      delete)
+        key="$3"
+        sed -i -E "/^$key\|/d" "$STATE" 2>/dev/null || true
+        awk -F'|' -v k="$key" '$2!=k' "$STATE" > "$STATE.tmp" 2>/dev/null && mv "$STATE.tmp" "$STATE"
+        [ "${FAKE_HCLOUD_DELETE_FAIL:-0}" = "1" ] && exit 1
+        exit 0
+        ;;
+      poweroff|shutdown|stop|reboot)
+        echo "FAKE-HCLOUD-VIOLATION: burst-lane.sh must never call 'server $2' (a stopped server still bills)" >&2
+        exit 99
+        ;;
+      *) exit 2 ;;
+    esac
+    ;;
+  *) exit 2 ;;
+esac

@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# burst-lane-bin/cargo — thin shim (requirement 4, PRD-build-burst-lane-ccx53)
+# so a worktree's ordinary `cargo test` (etc.) automatically routes through
+# the burst lane when BURST_LANE=1 and a session is up, and falls straight
+# through to the next cargo on PATH otherwise (which may be the local
+# concurrency-budget shim from scripts/cargo-budget-bin/cargo if that's also
+# on PATH behind this one — this shim does not disturb that fallback chain,
+# it only inserts itself ahead of it).
+#
+# Routed through scripts/burst-lane.sh run "$PWD" -- <real cargo> "$@":
+#   build, test, clippy, deny, nextest.
+# Always local (never routed, session or not):
+#   check, metadata — cheap/read-only, not the OOM source, and cargo
+#   check's fast turnaround is worth more than a round-trip to the box.
+set -uo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+WRAPPER="$HERE/../burst-lane.sh"
+
+# Find the next cargo behind this shim on PATH (skip only this shim's own
+# directory, so a chained shim like cargo-budget-bin still gets a turn on
+# local fallback — same pattern as cargo-budget-bin/cargo's own real_cargo()).
+real_cargo() {
+  local dir bin
+  local saved_ifs="$IFS"
+  IFS=:
+  for dir in $PATH; do
+    IFS="$saved_ifs"
+    [ -n "$dir" ] || continue
+    case "$(cd "$dir" 2>/dev/null && pwd -P || true)" in
+      "$HERE") continue ;;
+    esac
+    bin="$dir/cargo"
+    if [ -x "$bin" ]; then
+      printf '%s\n' "$bin"
+      return 0
+    fi
+  done
+  IFS="$saved_ifs"
+  return 1
+}
+
+REAL_CARGO="$(real_cargo)"
+if [ -z "$REAL_CARGO" ]; then
+  echo "burst-lane-bin/cargo: no real cargo found on PATH behind this shim" >&2
+  exit 127
+fi
+
+route=0
+sub="${1:-}"
+case "$sub" in
+  build|test|clippy|deny|nextest) route=1 ;;
+esac
+
+if [ "$route" -eq 1 ] && [ "${BURST_LANE:-0}" = "1" ] && [ -x "$WRAPPER" ]; then
+  status_out="$("$WRAPPER" status 2>/dev/null)"
+  if [ "$status_out" != "no active session" ] && [ -n "$status_out" ]; then
+    exec "$WRAPPER" run "$PWD" -- "$REAL_CARGO" "$@"
+  fi
+  echo "burst-lane: no session, local" >&2
+fi
+exec "$REAL_CARGO" "$@"

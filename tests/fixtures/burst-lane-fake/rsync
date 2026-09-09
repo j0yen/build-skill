@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# Fake rsync for burst-lane.sh offline tests: real local `cp` between the
+# last two path-like args (src/dst may carry a "user@host:" prefix, which
+# is stripped since our "remote" is a local scratch path). FAKE_RSYNC_FAIL=1
+# simulates a network/rsync failure. Prints a --stats-shaped line so
+# sync-back's byte-count parse has something to match.
+set -uo pipefail
+[ "${FAKE_RSYNC_FAIL:-0}" = "1" ] && exit 23
+src="${*: -2:1}"
+dst="${*: -1:1}"
+local_dst="${dst#*:}"
+local_src="${src#*:}"
+mkdir -p "$(dirname "$local_dst")" 2>/dev/null || true
+mkdir -p "$local_dst" 2>/dev/null || true
+cp -a "$local_src"/. "$local_dst"/ 2>/dev/null || true
+for a in "$@"; do
+  if [ "$a" = "--stats" ]; then
+    echo "Total transferred file size: 4,096 bytes"
+  fi
+done
+exit 0

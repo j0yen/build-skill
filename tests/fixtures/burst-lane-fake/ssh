@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# Fake ssh for burst-lane.sh offline tests. Last arg is the remote command:
+# "true" for reachability probes, the bwrap sandbox-probe one-liner for
+# sandbox_probe (succeeds unless FAKE_SSH_SANDBOX_FAIL=1), otherwise the
+# "cd <remote_path> && export ...; <cargo cmd>" string, eval'd locally
+# since our "remote" is really the local filesystem under
+# BURST_LANE_REMOTE_ROOT. FAKE_SSH_REMOTE_FAIL=<n> makes the remote command
+# "fail" with exit code n instead of running it.
+set -uo pipefail
+args=("$@")
+cmd="${args[-1]}"
+if [ "$cmd" = true ]; then exit 0; fi
+case "$cmd" in
+  *bwrap*)
+    [ "${FAKE_SSH_SANDBOX_FAIL:-0}" = "1" ] && exit 1
+    exit 0
+    ;;
+esac
+if [ "${FAKE_SSH_REMOTE_FAIL:-0}" != "0" ]; then exit "${FAKE_SSH_REMOTE_FAIL}"; fi
+eval "$cmd"
