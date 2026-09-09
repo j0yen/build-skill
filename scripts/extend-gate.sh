@@ -402,6 +402,37 @@ resolve_base() {
   git -C "$repo" rev-list --max-parents=0 HEAD 2>/dev/null | tail -1
 }
 
+# --- tag-lineage self-heal ----------------------------------------------
+# 2026-09-09: parallel-integrate branch agents bumped 0.32.0-0.34.0 without
+# tagging; one missing tag turned rollback-plan red for every sibling PRD
+# sharing the repo. Tagging is bookkeeping on commits that already exist, so
+# the gate repairs it deterministically instead of trusting agent prompts:
+# walk first-parent from HEAD to the newest existing v-tag (bounded), and for
+# every commit whose crate version changed, create + push the missing tag.
+backfill_version_tags() {
+  local manifest="$project_rel/Cargo.toml"
+  [ "$project_rel" = "." ] && manifest="Cargo.toml"
+  local sha ver parent pver n=0
+  while read -r sha; do
+    n=$((n + 1)); [ "$n" -gt 100 ] && break
+    # stop at the newest already-tagged commit — lineage below it is history
+    if git -C "$repo" tag --points-at "$sha" 2>/dev/null | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+      [ "$n" -gt 1 ] && break
+      continue
+    fi
+    ver="$(git -C "$repo" show "$sha:$manifest" 2>/dev/null | sed -n 's/^version *= *"\([0-9.]*\)".*/\1/p' | head -1)"
+    [ -n "$ver" ] || continue
+    parent="$(git -C "$repo" rev-parse "$sha^" 2>/dev/null)" || continue
+    pver="$(git -C "$repo" show "$parent:$manifest" 2>/dev/null | sed -n 's/^version *= *"\([0-9.]*\)".*/\1/p' | head -1)"
+    if [ "$ver" != "$pver" ] && ! git -C "$repo" rev-parse "v$ver" >/dev/null 2>&1; then
+      git -C "$repo" tag "v$ver" "$sha" 2>/dev/null \
+        && echo "extend-gate: tag-lineage self-heal — created v$ver at ${sha:0:9}" >&2 \
+        && git -C "$repo" push origin "refs/tags/v$ver" >/dev/null 2>&1 || true
+    fi
+  done < <(git -C "$repo" rev-list --first-parent HEAD 2>/dev/null)
+}
+backfill_version_tags
+
 head_now="$(git -C "$repo" rev-parse HEAD 2>/dev/null)"
 base_ref="$(resolve_base)"
 

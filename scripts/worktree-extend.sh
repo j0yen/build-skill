@@ -343,6 +343,15 @@ cmd_integrate() {
   git -C "$repo" add -A >&2
   git -C "$repo" "${GIT_ID[@]}" commit -q -m "$(basename "$repo"): v$newver — $slug (parallel integrate)" >&2 \
     || die 6 "version-bump commit failed"
+  # Tag the bump AT THE SOURCE (2026-09-09: three untagged parallel-integrate
+  # bumps turned the gate's rollback-plan red for every sibling PRD sharing
+  # the repo; extend-gate now self-heals lineage as a net, but the tag
+  # belongs to the commit that creates the version). Push is best-effort —
+  # the gate's push retries cover an offline integrate.
+  git -C "$repo" tag "v$newver" >&2 2>/dev/null \
+    || echo "worktree-extend: $slug: tag v$newver already exists (ok)" >&2
+  git -C "$repo" push origin "refs/tags/v$newver" >/dev/null 2>&1 \
+    || echo "worktree-extend: $slug: tag push deferred (offline?) — gate self-heal will push it" >&2
   # Clean integrate: reset conflict streak for this repo so parallel fan-out resumes.
   [ -x "$SERIAL_FALLBACK" ] && "$SERIAL_FALLBACK" streak-reset "$repo" >&2 || true
   # PRD-build-worktree-targets-off-root: the branch is merged, its worktree
