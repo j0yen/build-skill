@@ -203,7 +203,7 @@ precondition() {  # stdout = message; rc 0 pass, 1 fail
 # ---- up -------------------------------------------------------------------
 sandbox_probe() {  # $1 = ip -> echoes true|false
   if "$SSH_BIN" -o StrictHostKeyChecking=no -o ConnectTimeout=8 -i "$SSH_KEY" "$REMOTE_USER@$1" \
-       'bwrap --unshare-user --unshare-pid --die-with-parent python3 -c "print(1)"' >/dev/null 2>&1; then
+       'bwrap --ro-bind / / --dev /dev --proc /proc --unshare-user --unshare-pid --die-with-parent python3 -c "print(1)"' >/dev/null 2>&1; then
     echo true
   else
     echo false
