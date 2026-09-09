@@ -32,9 +32,14 @@
 #       config env file has SNAPSHOT_ID. Exit 0 pass; exit 1 + a message
 #       naming the first missing piece otherwise. Read-only, safe to poll.
 #   gate-burst.sh should-route --rust <n> --python <n>
-#       Mixed-tick routing predicate (P0). Exit 0 (route to burst) iff
-#       both counts are > 0; exit 1 (stay local) otherwise. Takes no
-#       action — callers decide what to do with the verdict.
+#       Routing predicate (P0). Exit 0 (route to burst) if
+#       `burst-lane.sh status --json` (PRD-build-burst-lane-ccx53) reports
+#       an active session — a live burst-lane box takes every rust gate
+#       regardless of tick mix, per that PRD's requirement 5 — or,
+#       failing that, if both counts are > 0 (the original mixed-tick
+#       predicate this script shipped with, PRD-build-gate-cloudburst).
+#       Exit 1 (stay local) otherwise. Takes no action — callers decide
+#       what to do with the verdict.
 #   gate-burst.sh up
 #       Idempotent. If a tracked box is already alive, exit 0 "already-up".
 #       Else runs `precondition`; on failure, exits 3 and prints
@@ -102,6 +107,12 @@ JOURNAL="${GATE_BURST_JOURNAL:-$HOME/brain/journal/build/$(date -u +%F).md}"
 HCLOUD="${GATE_BURST_HCLOUD_BIN:-hcloud}"
 SSH_BIN="${GATE_BURST_SSH_BIN:-ssh}"
 RSYNC_BIN="${GATE_BURST_RSYNC_BIN:-rsync}"
+
+# PRD-build-burst-lane-ccx53 requirement 5: should-route defers to the
+# session-lifecycle script's own state rather than re-deriving it. This is
+# an internal sibling script, not an external tool, but stays overridable
+# (GATE_BURST_BURST_LANE_BIN) so offline tests can point it at a fake.
+BURST_LANE_SH="${GATE_BURST_BURST_LANE_BIN:-$HERE/burst-lane.sh}"
 
 DEFAULT_SERVER_TYPE="ccx23"
 DEFAULT_LOCATION="fsn1"
@@ -186,6 +197,16 @@ cmd_precondition() {
 }
 
 # ---- should-route --------------------------------------------------------
+burst_lane_session_active() {  # exit 0 if burst-lane.sh reports an active session
+  [ -x "$BURST_LANE_SH" ] || return 1
+  local out
+  out="$("$BURST_LANE_SH" status --json 2>/dev/null)" || return 1
+  case "$out" in
+    *'"active":true'*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 cmd_should_route() {
   local rust=0 python=0
   while [ $# -gt 0 ]; do
@@ -195,6 +216,10 @@ cmd_should_route() {
       *) shift ;;
     esac
   done
+  if burst_lane_session_active; then
+    echo "route: burst session up (rust=$rust python=$python)"
+    exit 0
+  fi
   if [ "$rust" -gt 0 ] && [ "$python" -gt 0 ]; then
     echo "route: mixed tick (rust=$rust python=$python)"
     exit 0
@@ -277,6 +302,20 @@ cmd_run() {
   local repo="${1:-}"; shift || true
   [ -n "$repo" ] && [ $# -ge 1 ] || { echo "usage: gate-burst.sh run <repo> <command...>" >&2; exit 2; }
   [ -d "$repo" ] || die "no such repo: $repo" 2
+
+  # PRD-build-burst-lane-ccx53 requirement 5: "its run path pointed at the
+  # same session" — when a burst-lane session is up, delegate to it wholesale
+  # (rsync-up, remote exec, rsync-down of target/ all live in burst-lane.sh's
+  # own `run`) instead of booting gate-burst.sh's own separate box. The
+  # PRD's non-goal is one box on the account's 32-core limit, never two;
+  # this is what keeps that true once a burst-lane session exists.
+  if burst_lane_session_active; then
+    local rc
+    "$BURST_LANE_SH" run "$repo" -- "$@"
+    rc=$?
+    journal_line "$(now_iso)  gate-burst  run  routed-via-burst-lane  (repo=$repo exit=$rc)"
+    exit "$rc"
+  fi
 
   exec 201>"$RUN_LOCK"
   flock 201

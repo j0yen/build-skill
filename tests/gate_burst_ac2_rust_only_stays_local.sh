@@ -15,6 +15,11 @@ trap 'rm -rf "$T"' EXIT
 export PATH="$FAKE:$PATH"
 export GATE_BURST_STATE_DIR="$T/state"; mkdir -p "$GATE_BURST_STATE_DIR"
 export FAKE_HCLOUD_STATE="$T/hcloud.state"
+# Isolate should-route's new burst-lane.sh status check (PRD-build-burst-
+# lane-ccx53 req 5) from whatever real session may or may not be up on
+# this machine right now — this test is about the rust-only predicate
+# staying local when no burst session exists.
+export BURST_LANE_STATE_DIR="$T/burst-lane-state"; mkdir -p "$BURST_LANE_STATE_DIR"
 
 fail=0
 expect() {

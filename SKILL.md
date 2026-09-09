@@ -557,18 +557,25 @@ in this tick's selection run in parallel via Agent tool calls
   receipts) and runs `autobuilder gate --project .` as the single verdict.
   Counts as one tick action.
 
-  **Mixed-tick burst routing (2026-09-06, PRD-build-gate-cloudburst).**
+  **Mixed-tick burst routing (2026-09-06, PRD-build-gate-cloudburst;
+  updated 2026-09-09, PRD-build-burst-lane-ccx53 requirement 5).**
   Heavy cargo (this gate's 25-receipt regeneration) sharing a box with a
   timing-sensitive Python suite can flip the suite's verdict under load
   (observed 2026-09-06: a 444s mcphost gate beside a synthorg suite that
   went red at an unchanged green commit). Before invoking `extend-gate.sh`,
-  the tick consults the mixed-tick predicate with this tick's own dispatch
+  the tick consults the routing predicate with this tick's own dispatch
   counts:
   ```
   scripts/gate-burst.sh should-route --rust <n_rust_gate_prds> --python <n_python_prds>
   ```
-  Exit 0 (both counts > 0) routes the ENTIRE `extend-gate.sh` invocation
-  through the burst manager instead of running it locally:
+  `should-route` now checks `scripts/burst-lane.sh status --json`
+  (PRD-build-burst-lane-ccx53) FIRST: if that session is up, it routes to
+  burst unconditionally — a live burst-lane box takes every rust gate
+  regardless of tick mix, not only mixed ticks, per requirement 5 — and
+  only falls back to the original both-counts-must-be-positive mixed-tick
+  predicate when no burst-lane session exists. Either way, exit 0 routes
+  the ENTIRE `extend-gate.sh` invocation through the burst manager instead
+  of running it locally:
   ```
   scripts/gate-burst.sh run <build_into> -- scripts/extend-gate.sh <build_into> --head <landed sha>
   ```

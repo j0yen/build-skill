@@ -20,6 +20,11 @@ export GATE_BURST_JOURNAL="$T/journal.md"
 export GATE_BURST_ENV_FILE="$T/env"; echo "SNAPSHOT_ID=427125061" > "$GATE_BURST_ENV_FILE"
 export GATE_BURST_REMOTE_ROOT="$T/remote"
 export FAKE_HCLOUD_STATE="$T/hcloud.state"
+# Isolate should-route's new burst-lane.sh status check (PRD-build-burst-
+# lane-ccx53 req 5) from whatever real session may or may not be up on
+# this machine right now — this test is about the mixed-tick predicate,
+# not the burst-lane session, so give it an empty state dir of its own.
+export BURST_LANE_STATE_DIR="$T/burst-lane-state"; mkdir -p "$BURST_LANE_STATE_DIR"
 
 fail=0
 expect() {
