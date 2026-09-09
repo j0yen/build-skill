@@ -376,16 +376,41 @@ cmd_status() {
   exit 0
 }
 
+# ---- off-root cargo target-dir (PRD-build-worktree-targets-off-root) --------
+# A worktree's own .cargo/config.toml may point `target-dir` at an absolute
+# path OUTSIDE the worktree tree (e.g. /mnt/data/jsy/cargo-targets/<slug>) so
+# RedBaron's main checkout stays lean. That config file rides along in the
+# rsync-up, so remote cargo resolves the same absolute string and writes
+# there on the box's own filesystem — never under $remote_path/target — a
+# fact `pull_target_incremental` used to not know, so the pull-back for
+# every off-root worktree silently found nothing and fell back local
+# (mcphost-call-limits-honest, 2026-09-09 19:58Z: "No such file or
+# directory" for $remote_path/target on a box that had genuinely built).
+# Echoes the absolute override path, or empty for the plain (relative
+# $worktree/target) convention.
+cargo_target_dir_for() {  # $1=worktree -> stdout: absolute override, or ""
+  local cfg="$1/.cargo/config.toml"
+  [ -f "$cfg" ] || return 0
+  sed -n -E 's/^[[:space:]]*target-dir[[:space:]]*=[[:space:]]*"([^"]*)".*/\1/p' "$cfg" | head -n1
+}
+
 # ---- shared incremental target/ pull (requirement 10) -----------------------
 # A 95-binary test target should not copy whole on every run — both `run`'s
 # own pull-back and the standalone `sync-back` subcommand go through this one
 # `rsync --delete --stats` path so already-synced bytes on the box (warm from
 # a prior run on the same worktree) don't get re-counted or re-copied.
 pull_target_incremental() {  # $1=worktree $2=ip -> stdout: bytes transferred; rc 0/1
-  local worktree="$1" ip="$2" remote_path stats
+  local worktree="$1" ip="$2" remote_path stats local_target remote_target override
   remote_path="$REMOTE_ROOT/$(basename "$worktree")"
+  override="$(cargo_target_dir_for "$worktree")"
+  if [ -n "$override" ]; then
+    local_target="$override"; remote_target="$override"
+  else
+    local_target="$worktree/target"; remote_target="$remote_path/target"
+  fi
+  mkdir -p "$local_target" 2>/dev/null || true
   if ! stats="$("$RSYNC_BIN" -az --delete --stats -e "$SSH_BIN -o StrictHostKeyChecking=no -i $SSH_KEY" \
-        "$REMOTE_USER@$ip:$remote_path/target/" "$worktree/target/" 2>&1)"; then
+        "$REMOTE_USER@$ip:$remote_target/" "$local_target/" 2>&1)"; then
     return 1
   fi
   local bytes; bytes="$(echo "$stats" | grep -oE 'Total transferred file size: [0-9,]+' | grep -oE '[0-9,]+' | tr -d ',')"

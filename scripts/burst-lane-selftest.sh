@@ -90,6 +90,30 @@ expect "first run journaled a byte count" "[ -n \"$bytes1\" ]"
 expect "second run journaled a byte count" "[ -n \"$bytes2\" ]"
 expect "second run's journal line shows fewer bytes than the first (AC11)" "[ \"${bytes2:-0}\" -lt \"${bytes1:-0}\" ]"
 
+# ---- unit: cargo_target_dir_for (worktree-targets-off-root interaction) ----
+# mcphost-call-limits-honest, 2026-09-09 19:58Z: a worktree's own
+# .cargo/config.toml can point target-dir at an absolute path outside the
+# worktree (PRD-build-worktree-targets-off-root); pull_target_incremental
+# used to hardcode $worktree/target, which never existed for such a
+# worktree on the box, so every off-root worktree's rsync-down failed and
+# fell back local even after a real remote build succeeded. Checked as a
+# direct unit test (sourcing burst-lane.sh without running main) since the
+# fake rsync/ssh pair shares one filesystem for "remote" and "local" and
+# can't distinguish "pulled from the wrong path, worked anyway" from
+# "pulled from the right path" the way a real two-host rsync would.
+unit_rc=0
+( source "$BL"
+  wt_plain="$T/wt-plain"; mkdir -p "$wt_plain"
+  wt_off="$T/wt-offroot"; mkdir -p "$wt_off/.cargo"
+  printf '[build]\ntarget-dir = "/mnt/data/jsy/cargo-targets/fake-slug"\n' > "$wt_off/.cargo/config.toml"
+  got_plain="$(cargo_target_dir_for "$wt_plain")"
+  got_off="$(cargo_target_dir_for "$wt_off")"
+  [ -z "$got_plain" ] || { echo "plain worktree should have no override, got '$got_plain'" >&2; exit 1; }
+  [ "$got_off" = "/mnt/data/jsy/cargo-targets/fake-slug" ] || { echo "off-root override mismatch, got '$got_off'" >&2; exit 1; }
+) 2>"$T/unit-cargo-target-dir.err" || unit_rc=$?
+[ "$unit_rc" -eq 0 ] || cat "$T/unit-cargo-target-dir.err" >&2
+expect "cargo_target_dir_for resolves an off-root target-dir, none for a plain worktree" "[ $unit_rc -eq 0 ]"
+
 # ---- AC14: never poweroff/shutdown/stop -------------------------------------
 expect "no poweroff/shutdown/stop/reboot call was ever made" \
   "! grep -qE 'server (poweroff|shutdown|stop|reboot)' \"$FAKE_HCLOUD_CALLLOG\""
