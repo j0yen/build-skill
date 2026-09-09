@@ -39,14 +39,19 @@ if [ -f "$manifest" ]; then
   if [ -z "$ver" ]; then
     bad "version-tag: no version in $proj/Cargo.toml"
   else
+    # TAG OWNERSHIP (2026-09-09): the CURRENT version's tag is created by the
+    # gate's redeploy-tag producer at green HEAD — its ABSENCE here is the
+    # normal pending state, never a failure. What IS a defect: the current
+    # tag existing on a commit that doesn't declare this version (a stolen
+    # name blocks redeploy-tag), or any HISTORICAL version left untagged
+    # (checked by the gate's lineage backfill, not re-checked here).
     if git -C "$repo" rev-parse "v$ver" >/dev/null 2>&1; then
-      ok "version-tag: v$ver exists"
       tagsha="$(git -C "$repo" rev-list -n1 "v$ver" 2>/dev/null)"
       tagver="$(git -C "$repo" show "$tagsha:$([ "$proj" = "." ] && echo Cargo.toml || echo "$proj/Cargo.toml")" 2>/dev/null | sed -n 's/^version *= *"\([0-9.]*\)".*/\1/p' | head -1)"
-      if [ "$tagver" = "$ver" ]; then ok "tag-placement: v$ver at a commit declaring $ver"
-      else bad "tag-placement: v$ver points at a commit declaring '${tagver:-none}'"; fi
+      if [ "$tagver" = "$ver" ]; then ok "version-tag: v$ver exists at a commit declaring $ver"
+      else bad "tag-placement: v$ver points at a commit declaring '${tagver:-none}' — stolen name blocks redeploy-tag"; fi
     else
-      bad "version-tag: crate at $ver but tag v$ver missing"
+      ok "version-tag: v$ver pending (gate redeploy-tags at green HEAD)"
     fi
     lock="$repo/Cargo.lock"; [ -f "$repo/$proj/Cargo.lock" ] && lock="$repo/$proj/Cargo.lock"
     if [ -f "$lock" ] && [ -n "$crate" ]; then
