@@ -107,7 +107,7 @@ COST_PER_HOUR_EUR="0.47"
 REMOTE_ROOT="${BURST_LANE_REMOTE_ROOT:-/root/build}"
 
 die() { echo "burst-lane: $*" >&2; exit "${2:-1}"; }
-usage() { echo "usage: burst-lane.sh {up|status|run|sync-back|down|watchdog|cost|sub-cap} ..." >&2; exit 2; }
+usage() { echo "usage: burst-lane.sh {up|status|run|sync-back|down|watchdog|cost|sub-cap|verify} ..." >&2; exit 2; }
 
 now_epoch() { echo "${BURST_LANE_NOW:-$(date -u +%s)}"; }
 now_iso()   { date -u -d "@$(now_epoch)" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ; }
@@ -201,6 +201,16 @@ precondition() {  # stdout = message; rc 0 pass, 1 fail
 }
 
 # ---- up -------------------------------------------------------------------
+box_bootstrap() {  # $1 = ip — make a snapshot box ready (idempotent, ~1s when already done)
+  "$SSH_BIN" -o StrictHostKeyChecking=no -o ConnectTimeout=8 -i "$SSH_KEY" "$REMOTE_USER@$1" "
+    mkdir -p $REMOTE_ROOT
+    sysctl -qw kernel.apparmor_restrict_unprivileged_userns=0 2>/dev/null || true
+    command -v bwrap >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y -qq bubblewrap; } >/dev/null 2>&1
+    command -v python3 >/dev/null 2>&1 || apt-get install -y -qq python3-minimal python3 >/dev/null 2>&1
+    command -v uv >/dev/null 2>&1 || [ -x /root/.local/bin/uv ] || (curl -LsSf https://astral.sh/uv/install.sh | sh) >/dev/null 2>&1
+    true" 2>/dev/null || true
+}
+
 sandbox_probe() {  # $1 = ip -> echoes true|false
   if "$SSH_BIN" -o StrictHostKeyChecking=no -o ConnectTimeout=8 -i "$SSH_KEY" "$REMOTE_USER@$1" \
        'bwrap --ro-bind / / --dev /dev --proc /proc --unshare-user --unshare-pid --die-with-parent python3 -c "print(1)"' >/dev/null 2>&1; then
@@ -226,12 +236,14 @@ cmd_up() {
   local adopt; adopt="$(find_by_name "$SERVER_NAME" 2>/dev/null || true)"
   if [ -n "$adopt" ]; then
     local aid aip; aid="${adopt%% *}"; aip="${adopt##* }"
+    box_bootstrap "$aip"
     local sbx; sbx="$(sandbox_probe "$aip")"
     state_write "server_id=$aid" "ip=$aip" "server_type=$SERVER_TYPE" \
       "boot_ts=$(now_iso)" "boot_epoch=$(now_epoch)" "ttl_hours=$DEFAULT_TTL_HOURS" \
       "hard_ttl_hours=$HARD_TTL_HOURS" "runs_served=0" "sandbox_ok=$sbx" \
       "teardown_scheduled=false" "teardown_epoch="
     journal_line "$(now_iso)  burst-lane  up  adopted  (server_id=$aid ip=$aip sandbox_ok=$sbx)"
+    ( cmd_verify >/dev/null 2>&1 ) || journal_line "$(now_iso)  burst-lane  up  verify-failed-after-adopt  (lane unverified — run falls back local)"
     echo "already-up: $aid $aip (adopted)"
     exit 0
   fi
@@ -243,13 +255,15 @@ cmd_up() {
     exit 3
   fi
 
-  local create_out
+  local create_out create_err; create_err="$(mktemp)"
   if ! create_out="$("$HCLOUD" server create --name "$SERVER_NAME" --type "$SERVER_TYPE" \
-        --location "$LOCATION" --image "$SNAPSHOT_ID" --ssh-key "${HCLOUD_SSH_KEY:-default}" -o json 2>&1)"; then
-    journal_line "$(now_iso)  burst-lane  up  fallback  (cause=hcloud-server-create-failed: $create_out)"
-    echo "fallback: hcloud server create failed - $create_out"
+        --location "$LOCATION" --image "$SNAPSHOT_ID" --ssh-key "${HCLOUD_SSH_KEY:-default}" -o json 2>"$create_err")"; then
+    local emsg; emsg="$(tail -3 "$create_err" 2>/dev/null | tr '\n' ' ')"; rm -f "$create_err"
+    journal_line "$(now_iso)  burst-lane  up  fallback  (cause=hcloud-server-create-failed: $emsg)"
+    echo "fallback: hcloud server create failed - $emsg"
     exit 3
   fi
+  rm -f "$create_err"
   local id ip
   read -r id ip <<<"$(python3 -c '
 import json, sys
@@ -279,16 +293,60 @@ print(d.get("id",""), d.get("public_net",{}).get("ipv4",{}).get("ip",""))
     exit 3
   fi
 
+  box_bootstrap "$ip"
   local sbx; sbx="$(sandbox_probe "$ip")"
   state_write "server_id=$id" "ip=$ip" "server_type=$SERVER_TYPE" \
     "boot_ts=$(now_iso)" "boot_epoch=$(now_epoch)" "ttl_hours=$DEFAULT_TTL_HOURS" \
     "hard_ttl_hours=$HARD_TTL_HOURS" "runs_served=0" "sandbox_ok=$sbx" \
     "teardown_scheduled=false" "teardown_epoch="
   journal_line "$(now_iso)  burst-lane  up  booted  (server_id=$id ip=$ip type=$SERVER_TYPE sandbox_ok=$sbx)"
+  ( cmd_verify >/dev/null 2>&1 ) || journal_line "$(now_iso)  burst-lane  up  verify-failed-after-boot  (lane unverified — run falls back local)"
   if [ "$sbx" = false ]; then
     journal_line "$(now_iso)  burst-lane  up  sandbox-unavailable  (server_id=$id — rust selection falls back to local cap for python-kind sandboxed tests this tick)"
   fi
   echo "up: $id $ip"
+  exit 0
+}
+
+# ---- verify ---------------------------------------------------------------
+# End-to-end proof the lane can do real work: rsync roundtrip + remote cargo
+# + remote uv + sandbox, all with outcome assertions. Stamps verified=true
+# into session state on success; cmd_run refuses to route until it has.
+# This exists because every lane component "passed" its fixtures on
+# 2026-09-09 while zero real work had ever executed on a box.
+cmd_verify() {
+  state_active || { echo "verify: no active session"; exit 1; }
+  local ip; ip="$(state_read ip)"
+  local fails=0
+  vfail() { echo "verify FAIL: $1"; fails=$((fails+1)); }
+
+  local fx; fx="$(mktemp -d)"; echo ok > "$fx/probe.txt"
+  local rpath="$REMOTE_ROOT/.verify-fixture"
+  "$RSYNC_BIN" -az --delete --rsync-path="mkdir -p '$rpath' && rsync" \
+      -e "$SSH_BIN -o StrictHostKeyChecking=no -i $SSH_KEY" \
+      "$fx/" "$REMOTE_USER@$ip:$rpath/" >/dev/null 2>&1 || vfail "rsync roundtrip"
+  rm -rf "$fx"
+
+  local rout
+  rout="$("$SSH_BIN" -o StrictHostKeyChecking=no -i "$SSH_KEY" "$REMOTE_USER@$ip" \
+    'export PATH=/root/.cargo/bin:/root/.local/bin:$PATH; cargo --version && uv --version && python3 -c "print(1)"' 2>/dev/null)"
+  printf '%s' "$rout" | grep -q "^cargo " || vfail "remote cargo"
+  printf '%s' "$rout" | grep -q "^uv "    || vfail "remote uv"
+  printf '%s' "$rout" | grep -q "^1$"     || vfail "remote python3"
+  [ "$(sandbox_probe "$ip")" = "true" ]   || vfail "bwrap sandbox"
+
+  if [ "$fails" -gt 0 ]; then
+    journal_line "$(now_iso)  burst-lane  verify  FAILED  ($fails check(s) — lane stays unverified, all work falls back local)"
+    exit 1
+  fi
+  state_write "server_id=$(state_read server_id)" "ip=$ip" "server_type=$(state_read server_type)" \
+    "boot_ts=$(state_read boot_ts)" "boot_epoch=$(state_read boot_epoch)" \
+    "ttl_hours=$(state_read ttl_hours)" "hard_ttl_hours=$(state_read hard_ttl_hours)" \
+    "runs_served=$(state_read runs_served)" "sandbox_ok=$(state_read sandbox_ok)" \
+    "teardown_scheduled=$(state_read teardown_scheduled)" "teardown_epoch=$(state_read teardown_epoch)" \
+    "verified=true"
+  journal_line "$(now_iso)  burst-lane  verify  ok  (rsync+cargo+uv+python3+sandbox all real)"
+  echo "verify: ok"
   exit 0
 }
 
@@ -356,9 +414,18 @@ cmd_run() {
   fi
 
   local id ip; id="$(state_read server_id)"; ip="$(state_read ip)"
+  if [ "$(state_read verified)" != "true" ]; then
+    ( cmd_verify >/dev/null 2>&1 ) || true
+    if [ "$(state_read verified)" != "true" ]; then
+      journal_line "$(now_iso)  burst-lane  run  lane-unverified  (server_id=$id worktree=$worktree — falling back local)"
+      echo "fallback: lane not verified (burst-lane.sh verify) — running locally"
+      exit 3
+    fi
+  fi
   local remote_path="$REMOTE_ROOT/$(basename "$worktree")"
 
-  if ! "$RSYNC_BIN" -az --delete --exclude target --exclude .git \
+  if ! "$RSYNC_BIN" -az --delete --exclude target --exclude .git --exclude .venv \
+        --rsync-path="mkdir -p '$remote_path' && rsync" \
         -e "$SSH_BIN -o StrictHostKeyChecking=no -i $SSH_KEY" \
         "$worktree/" "$REMOTE_USER@$ip:$remote_path/" >/tmp/burst-lane-rsync-up.$$.log 2>&1; then
     journal_line "$(now_iso)  burst-lane  run  fallback  (cause=rsync-up-failed worktree=$worktree)"
@@ -366,9 +433,24 @@ cmd_run() {
     exit 3
   fi
 
-  local remote_cmd="cd $remote_path && export CARGO_HOME=\${CARGO_HOME:-\$HOME/.cargo} RUSTC_WRAPPER=sccache SCCACHE_DIR=/root/.sccache; $*"
+  # A caller (the PATH shims) may hand us the LOCAL absolute binary path —
+  # meaningless on the box. Route by bare name; the remote PATH below finds it.
+  local first="$1"; shift
+  case "$first" in */cargo) first=cargo ;; */uv) first=uv ;; esac
+  local remote_cmd="cd $remote_path && export PATH=/root/.cargo/bin:/root/.local/bin:\$PATH CARGO_HOME=\${CARGO_HOME:-\$HOME/.cargo} RUSTC_WRAPPER=sccache SCCACHE_DIR=/root/.sccache; $first $*"
   local rc=0
   "$SSH_BIN" -o StrictHostKeyChecking=no -i "$SSH_KEY" "$REMOTE_USER@$ip" "$remote_cmd" || rc=$?
+
+  # Remote 127/126 = the command or its interpreter is missing ON THE BOX —
+  # an infra failure of this lane, never a result of the caller's tests.
+  # Report fallback (exit 3) so shims re-run locally; a missing remote binary
+  # must never masquerade as a red test suite (2026-09-09: 14 "routed" runs
+  # were all exit=127 and nobody noticed until the journal was read).
+  if [ "$rc" -eq 127 ] || [ "$rc" -eq 126 ]; then
+    journal_line "$(now_iso)  burst-lane  run  infra-fail  (server_id=$id worktree=$worktree remote_rc=$rc cmd=$first — falling back local)"
+    echo "fallback: remote $first not runnable on box (rc=$rc)"
+    exit 3
+  fi
 
   local bytes
   if ! bytes="$(pull_target_incremental "$worktree" "$ip")"; then
@@ -382,7 +464,7 @@ cmd_run() {
     "boot_ts=$(state_read boot_ts)" "boot_epoch=$(state_read boot_epoch)" \
     "ttl_hours=$(state_read ttl_hours)" "hard_ttl_hours=$(state_read hard_ttl_hours)" \
     "runs_served=$runs" "sandbox_ok=$(state_read sandbox_ok)" \
-    "teardown_scheduled=$(state_read teardown_scheduled)" "teardown_epoch=$(state_read teardown_epoch)"
+    "teardown_scheduled=$(state_read teardown_scheduled)" "teardown_epoch=$(state_read teardown_epoch)" "verified=$(state_read verified)"
   journal_line "$(now_iso)  burst-lane  run  routed  (server_id=$id worktree=$worktree runs_served=$runs exit=$rc bytes=$bytes)"
   exit "$rc"
 }
@@ -454,7 +536,7 @@ cmd_down() {
       state_write "server_id=$id" "ip=$(state_read ip)" "server_type=$(state_read server_type)" \
         "boot_ts=$(state_read boot_ts)" "boot_epoch=$boot_epoch" "ttl_hours=$(state_read ttl_hours)" \
         "hard_ttl_hours=$(state_read hard_ttl_hours)" "runs_served=$(state_read runs_served)" \
-        "sandbox_ok=$(state_read sandbox_ok)" "teardown_scheduled=false" "teardown_epoch="
+        "sandbox_ok=$(state_read sandbox_ok)" "teardown_scheduled=false" "teardown_epoch=" "verified=$(state_read verified)"
       journal_line "$(now_iso)  burst-lane  down  decision=keep  (server_id=$id cause=rust-work-arrived, schedule cancelled)"
     else
       journal_line "$(now_iso)  burst-lane  down  decision=keep  (server_id=$id)"
@@ -493,7 +575,7 @@ cmd_down() {
   state_write "server_id=$id" "ip=$(state_read ip)" "server_type=$(state_read server_type)" \
     "boot_ts=$(state_read boot_ts)" "boot_epoch=$boot_epoch" "ttl_hours=$(state_read ttl_hours)" \
     "hard_ttl_hours=$(state_read hard_ttl_hours)" "runs_served=$(state_read runs_served)" \
-    "sandbox_ok=$(state_read sandbox_ok)" "teardown_scheduled=true" "teardown_epoch=$window_start"
+    "sandbox_ok=$(state_read sandbox_ok)" "teardown_scheduled=true" "teardown_epoch=$window_start" "verified=$(state_read verified)"
   journal_line "$(now_iso)  burst-lane  down  decision=scheduled  (server_id=$id teardown_at=$(date -u -d "@$window_start" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "$window_start"))"
   echo "decision=scheduled"
   exit 0
@@ -633,6 +715,7 @@ main() {
     watchdog)  cmd_watchdog "$@" ;;
     cost)      cmd_cost "$@" ;;
     sub-cap)   cmd_sub_cap "$@" ;;
+    verify)    cmd_verify "$@" ;;
     *) usage ;;
   esac
 }

@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# burst-lane-bin/uv — python leg of the burst lane (requirement 12,
+# PRD-build-burst-lane-ccx53). Mirrors the cargo shim: with BURST_LANE=1,
+# BURST_PY=1, and a VERIFIED session up, `uv run pytest ...` (and friends)
+# route through burst-lane.sh run; everything else — and every infra
+# failure — falls straight through to the real uv locally.
+#
+# BURST_PY is a second, deliberate opt-in: python suites that drive the
+# `claude` CLI or a logged-in Agent SDK session (synthorg consume-style)
+# MUST stay local — the box has no login. The branch prompt sets BURST_PY=1
+# only for PRDs whose tests are sandbox-safe; without it this shim is a
+# pure pass-through.
+#
+# Routed subcommands: run, sync (uv resolves the venv remotely from
+# uv.lock — .venv is never rsynced). Everything else: local.
+set -uo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+WRAPPER="$HERE/../burst-lane.sh"
+
+SHIM_DIRS=("$HERE")
+real_uv() {
+  local dir bin resolved shim skip
+  local saved_ifs="$IFS"
+  IFS=:
+  for dir in $PATH; do
+    IFS="$saved_ifs"
+    [ -n "$dir" ] || continue
+    resolved="$(cd "$dir" 2>/dev/null && pwd -P || true)"
+    [ -n "$resolved" ] || continue
+    skip=0
+    for shim in "${SHIM_DIRS[@]}"; do
+      [ "$resolved" = "$shim" ] && { skip=1; break; }
+    done
+    [ "$skip" -eq 1 ] && continue
+    bin="$dir/uv"
+    if [ -x "$bin" ]; then printf '%s\n' "$bin"; return 0; fi
+  done
+  IFS="$saved_ifs"
+  return 1
+}
+
+REAL_UV="$(real_uv)"
+if [ -z "$REAL_UV" ]; then
+  echo "burst-lane-bin/uv: no real uv found on PATH behind this shim" >&2
+  exit 127
+fi
+
+route=0
+case "${1:-}" in run|sync) route=1 ;; esac
+
+if [ "$route" -eq 1 ] && [ "${BURST_LANE:-0}" = "1" ] && [ "${BURST_PY:-0}" = "1" ] && [ -x "$WRAPPER" ]; then
+  status_out="$("$WRAPPER" status 2>/dev/null)"
+  if [ "$status_out" != "no active session" ] && [ -n "$status_out" ]; then
+    exec "$WRAPPER" run "$PWD" -- "$REAL_UV" "$@"
+  fi
+  echo "burst-lane: no session, local" >&2
+fi
+exec "$REAL_UV" "$@"
