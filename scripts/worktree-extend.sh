@@ -180,6 +180,7 @@ cmd_add() {
   if git -C "$repo" worktree list --porcelain | grep -qxF "worktree $wt"; then
     write_target_config "$wt" "$repo" "$slug"
     print_cargo_budget_path_reminder >&2
+    print_burst_lane_path_reminder "$repo" >&2
     echo "$wt"; return 0
   fi
   # Base the branch on main's HEAD (clean commit), ignoring any dirty files in
@@ -192,6 +193,7 @@ cmd_add() {
   fi
   write_target_config "$wt" "$repo" "$slug"
   print_cargo_budget_path_reminder >&2
+  print_burst_lane_path_reminder "$repo" >&2
   echo "$wt"
 }
 
@@ -208,6 +210,27 @@ print_cargo_budget_path_reminder() {
   echo "  export PATH=\"\$HOME/.claude/skills/build/scripts/cargo-budget-bin:\$PATH\"" >&2
   echo "worktree-extend: this routes cargo test/clippy/build --release/deny/nextest through" >&2
   echo "the shared concurrency budget; cargo check/metadata bypass it (PRD-build-cargo-concurrency-budget)." >&2
+}
+
+# PRD-build-burst-lane-ccx53 requirement 4: rust branches must be able to
+# route cargo through the Hetzner CCX53 burst lane when a session is up.
+# The burst-lane cargo shim (scripts/burst-lane-bin/cargo) has to sit AHEAD
+# of cargo-budget-bin on PATH (its own header comment: it inserts itself
+# ahead of that chain without disturbing it) so BURST_LANE=1 routes to the
+# box first and only falls through to the local budget shim when no session
+# exists. Printed to stderr, gated on the repo actually being a cargo repo
+# (same test cargo-budget's reminder uses) so a non-rust worktree gets no
+# irrelevant burst-lane noise. SKILL.md's branch dispatch prompt requires
+# the branch agent actually run this export for rust branches.
+print_burst_lane_path_reminder() {
+  local repo="${1:?print_burst_lane_path_reminder: missing repo arg}"
+  [ -f "$repo/Cargo.toml" ] || return 0
+  echo "worktree-extend: burst-lane — before any cargo command in this worktree, run:" >&2
+  echo "  export PATH=\"\$HOME/.claude/skills/build/scripts/burst-lane-bin:\$PATH\" BURST_LANE=1" >&2
+  echo "worktree-extend: (prepend AFTER cargo-budget-bin so burst-lane-bin resolves first —" >&2
+  echo "PATH=\"burst-lane-bin:cargo-budget-bin:\$PATH\") this routes cargo build/test/clippy/" >&2
+  echo "deny/nextest to the CCX53 burst lane when 'burst-lane.sh status' reports a session," >&2
+  echo "and falls through to cargo-budget-bin's local routing otherwise (PRD-build-burst-lane-ccx53)." >&2
 }
 
 cmd_integrate() {

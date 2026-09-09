@@ -1229,6 +1229,28 @@ PATH=\"$HOME/.claude/skills/build/scripts/cargo-budget-bin:$PATH\" so cargo
 test/clippy/build --release/deny/nextest route through the shared
 concurrency budget (cargo-budget.sh); cargo check/metadata are unaffected."
 
+**Burst-lane PATH, rust branches only, when a session is up
+(PRD-build-burst-lane-ccx53, requirement 4).** `scripts/burst-lane-bin/cargo`
+must resolve AHEAD of `cargo-budget-bin` on PATH — it re-execs the real
+cargo itself and, with `BURST_LANE=1` and `burst-lane.sh status` reporting a
+session, routes `build`/`test`/`clippy`/`deny`/`nextest` to the CCX53 over
+`burst-lane.sh run` instead of running them on RedBaron at all; with no
+session it falls straight through to whatever cargo is next on PATH
+(`cargo-budget-bin`'s shim, unaffected). `worktree-extend.sh add` prints this
+reminder to stderr for any worktree with a `Cargo.toml`. Every rust branch
+agent prompt must include this directive verbatim, in addition to (not
+instead of) the cargo-budget directive above: "Before any cargo command,
+also export PATH=\"$HOME/.claude/skills/build/scripts/burst-lane-bin:$PATH\"
+BURST_LANE=1 (prepended AFTER the cargo-budget-bin export above, so it
+resolves first) — this routes cargo build/test/clippy/deny/nextest to the
+Hetzner CCX53 burst lane when a session is up (burst-lane.sh status), and
+falls through to the local concurrency budget otherwise." The tick's own
+selection sub-cap formula for a live session (requirement 7:
+`min(floor(MemAvailable_gb/6), floor(nproc/4), rust candidates)`, journaled
+as `burst: sub-cap=<n> (avail_gb=<n> nproc=<n>)`) is not yet wired into
+selection as of this pass — see `scripts/burst-lane.sh`'s header for what
+remains.
+
 Each agent prompt must include, self-contained:
 
 - Prepend the output of `inoculate-preamble` (if installed) to the agent's task prompt, so spawned agents carry the in-force strain.
@@ -1241,6 +1263,15 @@ Each agent prompt must include, self-contained:
   cargo test/clippy/build --release/deny/nextest route through the shared
   concurrency budget (cargo-budget.sh); cargo check/metadata are
   unaffected."
+- For any RUST branch specifically (worktree or not): the burst-lane PATH
+  directive verbatim, in addition to the cargo-budget one above
+  (PRD-build-burst-lane-ccx53 requirement 4, see "Burst-lane PATH" above) —
+  "Before any cargo command, also export
+  PATH=\"$HOME/.claude/skills/build/scripts/burst-lane-bin:$PATH\"
+  BURST_LANE=1 (prepended AFTER the cargo-budget-bin export above, so it
+  resolves first) — this routes cargo build/test/clippy/deny/nextest to the
+  Hetzner CCX53 burst lane when a session is up (burst-lane.sh status), and
+  falls through to the local concurrency budget otherwise."
 - "You are advancing ONE PRD as part of a parallel /build tick.
   Run Phases 3 → 4 → 5 → 7 for this PRD only. Do not invoke /build
   recursively. Do not touch any PRD other than this one."
