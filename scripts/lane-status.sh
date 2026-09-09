@@ -12,11 +12,21 @@
 #   lane-status.sh report [--prd-dir <dir>] [--journal-dir <dir>] [--days <n>]
 #       Prints: each lane's last tick-summary line (scanned back <n> days,
 #       default 2), then every live claim and every stale claim found across
-#       build-queue/*.md (via lane-claim.sh status).
+#       build-queue/*.md (via lane-claim.sh status), then the last 5
+#       cargo-budget ledger rows (PRD-build-cargo-concurrency-budget).
+#
+# PRD-build-cargo-concurrency-budget (2026-09-09): `tick-summary` also
+# appends this tick's `cargo-budget: peak_load=... min_avail_gb=...
+# waits=... max_wait_s=...` line (via cargo-budget.sh summary's cursor —
+# each call covers only the window since the previous call) right after
+# the lane-health line, so the same Phase-7 parent step that already
+# writes lane health also records what this tick's cargo load looked
+# like. `report` additionally shows the last 5 raw ledger rows.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LANE_CLAIM="$HERE/lane-claim.sh"
+CARGO_BUDGET="${CARGO_BUDGET:-$HERE/cargo-budget.sh}"
 
 die() { echo "lane-status: $*" >&2; exit "${2:-4}"; }
 usage() { echo "usage: lane-status.sh {tick-summary|report} ..." >&2; exit 4; }
@@ -35,6 +45,10 @@ cmd_tick_summary() {
   mkdir -p "$(dirname "$journal")" 2>/dev/null || true
   printf '%s  lane-health  tick  claimed=%s skipped=%s  (lane=%s)\n' \
     "$(now_iso)" "$claimed" "$skipped" "$lane" >> "$journal"
+  if [ -x "$CARGO_BUDGET" ]; then
+    local cb_line; cb_line="$("$CARGO_BUDGET" summary 2>/dev/null || true)"
+    [ -n "$cb_line" ] && printf '%s\n' "$cb_line" >> "$journal"
+  fi
   echo "appended: $journal"
 }
 
@@ -78,6 +92,14 @@ cmd_report() {
     echo "$(basename "$pf" .md): $status"
   done
   if [ "$any" -eq 0 ]; then echo "(no live claims)"; fi
+
+  echo
+  echo "== cargo-budget: last 5 runs (PRD-build-cargo-concurrency-budget) =="
+  if [ -x "$CARGO_BUDGET" ]; then
+    "$CARGO_BUDGET" last 5
+  else
+    echo "(cargo-budget.sh not found at $CARGO_BUDGET)"
+  fi
 }
 
 main() {

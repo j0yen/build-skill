@@ -179,6 +179,7 @@ cmd_add() {
   # Resume if the worktree already exists (multi-tick build).
   if git -C "$repo" worktree list --porcelain | grep -qxF "worktree $wt"; then
     write_target_config "$wt" "$repo" "$slug"
+    print_cargo_budget_path_reminder >&2
     echo "$wt"; return 0
   fi
   # Base the branch on main's HEAD (clean commit), ignoring any dirty files in
@@ -190,7 +191,23 @@ cmd_add() {
     git -C "$repo" worktree add -b "$branch" "$wt" "$base" >&2 || die 2 "worktree add (new branch) failed"
   fi
   write_target_config "$wt" "$repo" "$slug"
+  print_cargo_budget_path_reminder >&2
   echo "$wt"
+}
+
+# PRD-build-cargo-concurrency-budget: a worktree's `cargo test`/`clippy`/
+# `build --release`/`deny`/`nextest` must route through the host-wide
+# cargo concurrency budget (cargo-budget.sh) so a wide tick's worktree
+# branches don't each assume they own RedBaron (the 2026-09-09 OOM: load
+# 21,466 with the same-target sub-cap at only 3). Printed to stderr (not
+# stdout, which stays the bare worktree path for any caller doing
+# `wt=$(worktree-extend.sh add ...)`); SKILL.md's branch dispatch prompt
+# requires the branch agent actually run this export.
+print_cargo_budget_path_reminder() {
+  echo "worktree-extend: cargo-budget — before any cargo command in this worktree, run:" >&2
+  echo "  export PATH=\"\$HOME/.claude/skills/build/scripts/cargo-budget-bin:\$PATH\"" >&2
+  echo "worktree-extend: this routes cargo test/clippy/build --release/deny/nextest through" >&2
+  echo "the shared concurrency budget; cargo check/metadata bypass it (PRD-build-cargo-concurrency-budget)." >&2
 }
 
 cmd_integrate() {

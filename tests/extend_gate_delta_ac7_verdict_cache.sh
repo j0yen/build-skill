@@ -31,6 +31,17 @@ export EXTEND_GATE_JOURNAL="$T/journal.md"
 export FAKE_GATE_CALL_COUNTER="$T/gate-calls"
 export FAKE_GATE_PASS_NAMES="audit,vti-plan,rollback-plan,proof-receipt"
 unset FAKE_GATE_BLOCKING_FILE || true
+# PRD-build-cargo-concurrency-budget: see the matching comment in
+# extend_gate_delta_ac6_record_ship_paths.sh — extend-gate.sh's producer
+# phases now route through cargo-budget.sh, which defaults to gating on
+# this box's real hostname/loadavg/meminfo. Pin it quiet+isolated so this
+# deterministic fixture test never waits on ambient host conditions.
+export CARGO_BUDGET_HOSTNAME="extend-gate-test"
+export CARGO_BUDGET_MIN_AVAIL_GB=0
+export CARGO_BUDGET_SLOTS=8
+export CARGO_BUDGET_WAIT_MAX=5
+export CARGO_BUDGET_STATE_DIR="$T/cargo-budget-state"
+export CARGO_BUDGET_JOURNAL="$T/cargo-budget-journal.md"
 
 fail=0
 expect() {

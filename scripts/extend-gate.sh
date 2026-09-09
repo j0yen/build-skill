@@ -150,6 +150,23 @@ REVIEWER_PROMPT="${REVIEWER_PROMPT:-$HOME/.claude/skills/rustbuild/prompts/revie
 AUTOBUILDER_CANONICAL_CARGO_TOML="${AUTOBUILDER_CANONICAL_CARGO_TOML:-$HOME/wintermute/autobuilder/autobuilder/Cargo.toml}"
 BUILD_SCRIPTS="$(cd "$(dirname "$0")" && pwd)"
 GATE_DELTA="$BUILD_SCRIPTS/gate-delta.sh"
+# PRD-build-cargo-concurrency-budget: every producer step below that shells
+# to cargo (the proof-receipt loop and the 17 extended producers) takes a
+# budget slot for its whole phase instead of assuming it owns the host —
+# see cargo-budget.sh's header for why (RedBaron OOMed for ~6min at
+# load 21,466 on 2026-09-09 with the sub-cap at 3). Overridable so tests/
+# can point at a fixture wrapper without touching production behavior.
+CARGO_BUDGET="${CARGO_BUDGET:-$BUILD_SCRIPTS/cargo-budget.sh}"
+cargo_budgeted() {
+  # Runs "$@" through the budget wrapper when it's present+executable;
+  # fails open (runs "$@" directly) if cargo-budget.sh is missing so a
+  # partial checkout never turns a missing helper into a gate outage.
+  if [ -x "$CARGO_BUDGET" ]; then
+    "$CARGO_BUDGET" run -- "$@"
+  else
+    "$@"
+  fi
+}
 
 die() { echo "extend-gate: $2" >&2; exit "$1"; }
 
@@ -494,8 +511,11 @@ fi
 ( cd "$repo" && autobuilder intake --validate agent/intent-card.json --project "$project_rel" ) 9>&- \
   || note_block "intake — autobuilder intake exited non-zero (schema violation in agent/intent-card.json, missing file, or receipt write failure — see output above)"
 
-# 3. proof receipt + session trace.
-( cd "$repo" && autobuilder loop --project "$project_rel" --iteration 0 --head-sha "$head_now" --trace ) 9>&- \
+# 3. proof receipt + session trace. Budgeted (PRD-build-cargo-concurrency-
+#    budget): this producer shells to `cargo test`/`cargo build` internally,
+#    so the whole phase takes one cargo-budget slot rather than racing every
+#    other budgeted cargo caller on the host.
+( cd "$repo" && cargo_budgeted autobuilder loop --project "$project_rel" --iteration 0 --head-sha "$head_now" --trace ) 9>&- \
   || note_block "proof-receipt — autobuilder loop --iteration 0 exited non-zero"
 
 # 4. vti-plan.
@@ -569,7 +589,12 @@ fi
 # the final `autobuilder gate` read from.
 # subshell wraps the direct exec so 9>&- has a scope to apply to — this
 # call is not otherwise inside a `( ... )` group.
-( "$RUSTBUILD_SCRIPTS/extended-receipts.sh" "$project_abs" "$parallelism" ) 9>&- \
+# Budgeted as ONE phase (PRD-build-cargo-concurrency-budget): the internal
+# $parallelism fan-out is exactly the "each branch/gate assumes it owns the
+# box" pattern the 2026-09-09 OOM came from, so the whole extended-receipts
+# run takes a single cargo-budget slot rather than each of its 17 producers
+# racing every other budgeted cargo caller independently.
+( cargo_budgeted "$RUSTBUILD_SCRIPTS/extended-receipts.sh" "$project_abs" "$parallelism" ) 9>&- \
   || note_block "extended-receipts — one or more extended producers did not pass|skip (see output above)"
 
 # 9. the risk gate itself — authoritative pass/block, reads all 25 receipts.

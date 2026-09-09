@@ -1002,6 +1002,14 @@ both lanes' contribution without cross-referencing every branch line.
 Read both lanes' status (last tick, live claims, stale claims) at any time
 with `scripts/lane-status.sh report`.
 
+**Cargo-budget summary line (P0, PRD-build-cargo-concurrency-budget).** The
+same `tick-summary` call above also appends `cargo-budget: peak_load=<n>
+min_avail_gb=<n> waits=<n> max_wait_s=<n>` (from the cargo-budget ledger's
+window since the previous tick-summary call) right after the lane-health
+line — no separate script invocation needed. `scripts/lane-status.sh
+report` shows the last 5 raw ledger rows alongside the lane health/claims
+sections. See "Parallelism" below for the two-tick rule this line feeds.
+
 **Parent step (after all branches return, before releasing `tick.lock`):**
 - Run `scripts/manifest-set.sh --replay-orphans`. For every
   `state/intent/*.json` whose patch is not yet reflected in the manifest
@@ -1069,8 +1077,21 @@ satisfy:
    the recall/agorabus/episodic-observer clusters that used to serialize
    one-per-tick behind a single repo. **Sub-cap: ≤2 same-target branches
    per tick** — parallel cargo builds of a heavy-dep crate (e.g. recall's
-   fastembed) are memory-hungry; 5 bounds the blast radius (operator decision 2026-09-09 after RedBaron OOMed at 3 with a gate overlapping, load 21k; PRD-build-cargo-concurrency-budget queued to make this measurable: RedBaron 30 GB, worktree targets on /mnt/data). Kernel-extend
+   fastembed) are memory-hungry (operator decision 2026-09-09 after RedBaron OOMed at 3 with a gate overlapping, load 21k). Kernel-extend
    targets are exempt from worktree fan-out (rule 2 already caps them).
+   **Cargo concurrency budget (PRD-build-cargo-concurrency-budget, built
+   2026-09-09).** The sub-cap alone never bounded what a branch or a gate
+   unleashes underneath it — see `scripts/cargo-budget.sh` and "Where cargo
+   runs" above for the host-wide slot/memory/load budget every cargo
+   invocation now shares. Every tick's summary line
+   (`cargo-budget: peak_load=<n> min_avail_gb=<n> waits=<n>
+   max_wait_s=<n>`, written by `lane-status.sh tick-summary` from the
+   ledger) is what the sub-cap should be raised or held on: **the sub-cap
+   may only be raised after two consecutive ticks at the current value show
+   `peak_load < 4 × nproc` AND `min_avail_gb ≥ 8`** — a raise on operator
+   instinct alone is exactly the 3→5→8 escalation that preceded the
+   2026-09-09 OOM. `scripts/lane-status.sh report` shows the last 5 ledger
+   rows for this check.
 
    **Serial-fallback override (loom-serial-fallback, PRD-loom-serial-fallback).**
    Before admitting multiple branches for the same `build_into` target, check
@@ -1151,11 +1172,43 @@ PATH so every cargo command runs on RedBaron. Do NOT run cargo directly on
 this machine. If cargo-on-redbaron.sh status reports RedBaron unreachable,
 mark the PRD blocked and stop; never rent a server."
 
+**Cargo concurrency budget, ALL cargo work on RedBaron (2026-09-09,
+PRD-build-cargo-concurrency-budget).** Wherever cargo actually executes
+(locally on RedBaron; remotely, ON RedBaron, when dispatched from carbon/
+ryzen7's shim above) it now shares a host-wide concurrency budget instead of
+each invocation assuming it owns the box — see `scripts/cargo-budget.sh`'s
+header for the mechanics (a small counting semaphore over `CARGO_BUDGET_SLOTS`
+slots, a memory floor, and, on RedBaron, a load ceiling, all journaled). This
+is a direct response to RedBaron OOMing for ~6 minutes at 06:08Z 2026-09-09
+(load average 21,466) while the same-target sub-cap was only 3 — the sub-cap
+counted branches, not what each branch's `cargo test` unleashed underneath
+it. Every branch agent doing ANY cargo work — worktree or not — MUST run
+`export PATH="$HOME/.claude/skills/build/scripts/cargo-budget-bin:$PATH"`
+before its first cargo command (ahead of `rustbuild/bin` in the carbon/
+ryzen7 case — cargo-budget-bin's own `cargo` shim resolves the real cargo
+itself and re-execs through `cargo-budget.sh run --`). That shim routes
+`cargo test`, `cargo clippy`, `cargo build --release`, `cargo deny`, and
+`cargo nextest` through the budget; `cargo check` and `cargo metadata`
+bypass it (cheap/read-only, never the OOM source). `scripts/extend-gate.sh`
+routes its own cargo-shelling producer phases (the proof-receipt loop and
+the 17 extended producers) through the same wrapper. Each agent prompt must
+include this directive verbatim: "Before any cargo command, export
+PATH=\"$HOME/.claude/skills/build/scripts/cargo-budget-bin:$PATH\" so cargo
+test/clippy/build --release/deny/nextest route through the shared
+concurrency budget (cargo-budget.sh); cargo check/metadata are unaffected."
+
 Each agent prompt must include, self-contained:
 
 - Prepend the output of `inoculate-preamble` (if installed) to the agent's task prompt, so spawned agents carry the in-force strain.
 - The PRD's absolute path.
 - The PRD's slug.
+- For any branch that will run cargo (worktree or not): the cargo-budget
+  PATH directive verbatim (PRD-build-cargo-concurrency-budget, see "Where
+  cargo runs" above) — "Before any cargo command, export
+  PATH=\"$HOME/.claude/skills/build/scripts/cargo-budget-bin:$PATH\" so
+  cargo test/clippy/build --release/deny/nextest route through the shared
+  concurrency budget (cargo-budget.sh); cargo check/metadata are
+  unaffected."
 - "You are advancing ONE PRD as part of a parallel /build tick.
   Run Phases 3 → 4 → 5 → 7 for this PRD only. Do not invoke /build
   recursively. Do not touch any PRD other than this one."
@@ -1380,7 +1433,10 @@ inside the returned worktree path, that it commits implementation-only on
 its branch (no version bump in the worktree), and that it finishes with
 `worktree-extend.sh integrate` then `wm-push` + `cleanup`. The
 `prd-<slug>.lock` still guards the branch's manifest/journal writes; the
-worktree guards the build tree.
+worktree guards the build tree. `worktree-extend.sh add` itself prints (to
+stderr) the cargo-budget PATH-export reminder covered above
+(PRD-build-cargo-concurrency-budget) — the branch agent must actually run
+that export before its first cargo command in the worktree, not just read it.
 
 **Merge-safe CLI dispatcher registration (cli-register.sh convention).**
 When a shared-target branch adds a new CLI subcommand to a binary crate,

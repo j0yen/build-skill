@@ -40,6 +40,19 @@ export PATH="$FAKE:/usr/bin:/bin"
 export RUSTBUILD_SCRIPTS="$FAKE"
 export EXTEND_GATE_JOURNAL="$T/journal.md"
 export FAKE_GATE_CALL_COUNTER="$T/gate-calls"
+# PRD-build-cargo-concurrency-budget: extend-gate.sh now routes its
+# producer phases through cargo-budget.sh, which by default gates on this
+# box's REAL hostname/loadavg/meminfo. This fixture's fake autobuilder
+# returns instantly, so the budget wrapper must never actually wait here —
+# pin it to a quiet, non-RedBaron, always-available environment (same
+# pattern cargo-budget-selftest.sh uses) rather than let ambient host load
+# turn this deterministic fixture test flaky/hung.
+export CARGO_BUDGET_HOSTNAME="extend-gate-test"
+export CARGO_BUDGET_MIN_AVAIL_GB=0
+export CARGO_BUDGET_SLOTS=8
+export CARGO_BUDGET_WAIT_MAX=5
+export CARGO_BUDGET_STATE_DIR="$T/cargo-budget-state"
+export CARGO_BUDGET_JOURNAL="$T/cargo-budget-journal.md"
 
 fail=0
 expect() {

@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# cargo-budget-bin/cargo — thin shim so a worktree's ordinary `cargo test`
+# (etc.) automatically routes through the shared concurrency budget
+# (PRD-build-cargo-concurrency-budget), without a branch agent's prompt
+# needing to say anything but `export PATH=".../cargo-budget-bin:$PATH"`.
+#
+# Routed through scripts/cargo-budget.sh run -- <real cargo> "$@":
+#   test, clippy, deny, nextest, and `build --release`.
+# Passed straight to the real cargo (no budget, no slot, no wait):
+#   check, metadata, and everything else not listed above — these are
+#   cheap/no-compile or read-only and were never the OOM source (see the
+#   PRD's Technical considerations: the sandbox/thread storm comes from
+#   `cargo test`'s binaries and `cargo build`'s codegen, not `cargo
+#   check`/`cargo metadata`).
+set -uo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WRAPPER="$HERE/../cargo-budget.sh"
+
+# Find the real cargo: walk $PATH entries in order, skip this shim's own
+# directory (and any other cargo-budget-bin dir, in case PATH has it
+# twice), take the first match. Falls back to `command -v cargo` outside
+# this process's PATH-search loop only if nothing else was found (should
+# not happen in practice — that would mean no real cargo is installed).
+real_cargo() {
+  local dir bin
+  local saved_ifs="$IFS"
+  IFS=:
+  for dir in $PATH; do
+    IFS="$saved_ifs"
+    [ -n "$dir" ] || continue
+    case "$(cd "$dir" 2>/dev/null && pwd -P || true)" in
+      "$HERE") continue ;;
+    esac
+    bin="$dir/cargo"
+    if [ -x "$bin" ]; then
+      printf '%s\n' "$bin"
+      return 0
+    fi
+  done
+  IFS="$saved_ifs"
+  return 1
+}
+
+REAL_CARGO="$(real_cargo)"
+if [ -z "$REAL_CARGO" ]; then
+  echo "cargo-budget-bin/cargo: no real cargo found on PATH behind this shim" >&2
+  exit 127
+fi
+
+route=0
+sub="${1:-}"
+case "$sub" in
+  test|clippy|deny|nextest) route=1 ;;
+  build)
+    for a in "$@"; do
+      if [ "$a" = "--release" ]; then route=1; break; fi
+    done
+    ;;
+esac
+
+if [ "$route" -eq 1 ] && [ -x "$WRAPPER" ]; then
+  exec "$WRAPPER" run -- "$REAL_CARGO" "$@"
+fi
+exec "$REAL_CARGO" "$@"
