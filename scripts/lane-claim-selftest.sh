@@ -156,4 +156,92 @@ set -e
 echo "$out" | grep -q '^busy: wedge-' || { echo "FAIL expected generic busy msg, got: $out"; exit 1; }
 echo ok
 
+echo "== own-claim continuation: a PRD already claimed by this lane is never blocked by its own claim (PRD-build-claims-resume-not-count, AC1/AC2) =="
+# Reproduces the 06:23Z OOM shape exactly: 3 live same-lane claims already
+# sit at the sub-cap (set up above), yet each of THOSE THREE PRDs must
+# still be selectable as a continuation of its own claim — the bug was
+# that the dead coordinator's own six claims blocked one another forever.
+echo "-- each of the 3 already-live claims resumes cleanly despite sitting at the sub-cap (AC1) --"
+for w in "$WEDGE_A" "$WEDGE_B" "$WEDGE_C"; do
+  out=$("$LC" target-busy /tmp/wedge-target-repo --lane redbaron --exclude-prd "$w" --prd-dir "$ROOT/clone")
+  echo "$out" | grep -q '^resume: own claim on /tmp/wedge-target-repo (lane=redbaron)$' \
+    || { echo "FAIL expected resume for $w, got: $out"; exit 1; }
+done
+echo ok
+
+echo "-- a genuinely new (unclaimed) 4th candidate is still sub-cap-blocked while the 3 continuations remain live (AC2) --"
+set +e
+out=$("$LC" target-busy /tmp/wedge-target-repo --lane redbaron --exclude-prd "$WEDGE_D" --prd-dir "$ROOT/clone" 2>&1); rc=$?
+set -e
+[ "$rc" -eq 1 ] || { echo "FAIL expected sub-cap busy exit 1, got $rc: $out"; exit 1; }
+echo "$out" | grep -q '^sub-cap: 3 same-lane claims already live' || { echo "FAIL expected sub-cap message, got: $out"; exit 1; }
+echo ok
+
+echo "== coordinator-liveness: a same-lane claim with a dead recorded PID is stale immediately, not after 3h (Requirement P0 #3, AC3) =="
+cat > "$ROOT/clone/build-queue/PRD-deadpid.md" <<'EOF'
+# PRD: deadpid
+
+- Status: queued
+- build_target: shell
+- build_into: /tmp/deadpid-target-repo
+- build_priority: high
+EOF
+git -C "$ROOT/clone" add -A
+git -C "$ROOT/clone" -c user.name=t -c user.email=t@t commit -q -m add-deadpid
+git -C "$ROOT/clone" push -q origin "$BR"
+DEADPID_PRD="$ROOT/clone/build-queue/PRD-deadpid.md"
+
+# Pick a PID guaranteed not to be running right now.
+DEAD_PID=999999
+while kill -0 "$DEAD_PID" 2>/dev/null; do DEAD_PID=$((DEAD_PID - 1)); done
+
+ts_fresh=$(now_iso)
+write_claim "$DEADPID_PRD" building "$(hostname) $ts_fresh pid=$DEAD_PID boot=$(current_boot_id)"
+git -C "$ROOT/clone" add -A
+git -C "$ROOT/clone" -c user.name=t -c user.email=t@t commit -q -m "claim: deadpid lane=$(hostname) (fixture, dead pid)"
+git -C "$ROOT/clone" push -q origin "$BR"
+
+echo "-- status: stale=yes at age ~0 because the recorded coordinator PID is gone --"
+out=$("$LC" status "$DEADPID_PRD")
+echo "$out" | grep -q 'stale=yes' || { echo "FAIL expected stale=yes, got: $out"; exit 1; }
+age_val=$(sed -E 's/.*age=([0-9]+)s.*/\1/' <<<"$out")
+[ "$age_val" -lt 10 ] || { echo "FAIL expected age <10s (immediate), got: $out"; exit 1; }
+echo ok
+
+echo "-- target-busy: the dead-pid claim doesn't count toward this lane's own sub-cap at all --"
+out=$("$LC" target-busy /tmp/deadpid-target-repo --lane "$(hostname)" --prd-dir "$ROOT/clone")
+[ "$out" = "free" ] || { echo "FAIL expected free (dead-pid claim excluded from count), got: $out"; exit 1; }
+echo ok
+
+echo "== coordinator-liveness: a claim recorded on ANOTHER host keeps the plain 3h age rule regardless of its pid trailer (Non-goal, AC4) =="
+cat > "$ROOT/clone/build-queue/PRD-otherhost.md" <<'EOF'
+# PRD: otherhost
+
+- Status: queued
+- build_target: shell
+- build_into: /tmp/otherhost-target-repo
+- build_priority: high
+EOF
+git -C "$ROOT/clone" add -A
+git -C "$ROOT/clone" -c user.name=t -c user.email=t@t commit -q -m add-otherhost
+git -C "$ROOT/clone" push -q origin "$BR"
+OTHERHOST_PRD="$ROOT/clone/build-queue/PRD-otherhost.md"
+
+# 1h old, pid=$$ (this very shell — definitely alive) but under a lane name
+# that never matches this host's hostname: PID namespaces are host-local,
+# so this must fall back to the age rule (not stale at 1h) rather than
+# either confirming it alive or dead.
+one_hour_ago=$(date -u -d '1 hour ago' +%Y-%m-%dT%H:%M:%SZ)
+write_claim "$OTHERHOST_PRD" building "some-other-lane-name $one_hour_ago pid=$$ boot=$(current_boot_id)"
+git -C "$ROOT/clone" add -A
+git -C "$ROOT/clone" -c user.name=t -c user.email=t@t commit -q -m "claim: otherhost lane=some-other-lane-name (fixture)"
+git -C "$ROOT/clone" push -q origin "$BR"
+
+set +e
+out=$("$LC" target-busy /tmp/otherhost-target-repo --lane redbaron --prd-dir "$ROOT/clone" 2>&1); rc=$?
+set -e
+[ "$rc" -eq 1 ] || { echo "FAIL expected busy exit 1, got $rc: $out"; exit 1; }
+echo "$out" | grep -q '^busy: otherhost some-other-lane-name' || { echo "FAIL busy msg: $out"; exit 1; }
+echo ok
+
 echo "ALL SELFTESTS PASSED"

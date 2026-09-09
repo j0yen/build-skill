@@ -35,7 +35,16 @@
 #       through to the ≤3 same-target sub-cap (SKILL.md Selection rules #1):
 #       once SAME_LANE_SUBCAP live same-lane claims are found, exit 1 +
 #       "sub-cap: <N> same-lane claims already live on <target> (lane=<l>)".
-#       Exit 0 + "free" if neither condition trips. Read-only.
+#       Exit 0 + "free" if neither condition trips.
+#       **Own-claim continuation (PRD-build-claims-resume-not-count).** If
+#       `--exclude-prd` itself already carries a live claim held by --lane,
+#       that PRD is a continuation of this lane's own prior work (Phase 2
+#       bucket 1), not a new selection: it is exempt from the sub-cap check
+#       entirely (exit 0 + "resume: own claim on <target> (lane=<l>)") even
+#       when SAME_LANE_SUBCAP other same-lane claims are already live. It is
+#       still subject to the unconditional cross-lane busy check like any
+#       other PRD on the target (Non-goal: cross-lane exclusivity unchanged).
+#       Read-only.
 #
 # Frontmatter forms read/written follow build-contract.md: bullet
 # (`- key: value`), bare (`key: value`), bold (`**key:** value`), first 80
@@ -44,6 +53,21 @@
 # workspace uses it; existing bare/bold Status lines are still read and
 # updated in place (form preserved) so a foreign-authored PRD isn't
 # reformatted.
+#
+# Coordinator liveness (PRD-build-claims-resume-not-count). A claim's Lane
+# line may carry a trailer after the ISO timestamp: `pid=<n> boot=<id>`,
+# recorded at claim time from `${BUILD_TICK_PID:-$PPID}` (the tick
+# coordinator, not this script's own subshell — branch subshells would
+# otherwise mis-identify $PPID) and `/proc/sys/kernel/random/boot_id`. The
+# trailer is display-only to the rest of the parser (build-contract.md), so
+# it never breaks a foreign reader that only looks at the first two tokens.
+# A claim's coordinator is confirmed gone — and the claim stale immediately,
+# regardless of age — only when the claim's own lane matches THIS host (PID
+# namespaces are host-local; a claim written by another lane cannot be
+# liveness-checked from here, so it keeps the plain 3h age rule) and either
+# the recorded boot id differs from the current one (PID reused since a
+# reboot) or the recorded PID no longer exists. Claims written before this
+# PRD carry no trailer and keep the age-only rule (Migration/compatibility).
 set -uo pipefail
 
 STALE_SECS=$((3 * 3600))
@@ -75,10 +99,13 @@ read_build_into() {
     | sed -E 's/[[:space:]]*#.*$//'
 }
 
-# lane_value -> "lane host" "iso-ts" split on the last whitespace-separated
-# token (the ISO timestamp never contains a space).
+# lane_value -> "lane host" "iso-ts" [pid=<n>] [boot=<id>] — host and ts are
+# the first two whitespace-separated tokens; pid/boot are optional trailer
+# tokens (absent on claims written before PRD-build-claims-resume-not-count).
 lane_host_of() { awk '{print $1}' <<<"$1"; }
 lane_ts_of()   { awk '{print $2}' <<<"$1"; }
+lane_pid_of()  { awk '{for(i=3;i<=NF;i++) if ($i ~ /^pid=/)  {print substr($i,5); exit}}' <<<"$1"; }
+lane_boot_of() { awk '{for(i=3;i<=NF;i++) if ($i ~ /^boot=/) {print substr($i,6); exit}}' <<<"$1"; }
 
 age_seconds() {
   local ts="$1" now_e ts_e
@@ -87,9 +114,36 @@ age_seconds() {
   echo $(( now_e - ts_e ))
 }
 
+current_boot_id() { cat /proc/sys/kernel/random/boot_id 2>/dev/null; }
+
+pid_alive() { local pid="$1"; [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; }
+
+# Confirmed-gone check for the coordinator that wrote a claim (Requirement
+# P0 #3). Returns 0 (confirmed gone) only when the claim's own lane is THIS
+# host (PID namespaces are host-local — a claim from another lane can't be
+# liveness-checked here) and a PID was recorded, and either the boot id
+# differs (PID reused across a reboot) or the PID no longer exists. Returns
+# 1 (cannot confirm — caller falls back to the age rule) for cross-host
+# claims and for claims with no PID trailer at all.
+coordinator_gone() {
+  local host="$1" pid="$2" boot="$3"
+  [ -n "$host" ] || return 1
+  same_lane "$host" "$(hostname)" || return 1
+  [ -n "$pid" ] || return 1
+  if [ -n "$boot" ]; then
+    local now_boot; now_boot=$(current_boot_id)
+    [ -n "$now_boot" ] && [ "$boot" != "$now_boot" ] && return 0
+  fi
+  pid_alive "$pid" && return 1
+  return 0
+}
+
+# $1=age $2=host $3=pid $4=boot (host/pid/boot optional; omitting them keeps
+# the original age-only behavior for call sites that predate the trailer).
 is_stale() {
-  local age="$1"
+  local age="$1" host="${2:-}" pid="${3:-}" boot="${4:-}"
   [ "$age" -lt 0 ] && return 0   # unparseable timestamp treated as stale
+  coordinator_gone "$host" "$pid" "$boot" && return 0
   [ "$age" -ge "$STALE_SECS" ]
 }
 
@@ -216,15 +270,16 @@ cmd_status() {
   local prd="$1" json=0
   [ "${2:-}" = "--json" ] && json=1
   [ -f "$prd" ] || die "no such file: $prd" 4
-  local lane_val host ts age stale
+  local lane_val host ts pid boot age stale
   lane_val=$(read_lane_line "$prd")
   if [ -z "$lane_val" ]; then
     if [ "$json" = 1 ]; then echo '{"claimed":false}'; else echo "free"; fi
     exit 0
   fi
   host=$(lane_host_of "$lane_val"); ts=$(lane_ts_of "$lane_val")
+  pid=$(lane_pid_of "$lane_val"); boot=$(lane_boot_of "$lane_val")
   age=$(age_seconds "$ts")
-  is_stale "$age" && stale=yes || stale=no
+  is_stale "$age" "$host" "$pid" "$boot" && stale=yes || stale=no
   if [ "$json" = 1 ]; then
     printf '{"claimed":true,"lane":"%s","ts":"%s","age_seconds":%s,"stale":%s}\n' \
       "$host" "$ts" "$age" "$stale"
@@ -239,20 +294,22 @@ cmd_claim() {
   local root; root=$(git_repo_root "$prd") || die "not a git repo: $prd" 4
   git_pull_or_die "$root"
 
-  local existing host ts age
+  local existing host ts pid boot age
   existing=$(read_lane_line "$prd")
   if [ -n "$existing" ]; then
     host=$(lane_host_of "$existing"); ts=$(lane_ts_of "$existing")
+    pid=$(lane_pid_of "$existing"); boot=$(lane_boot_of "$existing")
     age=$(age_seconds "$ts")
-    if ! same_lane "$host" "$lane" && ! is_stale "$age"; then
+    if ! same_lane "$host" "$lane" && ! is_stale "$age" "$host" "$pid" "$boot"; then
       echo "held: $host $ts age=${age}s"
       exit 2
     fi
-    if ! same_lane "$host" "$lane" && is_stale "$age"; then
+    if ! same_lane "$host" "$lane" && is_stale "$age" "$host" "$pid" "$boot"; then
       # Stale-claim recovery receipt: age, and a best-effort probe of the
       # claiming host (only meaningful for a fleet hostname on the same
       # tailnet; failure is expected and just means "unreachable", not an
-      # error).
+      # error). A gone-coordinator claim is stale at any age (Requirement
+      # P0 #3); the receipt still reports the true age for the journal.
       local probe="unreachable"
       if command -v ping >/dev/null 2>&1 && ping -c1 -W2 "$host" >/dev/null 2>&1; then
         probe="reachable"
@@ -262,12 +319,17 @@ cmd_claim() {
   fi
 
   local ts_new; ts_new=$(now_iso)
-  write_claim "$prd" "building" "$lane $ts_new"
+  local my_pid="${BUILD_TICK_PID:-$PPID}" my_boot; my_boot=$(current_boot_id)
+  local lane_val_new="$lane $ts_new"
+  [ -n "$my_pid" ]  && lane_val_new="$lane_val_new pid=$my_pid"
+  [ -n "$my_boot" ] && lane_val_new="$lane_val_new boot=$my_boot"
+  write_claim "$prd" "building" "$lane_val_new"
   git -C "$root" add -- "$prd"
   local slug; slug=$(slug_of "$prd")
   local subject="claim: $slug lane=$lane"
-  [ -n "$existing" ] && is_stale "$(age_seconds "$(lane_ts_of "$existing")")" 2>/dev/null \
-    && subject="reclaim: $slug lane=$lane (prev stale)"
+  if [ -n "$existing" ] && is_stale "$(age_seconds "$(lane_ts_of "$existing")")" "$host" "$pid" "$boot" 2>/dev/null; then
+    subject="reclaim: $slug lane=$lane (prev stale)"
+  fi
   git -C "$root" -c user.name="Joe Yen" -c user.email=jyen.tech@gmail.com \
     commit -q -m "$subject" -- "$prd"
   push_or_resolve_race "$root" "$prd" "$lane" "claim"
@@ -305,7 +367,24 @@ cmd_target_busy() {
       *) shift ;;
     esac
   done
-  local f bi lane_val host ts age same_count=0
+  # Own-claim continuation (PRD-build-claims-resume-not-count Requirement
+  # P0 #1): if the candidate being evaluated (--exclude-prd) already
+  # carries a live Lane: line naming the querying lane, it is work this
+  # lane already owns — Phase 2 bucket 1, resumed, never a new selection.
+  # It is exempt from the sub-cap below no matter how many OTHER same-lane
+  # claims are already live; it still can't bypass the unconditional
+  # cross-lane busy check applied to every PRD in the loop below.
+  local own_continuation=0
+  if [ -n "$exclude" ] && [ -f "$exclude" ]; then
+    local self_lane_val self_host
+    self_lane_val=$(read_lane_line "$exclude")
+    if [ -n "$self_lane_val" ]; then
+      self_host=$(lane_host_of "$self_lane_val")
+      same_lane "$self_host" "$query_lane" && own_continuation=1
+    fi
+  fi
+
+  local f bi lane_val host ts pid boot age same_count=0
   for f in "$prd_dir"/build-queue/PRD-*.md; do
     [ -f "$f" ] || continue
     [ -n "$exclude" ] && [ "$(cd "$(dirname "$f")" && pwd)/$(basename "$f")" = "$(cd "$(dirname "$exclude")" && pwd)/$(basename "$exclude")" ] && continue
@@ -314,8 +393,9 @@ cmd_target_busy() {
     lane_val=$(read_lane_line "$f")
     [ -z "$lane_val" ] && continue
     host=$(lane_host_of "$lane_val"); ts=$(lane_ts_of "$lane_val")
+    pid=$(lane_pid_of "$lane_val"); boot=$(lane_boot_of "$lane_val")
     age=$(age_seconds "$ts")
-    is_stale "$age" && continue
+    is_stale "$age" "$host" "$pid" "$boot" && continue
     if ! same_lane "$host" "$query_lane"; then
       # Foreign-lane claim: unconditional block, exactly as before
       # (cross-lane exclusivity is never relaxed).
@@ -323,13 +403,19 @@ cmd_target_busy() {
       exit 1
     fi
     # Same-lane claim: don't block outright — count it toward the
-    # ≤SAME_LANE_SUBCAP same-target worktree fan-out cap instead.
+    # ≤SAME_LANE_SUBCAP same-target worktree fan-out cap instead. A
+    # continuation candidate (own_continuation=1) is never refused by this
+    # count (Requirement P0 #2); a genuinely new candidate still is.
     same_count=$((same_count + 1))
-    if [ "$same_count" -ge "$SAME_LANE_SUBCAP" ]; then
+    if [ "$own_continuation" -eq 0 ] && [ "$same_count" -ge "$SAME_LANE_SUBCAP" ]; then
       echo "sub-cap: $SAME_LANE_SUBCAP same-lane claims already live on $target (lane=$query_lane)"
       exit 1
     fi
   done
+  if [ "$own_continuation" -eq 1 ]; then
+    echo "resume: own claim on $target (lane=$query_lane)"
+    exit 0
+  fi
   echo "free"
   exit 0
 }

@@ -152,6 +152,26 @@ set -e
 echo "$out" | grep -q '^skip: sub-cap:' || { echo "FAIL expected sub-cap skip msg, got: $out"; exit 1; }
 echo ok
 
+echo "== own-claim continuation: each of the 3 already-live claims is STILL selectable as a resume, even sitting at the sub-cap (PRD-build-claims-resume-not-count, AC1/AC2) =="
+# This is the exact 06:23Z OOM shape: 3 same-lane claims already sit at the
+# sub-cap (set up above), so a brand-new cap-d is rightly skipped — but
+# cap-a/b/c, which ARE those 3 claims, must never be skipped by the count
+# they themselves make up.
+for cap_prd in "$CAP_A" "$CAP_B" "$CAP_C"; do
+  out=$("$LP" select "$cap_prd" RedBaron "$ROOT/clone")
+  echo "$out" | grep -q '^ok: lane=RedBaron build_target=shell resume=own-claim$' \
+    || { echo "FAIL expected resume=own-claim for $cap_prd, got: $out"; exit 1; }
+done
+echo ok
+
+echo "== the 4th (never-claimed) candidate is still sub-cap-blocked after re-checking the continuations above (AC2) =="
+set +e
+out=$("$LP" select "$CAP_D" RedBaron "$ROOT/clone" 2>&1); rc=$?
+set -e
+[ "$rc" -eq 1 ] || { echo "FAIL expected exit 1 (sub-cap), got $rc: $out"; exit 1; }
+echo "$out" | grep -q '^skip: sub-cap:' || { echo "FAIL expected sub-cap skip msg, got: $out"; exit 1; }
+echo ok
+
 echo "== reachable: valid origin =="
 out=$("$LP" reachable "$ROOT/clone")
 [ "$out" = "reachable" ] || { echo "FAIL: $out"; exit 1; }

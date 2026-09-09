@@ -220,6 +220,38 @@ candidate:
   `scripts/lane-claim.sh target-busy` — is skipped by this lane this tick,
   regardless of which lane is doing the selecting.
 
+**Own live claims are continuations, not blocked slots (2026-09-09,
+PRD-build-claims-resume-not-count).** A PRD whose `Lane:` already names
+this host and whose `Status:` is `building` is this lane's own unfinished
+work — collect these first, ahead of the `status: queued` bucket, and
+admit them as continuations. `lane-predicate.sh select` on such a PRD
+returns `ok: ... resume=own-claim` (via `lane-claim.sh target-busy`'s
+own-claim exemption): a continuation is never skipped `sub-cap-blocked`
+by the count of this lane's OTHER live claims on the same `build_into` —
+that count still governs whether a genuinely NEW (not-yet-claimed)
+candidate on that repo gets admitted (≤3 same-lane claims live still
+leaves no slot for a 4th new one), it just no longer blocks the candidate
+that already owns the claim. Journal one `resume own-claim slug=<slug>
+age=<s>s` line per continuation admitted this tick, and fold the count
+into the tick's `lane-health` line as `resumed=<n>`. If every candidate
+for a `build_into` is skipped this tick and all its live claims belong to
+this lane (no foreign-lane claim involved), log exactly one
+`self-blocked: <build_into> — <n> own claims, <n> resumable` line for
+that repo instead of N separate skip lines — this is the "queue is full
+of my own work, nothing foreign to blame" case, distinct from a
+foreign-lane `busy:` skip.
+
+A claim is stale immediately, independent of the 3h age rule, when its
+own coordinator process is confirmed gone — see `lane-claim.sh`'s
+`coordinator_gone` (PID + boot-id trailer, `pid=<n> boot=<id>`, recorded
+at claim time from `BUILD_TICK_PID`/`$PPID`). This only resolves for
+claims this lane made itself (PID namespaces are host-local); a claim
+made by another, still-alive-for-all-we-know host keeps the plain 3h
+rule unchanged (Non-goal). A same-host claim whose coordinator is
+confirmed gone is picked up by this lane immediately as a continuation
+rather than waiting out the stale window — this is what prevented the
+2026-09-09 06:23Z OOM from wedging the queue for three hours.
+
 Before a lane's tick may CLAIM (not merely select) a PRD it runs
 `scripts/lane-claim.sh claim <prd-path> [lane-name]` — push-wins: it
 writes `Status: building` + `Lane: <hostname> <ISO-ts>` into the PRD's own
