@@ -44,6 +44,11 @@ fresh_env() {
   export FAKE_HCLOUD_CALLLOG="$T/hcloud.calls"; : > "$FAKE_HCLOUD_CALLLOG"
   export FAKE_RSYNC_STATS_DIR="$T/rsync-stats"; mkdir -p "$FAKE_RSYNC_STATS_DIR"
   export BURST_LANE_COST_LEDGER="$T/cost.jsonl"
+  # Three-state retrofit (PRD-build-three-state-probes): sandbox the shared
+  # probe ledger too, so this offline selftest never writes into the real
+  # state/probes/ledger.jsonl or ~/brain/journal/build/.
+  export BUILD_STATE_DIR="$T/state"
+  export PROBE_JOURNAL_DIR="$T/probe-journal"
   unset FAKE_HCLOUD_AUTH_FAIL FAKE_HCLOUD_CREATE_FAIL FAKE_HCLOUD_DELETE_FAIL FAKE_SSH_REMOTE_FAIL FAKE_SSH_SANDBOX_FAIL FAKE_RSYNC_FAIL BURST_LANE_NOW
 }
 

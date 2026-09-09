@@ -30,6 +30,11 @@ export RUSTBUILD_SCRIPTS="$FAKE"
 export EXTEND_GATE_JOURNAL="$T/journal.md"
 export FAKE_GATE_CALL_COUNTER="$T/gate-calls"
 export FAKE_GATE_PASS_NAMES="audit,vti-plan,rollback-plan,proof-receipt"
+# Three-state retrofit (PRD-build-three-state-probes): sandbox the shared
+# probe ledger so this offline test never writes into the real
+# state/probes/ledger.jsonl or ~/brain/journal/build/.
+export BUILD_STATE_DIR="$T/probestate"
+export PROBE_JOURNAL_DIR="$T/probe-journal"
 unset FAKE_GATE_BLOCKING_FILE || true
 # PRD-build-cargo-concurrency-budget: see the matching comment in
 # extend_gate_delta_ac6_record_ship_paths.sh — extend-gate.sh's producer

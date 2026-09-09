@@ -17,6 +17,15 @@ LOG="${CLAUDE_BUILD_LOG:-$HOME/brain/journal/build-auto.log}"
 me="$(hostname)"
 ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 logline() { echo "$(ts) lane-has-work: $*" >> "$LOG"; }
+
+# Three-state retrofit (PRD-build-three-state-probes): fail-open sourcing so
+# an unshipped/missing library never breaks this ExecCondition.
+if [ -r "$HERE/probe-result.sh" ]; then
+  # shellcheck source=probe-result.sh
+  source "$HERE/probe-result.sh"
+else
+  probe_emit() { :; }
+fi
 # See lane-defer.sh: an unpaced ExecCondition skip loops the path unit once
 # per second. Sleep inside the condition (only when the drop-in sets
 # LANE_SKIP_PACE) so the unit holds "activating (condition)" for the window.
@@ -28,6 +37,18 @@ status_of() {
   head -n 80 "$1" | grep -E '^(- *Status:|Status:|\*\*Status:\*\*)' | head -n1 \
     | sed -E 's/^(- *Status:|Status:|\*\*Status:\*\*)[[:space:]]*//' | awk '{print $1}'
 }
+
+# An unreadable/absent build-queue dir is not "zero PRDs queued" (clean) —
+# it's "this lane cannot even scan the queue" (could-not-check). Folding the
+# two together is exactly the two-state defect this retrofit exists to fix:
+# a broken PRD_DIR would otherwise silently read as a permanently-empty,
+# healthy-looking queue.
+if [ ! -d "$PRD_DIR/build-queue" ]; then
+  probe_emit lane-has-work could-not-check "build-queue dir missing or unreadable: $PRD_DIR/build-queue" >/dev/null
+  logline "could-not-check: build-queue dir missing or unreadable: $PRD_DIR/build-queue"
+  pace
+  exit 1
+fi
 
 total=0 selectable=0 first=""
 for prd in "$PRD_DIR"/build-queue/*.md; do
@@ -43,9 +64,11 @@ for prd in "$PRD_DIR"/build-queue/*.md; do
 done
 
 if [ "$selectable" -gt 0 ]; then
+  probe_emit lane-has-work dirty "$selectable of $total queued PRD(s) selectable on $me (first: $first)" >/dev/null
   logline "proceed: $selectable of $total queued PRD(s) selectable on $me (first: $first)"
   exit 0
 fi
+probe_emit lane-has-work clean "0 of $total queued PRD(s) selectable on $me (cargo-free filter / exclusivity)" >/dev/null
 logline "skip: 0 of $total queued PRD(s) selectable on $me (cargo-free filter / exclusivity); no tick launched"
 pace
 exit 1

@@ -69,6 +69,11 @@ export HOME="$T/fakehome"
 export PATH="$FAKEBIN:$FAKE:/usr/bin:/bin"
 export RUSTBUILD_SCRIPTS="$FAKE"
 export EXTEND_GATE_JOURNAL="$T/journal.md"
+# Three-state retrofit (PRD-build-three-state-probes): sandbox the shared
+# probe ledger so this offline test never writes into the real
+# state/probes/ledger.jsonl or ~/brain/journal/build/.
+export BUILD_STATE_DIR="$T/probestate"
+export PROBE_JOURNAL_DIR="$T/probe-journal"
 
 fail=0
 expect() {

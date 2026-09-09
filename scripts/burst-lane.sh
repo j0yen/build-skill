@@ -97,6 +97,15 @@ HCLOUD="${BURST_LANE_HCLOUD_BIN:-hcloud}"
 SSH_BIN="${BURST_LANE_SSH_BIN:-ssh}"
 RSYNC_BIN="${BURST_LANE_RSYNC_BIN:-rsync}"
 
+# Three-state retrofit (PRD-build-three-state-probes): fail-open sourcing so
+# an unshipped/missing library never breaks a burst-lane invocation.
+if [ -r "$HERE/probe-result.sh" ]; then
+  # shellcheck source=probe-result.sh
+  source "$HERE/probe-result.sh"
+else
+  probe_emit() { :; }
+fi
+
 SERVER_NAME="${BURST_LANE_SERVER_NAME:-wm-burst-lane}"
 SERVER_TYPE="${BURST_SERVER_TYPE:-ccx53}"
 DEFAULT_LOCATION="nbg1"
@@ -315,7 +324,10 @@ print(d.get("id",""), d.get("public_net",{}).get("ipv4",{}).get("ip",""))
 # This exists because every lane component "passed" its fixtures on
 # 2026-09-09 while zero real work had ever executed on a box.
 cmd_verify() {
-  state_active || { echo "verify: no active session"; exit 1; }
+  if ! state_active; then
+    probe_emit burst-verify could-not-check "no active session to verify" >/dev/null
+    echo "verify: no active session"; exit 1
+  fi
   local ip; ip="$(state_read ip)"
   local fails=0
   vfail() { echo "verify FAIL: $1"; fails=$((fails+1)); }
@@ -336,6 +348,7 @@ cmd_verify() {
   [ "$(sandbox_probe "$ip")" = "true" ]   || vfail "bwrap sandbox"
 
   if [ "$fails" -gt 0 ]; then
+    probe_emit burst-verify dirty "$fails check(s) failed — lane stays unverified, all work falls back local" >/dev/null
     journal_line "$(now_iso)  burst-lane  verify  FAILED  ($fails check(s) — lane stays unverified, all work falls back local)"
     exit 1
   fi
@@ -345,6 +358,7 @@ cmd_verify() {
     "runs_served=$(state_read runs_served)" "sandbox_ok=$(state_read sandbox_ok)" \
     "teardown_scheduled=$(state_read teardown_scheduled)" "teardown_epoch=$(state_read teardown_epoch)" \
     "verified=true"
+  probe_emit burst-verify clean "rsync+cargo+uv+python3+sandbox all real" >/dev/null
   journal_line "$(now_iso)  burst-lane  verify  ok  (rsync+cargo+uv+python3+sandbox all real)"
   echo "verify: ok"
   exit 0
@@ -361,12 +375,26 @@ cmd_status() {
   local json=0
   [ "${1:-}" = "--json" ] && json=1
   if ! state_active; then
+    probe_emit burst-status clean "no active session" >/dev/null
     if [ "$json" -eq 1 ]; then echo '{"active":false}'; else echo "no active session"; fi
+    exit 0
+  fi
+  # AC4 (PRD-build-three-state-probes): a corrupted session.json is a file
+  # that exists but does not mean "no session" and does not mean "a healthy
+  # active session" — it means the check itself couldn't run. Treat it as
+  # could-not-check, not as either two-state answer, while still emitting
+  # `"active":false` so every existing caller's fallback-local string match
+  # (e.g. gate-burst.sh's `*'"active":true'*`) is unaffected.
+  if [ -n "$JQ" ] && ! "$JQ" -e . "$STATE_FILE" >/dev/null 2>&1; then
+    probe_emit burst-status could-not-check "session.json corrupted (unparseable): $STATE_FILE" >/dev/null
+    journal_line "$(now_iso)  burst-lane  status  could-not-check  (session.json corrupted at $STATE_FILE — treating as no active session, falling back local)"
+    if [ "$json" -eq 1 ]; then echo '{"active":false,"could_not_check":true}'; else echo "could-not-check: session.json corrupted — treating as no active session"; fi
     exit 0
   fi
   local id ip alive ttl sbx
   id="$(state_read server_id)"; ip="$(state_read ip)"; alive="$(minutes_alive)"
   ttl="$(state_read ttl_hours)"; sbx="$(state_read sandbox_ok)"
+  probe_emit burst-status dirty "active session $id ip=$ip alive=${alive}m" >/dev/null
   if [ "$json" -eq 1 ]; then
     printf '{"active":true,"server_id":"%s","ip":"%s","minutes_alive":%s,"ttl_hours":"%s","sandbox_ok":"%s"}\n' \
       "$id" "$ip" "$alive" "$ttl" "$sbx"
@@ -676,6 +704,7 @@ cmd_sub_cap() {
   done
 
   if ! state_active; then
+    probe_emit burst-subcap clean "no session — local cap applies" >/dev/null
     journal_line "$(now_iso)  burst-lane  sub-cap  no-session  (local=3, fallback rules apply)"
     echo "sub-cap=0 local=3 (no session — local cap applies)"
     exit 0
@@ -684,14 +713,15 @@ cmd_sub_cap() {
   local ip; ip="$(state_read ip)"
   local probe
   if ! probe="$(probe_remote_capacity "$ip")"; then
+    probe_emit burst-subcap could-not-check "capacity probe failed server_id=$(state_read server_id)" >/dev/null
     journal_line "$(now_iso)  burst-lane  sub-cap  fallback  (cause=probe-failed server_id=$(state_read server_id))"
     echo "fallback: could not probe box capacity"
     exit 3
   fi
   local avail_gb nproc_n
   read -r avail_gb nproc_n <<<"$probe"
-  case "$avail_gb" in ''|*[!0-9]*) journal_line "$(now_iso)  burst-lane  sub-cap  fallback  (cause=bad-probe-output out=$probe)"; echo "fallback: bad probe output"; exit 3 ;; esac
-  case "$nproc_n"  in ''|*[!0-9]*) journal_line "$(now_iso)  burst-lane  sub-cap  fallback  (cause=bad-probe-output out=$probe)"; echo "fallback: bad probe output"; exit 3 ;; esac
+  case "$avail_gb" in ''|*[!0-9]*) probe_emit burst-subcap could-not-check "bad probe output: $probe" >/dev/null; journal_line "$(now_iso)  burst-lane  sub-cap  fallback  (cause=bad-probe-output out=$probe)"; echo "fallback: bad probe output"; exit 3 ;; esac
+  case "$nproc_n"  in ''|*[!0-9]*) probe_emit burst-subcap could-not-check "bad probe output: $probe" >/dev/null; journal_line "$(now_iso)  burst-lane  sub-cap  fallback  (cause=bad-probe-output out=$probe)"; echo "fallback: bad probe output"; exit 3 ;; esac
 
   local gb_per="${BURST_GB_PER_BRANCH:-6}" cores_per="${BURST_CORES_PER_BRANCH:-4}"
   local by_mem=$(( avail_gb / gb_per )) by_cpu=$(( nproc_n / cores_per ))
@@ -699,6 +729,7 @@ cmd_sub_cap() {
   [ "$by_cpu" -lt "$subcap" ] && subcap=$by_cpu
   if [ "$candidates" -gt 0 ] && [ "$candidates" -lt "$subcap" ]; then subcap=$candidates; fi
 
+  probe_emit burst-subcap clean "sub-cap=$subcap (avail_gb=$avail_gb nproc=$nproc_n)" >/dev/null
   journal_line "$(now_iso)  burst-lane  sub-cap  computed  (burst: sub-cap=$subcap (avail_gb=$avail_gb nproc=$nproc_n) local=0)"
   echo "sub-cap=$subcap local=0 (avail_gb=$avail_gb nproc=$nproc_n)"
   exit 0
