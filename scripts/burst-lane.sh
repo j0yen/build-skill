@@ -157,6 +157,7 @@ state_write() {  # $1..$N = key=value pairs
       first=0
       case "$v" in
         true|false|''|*[!0-9.]*) printf '  "%s":"%s"' "$k" "$v" ;;
+        *.*.*)                   printf '  "%s":"%s"' "$k" "$v" ;;
         *)                       printf '  "%s":%s' "$k" "$v" ;;
       esac
     done
