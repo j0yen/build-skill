@@ -343,15 +343,12 @@ cmd_integrate() {
   git -C "$repo" add -A >&2
   git -C "$repo" "${GIT_ID[@]}" commit -q -m "$(basename "$repo"): v$newver — $slug (parallel integrate)" >&2 \
     || die 6 "version-bump commit failed"
-  # Tag the bump AT THE SOURCE (2026-09-09: three untagged parallel-integrate
-  # bumps turned the gate's rollback-plan red for every sibling PRD sharing
-  # the repo; extend-gate now self-heals lineage as a net, but the tag
-  # belongs to the commit that creates the version). Push is best-effort —
-  # the gate's push retries cover an offline integrate.
-  git -C "$repo" tag "v$newver" >&2 2>/dev/null \
-    || echo "worktree-extend: $slug: tag v$newver already exists (ok)" >&2
-  git -C "$repo" push origin "refs/tags/v$newver" >/dev/null 2>&1 \
-    || echo "worktree-extend: $slug: tag push deferred (offline?) — gate self-heal will push it" >&2
+  # TAG OWNERSHIP (corrected 2026-09-09, second 5-whys): the CURRENT version's
+  # tag belongs to the GATE — its redeploy-tag model places v<ver> on the green
+  # HEAD as the redeploy point; integrate tagging its own bump commit stole the
+  # name and blocked every gate ("tag exists on a different commit"). Historical
+  # versions (superseded by a later bump) are backfilled by extend-gate's
+  # lineage self-heal. Integrate therefore creates NO tag.
   # Executable "shipped" contract (see scripts/ship-postconditions.sh header for
   # the 5-whys). Non-fatal here — the bump commit already exists and the gate
   # hard-fails on the same contract — but loud and sidecar-recorded.

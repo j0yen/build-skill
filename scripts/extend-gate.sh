@@ -431,6 +431,11 @@ resolve_base() {
 backfill_version_tags() {
   local manifest="$project_rel/Cargo.toml"
   [ "$project_rel" = "." ] && manifest="Cargo.toml"
+  # The CURRENT version (what HEAD's Cargo.toml declares) is never backfilled:
+  # the redeploy-tag producer owns placing it on the green HEAD. Backfill only
+  # heals HISTORICAL lineage (versions already superseded by a later bump).
+  local current_ver
+  current_ver="$(git -C "$repo" show "HEAD:$manifest" 2>/dev/null | sed -n 's/^version *= *"\([0-9.]*\)".*/\1/p' | head -1)"
   local sha ver parent pver n=0
   while read -r sha; do
     n=$((n + 1)); [ "$n" -gt 100 ] && break
@@ -443,6 +448,7 @@ backfill_version_tags() {
     [ -n "$ver" ] || continue
     parent="$(git -C "$repo" rev-parse "$sha^" 2>/dev/null)" || continue
     pver="$(git -C "$repo" show "$parent:$manifest" 2>/dev/null | sed -n 's/^version *= *"\([0-9.]*\)".*/\1/p' | head -1)"
+    [ "$ver" = "$current_ver" ] && continue
     if [ "$ver" != "$pver" ] && ! git -C "$repo" rev-parse "v$ver" >/dev/null 2>&1; then
       git -C "$repo" tag "v$ver" "$sha" 2>/dev/null \
         && echo "extend-gate: tag-lineage self-heal — created v$ver at ${sha:0:9}" >&2 \
