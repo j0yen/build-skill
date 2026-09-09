@@ -193,7 +193,7 @@ picked before their normal-priority siblings.
 
 Then pick **up to 30 PRDs** from the pool that mutually satisfy the
 parallel-dispatch rules in the "Parallelism" section (shared `build_into`
-isolated via worktrees up to the ≤5 same-target sub-cap, ≤1 kernel-extend,
+isolated via worktrees up to the ≤8 same-target sub-cap, ≤1 kernel-extend,
 ≤1 reflect-eligible). Fewer than 30 is fine; the cap is 30, the floor is
 whatever the queue admits after conflict-pruning. If the pool yields zero,
 exit clean.
@@ -1043,7 +1043,7 @@ self-throttle below it.**
 memory grounds.** Carbon has **15 GB RAM (0 swap), typically ~11 GB
 free** (RedBaron has 30 GB). On carbon/ryzen7 heavy cargo builds route
 to RedBaron through /rustbuild's cargo shim, so local memory pressure is minimal; on
-RedBaron they run locally, so honor the ≤5 same-target sub-cap strictly. The real OOM guard is the **≤5 same-target
+RedBaron they run locally, so honor the ≤8 same-target sub-cap strictly. The real OOM guard is the **≤8 same-target
 sub-cap** below (it bounds parallel cargo builds of ONE heavy crate like
 recall's fastembed); honoring that, total width 30 is safe. The **< 4 GB
 available** check (at selection time) is the ONLY permitted reason to
@@ -1067,9 +1067,9 @@ satisfy:
    `build_into`, each runs in its own git worktree (separate index, tree,
    and `target/`) — see "Worktree isolation" below. This is the fix for
    the recall/agorabus/episodic-observer clusters that used to serialize
-   one-per-tick behind a single repo. **Sub-cap: ≤5 same-target branches
+   one-per-tick behind a single repo. **Sub-cap: ≤8 same-target branches
    per tick** — parallel cargo builds of a heavy-dep crate (e.g. recall's
-   fastembed) are memory-hungry; 5 bounds the blast radius (raised 3 → 5 by user 2026-09-09: RedBaron 30 GB, worktree targets on /mnt/data). Kernel-extend
+   fastembed) are memory-hungry; 8 bounds the blast radius (raised 3 → 5 → 8 by user 2026-09-09: RedBaron 30 GB, worktree targets on /mnt/data). Kernel-extend
    targets are exempt from worktree fan-out (rule 2 already caps them).
 
    **Serial-fallback override (loom-serial-fallback, PRD-loom-serial-fallback).**
