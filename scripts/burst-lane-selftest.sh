@@ -262,5 +262,19 @@ subcap_fail_rc=0
 FAKE_SSH_PROBE_FAIL=1 "$BL" sub-cap >/dev/null 2>&1 || subcap_fail_rc=$?
 expect "sub-cap exits 3 (fallback, never blocks) when the probe fails" "[ $subcap_fail_rc -eq 3 ]"
 
+# ---- Requirement 6 / AC5: sandbox-unavailable session caps rust selection
+# at local=2 (a lower, more conservative fallback than the no-session cap of
+# 3) instead of honoring the box's memory/cpu-computed width — a session
+# whose `up` sandbox probe failed still has a session.json (state_active is
+# true), so without this check sub-cap would otherwise report the full
+# 8-wide box capacity computed above regardless of sandbox status.
+sed -i 's/"sandbox_ok":"true"/"sandbox_ok":"false"/' "$BURST_LANE_STATE_DIR/session.json"
+subcap_nosandbox="$(FAKE_SSH_MEMINFO_GB=120 FAKE_SSH_NPROC=32 "$BL" sub-cap --candidates 10)"
+expect "sub-cap falls back to local cap 2 when sandbox is unavailable (req 6 / AC5)" \
+  "grep -q '^sub-cap=2 local=0' <<<\"$subcap_nosandbox\""
+expect "sub-cap journals the sandbox-unavailable reason" \
+  "grep -q 'burst-lane  sub-cap  sandbox-unavailable' \"$BURST_LANE_JOURNAL\""
+sed -i 's/"sandbox_ok":"false"/"sandbox_ok":"true"/' "$BURST_LANE_STATE_DIR/session.json"
+
 echo "=== $([ $fail -eq 0 ] && echo PASS || echo FAIL) ==="
 exit $fail

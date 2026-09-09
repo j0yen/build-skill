@@ -811,6 +811,20 @@ cmd_sub_cap() {
     exit 0
   fi
 
+  # Requirement 6 / AC5: a session whose sandbox check failed at `up` never
+  # gets its box-computed width honored here — the tick's rust selection
+  # falls back to a local cap of 2 (a lower, more conservative fallback than
+  # the no-session cap of 3, since a sandbox-unverified box still might not
+  # be safe for the sandboxed suites that share the tick). Printed as
+  # `sub-cap=2` (not `local=2`) so effective_subcap's existing `sub-cap=<n>`
+  # parse picks it up as the cap directly, with no separate wiring needed.
+  if [ "$(state_read sandbox_ok)" = "false" ]; then
+    probe_emit burst-subcap dirty "sandbox unavailable — local cap 2 applies this tick" >/dev/null
+    journal_line "$(now_iso)  burst-lane  sub-cap  sandbox-unavailable  (server_id=$(state_read server_id) local cap=2 this tick)"
+    echo "sub-cap=2 local=0 (sandbox unavailable — falling back to local cap 2 this tick)"
+    exit 0
+  fi
+
   local ip; ip="$(state_read ip)"
   local probe
   if ! probe="$(probe_remote_capacity "$ip")"; then
