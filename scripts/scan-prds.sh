@@ -80,8 +80,22 @@ except Exception:
 fails = d.get("failures") or []
 if fails:
     print(fails[0]["id"] + "\t" + fails[0]["message"])
+elif d.get("ok"):
+    print("__LINT_OK__\t")
 ' 2>/dev/null)"
     [ -n "$line" ] || continue
+    if [ "${line%%$'\t'*}" = "__LINT_OK__" ]; then
+      # One-way-trap fix: a PRD parked as needs_classification whose file now
+      # passes lint is restored to queued (only that status is ever touched —
+      # the case gate above already excluded every other status).
+      if [ "$status" = "needs_classification" ]; then
+        tmp="$(mktemp)" || continue
+        printf '{"status":"queued","needs_classification_reason":""}' >"$tmp"
+        "$set_sh" "$slug" "$tmp" 1>&2 || echo "scan-prds: lint-restore manifest write failed for $slug" >&2
+        rm -f "$tmp"
+      fi
+      continue
+    fi
     id="${line%%$'\t'*}"
     msg="${line#*$'\t'}"
     tmp="$(mktemp)" || continue
