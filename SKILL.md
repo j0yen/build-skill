@@ -1121,6 +1121,13 @@ satisfy:
    per tick** — parallel cargo builds of a heavy-dep crate (e.g. recall's
    fastembed) are memory-hungry (operator decision 2026-09-09 after RedBaron OOMed at 3 with a gate overlapping, load 21k). Kernel-extend
    targets are exempt from worktree fan-out (rule 2 already caps them).
+   **Burst-lane override for rust targets (PRD-build-burst-lane-ccx53
+   requirement 7).** The ≤5 above is the local, no-session number. While a
+   Hetzner burst-lane session is up, `lane-claim.sh target-busy` swaps in
+   the box's computed sub-cap (about 8 on a CCX53, re-probed each call) for
+   any rust `build_into` target instead — see "Burst-lane PATH" below for
+   the exact mechanism. Non-rust targets, and rust targets when no session
+   is up, keep the ≤5 unchanged.
    **Cargo concurrency budget (PRD-build-cargo-concurrency-budget, built
    2026-09-09).** The sub-cap alone never bounded what a branch or a gate
    unleashes underneath it — see `scripts/cargo-budget.sh` and "Where cargo
@@ -1257,9 +1264,19 @@ Hetzner CCX53 burst lane when a session is up (burst-lane.sh status), and
 falls through to the local concurrency budget otherwise." The tick's own
 selection sub-cap formula for a live session (requirement 7:
 `min(floor(MemAvailable_gb/6), floor(nproc/4), rust candidates)`, journaled
-as `burst: sub-cap=<n> (avail_gb=<n> nproc=<n>)`) is not yet wired into
-selection as of this pass — see `scripts/burst-lane.sh`'s header for what
-remains.
+as `burst: sub-cap=<n> (avail_gb=<n> nproc=<n>)`) IS wired into selection:
+`scripts/lane-claim.sh target-busy` calls `burst-lane.sh sub-cap` (via its
+`effective_subcap()` helper) for any `build_into` path that looks like a
+rust crate (`Cargo.toml` at its root or one level down), and — only when
+that call reports a live session (`sub-cap=<n> local=0 ...`) — uses the
+box's `<n>` as the same-target fan-out cap in place of the local
+`SAME_LANE_SUBCAP` (default 5). No session, a probe failure, or a
+non-rust target all leave `SAME_LANE_SUBCAP` untouched, so behavior off a
+burst session is unchanged. This governs how many same-target *claims*
+selection admits; it does not by itself move cargo off RedBaron — that is
+the Burst-lane PATH directive above (requirement 4). Still open per
+`scripts/burst-lane.sh`'s header: the uv/python leg (requirement 12) and
+the cost ledger's "PRDs served" attribution (requirement 13).
 
 Each agent prompt must include, self-contained:
 

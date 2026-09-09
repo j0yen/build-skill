@@ -36,6 +36,16 @@
 #       once SAME_LANE_SUBCAP live same-lane claims are found, exit 1 +
 #       "sub-cap: <N> same-lane claims already live on <target> (lane=<l>)".
 #       Exit 0 + "free" if neither condition trips.
+#       **Burst-lane override (PRD-build-burst-lane-ccx53 requirement 7).**
+#       <N> above is not always SAME_LANE_SUBCAP: when <build_into-path>
+#       looks like a rust crate (Cargo.toml at its root or exactly one
+#       level down) AND `burst-lane.sh sub-cap` reports a live session
+#       (`sub-cap=<n> local=0 ...`), <N> is that box-computed number
+#       instead — "every rust branch runs on the box" only holds if
+#       selection actually admits that many concurrent same-target claims.
+#       No session, a probe failure, or a non-rust target all fall through
+#       to the unchanged local SAME_LANE_SUBCAP. See effective_subcap()
+#       below.
 #       **Own-claim continuation (PRD-build-claims-resume-not-count).** If
 #       `--exclude-prd` itself already carries a live claim held by --lane,
 #       that PRD is a continuation of this lane's own prior work (Phase 2
@@ -74,6 +84,12 @@ STALE_SECS=$((3 * 3600))
 # Max same-lane live claims on one build_into repo before target-busy blocks
 # a further same-lane candidate (SKILL.md Selection rules #1 worktree cap).
 SAME_LANE_SUBCAP="${SAME_LANE_SUBCAP:-5}"
+
+# PRD-build-burst-lane-ccx53 requirement 7: path to burst-lane.sh, whose
+# `sub-cap` subcommand computes the box-wide same-target cap for rust
+# targets while a session is up. Overridable so selftests can point this
+# at a fake script without a real Hetzner session.
+BURST_LANE_SH="${BURST_LANE_SH:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/burst-lane.sh}"
 
 die() { echo "lane-claim: $*" >&2; exit "${2:-4}"; }
 
@@ -355,6 +371,40 @@ cmd_release() {
   echo "released: $slug"
 }
 
+# Cheap, existence-only rust-target detection for effective_subcap() below:
+# a Cargo.toml at $1 itself or in exactly one immediate subdirectory
+# (mirrors extend-gate.sh's cargo-root resolution, minus its multi-
+# candidate disambiguation — a wrong guess here only ever affects which
+# cap number applies, never claim correctness).
+is_rust_target() {
+  local base="$1" d
+  [ -f "$base/Cargo.toml" ] && return 0
+  for d in "$base"/*/; do
+    [ -f "${d}Cargo.toml" ] && return 0
+  done
+  return 1
+}
+
+# Effective same-target fan-out cap for build_into path $1
+# (PRD-build-burst-lane-ccx53 requirement 7). Local SAME_LANE_SUBCAP unless
+# $1 looks like a rust crate AND `burst-lane.sh sub-cap` reports a live
+# session (`sub-cap=<n> local=0 ...`) — then the box-computed <n> wins.
+# Any hiccup (no session: `sub-cap=0 local=3 ...`; probe failure:
+# `fallback: ...`; script missing; non-rust target) falls straight through
+# to the unchanged local number, so behavior off a burst session is
+# byte-identical to before this wiring existed.
+effective_subcap() {
+  local target="$1" cap="$SAME_LANE_SUBCAP"
+  if [ -x "$BURST_LANE_SH" ] && is_rust_target "$target"; then
+    local out n
+    if out=$("$BURST_LANE_SH" sub-cap 2>/dev/null); then
+      n="${out#sub-cap=}"; n="${n%% *}"
+      case "$n" in [1-9]|[1-9][0-9]) cap="$n" ;; esac
+    fi
+  fi
+  echo "$cap"
+}
+
 cmd_target_busy() {
   local target="$1"; shift
   local exclude="" prd_dir="$HOME/Documents/PRDs" query_lane
@@ -384,6 +434,11 @@ cmd_target_busy() {
     fi
   fi
 
+  # Requirement 7: computed once per call (not per candidate in the loop
+  # below) so a live session costs this call one ssh round trip, not one
+  # per queued PRD sharing the target.
+  local cap; cap="$(effective_subcap "$target")"
+
   local f bi lane_val host ts pid boot age same_count=0
   for f in "$prd_dir"/build-queue/PRD-*.md; do
     [ -f "$f" ] || continue
@@ -407,8 +462,8 @@ cmd_target_busy() {
     # continuation candidate (own_continuation=1) is never refused by this
     # count (Requirement P0 #2); a genuinely new candidate still is.
     same_count=$((same_count + 1))
-    if [ "$own_continuation" -eq 0 ] && [ "$same_count" -ge "$SAME_LANE_SUBCAP" ]; then
-      echo "sub-cap: $SAME_LANE_SUBCAP same-lane claims already live on $target (lane=$query_lane)"
+    if [ "$own_continuation" -eq 0 ] && [ "$same_count" -ge "$cap" ]; then
+      echo "sub-cap: $cap same-lane claims already live on $target (lane=$query_lane)"
       exit 1
     fi
   done

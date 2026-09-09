@@ -16,16 +16,18 @@
 # transferred recorded on both commands' journal lines). Requirements 4
 # (worktree-extend.sh PATH prepend) and 5 (gate-burst.sh should-route/run)
 # landed in later ticks — see git log, this header is not kept current
-# per-commit. Requirement 7's FORMULA now lives here too: `sub-cap` probes
-# the box's MemAvailable/nproc over ssh and prints/journals
+# per-commit. Requirement 7's FORMULA lives here: `sub-cap` probes the
+# box's MemAvailable/nproc over ssh and prints/journals
 # `burst: sub-cap=<n> (avail_gb=<n> nproc=<n>)` (or the no-session local=3
-# fallback line) — but wiring that call INTO SKILL.md's selection rule and
-# lane-claim.sh's SAME_LANE_SUBCAP (so a live session actually drops the
-# local rust cap to 0 and admits up to sub-cap branches) is still a later
-# tick's step. NOT yet wired: that selection-side integration, the
-# uv/python leg (req 12), and the cost ledger's "PRDs served" attribution
-# (req 13, beyond the hours/eur it already tracks) — each is its own
-# well-defined next step for a later tick.
+# fallback line). That call is now ALSO wired into selection:
+# `lane-claim.sh`'s `target-busy` calls it (via `effective_subcap()`) for
+# any build_into path that looks like a rust crate, so a live session's
+# box-computed sub-cap governs same-target fan-out there instead of the
+# local SAME_LANE_SUBCAP — see lane-claim.sh's header and SKILL.md's
+# "Burst-lane PATH" section. NOT yet wired: the uv/python leg (req 12),
+# and the cost ledger's "PRDs served" attribution (req 13, beyond the
+# hours/eur it already tracks) — each is its own well-defined next step
+# for a later tick.
 #
 # Subcommands:
 #   burst-lane.sh up

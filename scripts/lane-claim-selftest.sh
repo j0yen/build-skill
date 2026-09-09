@@ -245,4 +245,81 @@ set -e
 echo "$out" | grep -q '^busy: otherhost some-other-lane-name' || { echo "FAIL busy msg: $out"; exit 1; }
 echo ok
 
+echo "== burst-lane override (PRD-build-burst-lane-ccx53 requirement 7): a rust target with a live session uses the box's sub-cap, not SAME_LANE_SUBCAP =="
+RUST_TARGET="$ROOT/rust-target-repo"
+mkdir -p "$RUST_TARGET"
+cat > "$RUST_TARGET/Cargo.toml" <<'EOF'
+[package]
+name = "fixture"
+version = "0.1.0"
+EOF
+
+FAKE_BURST="$ROOT/fake-burst-lane.sh"
+cat > "$FAKE_BURST" <<'EOF'
+#!/usr/bin/env bash
+[ "$1" = "sub-cap" ] || { echo "unexpected: $*" >&2; exit 2; }
+echo "${FAKE_BURST_OUT:-sub-cap=8 local=0 (avail_gb=120 nproc=32)}"
+exit "${FAKE_BURST_RC:-0}"
+EOF
+chmod +x "$FAKE_BURST"
+
+for n in 1 2 3 4 5 6 7 8 9; do
+cat > "$ROOT/clone/build-queue/PRD-rust-$n.md" <<EOF
+# PRD: rust-$n
+
+- Status: queued
+- build_target: rust-extend
+- build_into: $RUST_TARGET
+- build_priority: high
+EOF
+done
+git -C "$ROOT/clone" add -A
+git -C "$ROOT/clone" -c user.name=t -c user.email=t@t commit -q -m add-rust-prds
+git -C "$ROOT/clone" push -q origin "$BR"
+
+for n in 1 2 3 4 5 6 7; do
+  BURST_LANE_SH="$FAKE_BURST" "$LC" claim "$ROOT/clone/build-queue/PRD-rust-$n.md" redbaron >/dev/null
+done
+RUST8="$ROOT/clone/build-queue/PRD-rust-8.md"
+RUST9="$ROOT/clone/build-queue/PRD-rust-9.md"
+
+echo "-- 7 same-lane claims live on a rust target (SAME_LANE_SUBCAP=3 would already block); fake box sub-cap=8 still admits the 8th candidate --"
+out=$(BURST_LANE_SH="$FAKE_BURST" "$LC" target-busy "$RUST_TARGET" --lane redbaron --exclude-prd "$RUST8" --prd-dir "$ROOT/clone")
+[ "$out" = "free" ] || { echo "FAIL expected free under burst sub-cap=8, got: $out"; exit 1; }
+echo ok
+
+BURST_LANE_SH="$FAKE_BURST" "$LC" claim "$RUST8" redbaron >/dev/null
+
+echo "-- 8th claimed (8 live, at the fake box's sub-cap=8); a 9th candidate is now blocked with the box's own number, not the local 3 --"
+set +e
+out=$(BURST_LANE_SH="$FAKE_BURST" "$LC" target-busy "$RUST_TARGET" --lane redbaron --exclude-prd "$RUST9" --prd-dir "$ROOT/clone" 2>&1); rc=$?
+set -e
+[ "$rc" -eq 1 ] || { echo "FAIL expected sub-cap busy exit 1, got $rc: $out"; exit 1; }
+echo "$out" | grep -q '^sub-cap: 8 same-lane claims already live' || { echo "FAIL expected sub-cap=8 message, got: $out"; exit 1; }
+echo ok
+
+echo "-- same target WITHOUT the override (BURST_LANE_SH unset -> real burst-lane.sh, no session up here) falls back to local SAME_LANE_SUBCAP=3 and blocks the 9th --"
+set +e
+out=$("$LC" target-busy "$RUST_TARGET" --lane redbaron --exclude-prd "$RUST9" --prd-dir "$ROOT/clone" 2>&1); rc=$?
+set -e
+[ "$rc" -eq 1 ] || { echo "FAIL expected sub-cap busy exit 1 (no-session fallback), got $rc: $out"; exit 1; }
+echo "$out" | grep -q '^sub-cap: 3 same-lane claims already live' || { echo "FAIL expected local sub-cap=3 message, got: $out"; exit 1; }
+echo ok
+
+echo "-- fake box reporting only 40GB/16 cores (sub-cap=6): 8 live claims already exceed 6, candidate blocked with the box's own number --"
+set +e
+out=$(BURST_LANE_SH="$FAKE_BURST" FAKE_BURST_OUT="sub-cap=6 local=0 (avail_gb=40 nproc=16)" "$LC" target-busy "$RUST_TARGET" --lane redbaron --exclude-prd "$RUST9" --prd-dir "$ROOT/clone" 2>&1); rc=$?
+set -e
+[ "$rc" -eq 1 ] || { echo "FAIL expected sub-cap busy exit 1, got $rc: $out"; exit 1; }
+echo "$out" | grep -q '^sub-cap: 6 same-lane claims already live' || { echo "FAIL expected sub-cap=6 message, got: $out"; exit 1; }
+echo ok
+
+echo "-- burst override only applies to rust (Cargo.toml) targets: the same fake box (sub-cap=8) has no effect on the earlier non-rust wedge target, local SAME_LANE_SUBCAP=3 still governs --"
+set +e
+out=$(BURST_LANE_SH="$FAKE_BURST" "$LC" target-busy /tmp/wedge-target-repo --lane redbaron --exclude-prd "$WEDGE_D" --prd-dir "$ROOT/clone" 2>&1); rc=$?
+set -e
+[ "$rc" -eq 1 ] || { echo "FAIL expected sub-cap busy exit 1 (non-rust unaffected), got $rc: $out"; exit 1; }
+echo "$out" | grep -q '^sub-cap: 3 same-lane claims already live' || { echo "FAIL expected local sub-cap=3 message on non-rust target, got: $out"; exit 1; }
+echo ok
+
 echo "ALL SELFTESTS PASSED"
