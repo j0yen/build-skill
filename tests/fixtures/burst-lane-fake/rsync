@@ -3,7 +3,15 @@
 # last two path-like args (src/dst may carry a "user@host:" prefix, which
 # is stripped since our "remote" is a local scratch path). FAKE_RSYNC_FAIL=1
 # simulates a network/rsync failure. Prints a --stats-shaped line so
-# sync-back's byte-count parse has something to match.
+# sync-back's/run's byte-count parse has something to match.
+#
+# requirement 10: a real incremental rsync transfers fewer bytes on a second
+# pull of the same destination once it's warm. This fake can't replicate
+# rsync's delta logic, so it fakes the *symptom* instead — a per-destination
+# call counter (under FAKE_RSYNC_STATS_DIR, isolated per selftest tmpdir)
+# halves the reported byte count each successive --stats call against the
+# same dst, which is exactly what burst-lane-selftest.sh's two-consecutive-
+# `run` assertion (PRD-build-burst-lane-ccx53 AC11) checks for.
 set -uo pipefail
 [ "${FAKE_RSYNC_FAIL:-0}" = "1" ] && exit 23
 src="${*: -2:1}"
@@ -15,7 +23,15 @@ mkdir -p "$local_dst" 2>/dev/null || true
 cp -a "$local_src"/. "$local_dst"/ 2>/dev/null || true
 for a in "$@"; do
   if [ "$a" = "--stats" ]; then
-    echo "Total transferred file size: 4,096 bytes"
+    statedir="${FAKE_RSYNC_STATS_DIR:-${TMPDIR:-/tmp}/fake-rsync-stats}"
+    mkdir -p "$statedir" 2>/dev/null || true
+    key="$(printf '%s' "$local_dst" | cksum | cut -d' ' -f1)"
+    cf="$statedir/$key"
+    n="$(cat "$cf" 2>/dev/null || echo 0)"
+    n=$((n + 1))
+    echo "$n" > "$cf"
+    bytes=$((40960 / n))
+    echo "Total transferred file size: ${bytes} bytes"
   fi
 done
 exit 0

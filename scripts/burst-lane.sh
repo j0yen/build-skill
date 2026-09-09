@@ -10,11 +10,16 @@
 # two minutes of the current billed hour.
 #
 # THIS PASS implements requirement 1 (session lifecycle: up/status/run/
-# sync-back/down/watchdog) plus the requirement-6 sandbox probe on `up`.
-# NOT yet wired in this pass: the selection sub-cap formula (req 7) and its
-# SKILL.md rule, gate-burst.sh's should-route pointing at this session
-# (req 5), worktree-extend.sh's burst-mode PATH prepend, and the uv/python
-# leg (req 12) — each is its own well-defined next step for a later tick.
+# sync-back/down/watchdog), the requirement-6 sandbox probe on `up`, and
+# requirement 10 (the target/ pull-back `run` does on exit is now the same
+# incremental `rsync --delete --stats` path `sync-back` uses, with bytes
+# transferred recorded on both commands' journal lines). Requirements 4
+# (worktree-extend.sh PATH prepend) and 5 (gate-burst.sh should-route/run)
+# landed in later ticks — see git log, this header is not kept current
+# per-commit. NOT yet wired: the selection sub-cap formula (req 7) and its
+# SKILL.md rule, the uv/python leg (req 12), and the cost ledger's "PRDs
+# served" attribution (req 13, beyond the hours/eur it already tracks) —
+# each is its own well-defined next step for a later tick.
 #
 # Subcommands:
 #   burst-lane.sh up
@@ -291,6 +296,23 @@ cmd_status() {
   exit 0
 }
 
+# ---- shared incremental target/ pull (requirement 10) -----------------------
+# A 95-binary test target should not copy whole on every run — both `run`'s
+# own pull-back and the standalone `sync-back` subcommand go through this one
+# `rsync --delete --stats` path so already-synced bytes on the box (warm from
+# a prior run on the same worktree) don't get re-counted or re-copied.
+pull_target_incremental() {  # $1=worktree $2=ip -> stdout: bytes transferred; rc 0/1
+  local worktree="$1" ip="$2" remote_path stats
+  remote_path="$REMOTE_ROOT/$(basename "$worktree")"
+  if ! stats="$("$RSYNC_BIN" -az --delete --stats -e "$SSH_BIN -o StrictHostKeyChecking=no -i $SSH_KEY" \
+        "$REMOTE_USER@$ip:$remote_path/target/" "$worktree/target/" 2>&1)"; then
+    return 1
+  fi
+  local bytes; bytes="$(echo "$stats" | grep -oE 'Total transferred file size: [0-9,]+' | grep -oE '[0-9,]+' | tr -d ',')"
+  echo "${bytes:-0}"
+  return 0
+}
+
 # ---- run --------------------------------------------------------------------
 RUN_LOCK="$STATE_DIR/run.lock"
 
@@ -326,10 +348,10 @@ cmd_run() {
   local rc=0
   "$SSH_BIN" -o StrictHostKeyChecking=no -i "$SSH_KEY" "$REMOTE_USER@$ip" "$remote_cmd" || rc=$?
 
-  if ! "$RSYNC_BIN" -az -e "$SSH_BIN -o StrictHostKeyChecking=no -i $SSH_KEY" \
-        "$REMOTE_USER@$ip:$remote_path/target/" "$worktree/target/" >/tmp/burst-lane-rsync-down.$$.log 2>&1; then
+  local bytes
+  if ! bytes="$(pull_target_incremental "$worktree" "$ip")"; then
     journal_line "$(now_iso)  burst-lane  run  fallback  (cause=rsync-down-failed worktree=$worktree)"
-    echo "fallback: rsync from $ip failed (see /tmp/burst-lane-rsync-down.$$.log)"
+    echo "fallback: rsync from $ip failed"
     exit 3
   fi
 
@@ -339,7 +361,7 @@ cmd_run() {
     "ttl_hours=$(state_read ttl_hours)" "hard_ttl_hours=$(state_read hard_ttl_hours)" \
     "runs_served=$runs" "sandbox_ok=$(state_read sandbox_ok)" \
     "teardown_scheduled=$(state_read teardown_scheduled)" "teardown_epoch=$(state_read teardown_epoch)"
-  journal_line "$(now_iso)  burst-lane  run  routed  (server_id=$id worktree=$worktree runs_served=$runs exit=$rc)"
+  journal_line "$(now_iso)  burst-lane  run  routed  (server_id=$id worktree=$worktree runs_served=$runs exit=$rc bytes=$bytes)"
   exit "$rc"
 }
 
@@ -352,16 +374,12 @@ cmd_sync_back() {
     exit 3
   fi
   local ip; ip="$(state_read ip)"
-  local remote_path="$REMOTE_ROOT/$(basename "$worktree")"
-  local stats
-  if ! stats="$("$RSYNC_BIN" -az --delete --stats -e "$SSH_BIN -o StrictHostKeyChecking=no -i $SSH_KEY" \
-        "$REMOTE_USER@$ip:$remote_path/target/" "$worktree/target/" 2>&1)"; then
+  local bytes
+  if ! bytes="$(pull_target_incremental "$worktree" "$ip")"; then
     journal_line "$(now_iso)  burst-lane  sync-back  fallback  (cause=rsync-failed worktree=$worktree)"
     echo "fallback: rsync from $ip failed"
     exit 3
   fi
-  local bytes; bytes="$(echo "$stats" | grep -oE 'Total transferred file size: [0-9,]+' | grep -oE '[0-9,]+' | tr -d ',')"
-  bytes="${bytes:-0}"
   journal_line "$(now_iso)  burst-lane  sync-back  ok  (worktree=$worktree bytes=$bytes)"
   echo "synced: bytes=$bytes"
   exit 0

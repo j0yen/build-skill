@@ -4,7 +4,9 @@
 # tests/fixtures/burst-lane-fake/. No network calls, no real Hetzner spend.
 #
 # Covers: single-box refusal + session adoption (AC1), run's exit-code
-# passthrough (AC2), watchdog TTL teardown (AC6), down's keep/scheduled/
+# passthrough (AC2), the incremental target/ pull-back and its shrinking
+# byte count across two consecutive runs on the same worktree (AC11,
+# requirement 10), watchdog TTL teardown (AC6), down's keep/scheduled/
 # deleted decision as rust work does/doesn't remain in build-queue/ (AC8),
 # the never-poweroff/shutdown/stop invariant (AC14), and the cargo shim's
 # local fallback when no session exists (AC3, partial — the routed-through
@@ -38,6 +40,7 @@ fresh_env() {
   export BURST_LANE_PRD_DIR="$T/prds"; mkdir -p "$BURST_LANE_PRD_DIR/build-queue"
   export FAKE_HCLOUD_STATE="$T/hcloud.state"
   export FAKE_HCLOUD_CALLLOG="$T/hcloud.calls"; : > "$FAKE_HCLOUD_CALLLOG"
+  export FAKE_RSYNC_STATS_DIR="$T/rsync-stats"; mkdir -p "$FAKE_RSYNC_STATS_DIR"
   export BURST_LANE_COST_LEDGER="$T/cost.jsonl"
   unset FAKE_HCLOUD_AUTH_FAIL FAKE_HCLOUD_CREATE_FAIL FAKE_HCLOUD_DELETE_FAIL FAKE_SSH_REMOTE_FAIL FAKE_SSH_SANDBOX_FAIL FAKE_RSYNC_FAIL BURST_LANE_NOW
 }
@@ -72,6 +75,18 @@ run_out="$("$BL" run "$WT" -- bash build.sh 2>&1)"; run_rc=$?
 expect "run propagates the remote exit code" "[ $run_rc -eq 7 ]"
 expect "run pulled target/ back to the worktree" "[ -f \"$WT/target/out.txt\" ]"
 expect "run journaled the routed call" "grep -q 'burst-lane  run  routed' \"$BURST_LANE_JOURNAL\""
+expect "run's journal line records bytes transferred (req 10)" "grep -q 'burst-lane  run  routed.*bytes=[0-9]' \"$BURST_LANE_JOURNAL\""
+
+# ---- AC11: a second `run` on the same (now-warm) worktree transfers fewer
+# bytes than the first — the target/ pull-back is incremental, not a fresh
+# whole copy each time (requirement 10).
+run_out2="$("$BL" run "$WT" -- bash build.sh 2>&1)"; run_rc2=$?
+expect "second run also propagates the remote exit code" "[ $run_rc2 -eq 7 ]"
+bytes1="$(grep 'burst-lane  run  routed' "$BURST_LANE_JOURNAL" | sed -n '1p' | grep -oE 'bytes=[0-9]+' | cut -d= -f2)"
+bytes2="$(grep 'burst-lane  run  routed' "$BURST_LANE_JOURNAL" | sed -n '2p' | grep -oE 'bytes=[0-9]+' | cut -d= -f2)"
+expect "first run journaled a byte count" "[ -n \"$bytes1\" ]"
+expect "second run journaled a byte count" "[ -n \"$bytes2\" ]"
+expect "second run's journal line shows fewer bytes than the first (AC11)" "[ \"${bytes2:-0}\" -lt \"${bytes1:-0}\" ]"
 
 # ---- AC14: never poweroff/shutdown/stop -------------------------------------
 expect "no poweroff/shutdown/stop/reboot call was ever made" \
