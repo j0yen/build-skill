@@ -165,6 +165,19 @@ expect "cargo_target_dir_for resolves an off-root target-dir, none for a plain w
 expect "no poweroff/shutdown/stop/reboot call was ever made" \
   "! grep -qE 'server (poweroff|shutdown|stop|reboot)' \"$FAKE_HCLOUD_CALLLOG\""
 
+# ---- AC14: primary IP goes with the server, never a standalone/orphan-able
+# one — `server create` never attaches an existing Primary IP (--primary-ipv4)
+# and no separate `primary-ip create`/`primary-ip delete` call is ever made;
+# left at the default, Hetzner auto-manages an ephemeral Primary IPv4 that is
+# deleted in the same `server delete` call destroy_verify already makes, so
+# down's deletion removes the server's primary IP in the same step.
+expect "server create never attaches a standalone primary IP (--primary-ipv4)" \
+  "! grep -qE '^server create.*--primary-ipv4' \"$FAKE_HCLOUD_CALLLOG\""
+expect "no separate primary-ip create call was ever made (would outlive server delete)" \
+  "! grep -qE '^primary-ip create' \"$FAKE_HCLOUD_CALLLOG\""
+expect "no separate primary-ip delete call was needed (server delete already took it)" \
+  "! grep -qE '^primary-ip delete' \"$FAKE_HCLOUD_CALLLOG\""
+
 # ---- AC8: down keeps while rust work remains --------------------------------
 cat > "$BURST_LANE_PRD_DIR/build-queue/PRD-fake-rust.md" <<'EOF'
 # PRD — fake-rust

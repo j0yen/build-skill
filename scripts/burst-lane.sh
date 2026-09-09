@@ -279,6 +279,16 @@ cmd_up() {
     exit 3
   fi
 
+  # AC14 (primary-IP billing): deliberately never pass --primary-ipv4 (attach
+  # an existing, standalone Primary IP) or --without-ipv4 here. Left at the
+  # default, hcloud auto-creates an ephemeral Primary IPv4 that is owned by
+  # this server and is deleted automatically when the server is (Hetzner's
+  # documented default) — no separate `hcloud primary-ip delete` call is ever
+  # needed, and none is ever made (see destroy_verify below), so no orphan
+  # Primary IP can outlive teardown. If this ever grows an explicit
+  # --primary-ipv4 attach, destroy_verify must gain a matching
+  # `hcloud primary-ip delete` in the same step or every subsequent boot
+  # leaks a billed IP.
   local create_out create_err; create_err="$(mktemp)"
   if ! create_out="$("$HCLOUD" server create --name "$SERVER_NAME" --type "$SERVER_TYPE" \
         --location "$LOCATION" --image "$SNAPSHOT_ID" --ssh-key "${HCLOUD_SSH_KEY:-default}" -o json 2>"$create_err")"; then
@@ -631,6 +641,11 @@ rust_work_remains() {
 
 # ---- teardown (shared by down + watchdog) ------------------------------------
 destroy_verify() {  # $1 = server id -> 0 on verified-gone, 1 on still-present after retries
+  # AC14: `server delete` alone is the whole teardown — no separate
+  # `hcloud primary-ip delete` call, because cmd_up's create never attaches a
+  # standalone Primary IP (see the comment there). The ephemeral Primary IPv4
+  # Hetzner auto-created with this server is owned by it and goes with it in
+  # this same call, so no orphan IP survives to bill after teardown.
   local id="$1" attempt
   for attempt in 1 2 3; do
     "$HCLOUD" server delete "$id" >/dev/null 2>&1 || true

@@ -299,8 +299,16 @@ echo "$out" | grep -q '^sub-cap: 8 same-lane claims already live' || { echo "FAI
 echo ok
 
 echo "-- same target WITHOUT the override (BURST_LANE_SH unset -> real burst-lane.sh, no session up here) falls back to local SAME_LANE_SUBCAP=3 and blocks the 9th --"
+# Isolate from whatever the REAL burst-lane.sh sees on this host: BURST_LANE_SH
+# is deliberately unset (this sub-test proves the real script's own no-session
+# fallback, not the fake's), but a real box may genuinely be up on this
+# machine right now (PRD-build-burst-lane-ccx53's own session) — without an
+# isolated state dir, real burst-lane.sh would read the REAL session.json and
+# report the real box's sub-cap instead of "no session," making this
+# assertion depend on ambient host state rather than the code path under
+# test. Point it at an empty scratch dir so "no session" is deterministic.
 set +e
-out=$("$LC" target-busy "$RUST_TARGET" --lane redbaron --exclude-prd "$RUST9" --prd-dir "$ROOT/clone" 2>&1); rc=$?
+out=$(BURST_LANE_STATE_DIR="$ROOT/no-real-session-state" "$LC" target-busy "$RUST_TARGET" --lane redbaron --exclude-prd "$RUST9" --prd-dir "$ROOT/clone" 2>&1); rc=$?
 set -e
 [ "$rc" -eq 1 ] || { echo "FAIL expected sub-cap busy exit 1 (no-session fallback), got $rc: $out"; exit 1; }
 echo "$out" | grep -q '^sub-cap: 3 same-lane claims already live' || { echo "FAIL expected local sub-cap=3 message, got: $out"; exit 1; }
