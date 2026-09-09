@@ -1018,6 +1018,16 @@ At most ONCE PER DAY, write a follow-on PRD. Triggers:
 - A repeated failure pattern across two or more ticks → a PRD
   proposing a guardrail or pattern that prevents it.
 
+**Five whys before the draft (operator rule, 2026-09-09).** A failure-derived
+follow-on PRD is drafted only AFTER the why-chain: up to five whys, each
+answered by an observation from this tick's receipts/journal (never narrative),
+stopping only at a level outside this system's control. The chain goes into the
+PRD's problem statement verbatim, and the PRD targets the DEEPEST actionable
+level — a shallow guardrail may appear as a secondary requirement, never as the
+PRD's thesis. A reflect PRD that names only the level-1 symptom is a defect
+(see "Diagnosis doctrine" above; /dream hard rule 15 and buildloop-factory
+Law 29 are the same rule).
+
 Follow-on PRDs go in `~/Documents/PRDs/build-queue/PRD-build-<topic>.md`
 with frontmatter `Status: queued` and a `build_target`. Omit `build_auto` (no longer
 parsed). Bump `budget.used.prds_drafted` for telemetry.
