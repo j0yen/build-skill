@@ -311,6 +311,10 @@ cmd_run() {
   # this is what keeps that true once a burst-lane session exists.
   if burst_lane_session_active; then
     local rc
+    # Callers following older SKILL.md phrasing pass their own leading "--";
+    # doubling it made burst-lane exec a literal "--" remotely (rc=127,
+    # 2026-09-09 19:34Z). Strip any caller "--" before adding ours.
+    while [ "${1:-}" = "--" ]; do shift; done
     "$BURST_LANE_SH" run "$repo" -- "$@"
     rc=$?
     journal_line "$(now_iso)  gate-burst  run  routed-via-burst-lane  (repo=$repo exit=$rc)"

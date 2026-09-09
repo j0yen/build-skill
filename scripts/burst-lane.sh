@@ -398,7 +398,7 @@ RUN_LOCK="$STATE_DIR/run.lock"
 
 cmd_run() {
   local worktree="${1:-}"; shift || true
-  [ "${1:-}" = "--" ] && shift
+  while [ "${1:-}" = "--" ]; do shift; done  # guard: doubled -- from stacked wrappers
   [ -n "$worktree" ] && [ $# -ge 1 ] || { echo "usage: burst-lane.sh run <worktree> -- <cargo args...>" >&2; exit 2; }
   [ -d "$worktree" ] || die "no such worktree: $worktree" 2
 

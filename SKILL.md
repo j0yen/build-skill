@@ -620,15 +620,19 @@ read it before assuming a step is "the last one this tick".
   burst unconditionally — a live burst-lane box takes every rust gate
   regardless of tick mix, not only mixed ticks, per requirement 5 — and
   only falls back to the original both-counts-must-be-positive mixed-tick
-  predicate when no burst-lane session exists. Either way, exit 0 routes
-  the ENTIRE `extend-gate.sh` invocation through the burst manager instead
-  of running it locally:
+  predicate when no burst-lane session exists. **CORRECTED 2026-09-09 (five-whys: the 19:34Z remote rc=127):** never
+  route the extend-gate INVOCATION itself through `gate-burst.sh run` —
+  the box has no build-skill scripts, no autobuilder, and no reviewer, so
+  a remoted `extend-gate.sh` can only 127. The working pattern (proven
+  19:07Z, exit=0, 2.76 GB target pulled back) is: run `extend-gate.sh`
+  LOCALLY with the burst PATH shims armed, so its cargo-heavy producers
+  execute on the box while orchestration stays here:
   ```
-  scripts/gate-burst.sh run <build_into> -- scripts/extend-gate.sh <build_into> --head <landed sha>
+  export PATH="$HOME/.claude/skills/build/scripts/burst-lane-bin:$PATH" BURST_LANE=1
+  scripts/extend-gate.sh <build_into> --head <landed sha>
   ```
-  Exit 3 from `gate-burst.sh run` (or `should-route` reporting `local`)
-  means: run `extend-gate.sh` locally exactly as written above — today's
-  behavior, unchanged. `gate-burst.sh run`'s own fallback covers every
+  `should-route` reporting `local` (or any shim fallback) means the same
+  command simply runs its cargo locally — today's behavior, unchanged. `gate-burst.sh run`'s own fallback covers every
   burst failure mode (precondition absent, boot failure, rsync/ssh
   failure) by printing `fallback: <cause>` and exiting 3 — the tick must
   treat that exit code as "fall back to local", never as a gate block.
