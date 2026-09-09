@@ -16,7 +16,9 @@
 # ledger PRD-served attribution): run's BURST_LANE_PRD_SLUG opt-in and its
 # worktree-basename fallback both land in prds_served, ride into the
 # cost.jsonl row at teardown, and are printed back out by cost --today
-# (AC13).
+# (AC13); and requirement 12's pull-back half (AC12): a uv-routed run pulls
+# .pybuilder/ back instead of target/, since a python run has no Cargo
+# target-dir to resolve.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -111,6 +113,30 @@ expect "prds_served recorded the explicit BURST_LANE_PRD_SLUG" \
 expect "prds_served also recorded the worktree-basename fallback from the earlier unset-slug runs" \
   "grep -qxF worktree \"$BURST_LANE_STATE_DIR/prds_served\""
 
+# ---- requirement 12: a uv-routed run pulls .pybuilder/ back, not target/ ----
+# (pull_target_incremental hardcodes target/ or its Cargo override — a
+# python run has neither, so before this fix AC12's ".pybuilder/ receipts
+# appear locally afterwards" silently never happened even though routing
+# itself worked.) A fake `uv` on PATH stands in for the real one: `run`
+# resolves the routed command to the bare name "uv" whenever its first arg
+# ends in "/uv" (mirroring the shim's own real-uv absolute path), so the
+# eval'd fake-ssh remote command finds this fake `uv` and writes receipts
+# under the (locally-rooted) remote_path's own .pybuilder/.
+WT_PY="$T/worktree-py"; mkdir -p "$WT_PY"
+FAKEBIN_PY="$T/fakebin-py"; mkdir -p "$FAKEBIN_PY"
+cat > "$FAKEBIN_PY/uv" <<'EOF'
+#!/usr/bin/env bash
+mkdir -p .pybuilder
+echo "receipt" > .pybuilder/out.txt
+exit 0
+EOF
+chmod +x "$FAKEBIN_PY/uv"
+py_run_out="$(PATH="$FAKEBIN_PY:$PATH" "$BL" run "$WT_PY" -- "$FAKEBIN_PY/uv" run pytest 2>&1)"; py_run_rc=$?
+expect "python run (uv-routed) exits 0" "[ $py_run_rc -eq 0 ]"
+expect "python run pulled .pybuilder/ back to the worktree, not target/ (req 12)" \
+  "[ -f \"$WT_PY/.pybuilder/out.txt\" ] && [ ! -e \"$WT_PY/target\" ]"
+expect "python run journaled the routed call" "grep -q 'burst-lane  run  routed.*worktree=$WT_PY' \"$BURST_LANE_JOURNAL\""
+
 # ---- unit: cargo_target_dir_for (worktree-targets-off-root interaction) ----
 # mcphost-call-limits-honest, 2026-09-09 19:58Z: a worktree's own
 # .cargo/config.toml can point target-dir at an absolute path outside the
@@ -166,7 +192,7 @@ expect "cost ledger got a row" "[ -s \"$BURST_LANE_COST_LEDGER\" ]"
 # ---- requirement 13 (cont'd): the deleted session's cost.jsonl row carries
 # every PRD slug that session served, and `cost --today` prints them back.
 expect "cost ledger row records the PRDs this session served (req 13)" \
-  "python3 -c \"import json; d=json.loads(open('$BURST_LANE_COST_LEDGER').read().strip().splitlines()[-1]); import sys; sys.exit(0 if set(d.get('prds', [])) == {'worktree', 'fake-prd-slug-1'} else 1)\""
+  "python3 -c \"import json; d=json.loads(open('$BURST_LANE_COST_LEDGER').read().strip().splitlines()[-1]); import sys; sys.exit(0 if {'worktree', 'fake-prd-slug-1'}.issubset(set(d.get('prds', []))) else 1)\""
 cost_today_out="$("$BL" cost --today)"
 expect "cost --today prints hours and euros" "grep -qE 'hours=[0-9.]+ eur=[0-9.]+' <<<\"$cost_today_out\""
 expect "cost --today prints the PRDs served this session (AC13)" \

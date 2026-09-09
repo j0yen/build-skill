@@ -25,8 +25,11 @@
 # box-computed sub-cap governs same-target fan-out there instead of the
 # local SAME_LANE_SUBCAP — see lane-claim.sh's header and SKILL.md's
 # "Burst-lane PATH" section. The uv/python leg (req 12) is wired: SKILL.md's
-# "Burst-lane PATH, python branches" section, `burst-lane-bin/uv`, and
-# `up`'s uv install on the box. Requirement 13 (cost ledger "PRDs served"
+# "Burst-lane PATH, python branches" section, `burst-lane-bin/uv`, `up`'s uv
+# install on the box, and `run`'s pull-back branching on the routed command
+# (uv -> `pull_pybuilder_incremental` for `.pybuilder/`, everything else ->
+# `pull_target_incremental` for `target/` as before — a python run has no
+# Cargo target-dir to resolve). Requirement 13 (cost ledger "PRDs served"
 # attribution) is also wired: `run` appends the caller's
 # `BURST_LANE_PRD_SLUG` (or the worktree's own basename, falling back)
 # deduped to `state/burst-lane/prds_served`, `down`/`watchdog` read it into
@@ -459,6 +462,28 @@ pull_target_incremental() {  # $1=worktree $2=ip -> stdout: bytes transferred; r
   return 0
 }
 
+# ---- shared incremental .pybuilder/ pull (requirement 12) --------------------
+# `pull_target_incremental` only ever pulls `target/` (or its Cargo
+# target-dir override) back — a python `run` (routed through the uv shim)
+# has no Cargo target-dir at all, so that pull silently found nothing for
+# every python run and AC12's ".pybuilder/ receipts appear locally
+# afterwards" was unmet even though the routing itself worked. This mirrors
+# `pull_target_incremental`'s same incremental rsync --delete --stats
+# contract for pybuilder's own `.pybuilder/` receipt directory instead.
+pull_pybuilder_incremental() {  # $1=worktree $2=ip -> stdout: bytes transferred; rc 0/1
+  local worktree="$1" ip="$2" remote_path stats local_target remote_target
+  remote_path="$REMOTE_ROOT/$(basename "$worktree")"
+  local_target="$worktree/.pybuilder"; remote_target="$remote_path/.pybuilder"
+  mkdir -p "$local_target" 2>/dev/null || true
+  if ! stats="$("$RSYNC_BIN" -az --delete --stats -e "$SSH_BIN -o StrictHostKeyChecking=no -i $SSH_KEY" \
+        "$REMOTE_USER@$ip:$remote_target/" "$local_target/" 2>&1)"; then
+    return 1
+  fi
+  local bytes; bytes="$(echo "$stats" | grep -oE 'Total transferred file size: [0-9,]+' | grep -oE '[0-9,]+' | tr -d ',')"
+  echo "${bytes:-0}"
+  return 0
+}
+
 # ---- run --------------------------------------------------------------------
 RUN_LOCK="$STATE_DIR/run.lock"
 
@@ -518,11 +543,21 @@ cmd_run() {
     exit 3
   fi
 
+  # Requirement 12: a uv-routed (python) run pulls .pybuilder/ back, not
+  # target/ — it has no Cargo target-dir to resolve.
   local bytes
-  if ! bytes="$(pull_target_incremental "$worktree" "$ip")"; then
-    journal_line "$(now_iso)  burst-lane  run  fallback  (cause=rsync-down-failed worktree=$worktree)"
-    echo "fallback: rsync from $ip failed"
-    exit 3
+  if [ "$first" = "uv" ]; then
+    if ! bytes="$(pull_pybuilder_incremental "$worktree" "$ip")"; then
+      journal_line "$(now_iso)  burst-lane  run  fallback  (cause=rsync-down-failed worktree=$worktree kind=python)"
+      echo "fallback: rsync from $ip failed"
+      exit 3
+    fi
+  else
+    if ! bytes="$(pull_target_incremental "$worktree" "$ip")"; then
+      journal_line "$(now_iso)  burst-lane  run  fallback  (cause=rsync-down-failed worktree=$worktree)"
+      echo "fallback: rsync from $ip failed"
+      exit 3
+    fi
   fi
 
   local runs; runs="$(state_read runs_served)"; runs=$((runs + 1))
