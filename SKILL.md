@@ -1,6 +1,6 @@
 ---
 name: build
-description: Continuously implement queued PRDs end-to-end — scan for new PRDs, build them (delegating to /rustbuild for Rust — cargo runs on RedBaron, locally there and remotely from every other node), wire them into the system, publish them as GitHub repos per the PRD's `publish:` key (default `j0yen/private`; the joeyen-atscale route was retired 2026-08-27), update Abouts (per-repo READMEs + wintermute REPOS.md), and draft follow-on PRDs that expand Claude's own capabilities. Rust routes to /rustbuild, Python (`python-*`) to /pybuild. The parsed PRD contract is documented in build-contract.md. Runs on manual invocation or systemd-user timer when enabled; up to 30 PRDs advanced in parallel per tick (one action per PRD). Use when the user says /build, when the SessionStart hook reports a queued PRD, or when the user asks Claude to "make progress on the queue" or "build the next thing."
+description: Continuously implement queued PRDs end-to-end — scan for new PRDs, build them (delegating to /rustbuild for Rust — cargo runs on RedBaron, locally there and remotely from every other node), wire them into the system, publish them as GitHub repos per the PRD's `publish:` key (default `j0yen/private`; the joeyen-atscale route was retired 2026-08-27), update Abouts (per-repo READMEs + wintermute REPOS.md), and draft follow-on PRDs that expand Claude's own capabilities. Rust routes to /rustbuild, Python (`python-*`) to /pybuild. The parsed PRD contract is documented in build-contract.md. Runs on manual invocation or systemd-user timer when enabled; up to 30 PRDs advanced in parallel per tick, one ATOMIC step at a time per PRD, chained while green with no default cap (2026-09-09). Use when the user says /build, when the SessionStart hook reports a queued PRD, or when the user asks Claude to "make progress on the queue" or "build the next thing."
 model: sonnet
 ---
 
@@ -28,15 +28,33 @@ root, indexed in `~/wintermute/REPOS.md`). Canonical skill sources are listed
 in `README.md` and enforced by `fleet-sync`.
 
 Cadence is **every 5 minutes** (systemd-user timer `claude-build.timer`).
-Per tick, the skill advances **up to 30 PRDs in parallel** — one action
-per PRD, dispatched as parallel Agent (subagent) tool calls in a single
-tool-use message, then collected. The per-PRD one-action invariant is
-preserved; only fan-out per tick changed (2026-05-28: 1 → 5; 2026-05-29:
-5 → 10; raised by user 2026-06-11: 10 → 30 — **30 is the operative cap, do not
-self-throttle below it**). Worst-case blast radius is 30×288 = 8640 small
-changes/day, still bounded and each independently revertable. See the
-"Parallelism" section for selection, dispatch, locking, and failure
-isolation.
+Per tick, the skill dispatches **up to 30 PRDs in parallel** as parallel
+Agent (subagent) tool calls in a single tool-use message, then collects
+their results. **Per-PRD contract, updated 2026-09-09
+(PRD-build-chained-tick-actions; operator authorization, Joe, verbatim:
+"does it have to be one action per PRD for tick? Can we expand thsis?" —
+expand it, and on a chain cap, "no, no chain cap"):** each dispatched PRD
+advances **one ATOMIC step at a time, chained while green, with no
+default cap** — after committing a step's manifest transition, the branch
+re-checks the same preconditions the tick parent used to select it and,
+if they still hold, performs the PRD's next step too, in the same
+dispatch, repeating until a mandatory stop condition applies (gate red,
+blockers, needs-user, integrate lock contended, archive done, or an
+explicitly-set `CHAIN_MAX_STEPS`) — see "In-tick chaining" under Phase 4.
+The invariant this replaces ("exactly one action per PRD per tick") was
+never really about cadence; it was about atomic, independently-revertable
+progress, which chaining preserves by construction (every chained step is
+still its own manifest commit). Only the PER-TICK fan-out changed on the
+older timeline (2026-05-28: 1 → 5; 2026-05-29: 5 → 10; raised by user
+2026-06-11: 10 → 30 — **30 is the operative cap on fan-out, do not
+self-throttle below it**). Worst-case blast radius per tick is now
+30 PRDs × (however many atomic steps each chains through before a
+mandatory stop), each step still independently revertable; a green PRD's
+whole worst-case blast radius collapses to "however many steps it has,"
+same as it always did — chaining changes WHEN those steps land, not how
+many there are. See the "Parallelism" section for selection, dispatch,
+locking, and failure isolation, and "In-tick chaining" for the
+per-PRD chaining mechanics.
 
 **Auto-publish is the default, no opt-outs, no daily caps (updated
 2026-05-27).** Every PRD is buildable — `build_auto` is no longer
@@ -379,12 +397,33 @@ If classification is ambiguous, mark the PRD `status: needs_classification`
 and emit one line in the journal asking the user to add a hint to the PRD
 frontmatter (e.g., `build_target: rust-cli`).
 
-### Phase 4 — Implement (one action per selected PRD)
+### Phase 4 — Implement (one ATOMIC step at a time, chained while green)
 
-For each PRD selected in Phase 2, do exactly ONE of the following —
-whichever advances that PRD by one well-defined step. The 1..=30 PRDs
-in this tick's selection run in parallel via Agent tool calls
-(see "Parallelism" below). Each branch stops after its action.
+**Doctrine update (2026-09-09, PRD-build-chained-tick-actions; operator
+authorization, Joe, 2026-09-09, verbatim: "does it have to be one action
+per PRD for tick? Can we expand thsis?" — expand it; and on a chain cap,
+"no, no chain cap").** For each PRD selected in Phase 2, do ONE of the
+following — whichever advances that PRD by one well-defined, atomically
+manifest-committed step. The 1..=30 PRDs in this tick's selection run in
+parallel via Agent tool calls (see "Parallelism" below). **What changed:**
+a branch no longer stops unconditionally after its first action. After
+committing that step's manifest transition (Phase 7's `manifest-set.sh`
+call), it re-checks — for this SAME PRD only — the same preconditions the
+tick parent uses to select a PRD in the first place
+(`scripts/chain-guard.sh check <slug> ...`; see "In-tick chaining" right
+after "Dispatch" below). If they still hold, it performs the next step too,
+in the same dispatch, committing its own manifest transition before even
+considering a third step. There is **no chain cap by default** — a PRD that
+is green end-to-end runs all the way to `archived` in one dispatch. The
+per-PRD invariant is no longer "one action per tick"; it is now "one ATOMIC
+step at a time, chained while green, stopping at the same boundaries a tick
+would have stopped at anyway" (gate red / any step failure, blockers,
+needs-user, integrate lock contended past 60s, archive done, or an
+explicitly-set `CHAIN_MAX_STEPS`). `kernel-extend` PRDs and the tick's ≤1
+Phase-6 reflect candidate are excluded from chaining — they keep today's
+one-action-per-tick behavior unchanged. Full mechanics, stop-condition
+table, and the branch-prompt contract are in "In-tick chaining" below —
+read it before assuming a step is "the last one this tick".
 
 - **iter-1 (scaffold)**: For a Rust target, invoke `/rustbuild` with
   the PRD path. Let autobuilder run its own loop. Capture the result
@@ -443,8 +482,16 @@ in this tick's selection run in parallel via Agent tool calls
   `build_into` default branch exactly as for rust-extend. Main checkout
   of `build_into` is never left dirty between ticks.
 - **iter-2..N (continue)**: If `/rustbuild` left work, hand the same
-  PRD back to it. Each `/rustbuild` invocation IS one tick's action;
-  do not chain them within a single tick.
+  PRD back to it. Each `/rustbuild` invocation IS one atomic step —
+  commit its manifest transition, same as any other step. **Updated
+  2026-09-09 (PRD-build-chained-tick-actions):** this no longer stops the
+  chain by itself — run `scripts/chain-guard.sh check <slug> --step-count
+  <k> --prd-dir <dir>` exactly as any other step boundary would (see
+  "In-tick chaining"); a `continue` verdict means hand the PRD back to
+  `/rustbuild` again in the same dispatch instead of waiting for the next
+  tick. This is precisely the "build iterations" leg of the wait this PRD
+  was written to remove — a PRD stuck needing several rustbuild rounds no
+  longer pays a tick boundary per round.
 - **bump-version & commit** [rust-extend only]: when implementation is
   locally green, run `scripts/extend-handler.sh bump-version <build_into>
   <bump>` (bump from manifest `version_bump`, default minor), then
@@ -1079,12 +1126,18 @@ is REMOVED; do not reintroduce it in branch agents.
 
 ## Parallelism (per-tick fan-out, added 2026-05-28)
 
-Each tick advances **up to 30 PRDs in parallel**. The per-PRD
-constraint (one action per PRD per tick) is preserved unchanged;
-only the per-tick fan-out grew (1 → 5 → 10 → 30). User instruction
-2026-05-28: "this laptop can handle it"; raised 5 → 10 on 2026-05-29;
-raised 10 → 30 by user 2026-06-11 — **30 is the operative cap, do not
-self-throttle below it.**
+Each tick advances **up to 30 PRDs in parallel**. The per-tick fan-out
+grew (1 → 5 → 10 → 30) independently of the per-PRD step contract: **as
+of 2026-09-09 (PRD-build-chained-tick-actions) that per-PRD contract is
+"one ATOMIC step at a time, chained while green" rather than "exactly one
+action per PRD per tick"** — see "In-tick chaining" under Phase 4/Dispatch
+for the mechanics. Fan-out width (how many PRDs get dispatched at all
+this tick) and chain depth (how many steps one dispatched PRD advances
+before returning) are orthogonal: a 30-wide tick can still have some
+branches chain to `archived` while others take one step and stop at a
+mandatory boundary. User instruction 2026-05-28: "this laptop can handle
+it"; raised 5 → 10 on 2026-05-29; raised 10 → 30 by user 2026-06-11 —
+**30 is the operative cap on fan-out, do not self-throttle below it.**
 
 **Fan out to the full cap by default — do NOT self-throttle below 30 on
 memory grounds.** Carbon has **15 GB RAM (0 swap), typically ~11 GB
@@ -1339,6 +1392,33 @@ Each agent prompt must include, self-contained:
   crosscheck receipt against a second target (a sandboxed shell cannot
   brand a healthy host unreachable off one probe from a degraded
   context)."
+- "In-tick chaining (PRD-build-chained-tick-actions): after your Phase 7
+  `manifest-set.sh` call for this PRD's step succeeds, do NOT stop yet — run
+  `scripts/chain-guard.sh check <slug> --step-count <N> [--integrate-lock
+  <path> if the next step is integrate/gate] --prd-dir <dir>` (N = chained
+  steps completed so far THIS dispatch, starting at 1 after your first
+  step). Exit 0 (`continue: ...`) means run the PRD's next Phase 4 step now,
+  in this same dispatch, then repeat this check after committing IT. Exit 1
+  (`stop: <reason>`) means stop the chain here — this is not a failure,
+  it's `chain-guard.sh` doing the mandatory-stop-condition check for you
+  (gate red/blockers, needs-user, archive-done, lock-contended, cap,
+  target-busy, or the kernel-extend/reflect-candidate exclusion). Record the
+  stop reason via `vellum amend PRD-<slug>.md --append-iter-log "chain
+  stopped: <reason> after step <k>"` (or the manifest `outcome`/`next`
+  fields — whichever step's own action already writes one) and in your
+  journal line. There is NO default chain cap — an unset
+  `CHAIN_MAX_STEPS` means run every step that `chain-guard.sh` allows,
+  however many that is; only an explicitly-set `CHAIN_MAX_STEPS` env var
+  bounds it (`--max-steps` maps to that same cap if you set the env var
+  instead). Emit ONE journal line per chained step, not just one for the
+  whole dispatch: `chain: <slug> step <k> <action> -> <result>` (k=1 for
+  your first step, incrementing). Include `chained_steps: <k>` in EVERY
+  Phase 7 patch you write, even the first, so the manifest's own telemetry
+  shows how many steps this dispatch chained. You still hold ONE
+  `state/prd-<slug>.lock` for the ENTIRE chain (acquired once, before your
+  first step) — do not release and re-acquire it between chained steps.
+  Never chain into a second PRD: this directive governs re-running Phase
+  4-7 for the SAME PRD only."
 - "Return a one-line summary of what you did: `<slug>: <action>
   <outcome>` so the parent's journal sees it."
 - "Your Phase 7 journal line's `key=value` tail MUST include `lane=<hostname>`
@@ -1376,7 +1456,125 @@ a branch land on a `build_into` another lane already holds live (the
 2026-09-08 `autobuilder-gate-debt` collision this PRD is named for).
 
 Issue all calls in a single message — that's what makes them
-parallel. Do not chain follow-up Agent calls in the same tick.
+parallel. Do not chain follow-up Agent calls in the same tick — this means
+the PARENT never spawns a second wave of Agent/Task calls this tick, for
+this PRD or any other. It is unrelated to, and unchanged by, "In-tick
+chaining" below: that's a single already-dispatched branch agent looping
+Phases 4→7 inline, for its own one assigned PRD, without any new Agent
+tool call.
+
+### In-tick chaining (added 2026-09-09, PRD-build-chained-tick-actions)
+
+**Operator authorization, Joe, 2026-09-09, verbatim:** "does it have to be
+one action per PRD for tick? Can we expand thsis?" (expand it) and, on
+whether a chain should cap at some fixed count, "no, no chain cap" —
+superseding an earlier "can it do 10 per branch?" This section is the full
+mechanics behind the Phase 4 doctrine update and the branch-prompt bullet
+above; skip to "Stop conditions" if you already know the contract and just
+need the reason names.
+
+**Why:** the 5-minute tick timer used to be the ONLY thing that let a
+green PRD advance to its next lifecycle step. A PRD needing N sequential
+steps (scaffold → gate → integrate → archive, say) paid up to N tick
+boundaries even when every step's preconditions already held the moment
+the prior step committed. Chaining removes the cadence coupling while
+preserving exactly what the one-action invariant was actually protecting:
+per-step atomicity (requirement 2) and bounded per-tick blast radius
+(still true — a chain only ever touches the ONE PRD it was dispatched
+for).
+
+**Mechanism (requirement 1).** After a branch agent's Phase 7
+`manifest-set.sh` call for a step succeeds, it does not return yet. It
+calls:
+
+```
+scripts/chain-guard.sh check <slug> --step-count <k> \
+  [--integrate-lock <build_into>/.git/autobuilder-integrate.lock] \
+  [--reflect-candidate] [--prd-dir <dir>] [--lane <lane>]
+```
+
+`chain-guard.sh` re-checks the SAME preconditions the tick parent's own
+selection + dispatch-boundary guard would use to pick this PRD again from
+scratch — manifest status/blockers, the kernel-extend/reflect-candidate
+exclusion, an explicitly-set `CHAIN_MAX_STEPS`, the integrate lock (when
+the next step is `integrate`/`gate`), and `select-guard.sh` (sub-cap,
+cargo-budget, burst-route) — reusing those scripts unchanged rather than
+re-implementing their logic. Exit 0 (`continue: <slug>: <reason>`) means
+run the next Phase 4 step now, in the same dispatch; exit 1 (`stop:
+<slug>: <reason>`) means stop. This is a re-check ahead of EVERY step
+after the first, not a one-time gate — a chain that has run 5 green steps
+still re-checks before a 6th.
+
+**Per-step atomicity, unchanged (requirement 2).** Every chained step
+commits its own manifest transition via `manifest-set.sh`, exactly as a
+standalone tick action would, BEFORE the next step starts and BEFORE the
+next `chain-guard.sh` call. A branch killed mid-chain leaves the manifest
+in exactly the state its last completed step left it in — indistinguishable
+from a tick that was killed after a single action. Own-claim continuation
+(`resume: own claim`, PRD-build-claims-resume-not-count) resumes it next
+tick with no new code: the manifest doesn't know or care whether a given
+`in_progress` state was reached by one action or the fifth link in a
+chain. The branch's `state/prd-<slug>.lock` is acquired ONCE, before the
+first step, and held for the whole chain — it is not released and
+re-acquired between steps (that would open a window for another tick to
+race the same PRD mid-chain).
+
+**Stop conditions, all mandatory (requirement 3).** `chain-guard.sh`
+enforces these, in this order, and prints the matching reason:
+
+| Reason                        | Meaning                                                                 |
+|--------------------------------|--------------------------------------------------------------------------|
+| `excluded-kernel-extend`       | `build_target: kernel-extend` — never chained (requirement 5).           |
+| `excluded-reflect-candidate`   | this tick's ≤1 Phase-6 reflect candidate — never chained (requirement 5).|
+| `no-manifest-entry`            | defensive: the slug has no manifest entry at all.                        |
+| `archive-done`                 | manifest `status: shipped` — nothing left to chain.                      |
+| `blockers`                     | manifest `blockers` is non-empty — covers gate red and any step failure, since a failed step's own action already appends a `blockers` line (e.g. the `gate` action's `gate: <receipt> — <message>` on block) before returning here. |
+| `needs-user`                   | manifest `status: needs_classification` (or `needs_user`).               |
+| `cap`                          | `CHAIN_MAX_STEPS` is explicitly set (env var or `--max-steps`) and this step's count has reached it. |
+| `lock-contended`               | `--integrate-lock` given and not acquired within the wait bound (default 60s — requirements 1 and 3 both name this figure; a probe acquire-then-release, the real step re-acquires for its own work). |
+| `target-busy: <detail>`        | `select-guard.sh` (sub-cap / cargo-budget / burst-route / cross-lane busy) refused — same call the tick parent's dispatch-boundary guard makes. |
+
+On any stop, the branch records the reason in that step's own outcome
+(the manifest fields the step's OWN action already writes — `blockers`,
+`next`, `last_error` — chain-guard.sh does not itself mutate the
+manifest) and in its journal line, then returns per the normal Phase 7
+contract. A stop is not a branch failure; it is the chain doing exactly
+what a tick boundary used to do, just mechanically instead of by waiting
+for the timer.
+
+**No chain cap by default (requirement 4).** An unset `CHAIN_MAX_STEPS`
+means unlimited — the stop conditions above are the only limits, and a
+green PRD runs every step in the same dispatch until one of them applies
+(in practice, until `archive-done`). Setting `CHAIN_MAX_STEPS=<n>` (env
+var on the branch's process) acts as an emergency brake for exactly the
+scenario "this chain is doing something we didn't expect, cut it off
+after n steps" — selftests that exercise it pin their own value rather
+than relying on ambient state.
+
+**Excluded from chaining (requirement 5).** `kernel-extend` PRDs (the
+`makepkg` build already saturates the box — see the Selection rules'
+≤1-per-tick cap) and the tick's one Phase-6-eligible reflect candidate
+(the daily-reflect cap) take exactly one action per tick, same as before
+this PRD. `chain-guard.sh` refuses to continue either regardless of every
+other condition — this check runs FIRST, ahead of manifest state.
+
+**Journal visibility (requirement 6, P1).** Each chained step emits its
+own `chain: <slug> step <k> <action> -> <result>` line (k starting at 1)
+so a tick's blast radius stays auditable per step, not just per dispatch —
+see the branch-prompt bullet above for the exact contract.
+
+**Telemetry (requirement 8, P2).** Each Phase 7 patch includes
+`chained_steps: <k>` — the count of steps this dispatch has chained so
+far, including the current one. See "Manifest entry shape" below. This is
+what a future measure-loop pass reads to report boundary-wait time saved
+by chaining vs. the old one-tick-per-step cadence.
+
+**Non-goals (unchanged).** No cross-PRD chaining — a branch finishing PRD
+X never picks up PRD Y; new selection stays with the tick parent, which
+never spawns a second wave of Agent calls this tick either (see the note
+above). No change to the 5-minute timer, the 30-PRD fan-out cap, the
+sub-cap, cargo-budget, or burst-lane routing — chaining re-checks all of
+those before every step and defers to them exactly as selection would.
 
 ### Locking
 
@@ -1643,9 +1841,19 @@ to 5" wording. The cap is a number in the doc, not in code.
   "blockers": [],
   "last_shipped_version": null,
   "rebuild_reason": null,
-  "verified_completed": { "c1": null, "c2": null, "c3": null, "c4": null, "c5": null, "c6": null }
+  "verified_completed": { "c1": null, "c2": null, "c3": null, "c4": null, "c5": null, "c6": null },
+  "chained_steps": 0
 }
 ```
+
+`chained_steps` (PRD-build-chained-tick-actions, requirement 8) is the
+count of steps the MOST RECENT dispatch chained for this PRD — 1 after a
+single-action dispatch (unchanged pre-chaining behavior), N after an
+N-step chained dispatch reaching `archived` or a mandatory stop. Every
+Phase 7 patch, chained or not, sets it; it is not cumulative across
+ticks — a fresh dispatch that resumes an `in_progress` PRD next tick
+starts its own count at 1 again. Absent/null reads as 0 (pre-chaining
+manifest entries).
 
 `last_shipped_version` and `rebuild_reason` back the rebuild gate (see the
 `archive` action above) — both null until the first ship, then
