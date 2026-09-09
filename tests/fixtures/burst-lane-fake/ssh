@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 # Fake ssh for burst-lane.sh offline tests. Last arg is the remote command:
 # "true" for reachability probes, the bwrap sandbox-probe one-liner for
-# sandbox_probe (succeeds unless FAKE_SSH_SANDBOX_FAIL=1), otherwise the
-# "cd <remote_path> && export ...; <cargo cmd>" string, eval'd locally
+# sandbox_probe (succeeds unless FAKE_SSH_SANDBOX_FAIL=1), the
+# MemAvailable/nproc probe for cmd_sub_cap (canned via FAKE_SSH_MEMINFO_GB/
+# FAKE_SSH_NPROC so AC7's exact avail_gb/nproc scenarios are reproducible
+# without depending on the real test box's own /proc/meminfo), otherwise
+# the "cd <remote_path> && export ...; <cargo cmd>" string, eval'd locally
 # since our "remote" is really the local filesystem under
 # BURST_LANE_REMOTE_ROOT. FAKE_SSH_REMOTE_FAIL=<n> makes the remote command
 # "fail" with exit code n instead of running it.
@@ -13,6 +16,11 @@ if [ "$cmd" = true ]; then exit 0; fi
 case "$cmd" in
   *bwrap*)
     [ "${FAKE_SSH_SANDBOX_FAIL:-0}" = "1" ] && exit 1
+    exit 0
+    ;;
+  *MemAvailable*)
+    [ "${FAKE_SSH_PROBE_FAIL:-0}" = "1" ] && exit 1
+    echo "${FAKE_SSH_MEMINFO_GB:-8} ${FAKE_SSH_NPROC:-4}"
     exit 0
     ;;
 esac

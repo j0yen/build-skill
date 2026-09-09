@@ -16,10 +16,16 @@
 # transferred recorded on both commands' journal lines). Requirements 4
 # (worktree-extend.sh PATH prepend) and 5 (gate-burst.sh should-route/run)
 # landed in later ticks — see git log, this header is not kept current
-# per-commit. NOT yet wired: the selection sub-cap formula (req 7) and its
-# SKILL.md rule, the uv/python leg (req 12), and the cost ledger's "PRDs
-# served" attribution (req 13, beyond the hours/eur it already tracks) —
-# each is its own well-defined next step for a later tick.
+# per-commit. Requirement 7's FORMULA now lives here too: `sub-cap` probes
+# the box's MemAvailable/nproc over ssh and prints/journals
+# `burst: sub-cap=<n> (avail_gb=<n> nproc=<n>)` (or the no-session local=3
+# fallback line) — but wiring that call INTO SKILL.md's selection rule and
+# lane-claim.sh's SAME_LANE_SUBCAP (so a live session actually drops the
+# local rust cap to 0 and admits up to sub-cap branches) is still a later
+# tick's step. NOT yet wired: that selection-side integration, the
+# uv/python leg (req 12), and the cost ledger's "PRDs served" attribution
+# (req 13, beyond the hours/eur it already tracks) — each is its own
+# well-defined next step for a later tick.
 #
 # Subcommands:
 #   burst-lane.sh up
@@ -57,6 +63,16 @@
 #       outlived its TTL.
 #   burst-lane.sh cost --today
 #       Sums state/burst-lane/cost.jsonl rows for today's UTC date.
+#   burst-lane.sh sub-cap [--candidates <n>]
+#       Requirement 7's formula. No session -> prints "sub-cap=0 local=3
+#       (no session — local cap applies)" and journals a no-session line.
+#       Session up -> probes the box's MemAvailable_gb and nproc over ssh,
+#       computes min(floor(avail_gb/BURST_GB_PER_BRANCH),
+#       floor(nproc/BURST_CORES_PER_BRANCH)[, candidates]) (defaults 6 GB
+#       and 4 cores per branch), prints "sub-cap=<n> local=0
+#       (avail_gb=<n> nproc=<n>)" and journals
+#       "burst: sub-cap=<n> (avail_gb=<n> nproc=<n>)" (AC7). A failed probe
+#       exits 3 with "fallback: ...", never blocking the caller.
 #
 # Env overrides (offline testing only — never set in production):
 #   BURST_LANE_HCLOUD_BIN, BURST_LANE_SSH_BIN, BURST_LANE_RSYNC_BIN,
@@ -89,7 +105,7 @@ COST_PER_HOUR_EUR="0.47"
 REMOTE_ROOT="${BURST_LANE_REMOTE_ROOT:-/root/build}"
 
 die() { echo "burst-lane: $*" >&2; exit "${2:-1}"; }
-usage() { echo "usage: burst-lane.sh {up|status|run|sync-back|down|watchdog|cost} ..." >&2; exit 2; }
+usage() { echo "usage: burst-lane.sh {up|status|run|sync-back|down|watchdog|cost|sub-cap} ..." >&2; exit 2; }
 
 now_epoch() { echo "${BURST_LANE_NOW:-$(date -u +%s)}"; }
 now_iso()   { date -u -d "@$(now_epoch)" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ; }
@@ -522,6 +538,59 @@ cmd_watchdog() {
   exit 1
 }
 
+# ---- sub-cap (requirement 7 formula) -----------------------------------------
+# Probes the box's available memory and core count over ssh in one round
+# trip. The `\$2`/`\$(...)` inside the single-quoted remote_cmd are deliberately
+# unescaped from THIS script's perspective (single quotes suppress local
+# expansion) so they evaluate on the remote shell, matching the pattern
+# `run`'s own remote_cmd construction already uses.
+probe_remote_capacity() {  # $1 = ip -> stdout "avail_gb nproc"; rc 1 on failure
+  local ip="$1" out
+  local remote_cmd='avail_kb=$(grep MemAvailable /proc/meminfo | awk "{print \$2}"); echo $((avail_kb/1024/1024)) $(nproc)'
+  out="$("$SSH_BIN" -o StrictHostKeyChecking=no -o ConnectTimeout=8 -i "$SSH_KEY" \
+        "$REMOTE_USER@$ip" "$remote_cmd" 2>/dev/null)" || return 1
+  [ -n "$out" ] || return 1
+  echo "$out"
+}
+
+cmd_sub_cap() {
+  local candidates=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --candidates) candidates="${2:-0}"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+
+  if ! state_active; then
+    journal_line "$(now_iso)  burst-lane  sub-cap  no-session  (local=3, fallback rules apply)"
+    echo "sub-cap=0 local=3 (no session — local cap applies)"
+    exit 0
+  fi
+
+  local ip; ip="$(state_read ip)"
+  local probe
+  if ! probe="$(probe_remote_capacity "$ip")"; then
+    journal_line "$(now_iso)  burst-lane  sub-cap  fallback  (cause=probe-failed server_id=$(state_read server_id))"
+    echo "fallback: could not probe box capacity"
+    exit 3
+  fi
+  local avail_gb nproc_n
+  read -r avail_gb nproc_n <<<"$probe"
+  case "$avail_gb" in ''|*[!0-9]*) journal_line "$(now_iso)  burst-lane  sub-cap  fallback  (cause=bad-probe-output out=$probe)"; echo "fallback: bad probe output"; exit 3 ;; esac
+  case "$nproc_n"  in ''|*[!0-9]*) journal_line "$(now_iso)  burst-lane  sub-cap  fallback  (cause=bad-probe-output out=$probe)"; echo "fallback: bad probe output"; exit 3 ;; esac
+
+  local gb_per="${BURST_GB_PER_BRANCH:-6}" cores_per="${BURST_CORES_PER_BRANCH:-4}"
+  local by_mem=$(( avail_gb / gb_per )) by_cpu=$(( nproc_n / cores_per ))
+  local subcap=$by_mem
+  [ "$by_cpu" -lt "$subcap" ] && subcap=$by_cpu
+  if [ "$candidates" -gt 0 ] && [ "$candidates" -lt "$subcap" ]; then subcap=$candidates; fi
+
+  journal_line "$(now_iso)  burst-lane  sub-cap  computed  (burst: sub-cap=$subcap (avail_gb=$avail_gb nproc=$nproc_n) local=0)"
+  echo "sub-cap=$subcap local=0 (avail_gb=$avail_gb nproc=$nproc_n)"
+  exit 0
+}
+
 # ---- cost -------------------------------------------------------------------
 cmd_cost() {
   [ "${1:-}" = "--today" ] || { echo "usage: burst-lane.sh cost --today" >&2; exit 2; }
@@ -557,6 +626,7 @@ main() {
     down)      cmd_down "$@" ;;
     watchdog)  cmd_watchdog "$@" ;;
     cost)      cmd_cost "$@" ;;
+    sub-cap)   cmd_sub_cap "$@" ;;
     *) usage ;;
   esac
 }

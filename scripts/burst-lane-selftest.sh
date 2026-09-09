@@ -8,9 +8,11 @@
 # byte count across two consecutive runs on the same worktree (AC11,
 # requirement 10), watchdog TTL teardown (AC6), down's keep/scheduled/
 # deleted decision as rust work does/doesn't remain in build-queue/ (AC8),
-# the never-poweroff/shutdown/stop invariant (AC14), and the cargo shim's
+# the never-poweroff/shutdown/stop invariant (AC14), the cargo shim's
 # local fallback when no session exists (AC3, partial — the routed-through
-# half needs a live `run` and is exercised indirectly via AC2 above).
+# half needs a live `run` and is exercised indirectly via AC2 above), and
+# the requirement-7 sub-cap formula (AC7: 120GB/32cores -> 8, 40GB/32cores
+# -> 6, no session -> local cap 3 only).
 set -uo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -140,6 +142,31 @@ chmod +x "$FAKEBIN/cargo"
 shim_out="$(cd "$WT" && PATH="$HERE/burst-lane-bin:$FAKEBIN:$FAKE:$PATH" BURST_LANE=1 "$SHIM" test 2>&1)"
 expect "shim falls through to local cargo with no session" "grep -q 'local-cargo-ran: test' <<<\"$shim_out\""
 expect "shim journals the no-session fallback to stderr" "grep -q 'burst-lane: no session, local' <<<\"$shim_out\""
+
+# ---- AC7: sub-cap formula ----------------------------------------------------
+# No session -> only the local cap (3) applies; nothing computed from a box.
+fresh_env
+subcap_nosession="$("$BL" sub-cap)"
+expect "sub-cap with no session reports local=3" "grep -q 'local=3' <<<\"$subcap_nosession\""
+expect "sub-cap with no session journals it" "grep -q 'burst-lane  sub-cap  no-session' \"$BURST_LANE_JOURNAL\""
+
+"$BL" up >/dev/null
+
+# 120 GB avail, 32 cores, 10 rust candidates -> floor(120/6)=20, floor(32/4)=8,
+# min(20,8,10)=8 (AC7).
+subcap8="$(FAKE_SSH_MEMINFO_GB=120 FAKE_SSH_NPROC=32 "$BL" sub-cap --candidates 10)"
+expect "sub-cap admits 8 on a 120GB/32-core box (AC7)" "grep -q '^sub-cap=8 local=0' <<<\"$subcap8\""
+expect "sub-cap journals the AC7-shaped line" \
+  "grep -q 'burst: sub-cap=8 (avail_gb=120 nproc=32) local=0' \"$BURST_LANE_JOURNAL\""
+
+# 40 GB avail, 32 cores -> floor(40/6)=6, floor(32/4)=8, min(6,8,10)=6 (AC7).
+subcap6="$(FAKE_SSH_MEMINFO_GB=40 FAKE_SSH_NPROC=32 "$BL" sub-cap --candidates 10)"
+expect "sub-cap admits 6 on a 40GB/32-core box (AC7)" "grep -q '^sub-cap=6 local=0' <<<\"$subcap6\""
+
+# A failed probe never blocks the caller: fallback exit 3, no crash.
+subcap_fail_rc=0
+FAKE_SSH_PROBE_FAIL=1 "$BL" sub-cap >/dev/null 2>&1 || subcap_fail_rc=$?
+expect "sub-cap exits 3 (fallback, never blocks) when the probe fails" "[ $subcap_fail_rc -eq 3 ]"
 
 echo "=== $([ $fail -eq 0 ] && echo PASS || echo FAIL) ==="
 exit $fail
