@@ -371,8 +371,11 @@ Read the PRD. Determine its implementation shape:
   extend in place (no `gh repo create`); otherwise pybuilder scaffolds a new
   project and the new-repo publish path applies. Capture the Stage 4 gate
   verdict (`ready` / `blocked`) and the receipt directory
-  (`<project>/.pybuilder/`) into the manifest `verification` field. All
-  Python runs locally under `uv` — there is no remote leg for Python.
+  (`<project>/.pybuilder/`) into the manifest `verification` field. Python
+  runs locally under `uv` by default; when a Hetzner burst-lane session is
+  up and the PRD's test suite is sandbox-safe (does not need the `claude`
+  CLI login), it instead routes through the burst lane — see "Burst-lane
+  PATH, python branches" below (PRD-build-burst-lane-ccx53 requirement 12).
 - **Rust extend** (`build_target: rust-extend`) → the PRD declares an
   existing repo to extend, via `build_into: <abs-path>`. The skill
   validates the target with `scripts/extend-handler.sh validate <slug>`;
@@ -1402,9 +1405,36 @@ box's `<n>` as the same-target fan-out cap in place of the local
 non-rust target all leave `SAME_LANE_SUBCAP` untouched, so behavior off a
 burst session is unchanged. This governs how many same-target *claims*
 selection admits; it does not by itself move cargo off RedBaron — that is
-the Burst-lane PATH directive above (requirement 4). Still open per
-`scripts/burst-lane.sh`'s header: the uv/python leg (requirement 12) and
-the cost ledger's "PRDs served" attribution (requirement 13).
+the Burst-lane PATH directive above (requirement 4). `burst-lane.sh cost
+--today` (requirement 13) sums each session's hours/euros from
+`state/burst-lane/cost.jsonl` and prints the PRD slugs it served, attributed
+per `run` call via `BURST_LANE_PRD_SLUG` (or the worktree basename when a
+caller doesn't set it).
+
+**Burst-lane PATH, python branches, when a session is up and the suite is
+sandbox-safe (PRD-build-burst-lane-ccx53, requirement 12).**
+`scripts/burst-lane-bin/uv` mirrors the cargo shim: with `BURST_LANE=1`,
+`BURST_PY=1`, and `burst-lane.sh status` reporting a session, it routes
+`uv run` / `uv sync` to the CCX53 over `burst-lane.sh run` (the box's
+`.venv` is resolved there from `uv.lock` — `.venv` itself is excluded from
+the rsync in both directions); with no session, or `BURST_PY` unset, it
+falls straight through to the real `uv` locally. `BURST_PY` is a second,
+deliberate opt-in on top of `BURST_LANE=1` — the box has no `claude` CLI
+login, so any test module or PRD that depends on the CLI backend
+(`SYNTHORG_LLM_BACKEND=cli`, a `needs_claude_cli` marker, or any suite the
+PRD itself calls out as needing an interactive/logged-in agent) MUST stay
+local and MUST NOT set `BURST_PY=1`; when a python PRD's own tests carry
+no such marker/dependency, its branch agent prompt sets `BURST_PY=1`.
+Every sandbox-safe python branch agent prompt must include this directive
+verbatim, in addition to the standard PATH setup: "Before any `uv run` /
+`uv sync` command, export
+PATH=\"$HOME/.claude/skills/build/scripts/burst-lane-bin:$PATH\"
+BURST_LANE=1 BURST_PY=1 — this routes `uv run`/`uv sync` to the Hetzner
+CCX53 burst lane when a session is up (burst-lane.sh status), and falls
+through to local `uv` otherwise. Do NOT set BURST_PY=1 if any test in this
+PRD needs the `claude` CLI login (SYNTHORG_LLM_BACKEND=cli /
+needs_claude_cli) — those suites must stay local; run them without this
+export instead."
 
 Each agent prompt must include, self-contained:
 
@@ -1427,6 +1457,19 @@ Each agent prompt must include, self-contained:
   resolves first) — this routes cargo build/test/clippy/deny/nextest to the
   Hetzner CCX53 burst lane when a session is up (burst-lane.sh status), and
   falls through to the local concurrency budget otherwise."
+- For any PYTHON branch (`build_target: python-cli|python-lib|python-agent`)
+  whose test suite carries no CLI-login dependency (no
+  `SYNTHORG_LLM_BACKEND=cli`, no `needs_claude_cli` marker, no suite the
+  PRD calls out as needing an interactive/logged-in agent): the burst-lane
+  python PATH directive verbatim (PRD-build-burst-lane-ccx53 requirement
+  12, see "Burst-lane PATH, python branches" above) — "Before any `uv run`
+  / `uv sync` command, export
+  PATH=\"$HOME/.claude/skills/build/scripts/burst-lane-bin:$PATH\"
+  BURST_LANE=1 BURST_PY=1 — this routes uv run/uv sync to the Hetzner
+  CCX53 burst lane when a session is up (burst-lane.sh status), and falls
+  through to local uv otherwise. Do NOT set BURST_PY=1 if any test in this
+  PRD needs the claude CLI login — those suites must stay local; run them
+  without this export instead."
 - "You are advancing ONE PRD as part of a parallel /build tick.
   Run Phases 3 → 4 → 5 → 7 for this PRD only. Do not invoke /build
   recursively. Do not touch any PRD other than this one."

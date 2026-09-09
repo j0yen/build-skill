@@ -12,7 +12,11 @@
 # local fallback when no session exists (AC3, partial — the routed-through
 # half needs a live `run` and is exercised indirectly via AC2 above), and
 # the requirement-7 sub-cap formula (AC7: 120GB/32cores -> 8, 40GB/32cores
-# -> 6, no session -> local cap 3 only).
+# -> 6, no session -> local cap 3 only). Also covers requirement 13 (cost
+# ledger PRD-served attribution): run's BURST_LANE_PRD_SLUG opt-in and its
+# worktree-basename fallback both land in prds_served, ride into the
+# cost.jsonl row at teardown, and are printed back out by cost --today
+# (AC13).
 set -uo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -95,6 +99,18 @@ expect "first run journaled a byte count" "[ -n \"$bytes1\" ]"
 expect "second run journaled a byte count" "[ -n \"$bytes2\" ]"
 expect "second run's journal line shows fewer bytes than the first (AC11)" "[ \"${bytes2:-0}\" -lt \"${bytes1:-0}\" ]"
 
+# ---- requirement 13: cost-ledger PRD-served attribution ---------------------
+# A caller that knows its own PRD slug (branch/gate dispatch) exports
+# BURST_LANE_PRD_SLUG; a caller that doesn't still gets attributed by the
+# worktree's own basename (both runs above, unset, should have recorded
+# "worktree" — $WT's basename).
+run_out3="$(BURST_LANE_PRD_SLUG=fake-prd-slug-1 "$BL" run "$WT" -- bash build.sh 2>&1)"; run_rc3=$?
+expect "third run (explicit slug) also propagates the remote exit code" "[ $run_rc3 -eq 7 ]"
+expect "prds_served recorded the explicit BURST_LANE_PRD_SLUG" \
+  "grep -qxF fake-prd-slug-1 \"$BURST_LANE_STATE_DIR/prds_served\""
+expect "prds_served also recorded the worktree-basename fallback from the earlier unset-slug runs" \
+  "grep -qxF worktree \"$BURST_LANE_STATE_DIR/prds_served\""
+
 # ---- unit: cargo_target_dir_for (worktree-targets-off-root interaction) ----
 # mcphost-call-limits-honest, 2026-09-09 19:58Z: a worktree's own
 # .cargo/config.toml can point target-dir at an absolute path outside the
@@ -146,6 +162,16 @@ down_out3="$("$BL" down)"
 expect "down deletes once inside the last-two-minutes window" "[ \"$down_out3\" = 'decision=deleted' ]"
 expect "deletion journaled with cost" "grep -q 'burst-lane  down  decision=deleted' \"$BURST_LANE_JOURNAL\""
 expect "cost ledger got a row" "[ -s \"$BURST_LANE_COST_LEDGER\" ]"
+
+# ---- requirement 13 (cont'd): the deleted session's cost.jsonl row carries
+# every PRD slug that session served, and `cost --today` prints them back.
+expect "cost ledger row records the PRDs this session served (req 13)" \
+  "python3 -c \"import json; d=json.loads(open('$BURST_LANE_COST_LEDGER').read().strip().splitlines()[-1]); import sys; sys.exit(0 if set(d.get('prds', [])) == {'worktree', 'fake-prd-slug-1'} else 1)\""
+cost_today_out="$("$BL" cost --today)"
+expect "cost --today prints hours and euros" "grep -qE 'hours=[0-9.]+ eur=[0-9.]+' <<<\"$cost_today_out\""
+expect "cost --today prints the PRDs served this session (AC13)" \
+  "grep -q 'prds=' <<<\"$cost_today_out\" && grep -q 'fake-prd-slug-1' <<<\"$cost_today_out\" && grep -q 'worktree' <<<\"$cost_today_out\""
+expect "state cleared prds_served after deletion" "[ ! -f \"$BURST_LANE_STATE_DIR/prds_served\" ]"
 unset BURST_LANE_NOW
 
 # ---- AC6: watchdog TTL teardown ----------------------------------------------

@@ -24,10 +24,15 @@
 # any build_into path that looks like a rust crate, so a live session's
 # box-computed sub-cap governs same-target fan-out there instead of the
 # local SAME_LANE_SUBCAP — see lane-claim.sh's header and SKILL.md's
-# "Burst-lane PATH" section. NOT yet wired: the uv/python leg (req 12),
-# and the cost ledger's "PRDs served" attribution (req 13, beyond the
-# hours/eur it already tracks) — each is its own well-defined next step
-# for a later tick.
+# "Burst-lane PATH" section. The uv/python leg (req 12) is wired: SKILL.md's
+# "Burst-lane PATH, python branches" section, `burst-lane-bin/uv`, and
+# `up`'s uv install on the box. Requirement 13 (cost ledger "PRDs served"
+# attribution) is also wired: `run` appends the caller's
+# `BURST_LANE_PRD_SLUG` (or the worktree's own basename, falling back)
+# deduped to `state/burst-lane/prds_served`, `down`/`watchdog` read it into
+# each `cost.jsonl` row's `prds` array at teardown and reset it for the
+# next session, and `cost --today` unions and prints the slugs served
+# across today's rows.
 #
 # Subcommands:
 #   burst-lane.sh up
@@ -64,7 +69,8 @@
 #       journals a "watchdog teardown" line with uptime if the session has
 #       outlived its TTL.
 #   burst-lane.sh cost --today
-#       Sums state/burst-lane/cost.jsonl rows for today's UTC date.
+#       Sums state/burst-lane/cost.jsonl rows for today's UTC date and
+#       prints the union of PRD slugs those rows' sessions served (req 13).
 #   burst-lane.sh sub-cap [--candidates <n>]
 #       Requirement 7's formula. No session -> prints "sub-cap=0 local=3
 #       (no session — local cap applies)" and journals a no-session line.
@@ -89,6 +95,11 @@ SKILL_DIR="$(cd "$HERE/.." && pwd)"
 STATE_DIR="${BURST_LANE_STATE_DIR:-$SKILL_DIR/state/burst-lane}"
 STATE_FILE="$STATE_DIR/session.json"
 COST_LEDGER="${BURST_LANE_COST_LEDGER:-$STATE_DIR/cost.jsonl}"
+# Requirement 13: which PRD slugs this session served, one per line,
+# deduped. Reset on a fresh boot/adopt (alongside runs_served=0), appended
+# to (deduped) by every routed `run`, read into the cost-ledger row at
+# teardown, then cleared with the rest of the session state.
+SERVED_FILE="$STATE_DIR/prds_served"
 ENV_FILE="${BURST_LANE_ENV_FILE:-$HOME/.config/wm-burst/.env}"
 JOURNAL="${BURST_LANE_JOURNAL:-$HOME/brain/journal/build/burst-lane.log}"
 PRD_DIR="${BURST_LANE_PRD_DIR:-$HOME/Documents/PRDs}"
@@ -176,7 +187,7 @@ state_write() {  # $1..$N = key=value pairs
   mv -f "$tmp" "$STATE_FILE"
 }
 
-state_clear() { rm -f "$STATE_FILE"; }
+state_clear() { rm -f "$STATE_FILE" "$SERVED_FILE"; }
 state_active() { [ -f "$STATE_FILE" ]; }
 
 # ---- hcloud helpers -------------------------------------------------------
@@ -247,6 +258,7 @@ cmd_up() {
     local aid aip; aid="${adopt%% *}"; aip="${adopt##* }"
     box_bootstrap "$aip"
     local sbx; sbx="$(sandbox_probe "$aip")"
+    : > "$SERVED_FILE"
     state_write "server_id=$aid" "ip=$aip" "server_type=$SERVER_TYPE" \
       "boot_ts=$(now_iso)" "boot_epoch=$(now_epoch)" "ttl_hours=$DEFAULT_TTL_HOURS" \
       "hard_ttl_hours=$HARD_TTL_HOURS" "runs_served=0" "sandbox_ok=$sbx" \
@@ -304,6 +316,7 @@ print(d.get("id",""), d.get("public_net",{}).get("ipv4",{}).get("ip",""))
 
   box_bootstrap "$ip"
   local sbx; sbx="$(sandbox_probe "$ip")"
+  : > "$SERVED_FILE"
   state_write "server_id=$id" "ip=$ip" "server_type=$SERVER_TYPE" \
     "boot_ts=$(now_iso)" "boot_epoch=$(now_epoch)" "ttl_hours=$DEFAULT_TTL_HOURS" \
     "hard_ttl_hours=$HARD_TTL_HOURS" "runs_served=0" "sandbox_ok=$sbx" \
@@ -518,6 +531,17 @@ cmd_run() {
     "ttl_hours=$(state_read ttl_hours)" "hard_ttl_hours=$(state_read hard_ttl_hours)" \
     "runs_served=$runs" "sandbox_ok=$(state_read sandbox_ok)" \
     "teardown_scheduled=$(state_read teardown_scheduled)" "teardown_epoch=$(state_read teardown_epoch)" "verified=$(state_read verified)"
+
+  # Requirement 13: attribute this run to a PRD slug for the cost ledger.
+  # Callers that know their own slug (branch/gate dispatch) should export
+  # BURST_LANE_PRD_SLUG; otherwise fall back to the worktree's own basename
+  # (worktree-extend.sh's own <repo>-<slug> convention), which is still a
+  # useful, human-readable attribution even when not a bare PRD slug.
+  local served_id="${BURST_LANE_PRD_SLUG:-$(basename "$worktree")}"
+  if [ -n "$served_id" ]; then
+    grep -qxF "$served_id" "$SERVED_FILE" 2>/dev/null || echo "$served_id" >> "$SERVED_FILE"
+  fi
+
   journal_line "$(now_iso)  burst-lane  run  routed  (server_id=$id worktree=$worktree runs_served=$runs exit=$rc bytes=$bytes)"
   exit "$rc"
 }
@@ -568,8 +592,20 @@ destroy_verify() {  # $1 = server id -> 0 on verified-gone, 1 on still-present a
   return 1
 }
 
-ledger_append() {  # $1=hours $2=eur
-  printf '{"date":"%s","hours":%s,"eur":%s}\n' "$(now_iso)" "$1" "$2" >> "$COST_LEDGER"
+ledger_append() {  # $1=hours $2=eur; reads $SERVED_FILE (requirement 13:
+                    # PRD slugs this session served), one row per session
+  python3 -c '
+import json, sys
+date, hours, eur, served_path = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+prds = []
+try:
+    with open(served_path) as f:
+        prds = [l.strip() for l in f if l.strip()]
+except OSError:
+    pass
+row = {"date": date, "hours": float(hours), "eur": float(eur), "prds": prds}
+print(json.dumps(row))
+' "$(now_iso)" "$1" "$2" "$SERVED_FILE" >> "$COST_LEDGER"
 }
 
 # ---- down ---------------------------------------------------------------------
@@ -614,8 +650,9 @@ cmd_down() {
     if destroy_verify "$id"; then
       local hrs; hrs="$(awk -v m="$alive" 'BEGIN{printf "%.4f", m/60.0}')"
       local eur; eur="$(awk -v h="$hrs" -v r="$COST_PER_HOUR_EUR" 'BEGIN{printf "%.4f", h*r}')"
+      local served; served="$( [ -f "$SERVED_FILE" ] && paste -sd, "$SERVED_FILE" 2>/dev/null || true)"
       ledger_append "$hrs" "$eur"
-      journal_line "$(now_iso)  burst-lane  down  decision=deleted  (server_id=$id minutes=$alive cost_eur=$eur)"
+      journal_line "$(now_iso)  burst-lane  down  decision=deleted  (server_id=$id minutes=$alive cost_eur=$eur prds=${served:-none})"
       state_clear
       echo "decision=deleted"
       exit 0
@@ -668,8 +705,9 @@ cmd_watchdog() {
     local hrs eur
     hrs="$(awk -v m="$alive" 'BEGIN{printf "%.4f", m/60.0}')"
     eur="$(awk -v h="$hrs" -v r="$COST_PER_HOUR_EUR" 'BEGIN{printf "%.4f", h*r}')"
+    local served; served="$( [ -f "$SERVED_FILE" ] && paste -sd, "$SERVED_FILE" 2>/dev/null || true)"
     ledger_append "$hrs" "$eur"
-    journal_line "$(now_iso)  burst-lane  watchdog  teardown  (server_id=$id uptime=${alive}m cost_eur=$eur)"
+    journal_line "$(now_iso)  burst-lane  watchdog  teardown  (server_id=$id uptime=${alive}m cost_eur=$eur prds=${served:-none})"
     state_clear
     echo "watchdog teardown: $id (${alive}m)"
     exit 0
@@ -744,6 +782,7 @@ cmd_cost() {
 import json, sys
 today, path = sys.argv[1], sys.argv[2]
 hours = eur = 0.0
+prds = []
 for line in open(path):
     line = line.strip()
     if not line:
@@ -755,7 +794,11 @@ for line in open(path):
     if d.get("date", "").startswith(today):
         hours += float(d.get("hours", 0))
         eur += float(d.get("eur", 0))
-print(f"hours={hours:.2f} eur={eur:.2f}")
+        for p in d.get("prds", []) or []:
+            if p not in prds:
+                prds.append(p)
+prds_str = ",".join(prds) if prds else "none"
+print(f"hours={hours:.2f} eur={eur:.2f} prds={prds_str}")
 ' "$today" "$COST_LEDGER"
 }
 
