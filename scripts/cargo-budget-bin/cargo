@@ -14,7 +14,7 @@
 #   check`/`cargo metadata`).
 set -uo pipefail
 
-HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 WRAPPER="$HERE/../cargo-budget.sh"
 
 # Find the real cargo: walk $PATH entries in order, skip this shim's own
