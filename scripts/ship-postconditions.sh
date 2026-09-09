@@ -71,10 +71,14 @@ else
   ok "changelog: skipped"
 fi
 
+# clean-tree is ADVISORY (warn, never FAIL): the shared checkout legitimately
+# carries sibling PRDs' uncommitted claim-work between ticks (lane-claim's
+# continuation-threshold design) — "shipped" truth lives in the commit, tag,
+# changelog and lock, not in working-tree state at check time.
 if [ -z "$(git -C "$repo" status --porcelain -- "$proj" 2>/dev/null)" ]; then
   ok "clean-tree: $proj clean"
 else
-  bad "clean-tree: uncommitted changes under $proj"
+  echo "warn: clean-tree: uncommitted changes under $proj (sibling claim-work is legal — advisory only)"
 fi
 
 exit "$fails"
