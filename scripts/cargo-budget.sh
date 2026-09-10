@@ -47,6 +47,12 @@
 #   CARGO_BUDGET_SLOTS (2)  CARGO_BUDGET_WAIT_MAX (1200)
 #   CARGO_BUDGET_MIN_AVAIL_GB (6)  CARGO_BUDGET_TEST_THREADS (4)
 #   CARGO_BUDGET_MAX_LOAD (64)
+#   CARGO_BUDGET_WEDGE (unset=off) — opt a `run` call into gate-wedge.sh's
+#     per-step wall-clock budget + CPU-delta wedge probe (PRD-build-gate-
+#     wall-clock requirement 3). Off by default: see the note at the
+#     `"$@"` call site below for why (output buffering).
+#   GATE_WEDGE_SH (<skill-dir>/scripts/gate-wedge.sh)
+#   CARGO_BUDGET_STEP_NAME (cargo-budget) — step name on wedge receipts
 # Test-only hooks (never set these in production use):
 #   CARGO_BUDGET_STATE_DIR  CARGO_BUDGET_JOURNAL  CARGO_BUDGET_MEMINFO
 #   CARGO_BUDGET_LOADAVG  CARGO_BUDGET_HOSTNAME  CARGO_BUDGET_NPROC
@@ -199,7 +205,24 @@ cmd_run() {
   disown "$sampler_pid" 2>/dev/null || true
 
   local run_start_iso; run_start_iso="$(now_iso)"
-  "$@"
+  # PRD-build-gate-wall-clock requirement 3: opt-in per-step wall-clock
+  # budget + CPU-delta wedge probe (see gate-wedge.sh's own header — this
+  # is the 2026-09-10 incident's fix: a hung cargo/sccache client tree at
+  # zero CPU for 60+ minutes with nothing noticing). OFF by default
+  # ($CARGO_BUDGET_WEDGE unset) because gate-wedge.sh buffers <cmd...>'s
+  # stdout/stderr until it exits (needed to re-emit it after a false-start
+  # retry without interleaving two attempts' output) — a real behavior
+  # change for anything tailing a live build log, so this does not flip on
+  # for every existing cargo-budget.sh caller in production yet. Set
+  # CARGO_BUDGET_WEDGE=1 to opt a caller in today; $GATE_WEDGE_SH and
+  # $CARGO_BUDGET_STEP_NAME are forwarded overrides (see that script's
+  # header for the budget/probe timing envs it reads directly).
+  local wedge_bin="${GATE_WEDGE_SH:-$SKILL_DIR/scripts/gate-wedge.sh}"
+  if [ -n "${CARGO_BUDGET_WEDGE:-}" ] && [ -x "$wedge_bin" ]; then
+    "$wedge_bin" run --step "${CARGO_BUDGET_STEP_NAME:-cargo-budget}" -- "$@"
+  else
+    "$@"
+  fi
   local rc=$?
   local run_end_iso; run_end_iso="$(now_iso)"
 
