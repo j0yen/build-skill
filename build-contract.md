@@ -27,7 +27,7 @@ inside fenced code blocks are ignored; first match wins.
 | key | values | required | notes |
 |---|---|---|---|
 | `Status` | `queued` (dream) → `building` / `built` / `blocked` (build) | yes | display + lifecycle |
-| `build_target` | `rust-cli` `rust-lib` `rust-extend` `kernel-extend` `shell` `hooks` `config` `notebook` `mixed` — and `python-cli` `python-lib` `python-agent` (routes to `/pybuild`; wiring pending in this skill, see Follow-ups) — `product` is skipped, not built | yes | anything else → `needs_classification` |
+| `build_target` | `rust-cli` `rust-lib` `rust-extend` `kernel-extend` `shell` `hooks` `config` `notebook` `mixed` `python-cli` `python-lib` `python-agent` (routes to `/pybuild`; C1–C5 substitutions defined in SKILL.md's Verified-completed checklist, python-* path) — `product` is skipped, not built | yes | anything else → `needs_classification` |
 | `build_into` | absolute path of the repo to mutate | for `rust-extend`, `kernel-extend`, and any `python-*` that extends an existing repo | must exist locally at build time |
 | `build_priority` | `high` `normal` `low` | no | queue order; default `normal` |
 | `build_version_bump` | `patch` `minor` `major` | no | `rust-extend` only; default `minor` |
@@ -73,7 +73,7 @@ gate then sees zero ACs.
 ## Language routing
 
 - `rust-*` → `/rustbuild` (cargo runs on RedBaron: locally there, remotely from every other node via the skill's cargo shim).
-- `python-*` → `/pybuild` (planned; today this skill has no python row).
+- `python-*` → `/pybuild` (`--target cli|lib|agent` from the suffix); with `build_into` set, extends in place via `scripts/worktree-extend.sh add`/`land` (unconditional worktree isolation, PRD-build-python-worktree-isolation).
 - `shell`/`hooks`/`config` → direct edits. `kernel-extend` → hand-written C.
 
 ## Publish
@@ -118,10 +118,11 @@ independently-verified verdict, so a human reading the journal can tell
 "branch verified and complied" from "branch verified and correctly
 refused" from "branch complied blind."
 
-## Follow-ups (tracked, not yet done — 2026-08-27)
+## Follow-ups (updated 2026-09-10 — items 1–3 below are DONE; see SKILL.md)
 
-1. Honour `publish:` in Phase 4 (default `j0yen/private`); retire the
-   `joeyen-atscale` route (org access is gone).
-2. Add the `python-*` → `/pybuild` routing row and C1–C5 substitutions.
-3. Accept `archive/` as an alias of `ARCHIVE/` when reading, so kit-style
-   workspaces scan cleanly.
+All three items previously tracked here (`publish:` honoring in Phase 4,
+the `python-*` → `/pybuild` routing row + C1–C5 substitutions, and
+`archive/` read as an alias of `ARCHIVE/`) are implemented — see SKILL.md's
+Phase 4 `publish` action, Phase 3 python routing + Phase 4 "Verified-completed
+checklist (python-* path)", and "Where PRDs live" above. This section is
+intentionally empty; add new tracked gaps here as they're found.
