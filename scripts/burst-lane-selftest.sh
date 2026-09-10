@@ -88,8 +88,16 @@ fresh_env() {
   # test-scoped (the fake rsync fixture never expands a tilde).
   export FAKE_GATE_TOOLS_STATE="$T/gate-tools-installed"
   export BURST_LANE_GATE_TOOLS_REMOTE_BIN_DIR="$T/remote-cargo-bin"
+  # PRD-build-gate-on-casper requirement 4: the reviewer credential's REMOTE
+  # destination must be test-scoped too (same tilde/absolute-path hazard as
+  # GATE_TOOLS_REMOTE_BIN_DIR — the fake rsync/ssh never touch a real
+  # remote host, only this machine's own filesystem). BURST_GATE_REVIEWER
+  # stays unset by default so no test accidentally exercises credential
+  # placement (and BURST_CLAUDE_CRED_SRC keeps pointing at its real default
+  # of ~/.claude/.credentials.json) unless a test opts in explicitly.
+  export BURST_LANE_GATE_CRED_REMOTE_PATH="$T/remote-cred/.credentials.json"
   unset FAKE_HCLOUD_AUTH_FAIL FAKE_HCLOUD_CREATE_FAIL FAKE_HCLOUD_DELETE_FAIL FAKE_SSH_REMOTE_FAIL FAKE_SSH_SANDBOX_FAIL FAKE_RSYNC_FAIL BURST_LANE_NOW \
-        FAKE_SSH_GATE_TOOLS_MISSING FAKE_SSH_GATE_TOOLS_INSTALL_FAIL
+        FAKE_SSH_GATE_TOOLS_MISSING FAKE_SSH_GATE_TOOLS_INSTALL_FAIL BURST_GATE_REVIEWER BURST_CLAUDE_CRED_SRC
 }
 
 # ---- AC1: single-box refusal + adoption ------------------------------------
@@ -1105,6 +1113,30 @@ assert d.get('pass') == 24 and d.get('block') == 1, d
 expect "gatebox AC3: last-verdict.json carries a host field (extend-gate.sh itself never touched)" "[ $gate3_verdict_rc -eq 0 ]"
 expect "gatebox AC3: journal gate line names the verdict, host, and wall time" \
   "grep -qE 'burst-lane  gate  block  \(repo=.*host=[0-9.]+ wall=[0-9.]+s head='\"$head_gate\" \"$BURST_LANE_JOURNAL\""
+
+# ---- gatebox AC4: BURST_GATE_REVIEWER=1 places the reviewer credential at
+# `up` (mode 0600) and shreds it at `down`, and the sentinel token never
+# lands in the journal (requirement 4).
+fresh_env
+FAKE_CRED="$T/fake-claude-creds.json"
+echo '{"token": "SENTINEL-GATEBOX-TOKEN-XYZ123"}' > "$FAKE_CRED"
+export BURST_GATE_REVIEWER=1
+export BURST_CLAUDE_CRED_SRC="$FAKE_CRED"
+gatebox4_up_out="$("$BL" up)"; gatebox4_up_rc=$?
+expect "gatebox AC4: up succeeds with the reviewer credential enabled" "[ $gatebox4_up_rc -eq 0 ]"
+expect "gatebox AC4: the credential exists on the fake box after up" "[ -s \"$BURST_LANE_GATE_CRED_REMOTE_PATH\" ]"
+cred_mode="$(stat -c '%a' "$BURST_LANE_GATE_CRED_REMOTE_PATH" 2>/dev/null)"
+expect "gatebox AC4: the placed credential is mode 0600" "[ \"$cred_mode\" = 600 ]"
+expect "gatebox AC4: journal has 'cred  placed'" "grep -q 'burst-lane  up  cred  placed' \"$BURST_LANE_JOURNAL\""
+
+boot_epoch4="$(grep -oE '"boot_epoch":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+export BURST_LANE_NOW=$((boot_epoch4 + 3600 - 60))
+gatebox4_down_out="$("$BL" down)"; gatebox4_down_rc=$?
+unset BURST_LANE_NOW
+expect "gatebox AC4: down deletes cleanly with the reviewer credential in play" "[ \"$gatebox4_down_out\" = 'decision=deleted' ]"
+expect "gatebox AC4: the credential is gone from the fake box after down" "[ ! -e \"$BURST_LANE_GATE_CRED_REMOTE_PATH\" ]"
+expect "gatebox AC4: journal has 'cred  shredded'" "grep -q 'burst-lane  down  cred  shredded' \"$BURST_LANE_JOURNAL\""
+expect "gatebox AC4: the sentinel token never appears in the journal" "! grep -q 'SENTINEL-GATEBOX-TOKEN-XYZ123' \"$BURST_LANE_JOURNAL\""
 
 echo "=== $([ $fail -eq 0 ] && echo PASS || echo FAIL) ==="
 exit $fail

@@ -202,6 +202,12 @@ GATE_TOOLS_AUTOBUILDER_BIN="${BURST_LANE_AUTOBUILDER_BIN:-$HOME/.cargo/bin/autob
 # the production default (which matches cmd_verify's own hardcoded
 # /root/.cargo/bin PATH entry — this whole lane assumes REMOTE_USER=root).
 GATE_TOOLS_REMOTE_BIN_DIR="${BURST_LANE_GATE_TOOLS_REMOTE_BIN_DIR:-/root/.cargo/bin}"
+# PRD-build-gate-on-casper requirement 4: reviewer credential placement.
+# Absolute (no "~") for the same reason as GATE_TOOLS_REMOTE_BIN_DIR above —
+# the fake rsync fixture never expands a tilde. Overridable so the offline
+# selftest never touches this machine's real /root.
+GATE_CRED_SRC="${BURST_CLAUDE_CRED_SRC:-$HOME/.claude/.credentials.json}"
+GATE_CRED_REMOTE_PATH="${BURST_LANE_GATE_CRED_REMOTE_PATH:-/root/.claude/.credentials.json}"
 
 HCLOUD="${BURST_LANE_HCLOUD_BIN:-hcloud}"
 SSH_BIN="${BURST_LANE_SSH_BIN:-ssh}"
@@ -473,6 +479,46 @@ json.dump({"tools": {}, "missing": sys.argv[1].split()}, open(sys.argv[2], "w"))
   if [ -z "$GATE_TOOLS_MISSING" ]; then GATE_READY="true"; else GATE_READY="false"; fi
 }
 
+# ---- reviewer credential placement/shred (PRD-build-gate-on-casper --------
+# requirement 4) -------------------------------------------------------------
+# Opt-in (BURST_GATE_REVIEWER=1 — the snapshot and every other box never
+# see this file otherwise): `up` pushes the operator's Claude OAuth
+# credential file to the box at $GATE_CRED_REMOTE_PATH, mode 0600, and
+# journals ONLY that it did so — never the file's own content or even its
+# byte count, which could leak a token length. `down`/`watchdog` call
+# shred_gate_credential unconditionally (cheap, idempotent — `shred -u` on
+# a path that was never placed just fails silently and journals nothing);
+# the journal line is gated on the shred call's own exit code, so
+# "cred  shredded" only ever appears when a real file was actually
+# destroyed, with no separate "was it placed" state to keep in sync.
+place_gate_credential() {  # $1=ip
+  [ "${BURST_GATE_REVIEWER:-0}" = "1" ] || return 0
+  local ip="$1"
+  if [ ! -f "$GATE_CRED_SRC" ]; then
+    journal_line "$(now_iso)  burst-lane  up  cred-absent  (BURST_GATE_REVIEWER=1 but no credential file at $GATE_CRED_SRC — reviewer will not run)"
+    return 0
+  fi
+  "$SSH_BIN" -o StrictHostKeyChecking=no -o ConnectTimeout=8 -i "$SSH_KEY" "$REMOTE_USER@$ip" \
+    "mkdir -p '$(dirname "$GATE_CRED_REMOTE_PATH")'" >/dev/null 2>&1 || true
+  if "$RSYNC_BIN" -az -e "$SSH_BIN -o StrictHostKeyChecking=no -i $SSH_KEY" \
+       "$GATE_CRED_SRC" "$REMOTE_USER@$ip:$GATE_CRED_REMOTE_PATH" >/dev/null 2>&1; then
+    "$SSH_BIN" -o StrictHostKeyChecking=no -o ConnectTimeout=8 -i "$SSH_KEY" "$REMOTE_USER@$ip" \
+      "chmod 600 '$GATE_CRED_REMOTE_PATH'" >/dev/null 2>&1 || true
+    journal_line "$(now_iso)  burst-lane  up  cred  placed  (host=$ip)"
+  else
+    journal_line "$(now_iso)  burst-lane  up  cred-place-failed  (host=$ip — rsync push failed, reviewer will not run)"
+  fi
+}
+
+shred_gate_credential() {  # $1=ip $2=caller(down|watchdog)
+  local ip="${1:-}" caller="${2:-down}"
+  [ -n "$ip" ] || return 0
+  if "$SSH_BIN" -o StrictHostKeyChecking=no -o ConnectTimeout=8 -i "$SSH_KEY" "$REMOTE_USER@$ip" \
+       "shred -u -f '$GATE_CRED_REMOTE_PATH'" >/dev/null 2>&1; then
+    journal_line "$(now_iso)  burst-lane  $caller  cred  shredded  (host=$ip)"
+  fi
+}
+
 cmd_up() {
   if state_active; then
     local id; id="$(state_read server_id)"
@@ -492,6 +538,7 @@ cmd_up() {
     box_bootstrap "$aip"
     local sbx; sbx="$(sandbox_probe "$aip")"
     provision_gate_tools "$aip"
+    place_gate_credential "$aip"
     : > "$SERVED_FILE"
     state_write "server_id=$aid" "ip=$aip" "server_type=$SERVER_TYPE" \
       "boot_ts=$(now_iso)" "boot_epoch=$(now_epoch)" "ttl_hours=$DEFAULT_TTL_HOURS" \
@@ -562,6 +609,7 @@ print(d.get("id",""), d.get("public_net",{}).get("ipv4",{}).get("ip",""))
   box_bootstrap "$ip"
   local sbx; sbx="$(sandbox_probe "$ip")"
   provision_gate_tools "$ip"
+  place_gate_credential "$ip"
   : > "$SERVED_FILE"
   state_write "server_id=$id" "ip=$ip" "server_type=$SERVER_TYPE" \
     "boot_ts=$(now_iso)" "boot_epoch=$(now_epoch)" "ttl_hours=$DEFAULT_TTL_HOURS" \
@@ -2222,6 +2270,10 @@ cmd_down() {
     # worktree gets pulled (or goes cold) before the box that would strand
     # its artifacts is destroyed. Never blocks/aborts the teardown itself.
     sweep_dirty_worktrees down
+    # PRD-build-gate-on-casper requirement 4: shred the reviewer credential
+    # (if one was ever placed — a no-op, un-journaled, otherwise) before the
+    # box that would carry it away is destroyed.
+    shred_gate_credential "$(state_read ip)" down
     if destroy_verify "$id"; then
       local hrs; hrs="$(awk -v m="$alive" 'BEGIN{printf "%.4f", m/60.0}')"
       local eur; eur="$(awk -v h="$hrs" -v r="$COST_PER_HOUR_EUR" 'BEGIN{printf "%.4f", h*r}')"
@@ -2302,6 +2354,9 @@ cmd_watchdog() {
   # delete path — the watchdog is a teardown path too and must not strand
   # artifacts either.
   sweep_dirty_worktrees watchdog
+  # PRD-build-gate-on-casper requirement 4: same credential shred as
+  # `down`'s delete path — the watchdog is a teardown path too.
+  shred_gate_credential "$(state_read ip)" watchdog
   if destroy_verify "$id"; then
     local hrs eur
     hrs="$(awk -v m="$alive" 'BEGIN{printf "%.4f", m/60.0}')"

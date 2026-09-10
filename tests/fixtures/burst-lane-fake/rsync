@@ -25,9 +25,20 @@ src="${*: -2:1}"
 dst="${*: -1:1}"
 local_dst="${dst#*:}"
 local_src="${src#*:}"
-mkdir -p "$(dirname "$local_dst")" 2>/dev/null || true
-mkdir -p "$local_dst" 2>/dev/null || true
-cp -a "$local_src"/. "$local_dst"/ 2>/dev/null || true
+# PRD-build-gate-on-casper requirement 4: a FILE source (the single
+# credential push, no trailing slash on either side — a real rsync copies
+# a plain file to a plain file just fine) needs a plain file copy, not the
+# directory-tree copy every other caller in this codebase uses. Every
+# existing caller passes a directory for $local_src, so this branch never
+# fires for them.
+if [ -f "$local_src" ]; then
+  mkdir -p "$(dirname "$local_dst")" 2>/dev/null || true
+  cp -a "$local_src" "$local_dst" 2>/dev/null || true
+else
+  mkdir -p "$(dirname "$local_dst")" 2>/dev/null || true
+  mkdir -p "$local_dst" 2>/dev/null || true
+  cp -a "$local_src"/. "$local_dst"/ 2>/dev/null || true
+fi
 for a in "$@"; do
   if [ "$a" = "--stats" ]; then
     statedir="${FAKE_RSYNC_STATS_DIR:-${TMPDIR:-/tmp}/fake-rsync-stats}"
