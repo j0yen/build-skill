@@ -39,6 +39,13 @@ case "$cmd" in
       for i in $installed; do [ "$i" = "$t" ] && missing=0; done
       if [ "$missing" = "1" ]; then
         printf '%s=MISSING\n' "$t"
+      elif [ "$t" = "autobuilder" ]; then
+        # PRD-build-burst-gate-tools-scope requirement 1 (version-drift):
+        # defaults to matching the standard fake local autobuilder used
+        # across this selftest ("autobuilder 9.9.9", set once via
+        # BURST_LANE_AUTOBUILDER_BIN) so no test trips version-drift by
+        # accident; a dedicated test overrides this to something else.
+        printf '%s=%s\n' "$t" "${FAKE_SSH_AUTOBUILDER_VERSION:-autobuilder 9.9.9}"
       else
         printf '%s=%s-fakeversion\n' "$t" "$t"
       fi

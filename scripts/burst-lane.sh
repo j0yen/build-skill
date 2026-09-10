@@ -232,7 +232,7 @@ COST_PER_HOUR_EUR="0.47"
 REMOTE_ROOT="${BURST_LANE_REMOTE_ROOT:-/root/build}"
 
 die() { echo "burst-lane: $*" >&2; exit "${2:-1}"; }
-usage() { echo "usage: burst-lane.sh {up|status|run|sync-back|pull|ensure-fresh|down|watchdog|cost|sub-cap|verify|reap|route-check|parity|gate} ..." >&2; exit 2; }
+usage() { echo "usage: burst-lane.sh {up|status|run|sync-back|pull|ensure-fresh|down|watchdog|cost|sub-cap|verify|provision|reap|route-check|parity|gate} ..." >&2; exit 2; }
 
 now_epoch() { echo "${BURST_LANE_NOW:-$(date -u +%s)}"; }
 now_iso()   { date -u -d "@$(now_epoch)" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ; }
@@ -364,6 +364,11 @@ sandbox_probe() {  # $1 = ip -> echoes true|false
 gate_tools_probe() {  # $1=ip -> stdout: one "tool=version|MISSING" line per tool
   "$SSH_BIN" -o StrictHostKeyChecking=no -o ConnectTimeout=8 -i "$SSH_KEY" "$REMOTE_USER@$1" "
 # gate-tools-probe
+# PRD-build-burst-gate-tools-scope requirement 1: a non-login ssh shell's
+# PATH lacks /root/.cargo/bin and /root/.local/bin (cargo-installed tools,
+# uv, claude), so a correctly-installed tool read back MISSING without
+# this export — the exact box 165449166 failure mode.
+export PATH=/root/.cargo/bin:/root/.local/bin:\$PATH
 for t in $GATE_TOOLS_LIST; do
   if command -v \"\$t\" >/dev/null 2>&1; then
     v=\"\$(\"\$t\" --version 2>/dev/null | head -n1)\"
@@ -452,12 +457,27 @@ provision_gate_tools() {  # $1=ip
 
   sync_gate_tools_scripts "$ip"
 
+  # PRD-build-burst-gate-tools-scope requirement 1: autobuilder is the one
+  # tool this box can never install from a package repo — the copy from
+  # RedBaron IS the install. A remote version differing from this host's
+  # own `autobuilder --version` means the copy is stale (or was hand-fixed
+  # to a different build), so gate routing must not trust it even though
+  # `command -v` finds it. Computed here (once, after the reinstall/probe
+  # round trip above) rather than in `verify`, so `provision` gets the same
+  # check without duplicating it.
+  local local_ab_version=""
+  if [ -x "$GATE_TOOLS_AUTOBUILDER_BIN" ]; then
+    local_ab_version="$("$GATE_TOOLS_AUTOBUILDER_BIN" --version 2>/dev/null | head -n1)"
+  fi
+
   local final_out; final_out="$(gate_tools_probe "$ip")"
   mkdir -p "$STATE_DIR" 2>/dev/null || true
+  local drift_json=""
   if [ -n "$final_out" ]; then
-    python3 -c '
+    drift_json="$(python3 -c '
 import json, sys
 lines = sys.argv[1].strip().splitlines()
+local_ab_version = sys.argv[3]
 tools, missing = {}, []
 for ln in lines:
     if "=" not in ln:
@@ -466,15 +486,32 @@ for ln in lines:
     tools[k] = v
     if v == "MISSING":
         missing.append(k)
-json.dump({"tools": tools, "missing": missing}, open(sys.argv[2], "w"))
-' "$final_out" "$GATE_TOOLS_STATE_FILE"
+drift = {}
+ab_remote = tools.get("autobuilder")
+if ab_remote and ab_remote != "MISSING" and local_ab_version:
+    if ab_remote.strip() != local_ab_version.strip():
+        drift = {"local": local_ab_version.strip(), "remote": ab_remote.strip()}
+        if "autobuilder" not in missing:
+            missing.append("autobuilder")
+out = {"tools": tools, "missing": missing, "gate_tool_versions": tools}
+if drift:
+    out["version_drift"] = {"autobuilder": drift}
+json.dump(out, open(sys.argv[2], "w"))
+print(json.dumps(drift))
+' "$final_out" "$GATE_TOOLS_STATE_FILE" "$local_ab_version")"
     GATE_TOOLS_MISSING="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(",".join(d.get("missing",[])))' "$GATE_TOOLS_STATE_FILE" 2>/dev/null || true)"
   else
     python3 -c '
 import json, sys
-json.dump({"tools": {}, "missing": sys.argv[1].split()}, open(sys.argv[2], "w"))
+json.dump({"tools": {}, "missing": sys.argv[1].split(), "gate_tool_versions": {}}, open(sys.argv[2], "w"))
 ' "$GATE_TOOLS_LIST" "$GATE_TOOLS_STATE_FILE"
     GATE_TOOLS_MISSING="$GATE_TOOLS_LIST"
+  fi
+  if [ -n "$drift_json" ] && [ "$drift_json" != "{}" ]; then
+    local dl dr
+    dl="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("local",""))' "$drift_json" 2>/dev/null || true)"
+    dr="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("remote",""))' "$drift_json" 2>/dev/null || true)"
+    journal_line "$(now_iso)  burst-lane  gate-tools  version-drift  (tool=autobuilder local=\"$dl\" remote=\"$dr\")"
   fi
   if [ -z "$GATE_TOOLS_MISSING" ]; then GATE_READY="true"; else GATE_READY="false"; fi
 }
@@ -659,13 +696,21 @@ cmd_verify() {
   # tool, rather than a bare "gate-tools FAIL" — an operator staring at the
   # journal should not have to go re-run provisioning by hand to find out
   # which one.
+  #
+  # PRD-build-burst-gate-tools-scope requirement 2: gate-tools is scoped OFF
+  # the lane's own `$fails` counter — a missing/version-drifted gate tool
+  # must never block `verified=true` for ordinary cargo/uv/python runs, only
+  # `gate` routing (checked separately by cmd_gate against gate_ready). This
+  # is the exact box-165449166 defect: one gate-only tool took the whole
+  # lane down for 95 minutes.
   local gt_ready gt_missing gt_first
   gt_ready="$(state_read gate_ready)"; gt_missing="$(state_read gate_tools_missing)"
   if [ "$gt_ready" = "true" ]; then
     echo "gate-tools ok"
   else
     gt_first="${gt_missing%%,*}"
-    vfail "gate-tools (missing: ${gt_first:-unknown})"
+    echo "verify FAIL: gate-tools (missing: ${gt_first:-unknown})"
+    journal_line "$(now_iso)  burst-lane  verify  gate-tools-missing  (missing=${gt_missing:-unknown})"
   fi
 
   if [ "$fails" -gt 0 ]; then
@@ -684,6 +729,32 @@ cmd_verify() {
   journal_line "$(now_iso)  burst-lane  verify  ok  (rsync+cargo+uv+python3+sandbox all real)"
   echo "verify: ok"
   exit 0
+}
+
+# ---- provision --------------------------------------------------------------
+# PRD-build-burst-gate-tools-scope requirement 4: retry every missing gate
+# tool's install on the LIVE box and re-run the gate-tools check, without a
+# reboot — an operator who fixed whatever blocked an install (a flaky apt
+# mirror, a since-corrected autobuilder build on RedBaron) shouldn't have to
+# tear a healthy, verified box down and burn another `up` cycle just to pick
+# up gate readiness.
+cmd_provision() {
+  if ! state_active; then
+    echo "provision: no active session"; exit 1
+  fi
+  local ip; ip="$(state_read ip)"
+  provision_gate_tools "$ip"
+  state_write "server_id=$(state_read server_id)" "ip=$ip" "server_type=$(state_read server_type)" \
+    "boot_ts=$(state_read boot_ts)" "boot_epoch=$(state_read boot_epoch)" \
+    "ttl_hours=$(state_read ttl_hours)" "hard_ttl_hours=$(state_read hard_ttl_hours)" \
+    "runs_served=$(state_read runs_served)" "sandbox_ok=$(state_read sandbox_ok)" \
+    "teardown_scheduled=$(state_read teardown_scheduled)" "teardown_epoch=$(state_read teardown_epoch)" \
+    "verified=$(state_read verified)" \
+    "gate_ready=$GATE_READY" "gate_tools_missing=$GATE_TOOLS_MISSING"
+  journal_line "$(now_iso)  burst-lane  provision  done  (server_id=$(state_read server_id) gate_ready=$GATE_READY gate_tools_missing=${GATE_TOOLS_MISSING:-none})"
+  echo "provision: gate_ready=$GATE_READY missing=${GATE_TOOLS_MISSING:-}"
+  [ "$GATE_READY" = "true" ] && exit 0
+  exit 1
 }
 
 # ---- status -----------------------------------------------------------------
@@ -812,11 +883,15 @@ for r in json.loads(sys.argv[1]):
 ' "$gates_json")"
 
   if [ "$json" -eq 1 ]; then
-    printf '{"active":true,"server_id":"%s","ip":"%s","minutes_alive":%s,"ttl_hours":"%s","sandbox_ok":"%s","concurrent":"%s","free_disk_gb":%s,"disk_state":"%s","dirty":%s,"gates":%s,"gate_ready":"%s"}\n' \
-      "$id" "$ip" "$alive" "$ttl" "$sbx" "$conc" "$free_disk_gb" "$disk_state" "$dirty_json" "$gates_json" "$(state_read gate_ready)"
+    printf '{"active":true,"server_id":"%s","ip":"%s","minutes_alive":%s,"ttl_hours":"%s","sandbox_ok":"%s","concurrent":"%s","free_disk_gb":%s,"disk_state":"%s","dirty":%s,"gates":%s,"gate_ready":"%s","gate_tools_missing":"%s"}\n' \
+      "$id" "$ip" "$alive" "$ttl" "$sbx" "$conc" "$free_disk_gb" "$disk_state" "$dirty_json" "$gates_json" "$(state_read gate_ready)" "$(state_read gate_tools_missing)"
   else
     local gate_count; gate_count="$(python3 -c 'import json,sys; print(len(json.loads(sys.argv[1])))' "$gates_json")"
-    echo "active: $id ip=$ip alive=${alive}m ttl=${ttl}h sandbox_ok=$sbx concurrent=$conc disk_state=$disk_state free_disk_gb=$free_disk_gb gates:${gate_count}"
+    # PRD-build-burst-gate-tools-scope requirement 3: an operator (or
+    # lane-claim.sh) reading text-mode status must see gate readiness at a
+    # glance, independent of whether the lane itself is verified for
+    # ordinary runs.
+    echo "active: $id ip=$ip alive=${alive}m ttl=${ttl}h sandbox_ok=$sbx concurrent=$conc disk_state=$disk_state free_disk_gb=$free_disk_gb gates:${gate_count} gate_ready=$(state_read gate_ready) missing=$(state_read gate_tools_missing)"
     [ -n "$dirty_lines" ] && printf '%s\n' "$dirty_lines"
     [ -n "$gate_lines" ] && printf '%s\n' "$gate_lines"
   fi
@@ -1790,6 +1865,19 @@ sys.exit(0 if d.get("head_sha") == sys.argv[2] and d.get("diff") == [] else 1)
     fi
   fi
   local id ip; id="$(state_read server_id)"; ip="$(state_read ip)"
+
+  # PRD-build-burst-gate-tools-scope requirement 3: `run` routes on
+  # `verified` alone (ordinary cargo/uv/python work never cares about the
+  # gate toolchain), but `gate` needs the box's OWN gate tools — extend-
+  # gate.sh, autobuilder, cargo-deny, etc. — so it refuses closed here,
+  # naming every tool still missing (or version-drifted), rather than
+  # discovering the gap 126/127-deep into a remote ssh call below.
+  if [ "$(state_read gate_ready)" != "true" ]; then
+    local gt_missing; gt_missing="$(state_read gate_tools_missing)"
+    journal_line "$(now_iso)  burst-lane  gate  fallback  (cause=gate-tools-missing repo=$repo missing=${gt_missing:-unknown})"
+    echo "fallback: gate-tools-missing (${gt_missing:-unknown})"
+    exit 3
+  fi
 
   # Requirement 6: a burst run slot per gate (same acquire_run_slot()
   # semaphore `run` uses, one slot, held for this whole function's
@@ -2902,6 +2990,7 @@ main() {
     cost)      cmd_cost "$@" ;;
     sub-cap)   cmd_sub_cap "$@" ;;
     verify)    cmd_verify "$@" ;;
+    provision) cmd_provision "$@" ;;
     reap)      cmd_reap "$@" ;;
     route-check) cmd_route_check "$@" ;;
     parity)    cmd_parity "$@" ;;

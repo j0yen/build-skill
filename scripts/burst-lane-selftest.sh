@@ -102,7 +102,7 @@ fresh_env() {
   # dedicated AC8 block below override it back to unset for its own case.
   export BURST_GATE_REMOTE=1
   unset FAKE_HCLOUD_AUTH_FAIL FAKE_HCLOUD_CREATE_FAIL FAKE_HCLOUD_DELETE_FAIL FAKE_SSH_REMOTE_FAIL FAKE_SSH_SANDBOX_FAIL FAKE_RSYNC_FAIL BURST_LANE_NOW \
-        FAKE_SSH_GATE_TOOLS_MISSING FAKE_SSH_GATE_TOOLS_INSTALL_FAIL BURST_GATE_REVIEWER BURST_CLAUDE_CRED_SRC
+        FAKE_SSH_GATE_TOOLS_MISSING FAKE_SSH_GATE_TOOLS_INSTALL_FAIL FAKE_SSH_AUTOBUILDER_VERSION BURST_GATE_REVIEWER BURST_CLAUDE_CRED_SRC
 }
 
 # ---- AC1: single-box refusal + adoption ------------------------------------
@@ -1483,6 +1483,99 @@ expect "gatebox AC5: gate exits 3 when the rsync-up itself fails before the remo
 expect "gatebox AC5: gate prints fallback: <cause>" "grep -q '^fallback: rsync to .* failed' <<<\"$ac5_out\""
 expect "gatebox AC5: exactly one gate fallback journal line naming the cause" \
   "[ \"\$(grep -c 'burst-lane  gate  fallback.*cause=rsync-up-failed' \"$BURST_LANE_JOURNAL\")\" -eq 1 ]"
+
+# =============================================================================
+# PRD-build-burst-gate-tools-scope: a missing gate tool blocks gates, not
+# the lane. (test_prefix: gatetools)
+# =============================================================================
+
+# ---- gatetools AC1: given a fake box without autobuilder, `up` copies it
+# (fake rsync = real local `cp` onto BURST_LANE_GATE_TOOLS_REMOTE_BIN_DIR)
+# and session state records its version.
+fresh_env
+export FAKE_SSH_GATE_TOOLS_MISSING="autobuilder"
+gt1_out="$("$BL" up)"; gt1_rc=$?
+expect "gatetools AC1: up succeeds with autobuilder initially missing" "[ $gt1_rc -eq 0 ]"
+expect "gatetools AC1: the autobuilder binary was copied (rsync) to the remote cargo bin dir" \
+  "[ -f \"$BURST_LANE_GATE_TOOLS_REMOTE_BIN_DIR/autobuilder\" ]"
+expect "gatetools AC1: session state records autobuilder's version once provisioned" \
+  "python3 -c \"import json,sys; d=json.load(open('$BURST_LANE_STATE_DIR/gate-tools.json')); sys.exit(0 if d.get('tools',{}).get('autobuilder') not in (None,'','MISSING') else 1)\""
+unset FAKE_SSH_GATE_TOOLS_MISSING
+
+# ---- gatetools AC2: given a fake box where the autobuilder copy fails
+# (install-fail knob, so the fake never records it as installed even though
+# a plain rsync retry underneath it is a no-op either way), `verify` reports
+# verified=true gate_ready=false, journals gate-tools-missing, and `run`
+# still routes.
+fresh_env
+export FAKE_SSH_GATE_TOOLS_MISSING="autobuilder"
+export FAKE_SSH_GATE_TOOLS_INSTALL_FAIL=1
+"$BL" up >/dev/null
+gt2_verify_out="$("$BL" verify 2>&1)"; gt2_verify_rc=$?
+expect "gatetools AC2: verify exits 0 (lane checks alone decide verified) even though gate-tools failed" "[ $gt2_verify_rc -eq 0 ]"
+expect "gatetools AC2: session state is verified:true" "grep -q '\"verified\":\"true\"' \"$BURST_LANE_STATE_DIR/session.json\""
+expect "gatetools AC2: session state is gate_ready:false" "grep -q '\"gate_ready\":\"false\"' \"$BURST_LANE_STATE_DIR/session.json\""
+expect "gatetools AC2: verify journals gate-tools-missing naming autobuilder" \
+  "grep -q 'burst-lane  verify  gate-tools-missing.*missing=autobuilder' \"$BURST_LANE_JOURNAL\""
+
+WT_GT2="$T/gt2-repo"; mkdir -p "$WT_GT2"
+echo 'mkdir -p target && echo built > target/out.txt; exit 0' > "$WT_GT2/build.sh"
+gt2_run_out="$("$BL" run "$WT_GT2" -- bash build.sh 2>&1)"; gt2_run_rc=$?
+expect "gatetools AC2: run <worktree> -- cargo build still routes despite gate_ready=false" \
+  "[ $gt2_run_rc -eq 0 ] && ! grep -q 'lane not verified' <<<\"$gt2_run_out\""
+unset FAKE_SSH_GATE_TOOLS_MISSING FAKE_SSH_GATE_TOOLS_INSTALL_FAIL
+
+# ---- gatetools AC3: given gate_ready=false, `gate <repo> --head <sha>`
+# refuses with `fallback: gate-tools-missing (<list>)`, exit 3, one journal
+# line.
+fresh_env
+export FAKE_SSH_GATE_TOOLS_MISSING="autobuilder"
+export FAKE_SSH_GATE_TOOLS_INSTALL_FAIL=1
+"$BL" up >/dev/null
+WT_GT3="$T/gt3-repo"; mkdir -p "$WT_GT3/target/autobuilder/receipts"
+( cd "$WT_GT3" && git init -q && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init )
+head_gt3="$(git -C "$WT_GT3" rev-parse HEAD)"
+echo "{\"head_sha\": \"$head_gt3\", \"box_host\": \"x\", \"suites\": {}, \"diff\": []}" > "$WT_GT3/target/autobuilder/receipts/box-parity.json"
+gt3_out="$("$BL" gate "$WT_GT3" --head "$head_gt3" 2>&1)"; gt3_rc=$?
+expect "gatetools AC3: gate exits 3 when gate_ready=false" "[ $gt3_rc -eq 3 ]"
+expect "gatetools AC3: gate prints fallback: gate-tools-missing naming the tool" \
+  "grep -q '^fallback: gate-tools-missing (autobuilder)$' <<<\"$gt3_out\""
+expect "gatetools AC3: exactly one gate fallback journal line naming the cause" \
+  "[ \"\$(grep -c 'burst-lane  gate  fallback.*cause=gate-tools-missing' \"$BURST_LANE_JOURNAL\")\" -eq 1 ]"
+unset FAKE_SSH_GATE_TOOLS_MISSING FAKE_SSH_GATE_TOOLS_INSTALL_FAIL
+
+# ---- gatetools AC4: `burst-lane.sh provision` retries the missing install
+# on the LIVE box and re-runs the gate-tools check without a reboot (no new
+# hcloud server create call).
+fresh_env
+export FAKE_SSH_GATE_TOOLS_MISSING="autobuilder"
+export FAKE_SSH_GATE_TOOLS_INSTALL_FAIL=1
+"$BL" up >/dev/null
+gt4_creates_before="$(grep -c 'server create' "$FAKE_HCLOUD_CALLLOG")"
+expect "gatetools AC4 setup: gate_ready:false after up (copy failed)" "grep -q '\"gate_ready\":\"false\"' \"$BURST_LANE_STATE_DIR/session.json\""
+
+unset FAKE_SSH_GATE_TOOLS_INSTALL_FAIL
+gt4_out="$("$BL" provision 2>&1)"; gt4_rc=$?
+expect "gatetools AC4: provision exits 0 once the retried install succeeds" "[ $gt4_rc -eq 0 ]"
+expect "gatetools AC4: gate_ready becomes true without a reboot" \
+  "grep -q '\"gate_ready\":\"true\"' \"$BURST_LANE_STATE_DIR/session.json\""
+gt4_creates_after="$(grep -c 'server create' "$FAKE_HCLOUD_CALLLOG")"
+expect "gatetools AC4: no additional hcloud server create call happened" "[ \"$gt4_creates_after\" -eq \"$gt4_creates_before\" ]"
+gt4_status_out="$("$BL" status)"
+expect "gatetools AC4: status shows missing= empty" "grep -q 'missing=$' <<<\"$gt4_status_out\""
+unset FAKE_SSH_GATE_TOOLS_MISSING
+
+# ---- gatetools AC5: a box whose autobuilder version differs from this
+# host's own `autobuilder --version` sets gate_ready=false and journals
+# `gate-tools  version-drift`, even though the tool is found (not MISSING).
+fresh_env
+export FAKE_SSH_AUTOBUILDER_VERSION="autobuilder 1.0.0"
+gt5_out="$("$BL" up)"; gt5_rc=$?
+expect "gatetools AC5: up succeeds even though autobuilder's version drifted" "[ $gt5_rc -eq 0 ]"
+expect "gatetools AC5: gate_ready is false due to version drift" "grep -q '\"gate_ready\":\"false\"' \"$BURST_LANE_STATE_DIR/session.json\""
+expect "gatetools AC5: journal names gate-tools version-drift" \
+  "grep -q 'burst-lane  gate-tools  version-drift' \"$BURST_LANE_JOURNAL\""
+unset FAKE_SSH_AUTOBUILDER_VERSION
 
 echo "=== $([ $fail -eq 0 ] && echo PASS || echo FAIL) ==="
 exit $fail
