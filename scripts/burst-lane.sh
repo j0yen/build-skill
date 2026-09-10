@@ -226,7 +226,7 @@ COST_PER_HOUR_EUR="0.47"
 REMOTE_ROOT="${BURST_LANE_REMOTE_ROOT:-/root/build}"
 
 die() { echo "burst-lane: $*" >&2; exit "${2:-1}"; }
-usage() { echo "usage: burst-lane.sh {up|status|run|sync-back|pull|ensure-fresh|down|watchdog|cost|sub-cap|verify|reap|route-check} ..." >&2; exit 2; }
+usage() { echo "usage: burst-lane.sh {up|status|run|sync-back|pull|ensure-fresh|down|watchdog|cost|sub-cap|verify|reap|route-check|parity|gate} ..." >&2; exit 2; }
 
 now_epoch() { echo "${BURST_LANE_NOW:-$(date -u +%s)}"; }
 now_iso()   { date -u -d "@$(now_epoch)" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ; }
@@ -1393,6 +1393,161 @@ cmd_pull() {
   exit 3
 }
 
+# ---- parity (PRD-build-gate-on-casper requirement 2) ------------------------
+# Parses a `cargo test --workspace --no-fail-fast` log (real or fake — the
+# offline selftest arms a fake `cargo` on $PATH that emits this exact shape,
+# so this parser is exercised authentically rather than against canned JSON)
+# into {"<crate>::<source-path>": "ok"|"FAILED", ...}. A "Running [unittests]
+# <path> (target/.../deps/<bin>-<16-hex-hash>)" line opens a suite; a
+# "Doc-tests <crate>" line opens a doctest pseudo-suite; the next
+# "test result: (ok|FAILED)." line closes whichever is currently open.
+cargo_test_suites_json() {  # stdin=log -> stdout JSON object
+  python3 -c '
+import json, re, sys
+running_re = re.compile(r"Running\s+(?:unittests\s+)?(\S+)\s+\(target/[^)]*?/deps/([A-Za-z0-9_.\-]+)-[0-9a-f]{16}\)")
+doctest_re = re.compile(r"Doc-tests\s+(\S+)")
+result_re = re.compile(r"test result:\s*(ok|FAILED)\.")
+suites = {}
+current = None
+for line in sys.stdin:
+    m = running_re.search(line)
+    if m:
+        current = "%s::%s" % (m.group(2), m.group(1))
+        continue
+    m = doctest_re.search(line)
+    if m:
+        current = "%s::doctests" % m.group(1)
+        continue
+    m = result_re.search(line)
+    if m and current:
+        suites[current] = m.group(1)
+        current = None
+print(json.dumps(suites))
+'
+}
+
+cmd_parity() {
+  local repo="${1:-}"
+  [ -n "$repo" ] && [ -d "$repo" ] || { echo "usage: burst-lane.sh parity <repo>" >&2; exit 2; }
+
+  if ! state_active; then
+    local up_out; up_out="$(cmd_up 2>&1)"; local up_rc=$?
+    if [ "$up_rc" -ne 0 ]; then
+      echo "$up_out"
+      exit 3
+    fi
+  fi
+  local id ip; id="$(state_read server_id)"; ip="$(state_read ip)"
+
+  local head_sha; head_sha="$(git -C "$repo" rev-parse HEAD 2>/dev/null || true)"
+  [ -n "$head_sha" ] || { echo "fallback: could not resolve HEAD for $repo"; journal_line "$(now_iso)  burst-lane  parity  fallback  (cause=no-head repo=$repo)"; exit 3; }
+
+  # Serialize against a live `run`/`parity` on the SAME worktree — same lock
+  # `run`/`pull` already use, so a parity rsync-up never interleaves with a
+  # live compile's own rsync of the same remote dir.
+  mkdir -p "$STATE_DIR/locks" 2>/dev/null || true
+  exec 206>"$(wt_lock_file "$repo")"
+  flock 206
+
+  local remote_path; remote_path="$(remote_path_for "$repo")"
+  mkdir -p "$STATE_DIR/logs" 2>/dev/null || true
+  local up_log="$STATE_DIR/logs/rsync-parity.$$.log" rsync_up_rc=0
+  "$RSYNC_BIN" -az --delete --exclude target --exclude .git --exclude .venv \
+        --rsync-path="mkdir -p '$remote_path' && rsync" \
+        -e "$SSH_BIN -o StrictHostKeyChecking=no -i $SSH_KEY" \
+        "$repo/" "$REMOTE_USER@$ip:$remote_path/" >"$up_log" 2>&1 || rsync_up_rc=$?
+  if [ "$rsync_up_rc" -ne 0 ]; then
+    flock -u 206
+    local up_err; up_err="$(grep -v '^[[:space:]]*$' "$up_log" 2>/dev/null | tail -n1)"
+    journal_line "$(now_iso)  burst-lane  parity  fallback  (cause=rsync-up-failed rc=$rsync_up_rc err=\"$up_err\" repo=$repo)"
+    echo "fallback: rsync to $ip failed rc=$rsync_up_rc (see $up_log)"
+    exit 3
+  fi
+
+  local box_log; box_log="$("$SSH_BIN" -o StrictHostKeyChecking=no -i "$SSH_KEY" "$REMOTE_USER@$ip" \
+    "cd $remote_path && export PATH=/root/.cargo/bin:/root/.local/bin:\$PATH CARGO_TARGET_DIR=$remote_path/target; cargo test --workspace --no-fail-fast" 2>&1)"
+  flock -u 206
+  local box_suites; box_suites="$(printf '%s\n' "$box_log" | cargo_test_suites_json)"
+
+  local local_log_file="$repo/target/autobuilder/test-output.txt" local_log
+  if [ -f "$local_log_file" ]; then
+    local_log="$(cat "$local_log_file")"
+  else
+    mkdir -p "$(dirname "$local_log_file")" 2>/dev/null || true
+    local_log="$(cd "$repo" && cargo test --workspace --no-fail-fast 2>&1)"
+    printf '%s\n' "$local_log" > "$local_log_file"
+  fi
+  local local_suites; local_suites="$(printf '%s\n' "$local_log" | cargo_test_suites_json)"
+
+  mkdir -p "$repo/target/autobuilder/receipts" 2>/dev/null || true
+  local parity_file="$repo/target/autobuilder/receipts/box-parity.json"
+  local diff_json status_word
+  diff_json="$(python3 -c '
+import json, sys
+box = json.loads(sys.argv[1])
+local = json.loads(sys.argv[2])
+names = sorted(set(box) | set(local))
+suites = {}
+diff = []
+for n in names:
+    b, l = box.get(n), local.get(n)
+    suites[n] = {"box": b, "local": l}
+    if b != l:
+        diff.append(n)
+print(json.dumps({"suites": suites, "diff": diff}))
+' "$box_suites" "$local_suites")"
+  python3 -c '
+import json, sys
+d = json.loads(sys.argv[1])
+out = {"head_sha": sys.argv[2], "box_host": sys.argv[3], "suites": d["suites"], "diff": d["diff"]}
+json.dump(out, open(sys.argv[4], "w"), indent=2)
+' "$diff_json" "$head_sha" "$ip" "$parity_file"
+
+  local diff_count; diff_count="$(python3 -c 'import json,sys; print(len(json.loads(sys.argv[1])["diff"]))' "$diff_json")"
+  if [ "$diff_count" -eq 0 ]; then status_word="ok"; else status_word="diff"; fi
+  journal_line "$(now_iso)  burst-lane  parity  $status_word  (repo=$repo head=$head_sha box=$ip diff=$diff_count)"
+  echo "parity: $status_word (diff=$diff_count) — $parity_file"
+  exit 0
+}
+
+# ---- gate (PRD-build-gate-on-casper requirement 3 — STUB) -------------------
+# Only requirement 5's fallback contract is wired so far: refuses to route
+# (exit 3, "fallback: parity-diff|parity-unknown") unless `parity` has
+# already recorded a clean receipt AT THE REPO'S CURRENT HEAD — the parity
+# receipt lives inside the repo itself (target/autobuilder/receipts/
+# box-parity.json, written by cmd_parity above), so this check needs no
+# separate session-state field: a repo's own receipts tree is already the
+# single source of truth extend-gate.sh's other producers read. The actual
+# remote invocation (rsync repo up, run extend-gate.sh on the box, rsync
+# receipts back, propagate the exit code) is requirement 3 and NOT yet
+# implemented — see the PRD's own requirement list.
+cmd_gate() {
+  local repo="${1:-}"
+  [ -n "$repo" ] && [ -d "$repo" ] || { echo "usage: burst-lane.sh gate <repo> --head <sha> [extend-gate args...]" >&2; exit 2; }
+  shift || true
+
+  local head_now; head_now="$(git -C "$repo" rev-parse HEAD 2>/dev/null || true)"
+  local parity_file="$repo/target/autobuilder/receipts/box-parity.json"
+  local cause=""
+  if [ ! -f "$parity_file" ]; then
+    cause="parity-unknown"
+  else
+    python3 -c '
+import json, sys
+d = json.load(open(sys.argv[1]))
+sys.exit(0 if d.get("head_sha") == sys.argv[2] and d.get("diff") == [] else 1)
+' "$parity_file" "$head_now" || cause="parity-diff"
+  fi
+  if [ -n "$cause" ]; then
+    journal_line "$(now_iso)  burst-lane  gate  fallback  (cause=$cause repo=$repo head=$head_now)"
+    echo "fallback: $cause"
+    exit 3
+  fi
+
+  echo "gate: parity clean at head=$head_now — remote invocation not yet implemented (PRD-build-gate-on-casper requirement 3)" >&2
+  exit 2
+}
+
 # ---- ensure-fresh (PRD-build-burst-pull-on-demand requirement 2) -----------
 # The single invariant every local cargo/test consumer must go through
 # before touching a worktree: dirty -> pull (blocking on the worktree lock —
@@ -2290,6 +2445,8 @@ main() {
     verify)    cmd_verify "$@" ;;
     reap)      cmd_reap "$@" ;;
     route-check) cmd_route_check "$@" ;;
+    parity)    cmd_parity "$@" ;;
+    gate)      cmd_gate "$@" ;;
     *) usage ;;
   esac
 }

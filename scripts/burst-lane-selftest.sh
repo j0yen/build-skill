@@ -945,5 +945,116 @@ expect "gatebox AC1: adoption path also succeeds and re-provisions" "[ $gatebox1
 expect "gatebox AC1: adoption path also records gate_ready:true" \
   "grep -q '\"gate_ready\":\"true\"' \"$BURST_LANE_STATE_DIR/session.json\""
 
+# ---- gatebox AC2: `parity` runs the workspace suite on the box and
+# compares it to RedBaron's own baseline, writing exactly the differing
+# suites into receipts/box-parity.json; a following `gate` call then
+# refuses (exit 3, fallback: parity-diff) while that parity stands
+# (requirement 2 + requirement 5's fallback contract). The fake `cargo` on
+# $PATH tells "box" and "local" runs apart by $PWD (the remote run always
+# cd's under $BURST_LANE_REMOTE_ROOT first; the local run cd's into $repo
+# directly) rather than any burst-lane.sh-side special-casing, so the real
+# cargo-test-log parser (cargo_test_suites_json) is exercised authentically
+# instead of being handed canned JSON.
+fresh_env
+"$BL" up >/dev/null
+WT_PARITY="$T/parity-repo"; mkdir -p "$WT_PARITY"
+( cd "$WT_PARITY" && git init -q && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init )
+FAKEBIN_PARITY="$T/fakebin-parity"; mkdir -p "$FAKEBIN_PARITY"
+cat > "$FAKEBIN_PARITY/cargo" <<EOF
+#!/usr/bin/env bash
+if [ "\${1:-}" = "test" ]; then
+  case "\$PWD" in
+    "$BURST_LANE_REMOTE_ROOT"/*)
+      # box run: parity=ok, other=ok, integration=FAILED
+      cat <<'LOG'
+     Running unittests src/lib.rs (target/debug/deps/parity-1111111111111111)
+
+running 1 test
+test a ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/other.rs (target/debug/deps/other-2222222222222222)
+
+running 1 test
+test b ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/integration.rs (target/debug/deps/integration-3333333333333333)
+
+running 1 test
+test c ... FAILED
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+LOG
+      ;;
+    *)
+      # local (RedBaron) baseline run: parity=ok (matches), other=FAILED,
+      # integration=ok — exactly two suites (other, integration) differ
+      # from the box's run above.
+      cat <<'LOG'
+     Running unittests src/lib.rs (target/debug/deps/parity-4444444444444444)
+
+running 1 test
+test a ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/other.rs (target/debug/deps/other-5555555555555555)
+
+running 1 test
+test b ... FAILED
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/integration.rs (target/debug/deps/integration-6666666666666666)
+
+running 1 test
+test c ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+LOG
+      ;;
+  esac
+  exit 0
+fi
+echo "fake-cargo(parity): unhandled args: \$*" >&2
+exit 1
+EOF
+chmod +x "$FAKEBIN_PARITY/cargo"
+
+parity_out="$(PATH="$FAKEBIN_PARITY:$PATH" "$BL" parity "$WT_PARITY" 2>&1)"; parity_rc=$?
+expect "gatebox AC2: parity exits 0 (it records the diff, doesn't fail on one)" "[ $parity_rc -eq 0 ]"
+expect "gatebox AC2: parity reports diff=2" "grep -q 'diff=2' <<<\"$parity_out\""
+expect "gatebox AC2: journal has 'parity  diff'" "grep -q 'burst-lane  parity  diff' \"$BURST_LANE_JOURNAL\""
+parity_file="$WT_PARITY/target/autobuilder/receipts/box-parity.json"
+expect "gatebox AC2: box-parity.json was written" "[ -s \"$parity_file\" ]"
+parity_json_rc=0
+python3 -c "
+import json
+d = json.load(open('$parity_file'))
+assert sorted(d['diff']) == ['integration::tests/integration.rs', 'other::src/other.rs'], d['diff']
+assert d['head_sha'], d
+assert d['box_host'], d
+assert 'parity::src/lib.rs' not in d['diff']
+" || parity_json_rc=1
+expect "gatebox AC2: box-parity.json diff lists exactly the two differing suites (req 2)" "[ $parity_json_rc -eq 0 ]"
+expect "gatebox AC2: a fresh local baseline was cached to target/autobuilder/test-output.txt" \
+  "[ -s \"$WT_PARITY/target/autobuilder/test-output.txt\" ]"
+
+gate_out="$(PATH="$FAKEBIN_PARITY:$PATH" "$BL" gate "$WT_PARITY" --head "$(git -C "$WT_PARITY" rev-parse HEAD)" 2>&1)"; gate_rc=$?
+expect "gatebox AC2: gate refuses to route while parity is diff (exit 3)" "[ $gate_rc -eq 3 ]"
+expect "gatebox AC2: gate prints fallback: parity-diff" "grep -q '^fallback: parity-diff$' <<<\"$gate_out\""
+expect "gatebox AC2: gate journaled the fallback with cause" "grep -q 'burst-lane  gate  fallback.*cause=parity-diff' \"$BURST_LANE_JOURNAL\""
+
+# A brand-new repo with no parity receipt at all is "unknown", not "diff" —
+# same refusal, a different named cause.
+WT_NOPARITY="$T/noparity-repo"; mkdir -p "$WT_NOPARITY"
+( cd "$WT_NOPARITY" && git init -q && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init )
+gate_unknown_out="$("$BL" gate "$WT_NOPARITY" --head x 2>&1)"; gate_unknown_rc=$?
+expect "gatebox AC2: gate refuses on no parity receipt at all (exit 3)" "[ $gate_unknown_rc -eq 3 ]"
+expect "gatebox AC2: gate names the parity-unknown cause" "grep -q '^fallback: parity-unknown$' <<<\"$gate_unknown_out\""
+
 echo "=== $([ $fail -eq 0 ] && echo PASS || echo FAIL) ==="
 exit $fail
