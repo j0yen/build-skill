@@ -1386,5 +1386,34 @@ rollup_line_r9="$(grep '^burst-cost:' "$BURST_LANE_TICK_JOURNAL_DIR/$today_r9.md
 expect "gatebox AC9: the daily rollup line carries gates_remote=2 gates_local=1" \
   "grep -q 'gates_remote=2 gates_local=1' <<<\"$rollup_line_r9\""
 
+# ---- gatebox requirement 8: `status` (text mode) lists a running remote
+# gate with repo, HEAD (shortened), age, and slot; `status --json` carries
+# the same fields plus gate_ready. A hand-crafted marker (same shape
+# cmd_gate itself now writes, including head_sha/slot since step 6) is
+# enough here — the marker's own SHAPE is already exercised end-to-end by
+# a real `gate` call in the AC6/AC9 blocks above.
+fresh_env
+"$BL" up >/dev/null
+mkdir -p "$BURST_LANE_STATE_DIR/gate-inflight"
+python3 -c "import json; json.dump({'repo': '/fake/status-repo', 'host': '127.0.0.1', 'started_epoch': $(date -u +%s) - 90, 'budget_s': 1800, 'head_sha': 'abcdef0123456789', 'slot': '2'}, open('$BURST_LANE_STATE_DIR/gate-inflight/statusgate.json', 'w'))"
+status_text_r8="$("$BL" status 2>&1)"
+expect "gatebox req8: status (text) lists the gate with repo/head/age/slot" \
+  "grep -qE 'gate: /fake/status-repo head=abcdef012345 age=[0-9]+s slot=2' <<<\"$status_text_r8\""
+status_json_r8="$("$BL" status --json 2>&1)"
+r8_json_rc=0
+python3 -c "
+import json, sys
+d = json.loads(sys.argv[1])
+gates = d.get('gates', [])
+assert len(gates) == 1, gates
+g = gates[0]
+assert g.get('repo') == '/fake/status-repo', g
+assert g.get('head_sha') == 'abcdef0123456789', g
+assert g.get('slot') == '2', g
+assert g.get('age_seconds', 0) >= 90, g
+assert 'gate_ready' in d, d
+" "$status_json_r8" || r8_json_rc=1
+expect "gatebox req8: status --json carries the gate with repo/head_sha/slot/age_seconds and gate_ready" "[ $r8_json_rc -eq 0 ]"
+
 echo "=== $([ $fail -eq 0 ] && echo PASS || echo FAIL) ==="
 exit $fail

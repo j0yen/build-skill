@@ -799,6 +799,18 @@ for f in sorted(glob.glob(sys.argv[2] + "/*.json")):
 print(json.dumps(rows))
 ' "$(now_epoch)" "$GATE_INFLIGHT_DIR")"
 
+  # Requirement 8's own text-mode ask: "status lists running remote gates
+  # with repo, HEAD, age, and slot" — one line per gate, HEAD shortened to
+  # 12 chars (readable, still unambiguous) the same way `git log --oneline`
+  # would.
+  local gate_lines
+  gate_lines="$(python3 -c '
+import json, sys
+for r in json.loads(sys.argv[1]):
+    head = (r.get("head_sha") or "")[:12]
+    print("gate: %s head=%s age=%ss slot=%s" % (r.get("repo", ""), head or "?", r.get("age_seconds", 0), r.get("slot") or "?"))
+' "$gates_json")"
+
   if [ "$json" -eq 1 ]; then
     printf '{"active":true,"server_id":"%s","ip":"%s","minutes_alive":%s,"ttl_hours":"%s","sandbox_ok":"%s","concurrent":"%s","free_disk_gb":%s,"disk_state":"%s","dirty":%s,"gates":%s,"gate_ready":"%s"}\n' \
       "$id" "$ip" "$alive" "$ttl" "$sbx" "$conc" "$free_disk_gb" "$disk_state" "$dirty_json" "$gates_json" "$(state_read gate_ready)"
@@ -806,6 +818,7 @@ print(json.dumps(rows))
     local gate_count; gate_count="$(python3 -c 'import json,sys; print(len(json.loads(sys.argv[1])))' "$gates_json")"
     echo "active: $id ip=$ip alive=${alive}m ttl=${ttl}h sandbox_ok=$sbx concurrent=$conc disk_state=$disk_state free_disk_gb=$free_disk_gb gates:${gate_count}"
     [ -n "$dirty_lines" ] && printf '%s\n' "$dirty_lines"
+    [ -n "$gate_lines" ] && printf '%s\n' "$gate_lines"
   fi
   exit 0
 }
@@ -1199,8 +1212,11 @@ count_held_slots() {  # -> stdout "<held>/<cap>"
 # 120s), never fails the caller. Acquired on fd 202; released with the process.
 # MUST be called directly (never in $(...) — a command substitution is a
 # subshell and the flock dies with it, which is exactly the bug the selftest
-# caught on first run). Sets SLOT_HELD="held/cap"; holds fd 202 on return.
+# caught on first run). Sets SLOT_HELD="held/cap" and SLOT_INDEX (the actual
+# 1..cap slot number acquired — requirement 8 wants this reported per gate);
+# holds fd 202 on return.
 SLOT_HELD=""
+SLOT_INDEX=""
 acquire_run_slot() {
   local cap="${BURST_MAX_CONCURRENT_RUNS:-4}" i waited=0
   mkdir -p "$STATE_DIR/slots" 2>/dev/null || true
@@ -1214,6 +1230,7 @@ acquire_run_slot() {
           ( exec 210>"$STATE_DIR/slots/$j.lock"; flock -n 210 ) 2>/dev/null || held=$((held+1))
         done
         SLOT_HELD="$held/$cap"
+        SLOT_INDEX="$i"
         return 0
       fi
     done
@@ -1606,13 +1623,16 @@ gate_inflight_marker_file() {  # $1=repo -> stdout path
   printf '%s/%s.json\n' "$GATE_INFLIGHT_DIR" "$rkey"
 }
 
-gate_inflight_write() {  # $1=marker_file $2=repo $3=ip
+gate_inflight_write() {  # $1=marker_file $2=repo $3=ip $4=head_sha $5=slot
   mkdir -p "$GATE_INFLIGHT_DIR" 2>/dev/null || true
   python3 -c '
 import json, sys
-path, repo, host, started, budget = sys.argv[1:6]
-json.dump({"repo": repo, "host": host, "started_epoch": int(started), "budget_s": int(budget)}, open(path, "w"))
-' "$1" "$2" "$3" "$(now_epoch)" "$GATE_WALL_BUDGET_S"
+path, repo, host, started, budget, head_sha, slot = sys.argv[1:8]
+json.dump({
+    "repo": repo, "host": host, "started_epoch": int(started), "budget_s": int(budget),
+    "head_sha": head_sha, "slot": slot,
+}, open(path, "w"))
+' "$1" "$2" "$3" "$(now_epoch)" "$GATE_WALL_BUDGET_S" "$4" "$5"
 }
 
 # `down`/`watchdog` call this right before their own destroy_verify: for
@@ -1791,7 +1811,7 @@ sys.exit(0 if d.get("head_sha") == sys.argv[2] and d.get("diff") == [] else 1)
   # this script itself died mid-remote-call, which is exactly the case
   # gate_wait_for_inflight()'s own budget-based abandonment exists for.
   local inflight_marker; inflight_marker="$(gate_inflight_marker_file "$repo")"
-  gate_inflight_write "$inflight_marker" "$repo" "$ip"
+  gate_inflight_write "$inflight_marker" "$repo" "$ip" "$head_now" "$SLOT_INDEX"
 
   local t0 t1 rc=0
   t0="$(now_fractional)"
