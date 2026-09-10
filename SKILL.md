@@ -369,8 +369,29 @@ Read the PRD. Determine its implementation shape:
   sets `build_into: <abs-path>`, validate the path exists and is a git repo
   with a `pyproject.toml`, set `output_repo_path` to it and let pybuilder
   extend in place (no `gh repo create`); otherwise pybuilder scaffolds a new
-  project and the new-repo publish path applies. Capture the Stage 4 gate
-  verdict (`ready` / `blocked`) and the receipt directory
+  project and the new-repo publish path applies.
+
+  **Worktree isolation, unconditional (PRD-build-python-worktree-isolation,
+  2026-09-10) — the python `wm-buildtree`-equivalent.** Before ANY Phase-4
+  write for a `build_into`-set python-cli/python-lib/python-agent PRD, run
+  `scripts/worktree-extend.sh add <build_into> <slug>` and run every
+  subsequent `/pybuild` invocation with cwd = the printed worktree path,
+  never `build_into` directly — same unconditional guarantee rust-extend's
+  `wm-buildtree ensure` gives (whether or not another same-lane PRD shares
+  this `build_into` this tick; see "Worktree isolation" below for why this
+  closes a real collision, not a hypothetical one). `/pybuild` commits its
+  own work (including any version bump — python has no serial bump step)
+  on the branch inside the worktree, exactly as it would against a plain
+  checkout. When the PRD's iteration is done (Stage 4 gate `ready`, or the
+  PRD's own stopping point), run `scripts/worktree-extend.sh land
+  <build_into> <slug>` to fast-forward-merge the branch back onto
+  `build_into`'s main — it exits 4 (no mutation) if the main checkout is
+  dirty at land time, preserving the worktree's commits for a retry next
+  tick, mirroring rust's `wm-buildtree land` exit-4 contract. Do NOT use
+  `worktree-extend.sh integrate` for python — that subcommand's
+  version-bump/CHANGELOG step is Cargo.toml-specific; `land` is the
+  language-agnostic merge-only counterpart added for this PRD. Capture the
+  Stage 4 gate verdict (`ready` / `blocked`) and the receipt directory
   (`<project>/.pybuilder/`) into the manifest `verification` field. Python
   runs locally under `uv` by default; when a Hetzner burst-lane session is
   up and the PRD's test suite is sandbox-safe (does not need the `claude`
@@ -1743,13 +1764,27 @@ those before every step and defers to them exactly as selection would.
   `worktree-extend.sh integrate` so same-repo integrations serialize.
   Internal to the helper; branches don't manage it directly.
 
-### Worktree isolation (shared `build_into`, added 2026-05-28)
+### Worktree isolation (shared `build_into`, added 2026-05-28; python-cli/
+python-lib/python-agent added 2026-09-10, PRD-build-python-worktree-isolation)
 
-When a tick selects ≥2 rust-extend PRDs that share one `build_into`
-repo, the branches do **not** mutate that repo in place. The expensive
-work (cargo build/clippy/test/deny) runs in parallel, each branch in its
-own git worktree; only the cheap final step (merge + version bump +
-changelog) is serial. Mechanics live in `scripts/worktree-extend.sh`:
+When a tick selects ≥2 rust-extend PRDs (or ≥2 python-cli/python-lib/
+python-agent extend-in-place PRDs — see the `land` subcommand below and
+Phase 3's python routing above, which uses it UNCONDITIONALLY, not only
+when a `build_into` is shared) that share one `build_into` repo, the
+branches do **not** mutate that repo in place. The expensive work (cargo
+build/clippy/test/deny, or `uv run pytest`/`pybuilder gate` for python)
+runs in parallel, each branch in its own git worktree; only the cheap
+final step (merge [+ version bump + changelog, rust only]) is serial.
+Mechanics live in `scripts/worktree-extend.sh`. This is the closed version
+of a real 2026-09-10 gap: two same-lane python-agent PRDs
+(`synthorg-run-telemetry`, `synthorg-capability-tasks`) collided writing
+`src/synthorg/cli.py` in a shared main checkout with no isolation
+mechanism at all for python — only the rust-extend/kernel-extend paths had
+one. What follows is written from the rust-extend angle (the original,
+still-primary use); python-extend uses `add` + `land` (not `integrate`,
+which is Cargo.toml-specific) — see the `land` subcommand doc comment in
+`scripts/worktree-extend.sh` and Phase 3's python routing above for the
+python-specific contract.
 
 1. **add** — `worktree-extend.sh add <repo> <slug>` creates (or resumes)
    a worktree at `~/.cache/build-worktrees/<repo>-<slug>` on branch

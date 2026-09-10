@@ -1,13 +1,28 @@
 #!/usr/bin/env bash
-# worktree-extend.sh — isolate same-target rust-extend branches so a /build
-# tick can advance several PRDs that share one `build_into` repo in parallel
-# without racing the git index or cargo `target/`.
+# worktree-extend.sh — isolate same-target extend-in-place branches so a
+# /build tick can advance several PRDs that share one `build_into` repo in
+# parallel without racing the git index (or, for rust, cargo `target/`).
 #
-# Model: the EXPENSIVE work (cargo build/clippy/test/deny) runs in parallel,
-# each branch in its own git worktree off the target's `main` HEAD. The CHEAP
-# work (merge back + version bump + changelog) is SERIAL, guarded by a
-# per-repo integration flock, so sequential branches get clean incrementing
-# versions and a linear history.
+# Originally rust-extend-only; PRD-build-python-worktree-isolation
+# (2026-09-10) extended it to python-cli/python-lib/python-agent targets by
+# adding the `land` subcommand below. The git worktree plumbing itself
+# (`add`/`cleanup`/`prune-landed`/`list`) was already language-agnostic —
+# only the FRAMING (this header, the cargo-target-dir/cargo-budget/burst-lane
+# reminders) was rust-specific; those reminders are now gated on the
+# presence of the language's manifest file (Cargo.toml / pyproject.toml) so
+# a python worktree gets python-shaped advice instead of irrelevant cargo
+# noise. `integrate` (rust's Cargo.toml version-bump + CHANGELOG.md step)
+# stays rust-specific and unchanged — python's `/pybuild` already owns its
+# own version-bump/commit, so python-extend PRDs use the new `land`
+# subcommand instead, which is a pure merge with NO bump/changelog step.
+#
+# Model: the EXPENSIVE work (cargo build/clippy/test/deny, or `uv run
+# pytest`/`pybuilder gate`) runs in parallel, each branch in its own git
+# worktree off the target's `main` HEAD. The CHEAP work (merge back [+
+# version bump + changelog, rust only]) is SERIAL, guarded by a per-repo
+# integration flock, so sequential branches get clean incrementing versions
+# (rust) or a clean linear history (python) and never observe each other's
+# uncommitted files.
 #
 # Subcommands:
 #   add <repo> <slug>
@@ -15,7 +30,28 @@
 #       autobuilder/<slug>, based on <repo>'s current `main` HEAD. The branch
 #       agent then cwd's into the printed path, edits src/tests, runs the
 #       gate, and commits its IMPLEMENTATION there (no version bump — that
-#       happens at integration). Prints the worktree path on stdout.
+#       happens at integration, for rust; python commits its own version
+#       bump if any, since `land` never touches manifest files). Prints the
+#       worktree path on stdout.
+#
+#   land <repo> <slug>
+#       [rust-extend and python-cli/python-lib/python-agent, added
+#       PRD-build-python-worktree-isolation] SERIAL, same per-repo
+#       integration lock as `integrate` below (mutually exclusive with it —
+#       one lock per repo regardless of language). Refuses (exit 4, no
+#       mutation) if <repo>'s main working tree is dirty at land time —
+#       fail-closed, mirroring SKILL.md's `wm-buildtree land` exit-4-on-dirty
+#       contract (distinct from `integrate`'s exit 3 for the same dirty-tree
+#       case, so callers can tell the two land paths apart). Merges
+#       autobuilder/<slug> into main (--no-ff), with the same rebase-retry
+#       fallback `integrate` uses on conflict. Performs NO version-bump, NO
+#       CHANGELOG edit, and NO cargo-lock regen — the branch's own commits
+#       (made by `/pybuild`, or any other writer) already carry whatever
+#       version bump they need; `land`'s only job is getting them onto main
+#       safely. On success, runs `cleanup` (branch kept, worktree freed).
+#       Use this (not `integrate`) for EVERY python-extend PRD, solo or
+#       shared build_into — it is the python `wm-buildtree`-equivalent
+#       (SKILL.md Phase 3/4 python routing, "Worktree isolation" section).
 #
 #   integrate [--project-root <rel>] <repo> <slug> <bump> <tldr-file>
 #       SERIAL. Takes the per-repo integration lock. Refuses if <repo>'s main
@@ -102,8 +138,12 @@ target_dir_for() { echo "$(target_root)/$(basename "$1")-$2"; }
 # `git -C <worktree> rev-parse --git-path` resolves it correctly even though
 # a worktree's own `.git` is a file, not a directory — info/exclude is not
 # per-worktree). Idempotent: safe to call again on an existing worktree.
+# No-op for a non-cargo (e.g. python) repo (PRD-build-python-worktree-
+# isolation) — a python worktree has no `target/` to isolate, and writing
+# an unused `.cargo/` dir there would just be noise.
 write_target_config() {
   local wt="$1" repo="$2" slug="$3" tdir
+  [ -f "$repo/Cargo.toml" ] || return 0
   tdir="$(target_dir_for "$repo" "$slug")"
   mkdir -p "$tdir" || die 2 "could not create cargo target dir: $tdir"
   mkdir -p "$wt/.cargo" || die 2 "could not create $wt/.cargo"
@@ -179,8 +219,9 @@ cmd_add() {
   # Resume if the worktree already exists (multi-tick build).
   if git -C "$repo" worktree list --porcelain | grep -qxF "worktree $wt"; then
     write_target_config "$wt" "$repo" "$slug"
-    print_cargo_budget_path_reminder >&2
+    print_cargo_budget_path_reminder "$repo" >&2
     print_burst_lane_path_reminder "$repo" >&2
+    print_python_burst_lane_path_reminder "$repo" >&2
     echo "$wt"; return 0
   fi
   # Base the branch on main's HEAD (clean commit), ignoring any dirty files in
@@ -192,8 +233,9 @@ cmd_add() {
     git -C "$repo" worktree add -b "$branch" "$wt" "$base" >&2 || die 2 "worktree add (new branch) failed"
   fi
   write_target_config "$wt" "$repo" "$slug"
-  print_cargo_budget_path_reminder >&2
+  print_cargo_budget_path_reminder "$repo" >&2
   print_burst_lane_path_reminder "$repo" >&2
+  print_python_burst_lane_path_reminder "$repo" >&2
   echo "$wt"
 }
 
@@ -204,12 +246,34 @@ cmd_add() {
 # 21,466 with the same-target sub-cap at only 3). Printed to stderr (not
 # stdout, which stays the bare worktree path for any caller doing
 # `wt=$(worktree-extend.sh add ...)`); SKILL.md's branch dispatch prompt
-# requires the branch agent actually run this export.
+# requires the branch agent actually run this export. Gated on the repo
+# actually being a cargo repo (PRD-build-python-worktree-isolation) so a
+# python worktree doesn't get irrelevant cargo advice.
 print_cargo_budget_path_reminder() {
+  local repo="${1:?print_cargo_budget_path_reminder: missing repo arg}"
+  [ -f "$repo/Cargo.toml" ] || return 0
   echo "worktree-extend: cargo-budget — before any cargo command in this worktree, run:" >&2
   echo "  export PATH=\"\$HOME/.claude/skills/build/scripts/cargo-budget-bin:\$PATH\"" >&2
   echo "worktree-extend: this routes cargo test/clippy/build --release/deny/nextest through" >&2
   echo "the shared concurrency budget; cargo check/metadata bypass it (PRD-build-cargo-concurrency-budget)." >&2
+}
+
+# PRD-build-python-worktree-isolation: python-cli/python-lib/python-agent
+# worktrees get the python-shaped equivalent of the two reminders above —
+# the burst-lane python PATH directive SKILL.md's Phase 3 python routing
+# already documents (PRD-build-burst-lane-ccx53 requirement 12), so a
+# python worktree's branch agent doesn't have to rediscover it. Gated on
+# the repo actually being a python project (pyproject.toml present).
+print_python_burst_lane_path_reminder() {
+  local repo="${1:?print_python_burst_lane_path_reminder: missing repo arg}"
+  [ -f "$repo/pyproject.toml" ] || return 0
+  echo "worktree-extend: burst-lane (python) — before any 'uv run'/'uv sync' command in" >&2
+  echo "this worktree, run:" >&2
+  echo "  export PATH=\"\$HOME/.claude/skills/build/scripts/burst-lane-bin:\$PATH\" BURST_LANE=1 BURST_PY=1" >&2
+  echo "worktree-extend: this routes uv run/uv sync to the Hetzner CCX53 burst lane when a" >&2
+  echo "session is up, and falls through to local uv otherwise (PRD-build-burst-lane-ccx53" >&2
+  echo "requirement 12). Do NOT set BURST_PY=1 if any test in this PRD needs the claude CLI" >&2
+  echo "login — run those suites locally instead." >&2
 }
 
 # PRD-build-burst-lane-ccx53 requirement 4: rust branches must be able to
@@ -231,6 +295,87 @@ print_burst_lane_path_reminder() {
   echo "PATH=\"burst-lane-bin:cargo-budget-bin:\$PATH\") this routes cargo build/test/clippy/" >&2
   echo "deny/nextest to the CCX53 burst lane when 'burst-lane.sh status' reports a session," >&2
   echo "and falls through to cargo-budget-bin's local routing otherwise (PRD-build-burst-lane-ccx53)." >&2
+}
+
+# cmd_land — PRD-build-python-worktree-isolation's python `wm-buildtree land`
+# equivalent. Language-agnostic: a pure merge of autobuilder/<slug> into
+# main, with the same rebase-retry conflict fallback `integrate` uses below,
+# but with NO version-bump/CHANGELOG/lockfile-regen step — the caller
+# (/pybuild for python; usable by any writer) already committed whatever
+# version bump it needs on the branch itself, inside the worktree. Kept as
+# its own function (mirroring, not sharing code with, cmd_integrate) rather
+# than refactoring cmd_integrate's proven conflict-handling into a shared
+# helper — this PRD's non-goals say it "reuses or mirrors" the existing
+# mechanics, "does not redesign them"; touching cmd_integrate's internals
+# risks the rust-extend shared-target path this PRD must not regress.
+cmd_land() {
+  local no_rebase=""
+  local -a pos=()
+  while [ $# -gt 0 ]; do
+    case "${1:-}" in
+      --no-rebase) no_rebase=1; shift ;;
+      *) pos+=("${1:-}"); shift ;;
+    esac
+  done
+  local repo="${pos[0]:-}" slug="${pos[1]:-}"
+  need "$repo" "usage: land [--no-rebase] <repo> <slug>"; need "$slug" "missing slug"
+  local branch="autobuilder/$slug"
+  local wt; wt="$(wt_path "$repo" "$slug")"
+  # Same per-repo integration lock file as cmd_integrate: land and integrate
+  # against the same repo are mutually exclusive, language-agnostic.
+  # PRD-extend-gate-lock-cloexec convention: no cargo is invoked in this
+  # function, so no fd-9 close is needed here (unlike cmd_integrate).
+  exec 9>"$repo/.git/autobuilder-integrate.lock"
+  flock -w 120 9 || die 5 "could not acquire integration lock for $repo"
+
+  # Fail closed (AC3): never merge into a dirty main tree. Mirrors SKILL.md's
+  # `wm-buildtree land` exit-4-on-dirty contract; deliberately a DIFFERENT
+  # exit code than cmd_integrate's exit 3 for the same condition, so a
+  # caller can tell which landing path refused.
+  if [ -n "$(git -C "$repo" status --porcelain)" ]; then
+    die 4 "target tree dirty; refusing to land $slug (commit-or-revert the working tree first)"
+  fi
+  git -C "$repo" show-ref --verify --quiet "refs/heads/$branch" || die 2 "no branch $branch to land"
+  git -C "$repo" checkout main >&2 2>/dev/null || git -C "$repo" checkout -q main
+  if ! git -C "$repo" "${GIT_ID[@]}" merge --no-ff --no-edit "$branch" >&2; then
+    git -C "$repo" merge --abort 2>/dev/null
+    if [ -n "$no_rebase" ] || [ ! -d "$wt" ]; then
+      local _early_cf; _early_cf="$(git -C "$repo" diff --name-only --diff-filter=U 2>/dev/null | sort | tr '\n' ',' | sed 's/,$//')"
+      [ -z "$_early_cf" ] && _early_cf="unknown"
+      [ -x "$SIDECAR" ] && "$SIDECAR" write "$slug" "last_error=land-conflict:${_early_cf}" >&2 || true
+      [ -x "$SERIAL_FALLBACK" ] && "$SERIAL_FALLBACK" streak-record "$repo" "$_early_cf" >&2 || true
+      die 4 "merge conflict landing $slug; aborted (branch kept for next tick, worktree commits intact)"
+    fi
+    echo "worktree-extend: $slug: merge conflict landing — attempting rebase onto current main HEAD" >&2
+    local main_head; main_head="$(git -C "$repo" rev-parse main)"
+    if ! git -C "$wt" "${GIT_ID[@]}" rebase "$main_head" >&2; then
+      git -C "$wt" rebase --abort 2>/dev/null
+      local conflict_files; conflict_files="$(git -C "$wt" diff --name-only --diff-filter=U 2>/dev/null | tr '\n' ',' | sed 's/,$//')"
+      [ -z "$conflict_files" ] && conflict_files="unknown"
+      [ -x "$SIDECAR" ] && "$SIDECAR" write "$slug" "last_error=land-conflict:${conflict_files}" >&2 || true
+      [ -x "$SERIAL_FALLBACK" ] && "$SERIAL_FALLBACK" streak-record "$repo" "$conflict_files" >&2 || true
+      die 4 "rebase conflict landing $slug; aborted (branch kept for next tick, worktree commits intact)"
+    fi
+    # No cargo-check guard here (unlike integrate) — language-agnostic;
+    # the caller's own test suite (uv run pytest / pybuilder gate) is a
+    # separate step run before land, not something this script re-verifies.
+    if ! git -C "$repo" "${GIT_ID[@]}" merge --no-ff --no-edit "$branch" >&2; then
+      git -C "$repo" merge --abort 2>/dev/null
+      local _retry_cf; _retry_cf="$(git -C "$repo" diff --name-only --diff-filter=U 2>/dev/null | sort | tr '\n' ',' | sed 's/,$//')"
+      [ -z "$_retry_cf" ] && _retry_cf="unknown"
+      [ -x "$SIDECAR" ] && "$SIDECAR" write "$slug" "last_error=land-conflict:${_retry_cf}" >&2 || true
+      [ -x "$SERIAL_FALLBACK" ] && "$SERIAL_FALLBACK" streak-record "$repo" "$_retry_cf" >&2 || true
+      die 4 "merge still conflicted after rebase landing $slug; aborted (branch kept)"
+    fi
+    echo "worktree-extend: $slug: rebase-retry succeeded (land)" >&2
+  fi
+  [ -x "$SERIAL_FALLBACK" ] && "$SERIAL_FALLBACK" streak-reset "$repo" >&2 || true
+  # Land is complete: free the worktree now, same reasoning as integrate
+  # (PRD-build-worktree-targets-off-root) — keep the branch (no --drop-branch)
+  # so the caller's own cleanup/--drop-branch decision stays theirs.
+  local cleanup_out; cleanup_out="$(cmd_cleanup "$repo" "$slug")"
+  echo "worktree-extend: $slug: land: $cleanup_out" >&2
+  git -C "$repo" rev-parse HEAD
 }
 
 cmd_integrate() {
@@ -375,9 +520,12 @@ cmd_cleanup() {
   # Prefer the target-dir the worktree's own config names (read BEFORE
   # removing the worktree); fall back to recomputing it if the worktree/file
   # is already gone (e.g. re-running cleanup, or a worktree that pre-dates
-  # this config).
+  # this config). Non-cargo (e.g. python) repos never had one written
+  # (write_target_config no-ops for them) — skip the fallback recompute so
+  # cleanup's "freed target" message doesn't name a directory that was
+  # never created (PRD-build-python-worktree-isolation, AC2 cleanliness).
   tdir="$(read_target_dir "$wt")"
-  [ -n "$tdir" ] || tdir="$(target_dir_for "$repo" "$slug")"
+  [ -n "$tdir" ] || { [ -f "$repo/Cargo.toml" ] && tdir="$(target_dir_for "$repo" "$slug")"; }
   git -C "$repo" worktree remove --force "$wt" 2>/dev/null
   git -C "$repo" worktree prune 2>/dev/null
   [ -n "$tdir" ] && rm -rf "$tdir"
@@ -422,9 +570,10 @@ cmd_list() { local repo="${1:-}"; need "$repo" "usage: list <repo>"; git -C "$re
 
 case "${1:-}" in
   add)          shift; cmd_add "$@" ;;
+  land)         shift; cmd_land "$@" ;;
   integrate)    shift; cmd_integrate "$@" ;;
   cleanup)      shift; cmd_cleanup "$@" ;;
   prune-landed) shift; cmd_prune_landed "$@" ;;
   list)         shift; cmd_list "$@" ;;
-  *) echo "usage: worktree-extend.sh {add|integrate|cleanup|prune-landed|list} ..." >&2; exit 1 ;;
+  *) echo "usage: worktree-extend.sh {add|land|integrate|cleanup|prune-landed|list} ..." >&2; exit 1 ;;
 esac
