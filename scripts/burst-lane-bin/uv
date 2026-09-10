@@ -56,4 +56,12 @@ if [ "$route" -eq 1 ] && [ "${BURST_LANE:-0}" = "1" ] && [ "${BURST_PY:-0}" = "1
   fi
   echo "burst-lane: no session, local" >&2
 fi
+
+# PRD-build-burst-pull-on-demand requirement 2: same local-read guard as the
+# cargo shim — a worktree a burst-lane `run` elsewhere marked remote-dirty
+# (its .pybuilder/ ahead of local) must be pulled fresh before this local uv
+# reads it. Fails open if burst-lane.sh is missing.
+if [ -x "$WRAPPER" ]; then
+  "$WRAPPER" ensure-fresh "$PWD" >/dev/null 2>&1 || true
+fi
 exec "$REAL_UV" "$@"

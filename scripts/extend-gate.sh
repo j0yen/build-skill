@@ -188,7 +188,21 @@ CARGO_BUDGET="${CARGO_BUDGET:-$BUILD_SCRIPTS/cargo-budget.sh}"
 # (default unchanged in spirit, just named and shortened from the prior
 # unconditional 120 to the PRD's specified 90).
 EXTEND_GATE_PRODUCER_LOCK_WAIT="${EXTEND_GATE_PRODUCER_LOCK_WAIT:-90}"
+# PRD-build-burst-pull-on-demand requirement 2: this IS the gate harness's
+# own local-cargo choke point — every producer below (the proof-receipt
+# loop's `autobuilder loop` AND extended-receipts.sh's 17 producers) funnels
+# through cargo_budgeted, always running LOCALLY (cargo-budget.sh is a local
+# concurrency cap, never a remote route). A burst-lane `run` elsewhere may
+# have left $repo's target/ remote-dirty in the meantime; overridable so
+# tests/ can point at a fixture without touching production behavior.
+BURST_LANE_SH="${BURST_LANE_SH:-$BUILD_SCRIPTS/burst-lane.sh}"
 cargo_budgeted() {
+  # Fails open (never blocks the gate) if burst-lane.sh is missing or the
+  # pull itself fails — this gate must still run against whatever is on
+  # disk rather than turn a lazy-pull hiccup into a gate outage.
+  if [ -x "$BURST_LANE_SH" ]; then
+    "$BURST_LANE_SH" ensure-fresh "$repo" >/dev/null 2>&1 || true
+  fi
   # Runs "$@" through the budget wrapper when it's present+executable;
   # fails open (runs "$@" directly) if cargo-budget.sh is missing so a
   # partial checkout never turns a missing helper into a gate outage.

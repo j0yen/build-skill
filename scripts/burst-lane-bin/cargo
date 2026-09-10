@@ -74,4 +74,14 @@ if [ "$route" -eq 1 ] && [ "${BURST_LANE:-0}" = "1" ] && [ -x "$WRAPPER" ]; then
   fi
   echo "burst-lane: no session, local" >&2
 fi
+
+# PRD-build-burst-pull-on-demand requirement 2: every local-cargo path this
+# shim can fall through to (unrouted subcommands like `check`/`metadata`, a
+# routed subcommand with BURST_LANE unset, or the no-session branch just
+# above) lands here — the single choke point where a worktree a burst-lane
+# `run` elsewhere marked remote-dirty must be pulled fresh before it is read
+# locally. Fails open (never blocks the caller) if burst-lane.sh is missing.
+if [ -x "$WRAPPER" ]; then
+  "$WRAPPER" ensure-fresh "$PWD" >/dev/null 2>&1 || true
+fi
 exec "$REAL_CARGO" "$@"

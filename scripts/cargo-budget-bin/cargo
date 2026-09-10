@@ -75,4 +75,15 @@ esac
 if [ "$route" -eq 1 ] && [ -x "$WRAPPER" ]; then
   exec "$WRAPPER" run -- "$REAL_CARGO" "$@"
 fi
+
+# PRD-build-burst-pull-on-demand requirement 2: this shim runs purely
+# locally (cargo-budget.sh is a concurrency cap, never a remote route), but
+# a burst-lane `run` elsewhere may have marked $PWD remote-dirty in the
+# meantime — the invariant is "no local cargo without a preceding pull" for
+# EVERY local-cargo path, not just burst-lane-bin/cargo's own. Fails open if
+# burst-lane.sh is missing.
+BURST_LANE_SH="$HERE/../burst-lane.sh"
+if [ -x "$BURST_LANE_SH" ]; then
+  "$BURST_LANE_SH" ensure-fresh "$PWD" >/dev/null 2>&1 || true
+fi
 exec "$REAL_CARGO" "$@"

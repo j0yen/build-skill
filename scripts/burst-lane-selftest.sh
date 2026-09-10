@@ -37,6 +37,21 @@ expect() {
   if eval "$cond"; then echo "ok  $label"; else echo "FAIL $label" >&2; fail=1; fi
 }
 
+# PRD-build-burst-pull-on-demand: rc0 iff `status --json`'s "dirty" array
+# lists $1 by exact worktree path (used instead of a raw grep since a JSON
+# array's field order/whitespace is an implementation detail this selftest
+# should not pin down).
+dirty_has() {
+  "$BL" status --json 2>/dev/null | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+sys.exit(0 if any(x.get("worktree") == sys.argv[1] for x in d.get("dirty", [])) else 1)
+' "$1"
+}
+
 fresh_env() {
   T="$(mktemp -d "${TMPDIR:-/tmp}/bl-selftest.XXXXXX")"
   ALL_TMPDIRS+=("$T")
@@ -88,25 +103,49 @@ create_calls3="$(grep -c 'server create' "$FAKE_HCLOUD_CALLLOG")"
 expect "adoption made no create call" "[ \"$create_calls3\" -eq 1 ]"
 expect "adoption journaled" "grep -q 'burst-lane  up  adopted' \"$BURST_LANE_JOURNAL\""
 
-# ---- AC2: run's exit-code passthrough + artifact sync-back -----------------
+# ---- AC2: run's exit-code passthrough; PRD-build-burst-pull-on-demand ------
+# requirement 1 supersedes the old "run pulls target/ back itself" behavior:
+# `run` now only marks the worktree remote-dirty and returns — the artifact
+# is fetched lazily, at whichever consumer actually needs it next (here, an
+# explicit `pull`).
 WT="$T/worktree"; mkdir -p "$WT"
 echo 'mkdir -p target && echo built > target/out.txt; exit 7' > "$WT/build.sh"
 run_out="$("$BL" run "$WT" -- bash build.sh 2>&1)"; run_rc=$?
 expect "run propagates the remote exit code" "[ $run_rc -eq 7 ]"
-expect "run pulled target/ back to the worktree" "[ -f \"$WT/target/out.txt\" ]"
+expect "run does NOT pull target/ back itself (burstpull req 1)" "[ ! -e \"$WT/target\" ]"
 expect "run journaled the routed call" "grep -q 'burst-lane  run  routed' \"$BURST_LANE_JOURNAL\""
-expect "run's journal line records bytes transferred (req 10)" "grep -q 'burst-lane  run  routed.*bytes=[0-9]' \"$BURST_LANE_JOURNAL\""
+expect "run's journal line marks the worktree dirty instead of pulling (burstpull req 1)" \
+  "grep -q 'burst-lane  run  routed.*dirty=1' \"$BURST_LANE_JOURNAL\""
+expect "run leaves the worktree listed dirty by status (burstpull req 3)" "dirty_has \"$WT\""
 
-# ---- AC11: a second `run` on the same (now-warm) worktree transfers fewer
-# bytes than the first — the target/ pull-back is incremental, not a fresh
-# whole copy each time (requirement 10).
+pull_out="$("$BL" pull "$WT" 2>&1)"; pull_rc=$?
+expect "explicit pull succeeds (burstpull req 3)" "[ $pull_rc -eq 0 ] && [ \"$pull_out\" = pulled ]"
+expect "explicit pull fetched target/ back (burstpull req 3)" "[ -f \"$WT/target/out.txt\" ]"
+expect "explicit pull cleared the dirty marker (burstpull req 3)" "! dirty_has \"$WT\""
+
+# ---- burstpull AC1: two consecutive remote runs on one worktree pull ZERO
+# times between them — the marker stays dirty across both, and both
+# attribution rows carry pulls_skipped with an estimate flag (requirement 1,
+# requirement 5).
+rm -rf "$WT/target"
 run_out2="$("$BL" run "$WT" -- bash build.sh 2>&1)"; run_rc2=$?
 expect "second run also propagates the remote exit code" "[ $run_rc2 -eq 7 ]"
-bytes1="$(grep 'burst-lane  run  routed' "$BURST_LANE_JOURNAL" | sed -n '1p' | grep -oE 'bytes=[0-9]+' | cut -d= -f2)"
-bytes2="$(grep 'burst-lane  run  routed' "$BURST_LANE_JOURNAL" | sed -n '2p' | grep -oE 'bytes=[0-9]+' | cut -d= -f2)"
-expect "first run journaled a byte count" "[ -n \"$bytes1\" ]"
-expect "second run journaled a byte count" "[ -n \"$bytes2\" ]"
-expect "second run's journal line shows fewer bytes than the first (AC11)" "[ \"${bytes2:-0}\" -lt \"${bytes1:-0}\" ]"
+run_out2b="$("$BL" run "$WT" -- bash build.sh 2>&1)"; run_rc2b=$?
+expect "third (consecutive) run also propagates the remote exit code" "[ $run_rc2b -eq 7 ]"
+expect "no pull ran between two consecutive remote runs (AC1)" "[ ! -e \"$WT/target\" ]"
+expect "worktree still listed dirty after two consecutive runs (AC1)" "dirty_has \"$WT\""
+ac1_rc=0
+python3 -c "
+import json
+rows = [json.loads(l) for l in open('$BURST_LANE_ATTR_LEDGER') if l.strip()]
+last_two = [r for r in rows if r.get('kind', 'run') == 'run'][-2:]
+assert len(last_two) == 2, 'expected 2 run rows, got %d' % len(last_two)
+for r in last_two:
+    assert r.get('pulls_skipped') == 1, r
+    assert r.get('estimate') is True, r
+" || ac1_rc=1
+expect "both consecutive-run attribution rows carry pulls_skipped + estimate=true (AC1)" "[ $ac1_rc -eq 0 ]"
+"$BL" pull "$WT" >/dev/null 2>&1   # leave the worktree clean for the next block
 
 # ---- requirement 13: cost-ledger PRD-served attribution ---------------------
 # A caller that knows its own PRD slug (branch/gate dispatch) exports
@@ -140,9 +179,17 @@ EOF
 chmod +x "$FAKEBIN_PY/uv"
 py_run_out="$(PATH="$FAKEBIN_PY:$PATH" "$BL" run "$WT_PY" -- "$FAKEBIN_PY/uv" run pytest 2>&1)"; py_run_rc=$?
 expect "python run (uv-routed) exits 0" "[ $py_run_rc -eq 0 ]"
-expect "python run pulled .pybuilder/ back to the worktree, not target/ (req 12)" \
-  "[ -f \"$WT_PY/.pybuilder/out.txt\" ] && [ ! -e \"$WT_PY/target\" ]"
+# PRD-build-burst-pull-on-demand: laziness applies to the pybuilder pull-back
+# exactly like the cargo one — `run` marks the worktree dirty (kind=pybuilder)
+# and does not pull; an explicit pull fetches .pybuilder/, never target/.
+expect "python run does NOT pull .pybuilder/ back itself (burstpull req 1)" \
+  "[ ! -e \"$WT_PY/.pybuilder\" ] && [ ! -e \"$WT_PY/target\" ]"
 expect "python run journaled the routed call" "grep -q 'burst-lane  run  routed.*worktree=$WT_PY' \"$BURST_LANE_JOURNAL\""
+expect "python run journaled dirty=1 kind=pybuilder (burstpull req 1)" \
+  "grep -q 'burst-lane  run  routed.*worktree=$WT_PY.*dirty=1 kind=pybuilder' \"$BURST_LANE_JOURNAL\""
+py_pull_out="$("$BL" pull "$WT_PY" 2>&1)"; py_pull_rc=$?
+expect "explicit pull fetches .pybuilder/ back, not target/ (burstpull req 3)" \
+  "[ $py_pull_rc -eq 0 ] && [ -f \"$WT_PY/.pybuilder/out.txt\" ] && [ ! -e \"$WT_PY/target\" ]"
 
 # ---- unit: cargo_target_dir_for (worktree-targets-off-root interaction) ----
 # mcphost-call-limits-honest, 2026-09-09 19:58Z: a worktree's own
@@ -218,6 +265,126 @@ expect "cost --today prints hours and euros" "grep -qE 'hours=[0-9.]+ eur=[0-9.]
 expect "cost --today prints the PRDs served this session (AC13)" \
   "grep -q 'prds=' <<<\"$cost_today_out\" && grep -q 'fake-prd-slug-1' <<<\"$cost_today_out\" && grep -q 'worktree' <<<\"$cost_today_out\""
 expect "state cleared prds_served after deletion" "[ ! -f \"$BURST_LANE_STATE_DIR/prds_served\" ]"
+unset BURST_LANE_NOW
+
+# ---- burstpull AC2: a dirty worktree's local cargo consumer (the shim's
+# local-fallback path) triggers exactly one pull first, clears the marker,
+# and the pull's own attribution row records trigger=local-read with the
+# reading slug (requirement 2).
+fresh_env
+mkdir -p "$BURST_LANE_REPOS_DIR/mcphost"
+WT_LR="$BURST_LANE_REPOS_DIR/mcphost"   # -> attribution_slug_for = shared-mcphost
+echo 'mkdir -p target && echo built > target/out.txt; exit 0' > "$WT_LR/build.sh"
+"$BL" run "$WT_LR" -- bash build.sh >/dev/null 2>&1
+expect "burstpull AC2 setup: run left the worktree dirty" "dirty_has \"$WT_LR\""
+expect "burstpull AC2 setup: target/ not present yet" "[ ! -e \"$WT_LR/target\" ]"
+
+FAKEBIN_LR="$T/fakebin-lr"; mkdir -p "$FAKEBIN_LR"
+cat > "$FAKEBIN_LR/cargo" <<'EOF'
+#!/usr/bin/env bash
+echo "local-cargo-ran: $*"
+exit 0
+EOF
+chmod +x "$FAKEBIN_LR/cargo"
+# `check` is never routed regardless of BURST_LANE — a deterministic way to
+# exercise the shim's local-fallback path (and therefore ensure-fresh).
+shim_lr_out="$(cd "$WT_LR" && PATH="$HERE/burst-lane-bin:$FAKEBIN_LR:$FAKE:$PATH" BURST_LANE=1 "$SHIM" check 2>&1)"
+expect "burstpull AC2: shim ran local cargo (after the pull)" "grep -q 'local-cargo-ran: check' <<<\"$shim_lr_out\""
+expect "burstpull AC2: one pull happened before the local cargo ran" "[ -f \"$WT_LR/target/out.txt\" ]"
+expect "burstpull AC2: marker cleared after the local-read pull" "! dirty_has \"$WT_LR\""
+ac2lr_rc=0
+python3 -c "
+import json
+rows = [json.loads(l) for l in open('$BURST_LANE_ATTR_LEDGER') if l.strip()]
+pulls = [r for r in rows if r.get('kind') == 'pull']
+assert len(pulls) == 1, pulls
+assert pulls[0]['trigger'] == 'local-read', pulls[0]
+assert pulls[0]['slug'] == 'shared-mcphost', pulls[0]
+" || ac2lr_rc=1
+expect "burstpull AC2: exactly one pull attribution row, trigger=local-read, reading slug (req 2)" "[ $ac2lr_rc -eq 0 ]"
+
+# ---- burstpull AC5: an explicit pull racing a live run on the SAME
+# worktree is refused (named error, no rsync) rather than interleaved with
+# it (requirement 6). $WT_LR is already dirty from the AC2 block's re-run
+# above; a background holder of the SAME worktree lock file `run` itself
+# would hold (acquire_run_slot's fd 203 lock, keyed by worktree_lock_key)
+# stands in for a live run in flight — never call `run` itself here, since
+# it would just block on that same lock rather than race it.
+"$BL" run "$WT_LR" -- bash build.sh >/dev/null 2>&1   # re-dirty it for this test
+lockfile_lr="$BURST_LANE_STATE_DIR/locks/wt-$(python3 -c "import hashlib,sys; print(hashlib.sha1(sys.argv[1].encode()).hexdigest()[:16])" "$WT_LR").lock"
+mkdir -p "$(dirname "$lockfile_lr")"
+(
+  exec 209>"$lockfile_lr"
+  flock 209
+  sleep 2
+) &
+holder_pid=$!
+sleep 0.3   # let the background subshell actually take the flock first
+race_out="$("$BL" pull "$WT_LR" 2>&1)"; race_rc=$?
+wait "$holder_pid" 2>/dev/null || true
+expect "burstpull AC5: explicit pull is refused while the worktree lock is held" "[ $race_rc -eq 4 ]"
+expect "burstpull AC5: refusal names the cause" "grep -qi 'refused: worktree busy' <<<\"$race_out\""
+expect "burstpull AC5: refusal journaled" "grep -q 'burst-lane  pull  refused' \"$BURST_LANE_JOURNAL\""
+"$BL" pull "$WT_LR" >/dev/null 2>&1   # clean up now that the holder has released
+
+# ---- burstpull AC4: teardown sweep pulls every still-dirty worktree before
+# the box dies; a worktree whose remote dir has vanished goes cold (cleared,
+# journaled) instead of aborting the sweep or leaking a stale read; the
+# other two dirty worktrees are still pulled and the box is deleted only
+# after the sweep runs (requirement 4).
+fresh_env
+mkdir -p "$BURST_LANE_REPOS_DIR/mcphost"
+"$BL" up >/dev/null
+declare -a sweep_wts=()
+for slug in sw-one sw-two sw-cold sw-busy; do
+  wt="$T/mcphost-$slug"; mkdir -p "$wt"
+  echo 'mkdir -p target && echo built > target/out.txt; exit 0' > "$wt/build.sh"
+  "$BL" run "$wt" -- bash build.sh >/dev/null 2>&1
+  sweep_wts+=("$wt")
+done
+for wt in "${sweep_wts[@]}"; do
+  expect "burstpull AC4 setup: $(basename "$wt") is dirty before teardown" "dirty_has \"$wt\""
+done
+# Simulate "the box already gone for this one worktree": delete its remote
+# dir out from under the (otherwise still-alive) session.
+cold_remote="$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('remote_path',''))" \
+  "$BURST_LANE_STATE_DIR/dirty/$(printf '%s' "$T/mcphost-sw-cold" | sha1sum | cut -c1-8).json")"
+rm -rf "$cold_remote"
+
+# Simulate "a live run is still in flight on this one worktree right as the
+# box is about to die": hold its wt-lock in the background — the sweep must
+# skip it (leave it dirty, journal a failure) rather than abort (requirement
+# 4: "per-worktree failure does not abort the sweep").
+busy_lockfile="$BURST_LANE_STATE_DIR/locks/wt-$(python3 -c "import hashlib,sys; print(hashlib.sha1(sys.argv[1].encode()).hexdigest()[:16])" "$T/mcphost-sw-busy").lock"
+mkdir -p "$(dirname "$busy_lockfile")"
+( exec 208>"$busy_lockfile"; flock 208; sleep 3 ) &
+busy_holder_pid=$!
+sleep 0.3
+
+boot_epoch_sw="$(grep -oE '"boot_epoch":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+export BURST_LANE_NOW=$((boot_epoch_sw + 3600 - 60))
+down_sw_out="$("$BL" down)"
+wait "$busy_holder_pid" 2>/dev/null || true
+expect "burstpull AC4: teardown still deletes cleanly despite one cold + one busy worktree" "[ \"$down_sw_out\" = 'decision=deleted' ]"
+expect "burstpull AC4: the two pullable worktrees got their target/ back" \
+  "[ -f \"$T/mcphost-sw-one/target/out.txt\" ] && [ -f \"$T/mcphost-sw-two/target/out.txt\" ]"
+expect "burstpull AC4: the cold worktree's target/ was never fetched" "[ ! -e \"$T/mcphost-sw-cold/target\" ]"
+expect "burstpull AC4: the busy worktree's target/ was never fetched either (sweep skipped it, did not wait)" \
+  "[ ! -e \"$T/mcphost-sw-busy/target\" ]"
+# NOTE: `dirty_has` reads `status --json`'s "dirty" array, which (like
+# "no active session" above) is only populated while a session is active —
+# `down` just tore this one down, so from here on marker state must be
+# checked as raw files on disk instead (marker_file mirrors
+# dirty_marker_file()'s own sha1-prefix key scheme).
+marker_file() { printf '%s/dirty/%s.json\n' "$BURST_LANE_STATE_DIR" "$(printf '%s' "$1" | sha1sum | cut -c1-8)"; }
+expect "burstpull AC4: the pulled/cold markers are cleared after the sweep" \
+  "[ ! -s \"$(marker_file "$T/mcphost-sw-one")\" ] && [ ! -s \"$(marker_file "$T/mcphost-sw-two")\" ] && [ ! -s \"$(marker_file "$T/mcphost-sw-cold")\" ]"
+expect "burstpull AC4: the busy worktree's marker is LEFT dirty for a later retry (sweep does not abort on it)" \
+  "[ -s \"$(marker_file "$T/mcphost-sw-busy")\" ]"
+expect "burstpull AC4: the cold worktree was journaled cold, not silently dropped" \
+  "grep -q 'burst-lane  pull  cold.*mcphost-sw-cold' \"$BURST_LANE_JOURNAL\""
+expect "burstpull AC4: the busy worktree's sweep failure is journaled, and the sweep continued past it" \
+  "grep -q 'burst-lane  down  sweep-failed.*mcphost-sw-busy' \"$BURST_LANE_JOURNAL\""
 unset BURST_LANE_NOW
 
 # ---- AC6: watchdog TTL teardown ----------------------------------------------
@@ -342,8 +509,14 @@ rows = [json.loads(l) for l in open("$BURST_LANE_COST_LEDGER") if l.strip()]
 sid = "$sid3"
 session_rows = [r for r in rows if r.get("session_id") == sid and "hours" in r]
 slug_rows = [r for r in rows if r.get("kind") == "slug" and r.get("session_id") == sid]
-if len(slug_rows) != 3:
-    print("expected 3 slug rows, got", len(slug_rows), file=sys.stderr); sys.exit(1)
+# PRD-build-burst-pull-on-demand requirement 4: none of these 3 runs had a
+# local reader, so all 3 worktrees are still dirty at teardown — the sweep
+# pulls all 3 before the box dies, landing a 4th "teardown" slug row (lane
+# overhead, requirement 7) alongside alpha/beta/gamma.
+if len(slug_rows) != 4:
+    print("expected 4 slug rows (alpha/beta/gamma + teardown), got", len(slug_rows), file=sys.stderr); sys.exit(1)
+if not any(r.get("slug") == "teardown" for r in slug_rows):
+    print("expected a teardown-attributed slug row from the sweep", file=sys.stderr); sys.exit(1)
 if not session_rows:
     print("no session row found for", sid, file=sys.stderr); sys.exit(1)
 total = sum(r["eur"] for r in slug_rows)
@@ -351,7 +524,7 @@ if abs(total - session_rows[-1]["eur"]) > 1e-6:
     print("conservation mismatch", total, session_rows[-1]["eur"], file=sys.stderr); sys.exit(1)
 sys.exit(0)
 PY
-expect "AC3: cost ledger gains 3 slug rows whose eur sums exactly to the session eur" "[ \"$ac3_rc\" -eq 0 ]"
+expect "AC3: cost ledger gains 4 slug rows (incl. teardown sweep) whose eur sums exactly to the session eur" "[ \"$ac3_rc\" -eq 0 ]"
 
 # ---- AC4: `cost --by-prd --session <id>` lists the 3 slugs + a totals row -
 by_prd_out="$("$BL" cost --by-prd --session "$sid3" 2>&1)"; by_prd_rc=$?
@@ -359,6 +532,13 @@ expect "AC4: cost --by-prd --session exits 0 (conservation check passes)" "[ $by
 expect "AC4: cost --by-prd lists all 3 slugs" \
   "grep -q '^alpha' <<<\"$by_prd_out\" && grep -q '^beta' <<<\"$by_prd_out\" && grep -q '^gamma' <<<\"$by_prd_out\""
 expect "AC4: cost --by-prd prints a TOTAL row" "grep -q '^TOTAL' <<<\"$by_prd_out\""
+# ---- burstpull P1 AC7: the skip yield (pulls_skipped, bytes_saved -> GB) is
+# readable in the same table, per-slug — not a separate report (requirement
+# 5). alpha/beta/gamma above were never locally read, so the teardown sweep
+# skip-accounted them; a "teardown" row (the sweep's own pulls) and the
+# alpha/beta/gamma rows should all show up under the header.
+expect "burstpull P1 AC7: cost --by-prd table header includes the skip-yield columns" \
+  "grep -qE '^slug .*skipped.*GBsaved' <<<\"$by_prd_out\""
 unset BURST_LANE_NOW
 
 # ---- AC5: a crashed prior session's rows roll into the next teardown, ------
@@ -402,6 +582,13 @@ today_file="$BURST_LANE_TICK_JOURNAL_DIR/$(date -u -d "@$BURST_LANE_NOW" +%Y-%m-
 rollup_count="$(grep -c '^burst-cost:' "$today_file" 2>/dev/null || echo 0)"
 expect "AC6: exactly one daily burst-cost rollup line after two down calls same day" "[ \"$rollup_count\" -eq 1 ]"
 expect "AC6: rollup line names eur/slug-count/top slug" "grep -q '^burst-cost: .* across .* slugs; top ' \"$today_file\""
+# ---- burstpull P1 AC8: the same daily rollup line also carries the lazy-
+# pull yield — pulls skipped and estimated GB saved (requirement 5/8). wt6's
+# run above was never locally read before teardown, so its sweep pull counts
+# as one skip surfaced here (bytes_saved=0 the first time anything ever ran
+# against a fresh worktree — no prior pull to estimate from).
+expect "burstpull P1 AC8: daily rollup line names pulls skipped and GB saved" \
+  "grep -qE '^burst-cost: .*; pulls skipped [0-9]+, saved ~[0-9.]+ GB' \"$today_file\""
 unset BURST_LANE_NOW
 
 echo "=== $([ $fail -eq 0 ] && echo PASS || echo FAIL) ==="

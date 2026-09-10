@@ -137,6 +137,14 @@ PRD_DIR="${BURST_LANE_PRD_DIR:-$HOME/Documents/PRDs}"
 # 4), and the tick journal directory that rollup line lands in — distinct
 # from $JOURNAL above, which is this script's own flat log.
 ATTR_LEDGER="${BURST_LANE_ATTR_LEDGER:-$STATE_DIR/attribution.jsonl}"
+# PRD-build-burst-pull-on-demand: lazy-pull state. DIRTY_DIR holds one
+# marker per worktree (keyed like remote_path_for()'s sha1 scheme) recording
+# that a completed remote `run` left target/ (or .pybuilder/) ahead of the
+# local worktree; PULLSZ_DIR remembers the last ACTUAL pull's byte count per
+# worktree (survives marker clears) so a skipped pull's telemetry can still
+# print an `estimate: true` bytes_saved figure instead of a bare zero.
+DIRTY_DIR="$STATE_DIR/dirty"
+PULLSZ_DIR="$STATE_DIR/pull-sizes"
 ATTR_REPOS_DIR="${BURST_LANE_REPOS_DIR:-$HOME/wintermute}"
 ROLLUP_CURSOR="$STATE_DIR/.rollup-cursor"
 TICK_JOURNAL_DIR="${BURST_LANE_TICK_JOURNAL_DIR:-$HOME/brain/journal/build}"
@@ -164,7 +172,7 @@ COST_PER_HOUR_EUR="0.47"
 REMOTE_ROOT="${BURST_LANE_REMOTE_ROOT:-/root/build}"
 
 die() { echo "burst-lane: $*" >&2; exit "${2:-1}"; }
-usage() { echo "usage: burst-lane.sh {up|status|run|sync-back|down|watchdog|cost|sub-cap|verify} ..." >&2; exit 2; }
+usage() { echo "usage: burst-lane.sh {up|status|run|sync-back|pull|ensure-fresh|down|watchdog|cost|sub-cap|verify} ..." >&2; exit 2; }
 
 now_epoch() { echo "${BURST_LANE_NOW:-$(date -u +%s)}"; }
 now_iso()   { date -u -d "@$(now_epoch)" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ; }
@@ -459,11 +467,45 @@ cmd_status() {
   # `concurrent=` fields scattered across `run` lines.
   conc="$(count_held_slots)"
   probe_emit burst-status dirty "active session $id ip=$ip alive=${alive}m" >/dev/null
+
+  # PRD-build-burst-pull-on-demand requirement 3: dirty worktrees, with age
+  # (seconds since marked), so an operator can see the lazy-pull backlog at a
+  # glance. Appended only in the ACTIVE-session branch — the "no active
+  # session"/"could-not-check" strings above are matched EXACTLY (by name,
+  # not substring) by the cargo/uv shims' own status-parse, and must never
+  # gain trailing content.
+  mkdir -p "$DIRTY_DIR" 2>/dev/null || true
+  local dirty_json dirty_lines
+  dirty_json="$(python3 -c '
+import json, glob, sys, time
+now = int(sys.argv[1])
+rows = []
+for f in sorted(glob.glob(sys.argv[2] + "/*.json")):
+    try:
+        d = json.load(open(f))
+    except Exception:
+        continue
+    ts = d.get("marked_ts", "")
+    try:
+        marked_epoch = int(time.mktime(time.strptime(ts, "%Y-%m-%dT%H:%M:%SZ")))
+    except Exception:
+        marked_epoch = now
+    d["age_seconds"] = max(0, now - marked_epoch)
+    rows.append(d)
+print(json.dumps(rows))
+' "$(now_epoch)" "$DIRTY_DIR")"
+  dirty_lines="$(python3 -c '
+import json, sys
+for r in json.loads(sys.argv[1]):
+    print("dirty: %s age=%ss" % (r.get("worktree", ""), r.get("age_seconds", 0)))
+' "$dirty_json")"
+
   if [ "$json" -eq 1 ]; then
-    printf '{"active":true,"server_id":"%s","ip":"%s","minutes_alive":%s,"ttl_hours":"%s","sandbox_ok":"%s","concurrent":"%s"}\n' \
-      "$id" "$ip" "$alive" "$ttl" "$sbx" "$conc"
+    printf '{"active":true,"server_id":"%s","ip":"%s","minutes_alive":%s,"ttl_hours":"%s","sandbox_ok":"%s","concurrent":"%s","dirty":%s}\n' \
+      "$id" "$ip" "$alive" "$ttl" "$sbx" "$conc" "$dirty_json"
   else
     echo "active: $id ip=$ip alive=${alive}m ttl=${ttl}h sandbox_ok=$sbx concurrent=$conc"
+    [ -n "$dirty_lines" ] && printf '%s\n' "$dirty_lines"
   fi
   exit 0
 }
@@ -590,19 +632,38 @@ now_fractional() { date +%s.%N; }
 # Requirement 1 (cont'd): append one NDJSON row to the attribution ledger.
 # Called from inside cmd_run, under the RUN_LOCK it already holds for the
 # whole rsync+ssh+rsync body — no separate lock needed for the append.
-attribution_record() {  # $1=slug $2=session_id $3=wall_s $4=sync_s $5=bytes $6=worktree
+#
+# PRD-build-burst-pull-on-demand extends this with two row shapes sharing
+# one file (the cost-ledger's own kind:"slug" additive-row precedent):
+#   kind="run"  (default, $7 unset/"run"): a completed remote run. $8/$9/$10
+#     are pulls_skipped (0/1 — always 1 now that `run` never pulls itself),
+#     bytes_saved (estimate from the worktree's last observed pull, or 0 if
+#     none has ever happened) and estimate (always "true" when
+#     pulls_skipped>0 — this PRD never claims an exact figure for a transfer
+#     that didn't happen).
+#   kind="pull" ($7="pull"): a lazy pull that DID execute. $11=trigger
+#     (local-read|explicit|teardown). wall_seconds is always 0 (no remote
+#     exec happened); sync_s/bytes are the pull's own cost.
+attribution_record() {  # $1=slug $2=session_id $3=wall_s $4=sync_s $5=bytes $6=worktree [$7=kind $8=pulls_skipped $9=bytes_saved $10=estimate $11=trigger]
   mkdir -p "$STATE_DIR" 2>/dev/null || true
+  local kind="${7:-run}" pulls_skipped="${8:-0}" bytes_saved="${9:-0}" estimate="${10:-false}" trigger="${11:-}"
   python3 -c '
 import json, sys
-slug, sid, wall_s, sync_s, nbytes, worktree, date, path = sys.argv[1:9]
+slug, sid, wall_s, sync_s, nbytes, worktree, date, path, kind, pulls_skipped, bytes_saved, estimate, trigger = sys.argv[1:14]
 row = {
     "date": date, "session_id": sid, "slug": slug,
     "wall_seconds": round(float(wall_s), 3), "sync_s": round(float(sync_s), 3),
-    "bytes": int(nbytes or 0), "worktree": worktree,
+    "bytes": int(nbytes or 0), "worktree": worktree, "kind": kind,
 }
+if kind == "pull":
+    row["trigger"] = trigger
+else:
+    row["pulls_skipped"] = int(pulls_skipped or 0)
+    row["bytes_saved"] = int(bytes_saved or 0)
+    row["estimate"] = (estimate == "true")
 with open(path, "a") as fh:
     fh.write(json.dumps(row) + "\n")
-' "$1" "$2" "$3" "$4" "$5" "$6" "$(now_iso)" "$ATTR_LEDGER"
+' "$1" "$2" "$3" "$4" "$5" "$6" "$(now_iso)" "$ATTR_LEDGER" "$kind" "$pulls_skipped" "$bytes_saved" "$estimate" "$trigger"
 }
 
 # ---- run --------------------------------------------------------------------
@@ -617,6 +678,128 @@ remote_path_for() {  # $1=worktree -> stdout remote dir
   printf '%s/%s-%s\n' "$REMOTE_ROOT" "$(basename "$1")" "$wkey"
 }
 worktree_lock_key() { printf '%s' "$1" | sha1sum | cut -c1-16; }
+wt_lock_file() { printf '%s/locks/wt-%s.lock\n' "$STATE_DIR" "$(worktree_lock_key "$1")"; }
+
+# ---- lazy pull: dirty marker (PRD-build-burst-pull-on-demand requirement 1) -
+# One marker file per worktree, keyed the same way remote_path_for() keys its
+# remote dir — so the marker survives a worktree's own git resets (state
+# lives outside the worktree, per the worktree-reset-wipes-state rule) and
+# is trivially found again by any later invocation regardless of the
+# worktree's own git state.
+dirty_marker_file() {  # $1=worktree -> stdout path
+  local wkey; wkey="$(printf '%s' "$1" | sha1sum | cut -c1-8)"
+  printf '%s/%s.json\n' "$DIRTY_DIR" "$wkey"
+}
+
+mark_dirty() {  # $1=worktree $2=session_id $3=remote_path $4=kind (target|pybuilder)
+  mkdir -p "$DIRTY_DIR" 2>/dev/null || true
+  python3 -c '
+import json, sys
+worktree, sid, remote_path, kind, ts, path = sys.argv[1:7]
+row = {"worktree": worktree, "session_id": sid, "remote_path": remote_path, "kind": kind, "marked_ts": ts}
+with open(path, "w") as fh:
+    fh.write(json.dumps(row))
+' "$1" "$2" "$3" "$4" "$(now_iso)" "$(dirty_marker_file "$1")"
+}
+
+is_dirty() { [ -s "$(dirty_marker_file "$1")" ]; }  # $1=worktree -> rc0 dirty
+
+dirty_field() {  # $1=worktree $2=field -> stdout value; rc1 if no marker/field
+  local f; f="$(dirty_marker_file "$1")"
+  [ -s "$f" ] || return 1
+  python3 -c '
+import json, sys
+path, key = sys.argv[1:3]
+try:
+    d = json.load(open(path))
+except Exception:
+    sys.exit(1)
+print(d.get(key, ""))
+' "$f" "$2"
+}
+
+clear_dirty() { rm -f "$(dirty_marker_file "$1")"; }  # $1=worktree
+
+# Last ACTUAL pull's byte count for a worktree — the "last observed pull
+# size" the PRD's requirement 1 wants a skipped pull's bytes_saved estimated
+# from. Kept in its own file (not the marker) so it survives clear_dirty.
+record_pull_size() {  # $1=worktree $2=bytes
+  mkdir -p "$PULLSZ_DIR" 2>/dev/null || true
+  local wkey; wkey="$(printf '%s' "$1" | sha1sum | cut -c1-8)"
+  printf '%s\n' "${2:-0}" > "$PULLSZ_DIR/$wkey"
+}
+last_pull_size() {  # $1=worktree -> stdout bytes (0 if never pulled)
+  local wkey; wkey="$(printf '%s' "$1" | sha1sum | cut -c1-8)"
+  cat "$PULLSZ_DIR/$wkey" 2>/dev/null || echo 0
+}
+
+# rc0 if the box currently reachable at $1 still has $2 on disk — used both
+# to decide whether a lazy pull can proceed and (when it can't) whether that
+# marker should go COLD (box/dir provably gone — requirement 4) rather than
+# be left dirty forever. A totally unreachable box (ssh itself fails) is
+# indistinguishable from "the dir is gone" here, and is treated the same:
+# correctness by recompile, never a silent stale read.
+remote_dir_exists() {  # $1=ip $2=remote_path -> rc0 exists
+  "$SSH_BIN" -o StrictHostKeyChecking=no -o ConnectTimeout=8 -i "$SSH_KEY" \
+    "$REMOTE_USER@$1" "[ -d '$2' ]" 2>/dev/null
+}
+
+# Shared body for actually executing a lazy pull against one dirty marker.
+# Does NOT itself lock — callers hold (or non-blockingly probe) the
+# worktree's own flock as their race-safety strategy differs (see cmd_pull,
+# cmd_ensure_fresh, sweep_dirty_worktrees below). Three outcomes:
+#   pulled: marker cleared, pull size recorded, kind="pull" attribution row
+#     appended, journaled — rc0.
+#   cold (no active session, or the remote dir provably no longer exists):
+#     marker cleared anyway (requirement 4 — never a silent stale read; the
+#     next local build just recompiles), journaled, rc0.
+#   real failure (box up, dir exists, rsync itself failed): marker LEFT IN
+#     PLACE for a later retry, journaled, rc1.
+do_marker_pull() {  # $1=worktree $2=trigger(local-read|explicit|teardown) -> rc0 handled, rc1 real failure
+  local worktree="$1" trigger="$2" sid remote_path kind
+  is_dirty "$worktree" || return 0
+  sid="$(dirty_field "$worktree" session_id)"
+  remote_path="$(dirty_field "$worktree" remote_path)"
+  kind="$(dirty_field "$worktree" kind)"
+
+  if ! state_active; then
+    clear_dirty "$worktree"
+    journal_line "$(now_iso)  burst-lane  pull  cold  (worktree=$worktree session_id=$sid trigger=$trigger cause=no-active-session — local target stale, next local build recompiles)"
+    return 0
+  fi
+  local ip; ip="$(state_read ip)"
+
+  if ! remote_dir_exists "$ip" "$remote_path"; then
+    clear_dirty "$worktree"
+    journal_line "$(now_iso)  burst-lane  pull  cold  (worktree=$worktree session_id=$sid remote_path=$remote_path trigger=$trigger cause=remote-dir-missing — local target stale, next local build recompiles)"
+    return 0
+  fi
+
+  local t0 t1 bytes prc=0
+  t0="$(now_fractional)"
+  if [ "$kind" = "pybuilder" ]; then
+    bytes="$(pull_pybuilder_incremental "$worktree" "$ip")" || prc=1
+  else
+    bytes="$(pull_target_incremental "$worktree" "$ip")" || prc=1
+  fi
+  t1="$(now_fractional)"
+  if [ "$prc" -ne 0 ]; then
+    journal_line "$(now_iso)  burst-lane  pull  fallback  (cause=rsync-failed worktree=$worktree trigger=$trigger — marker left dirty for retry)"
+    return 1
+  fi
+
+  record_pull_size "$worktree" "${bytes:-0}"
+  clear_dirty "$worktree"
+  local sync_s slug
+  sync_s="$(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.3f", b-a}')"
+  # requirement 7: teardown pulls are lane overhead, not the reading party's
+  # own cost — everything else is attributed to whoever's local read
+  # triggered it (same derivation a run itself would use for this worktree).
+  if [ "$trigger" = "teardown" ]; then slug="teardown"; else slug="$(attribution_slug_for "$worktree")"; fi
+  attribution_record "$slug" "$sid" 0 "$sync_s" "${bytes:-0}" "$worktree" pull 0 0 false "$trigger"
+  journal_line "$(now_iso)  burst-lane  pull  ok  (worktree=$worktree trigger=$trigger bytes=${bytes:-0} slug=$slug)"
+  return 0
+}
 
 # PRD-build-burst-parallel-runs AC6: non-blocking peek at how many run slots
 # are currently held, for `status` to report `concurrent=<held>/<cap>`. Never
@@ -707,7 +890,7 @@ cmd_run() {
   # slug measure the REMOTE EXEC only; rsync up+down time is tracked
   # separately as sync_s (sizing evidence for the incremental-pull work,
   # not this PRD's own cost-share denominator).
-  local t_up_start t_up_end t_remote_end t_down_end
+  local t_up_start t_up_end t_remote_end
   t_up_start="$(now_fractional)"
 
   if ! "$RSYNC_BIN" -az --delete --exclude target --exclude .git --exclude .venv \
@@ -744,23 +927,15 @@ cmd_run() {
     exit 3
   fi
 
-  # Requirement 12: a uv-routed (python) run pulls .pybuilder/ back, not
-  # target/ — it has no Cargo target-dir to resolve.
-  local bytes
-  if [ "$first" = "uv" ]; then
-    if ! bytes="$(pull_pybuilder_incremental "$worktree" "$ip")"; then
-      journal_line "$(now_iso)  burst-lane  run  fallback  (cause=rsync-down-failed worktree=$worktree kind=python)"
-      echo "fallback: rsync from $ip failed"
-      exit 3
-    fi
-  else
-    if ! bytes="$(pull_target_incremental "$worktree" "$ip")"; then
-      journal_line "$(now_iso)  burst-lane  run  fallback  (cause=rsync-down-failed worktree=$worktree)"
-      echo "fallback: rsync from $ip failed"
-      exit 3
-    fi
-  fi
-  t_down_end="$(now_fractional)"
+  # PRD-build-burst-pull-on-demand requirement 1: `run` no longer pulls
+  # target/ (or .pybuilder/) back itself — it marks the worktree remote-dirty
+  # and returns. The pull happens lazily, at whichever of the three points
+  # (explicit `pull`, a local cargo consumer via `ensure-fresh`, or the
+  # teardown sweep) actually needs the artifacts next. This is the whole
+  # laziness: 19 of 21 pulls in the PRD's own baseline session sat between
+  # two remote runs where nothing local ever read the worktree.
+  local kind; kind="$([ "$first" = "uv" ] && echo pybuilder || echo target)"
+  mark_dirty "$worktree" "$id" "$remote_path" "$kind"
 
   # Read-modify-write of session state back under the brief global lock.
   flock 201
@@ -785,16 +960,22 @@ cmd_run() {
   # to a PRD slug in the attribution ledger (independent of, and finer-
   # grained than, requirement 13's prds_served roster above — that roster
   # is a per-session dedup list; this ledger is a per-run cost record).
-  local wall_s sync_s slug
+  # PRD-build-burst-pull-on-demand requirement 5: since the pull itself is
+  # now always skipped here, this row always carries pulls_skipped=1 and an
+  # ESTIMATED bytes_saved (the worktree's last actually-observed pull size,
+  # or 0 the first time anything ever ran against it) — never a claimed
+  # exact figure for a transfer that didn't happen. sync_s is now upload-only
+  # (no download occurred); "bytes" is 0 for the same reason.
+  local wall_s sync_s slug bytes_saved
   wall_s="$(awk -v a="$t_remote_end" -v b="$t_up_end" 'BEGIN{printf "%.3f", a-b}')"
-  sync_s="$(awk -v u0="$t_up_start" -v u1="$t_up_end" -v d1="$t_down_end" -v r1="$t_remote_end" \
-             'BEGIN{printf "%.3f", (u1-u0)+(d1-r1)}')"
+  sync_s="$(awk -v u0="$t_up_start" -v u1="$t_up_end" 'BEGIN{printf "%.3f", u1-u0}')"
   slug="$(attribution_slug_for "$worktree")"
-  attribution_record "$slug" "$id" "$wall_s" "$sync_s" "$bytes" "$worktree"
+  bytes_saved="$(last_pull_size "$worktree")"
+  attribution_record "$slug" "$id" "$wall_s" "$sync_s" 0 "$worktree" run 1 "$bytes_saved" true
 
   flock -u 201
 
-  journal_line "$(now_iso)  burst-lane  run  routed  (server_id=$id worktree=$worktree runs_served=$runs exit=$rc bytes=$bytes slug=$slug wall_s=$wall_s concurrent=$slot_held)"
+  journal_line "$(now_iso)  burst-lane  run  routed  (server_id=$id worktree=$worktree runs_served=$runs exit=$rc dirty=1 kind=$kind bytes_saved=$bytes_saved slug=$slug wall_s=$wall_s concurrent=$slot_held)"
   exit "$rc"
 }
 
@@ -813,9 +994,110 @@ cmd_sync_back() {
     echo "fallback: rsync from $ip failed"
     exit 3
   fi
+  # PRD-build-burst-pull-on-demand: sync-back is a real pull — it must not
+  # leave a stale dirty marker behind claiming target/ is still ahead.
+  record_pull_size "$worktree" "${bytes:-0}"
+  clear_dirty "$worktree"
   journal_line "$(now_iso)  burst-lane  sync-back  ok  (worktree=$worktree bytes=$bytes)"
   echo "synced: bytes=$bytes"
   exit 0
+}
+
+# ---- pull (PRD-build-burst-pull-on-demand requirement 3, explicit) ----------
+# Forces a pull and clears the marker. Requirement 6: refuses (rc4, named
+# error, no rsync) rather than blocking if the worktree's lock is currently
+# held by a live `run` — an explicit pull racing a live compile must never
+# interleave rsync with it.
+cmd_pull() {
+  local worktree="${1:-}"
+  [ -n "$worktree" ] && [ -d "$worktree" ] || { echo "usage: burst-lane.sh pull <worktree>" >&2; exit 2; }
+  mkdir -p "$STATE_DIR/locks" 2>/dev/null || true
+  exec 205>"$(wt_lock_file "$worktree")"
+  if ! flock -n 205; then
+    journal_line "$(now_iso)  burst-lane  pull  refused  (worktree=$worktree cause=worktree-busy — a live run holds this worktree's lock)"
+    echo "refused: worktree busy (live run in progress)" >&2
+    exit 4
+  fi
+  if ! is_dirty "$worktree"; then
+    flock -u 205
+    echo "clean: nothing to pull"
+    exit 0
+  fi
+  if do_marker_pull "$worktree" explicit; then
+    flock -u 205
+    echo "pulled"
+    exit 0
+  fi
+  flock -u 205
+  echo "fallback: pull failed"
+  exit 3
+}
+
+# ---- ensure-fresh (PRD-build-burst-pull-on-demand requirement 2) -----------
+# The single invariant every local cargo/test consumer must go through
+# before touching a worktree: dirty -> pull (blocking on the worktree lock —
+# a live run finishing first is the correct wait here, unlike the explicit
+# `pull` command's non-blocking refusal), clear marker, then the caller
+# proceeds. Clean (or no marker at all) is a fast, lock-free no-op. Called
+# from burst-lane-bin/cargo's and cargo-budget-bin/cargo's local-fallback
+# paths, and from extend-gate.sh's cargo_budgeted() (the gate harness's own
+# choke point for every producer's cargo, including extended-receipts.sh's
+# 17). Never blocks the caller on infra trouble — a failed pull here still
+# exits 0 so a build-skill invocation never turns "no pull yet" into "no
+# build at all"; the caller simply runs against whatever's on disk.
+cmd_ensure_fresh() {
+  local worktree="${1:-}"
+  [ -n "$worktree" ] && [ -d "$worktree" ] || { echo "usage: burst-lane.sh ensure-fresh <worktree>" >&2; exit 2; }
+  if ! is_dirty "$worktree"; then
+    echo "clean"
+    exit 0
+  fi
+  mkdir -p "$STATE_DIR/locks" 2>/dev/null || true
+  exec 204>"$(wt_lock_file "$worktree")"
+  flock 204
+  if ! is_dirty "$worktree"; then
+    flock -u 204
+    echo "clean"
+    exit 0
+  fi
+  do_marker_pull "$worktree" local-read
+  flock -u 204
+  echo "ensured"
+  exit 0
+}
+
+# ---- teardown sweep (PRD-build-burst-pull-on-demand requirement 4) ---------
+# Every dirty marker on disk — not just this session's own — gets one pull
+# attempt before a box is destroyed (down's delete path, watchdog's TTL
+# teardown). A marker from a session that already died some other way (crash,
+# a teardown that skipped the sweep) is exactly what do_marker_pull's "cold"
+# path exists for: it finds no active session (or a session whose IP no
+# longer serves that remote_path) and clears the marker rather than leaving
+# it dirty forever. A worktree whose lock is currently held (a live run
+# still in flight right as the box is about to die) is left alone and
+# journaled — never aborts the rest of the sweep.
+sweep_dirty_worktrees() {  # $1=caller (down|watchdog)
+  mkdir -p "$DIRTY_DIR" "$STATE_DIR/locks" 2>/dev/null || true
+  local f wt
+  for f in "$DIRTY_DIR"/*.json; do
+    [ -e "$f" ] || continue
+    wt="$(python3 -c '
+import json, sys
+try:
+    print(json.load(open(sys.argv[1])).get("worktree", ""))
+except Exception:
+    print("")
+' "$f" 2>/dev/null)"
+    if [ -z "$wt" ]; then
+      rm -f "$f"
+      continue
+    fi
+    if ( exec 206>"$(wt_lock_file "$wt")"; flock -n 206 && do_marker_pull "$wt" teardown ); then
+      :
+    else
+      journal_line "$(now_iso)  burst-lane  ${1:-down}  sweep-failed  (worktree=$wt — busy or pull failed; marker left in place, sweep continues)"
+    fi
+  done
 }
 
 # ---- rust-work-remains (drives down's keep/schedule/delete decision) --------
@@ -911,11 +1193,28 @@ for line in lines:
         row = json.loads(line)
     except ValueError:
         continue
+    # PRD-build-burst-pull-on-demand requirement 7: a pull row own sync_s
+    # is attributed to whichever slug triggered the read (do_marker_pull
+    # already resolved teardown -> the literal slug teardown as a lane-
+    # overhead bucket, rather than the reading worktree own PRD) - this is
+    # what closes the ledger prior open question (prorate rsync time to
+    # slugs, or hold as lane overhead): prorated, to the reader.
     slug = row.get("slug") or "unattributed"
-    secs = float(row.get("wall_seconds", 0) or 0)
-    by_slug.setdefault(slug, {"seconds": 0.0, "runs": 0})
-    by_slug[slug]["seconds"] += secs
-    by_slug[slug]["runs"] += 1
+    kind = row.get("kind", "run")
+    by_slug.setdefault(slug, {
+        "seconds": 0.0, "runs": 0, "pulls_skipped": 0, "bytes_saved": 0,
+        "pulls_performed": 0, "bytes_pulled": 0,
+    })
+    v = by_slug[slug]
+    if kind == "pull":
+        v["seconds"] += float(row.get("sync_s", 0) or 0)
+        v["pulls_performed"] += 1
+        v["bytes_pulled"] += int(row.get("bytes", 0) or 0)
+    else:
+        v["seconds"] += float(row.get("wall_seconds", 0) or 0)
+        v["runs"] += 1
+        v["pulls_skipped"] += int(row.get("pulls_skipped", 0) or 0)
+        v["bytes_saved"] += int(row.get("bytes_saved", 0) or 0)
     sessions.add(row.get("session_id", ""))
 
 total_secs = sum(v["seconds"] for v in by_slug.values())
@@ -933,6 +1232,8 @@ if total_secs > 0:
         out_rows.append({
             "date": date, "session_id": sid, "kind": "slug", "slug": slug,
             "seconds": round(v["seconds"], 3), "runs": v["runs"], "eur": slug_eur,
+            "pulls_skipped": v["pulls_skipped"], "bytes_saved": v["bytes_saved"],
+            "pulls_performed": v["pulls_performed"], "bytes_pulled": v["bytes_pulled"],
         })
     with open(cost_path, "a") as fh:
         for row in out_rows:
@@ -975,6 +1276,8 @@ import json, sys, collections
 
 today, path = sys.argv[1], sys.argv[2]
 totals = collections.OrderedDict()
+pulls_skipped_total = 0
+bytes_saved_total = 0
 for ln in open(path):
     ln = ln.strip()
     if not ln:
@@ -987,13 +1290,20 @@ for ln in open(path):
         continue
     s = d.get("slug", "unattributed")
     totals[s] = totals.get(s, 0.0) + float(d.get("eur", 0) or 0)
+    # PRD-build-burst-pull-on-demand requirement 5/8: the yield (pulls
+    # skipped, GB saved) belongs in the same once-a-day line as the cost —
+    # "readable in one place", not a number scattered across journal greps.
+    pulls_skipped_total += int(d.get("pulls_skipped", 0) or 0)
+    bytes_saved_total += int(d.get("bytes_saved", 0) or 0)
 
 if not totals:
     sys.exit(1)
 
 grand = sum(totals.values())
 top_slug, top_eur = max(totals.items(), key=lambda kv: kv[1])
-print("burst-cost: %.4f across %d slugs; top %s %.4f" % (grand, len(totals), top_slug, top_eur))
+gb_saved = bytes_saved_total / (1024.0 ** 3)
+print("burst-cost: %.4f across %d slugs; top %s %.4f; pulls skipped %d, saved ~%.2f GB" %
+      (grand, len(totals), top_slug, top_eur, pulls_skipped_total, gb_saved))
 ' "$today" "$COST_LEDGER")" || return 0
 
   mkdir -p "$TICK_JOURNAL_DIR" 2>/dev/null || true
@@ -1046,6 +1356,10 @@ cmd_down() {
 
   if [ "$now" -ge "$window_start" ]; then
     local alive; alive="$(minutes_alive)"
+    # PRD-build-burst-pull-on-demand requirement 4: every still-dirty
+    # worktree gets pulled (or goes cold) before the box that would strand
+    # its artifacts is destroyed. Never blocks/aborts the teardown itself.
+    sweep_dirty_worktrees down
     if destroy_verify "$id"; then
       local hrs; hrs="$(awk -v m="$alive" 'BEGIN{printf "%.4f", m/60.0}')"
       local eur; eur="$(awk -v h="$hrs" -v r="$COST_PER_HOUR_EUR" 'BEGIN{printf "%.4f", h*r}')"
@@ -1116,6 +1430,10 @@ cmd_watchdog() {
   fi
 
   local alive; alive="$(minutes_alive)"
+  # PRD-build-burst-pull-on-demand requirement 4: same sweep as `down`'s
+  # delete path — the watchdog is a teardown path too and must not strand
+  # artifacts either.
+  sweep_dirty_worktrees watchdog
   if destroy_verify "$id"; then
     local hrs eur
     hrs="$(awk -v m="$alive" 'BEGIN{printf "%.4f", m/60.0}')"
@@ -1292,22 +1610,31 @@ for line in open(path):
         continue
     if d.get("kind") == "slug":
         s = d.get("slug", "unattributed")
-        slug_totals.setdefault(s, {"runs": 0, "seconds": 0.0, "eur": 0.0})
+        slug_totals.setdefault(s, {"runs": 0, "seconds": 0.0, "eur": 0.0,
+                                    "pulls_skipped": 0, "bytes_saved": 0})
         slug_totals[s]["runs"] += int(d.get("runs", 0) or 0)
         slug_totals[s]["seconds"] += float(d.get("seconds", 0) or 0)
         slug_totals[s]["eur"] += float(d.get("eur", 0) or 0)
+        # PRD-build-burst-pull-on-demand requirement 5: the skip yield lands
+        # in this same table, not a separate report.
+        slug_totals[s]["pulls_skipped"] += int(d.get("pulls_skipped", 0) or 0)
+        slug_totals[s]["bytes_saved"] += int(d.get("bytes_saved", 0) or 0)
     else:
         session_eur_total += float(d.get("eur", 0) or 0)
 
 rows = sorted(slug_totals.items(), key=lambda kv: -kv[1]["eur"])
-print("{:<28}{:>6}{:>12}{:>10}".format("slug", "runs", "box-min", "eur"))
+print("{:<28}{:>6}{:>12}{:>10}{:>10}{:>10}".format("slug", "runs", "box-min", "eur", "skipped", "GBsaved"))
 grand_eur = grand_min = 0.0
-grand_runs = 0
+grand_runs = grand_skipped = 0
+grand_bytes_saved = 0
 for slug, v in rows:
     mins = v["seconds"] / 60.0
+    gb = v["bytes_saved"] / (1024.0 ** 3)
     grand_eur += v["eur"]; grand_min += mins; grand_runs += v["runs"]
-    print("{:<28}{:>6}{:>12.2f}{:>10.4f}".format(slug, v["runs"], mins, v["eur"]))
-print("{:<28}{:>6}{:>12.2f}{:>10.4f}".format("TOTAL", grand_runs, grand_min, grand_eur))
+    grand_skipped += v["pulls_skipped"]; grand_bytes_saved += v["bytes_saved"]
+    print("{:<28}{:>6}{:>12.2f}{:>10.4f}{:>10}{:>10.3f}".format(slug, v["runs"], mins, v["eur"], v["pulls_skipped"], gb))
+grand_gb = grand_bytes_saved / (1024.0 ** 3)
+print("{:<28}{:>6}{:>12.2f}{:>10.4f}{:>10}{:>10.3f}".format("TOTAL", grand_runs, grand_min, grand_eur, grand_skipped, grand_gb))
 
 # Conservation check (in-code, per the success-metrics table): the sum of
 # printed slug eur must equal the session-total eur it was prorated from.
@@ -1325,6 +1652,8 @@ main() {
     status)    cmd_status "$@" ;;
     run)       cmd_run "$@" ;;
     sync-back) cmd_sync_back "$@" ;;
+    pull)      cmd_pull "$@" ;;
+    ensure-fresh) cmd_ensure_fresh "$@" ;;
     down)      cmd_down "$@" ;;
     watchdog)  cmd_watchdog "$@" ;;
     cost)      cmd_cost "$@" ;;
