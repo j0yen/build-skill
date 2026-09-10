@@ -13,7 +13,14 @@
 # same dst, which is exactly what burst-lane-selftest.sh's two-consecutive-
 # `run` assertion (PRD-build-burst-lane-ccx53 AC11) checks for.
 set -uo pipefail
-[ "${FAKE_RSYNC_FAIL:-0}" = "1" ] && exit 23
+# PRD-build-burst-remote-disk-guard AC3: FAKE_RSYNC_FAIL_RC/FAKE_RSYNC_FAIL_MSG
+# let a test pin the exact exit code and stderr line `run`'s named
+# rsync-up-failed journaling (requirement 4) must surface — default rc/msg
+# preserved for any older FAKE_RSYNC_FAIL=1 caller that never set them.
+if [ "${FAKE_RSYNC_FAIL:-0}" = "1" ]; then
+  echo "${FAKE_RSYNC_FAIL_MSG:-rsync: fake failure injected}" >&2
+  exit "${FAKE_RSYNC_FAIL_RC:-23}"
+fi
 src="${*: -2:1}"
 dst="${*: -1:1}"
 local_dst="${dst#*:}"

@@ -91,6 +91,14 @@
 #       (avail_gb=<n> nproc=<n>)" and journals
 #       "burst: sub-cap=<n> (avail_gb=<n> nproc=<n>)" (AC7). A failed probe
 #       exits 3 with "fallback: ...", never blocking the caller.
+#   burst-lane.sh reap
+#       PRD-build-burst-remote-disk-guard requirement 5: lists $REMOTE_ROOT's
+#       immediate children, deletes any whose local worktree is gone (a
+#       dirty marker or a held per-worktree lock protects a dir instead),
+#       and prints "reaped_dirs=<n> reaped_bytes=<n>". Also called
+#       automatically by `down` and `watchdog` before their own
+#       keep/delete decision (requirement 6) — a reap trouble is journaled,
+#       never fatal.
 #
 # Cost attribution (PRD-build-cost-attribution, 2026-09-10): every routed
 # `run` now also appends a row to state/burst-lane/attribution.jsonl —
@@ -172,7 +180,7 @@ COST_PER_HOUR_EUR="0.47"
 REMOTE_ROOT="${BURST_LANE_REMOTE_ROOT:-/root/build}"
 
 die() { echo "burst-lane: $*" >&2; exit "${2:-1}"; }
-usage() { echo "usage: burst-lane.sh {up|status|run|sync-back|pull|ensure-fresh|down|watchdog|cost|sub-cap|verify} ..." >&2; exit 2; }
+usage() { echo "usage: burst-lane.sh {up|status|run|sync-back|pull|ensure-fresh|down|watchdog|cost|sub-cap|verify|reap} ..." >&2; exit 2; }
 
 now_epoch() { echo "${BURST_LANE_NOW:-$(date -u +%s)}"; }
 now_iso()   { date -u -d "@$(now_epoch)" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ; }
@@ -500,11 +508,35 @@ for r in json.loads(sys.argv[1]):
     print("dirty: %s age=%ss" % (r.get("worktree", ""), r.get("age_seconds", 0)))
 ' "$dirty_json")"
 
+  # PRD-build-burst-remote-disk-guard requirement 3: free disk and a
+  # three-state ok|low|full read, straight from the same probe sub-cap and
+  # run's route-refusal use — so an operator (or lane-claim.sh) never has to
+  # ssh in to learn what run's next fallback: disk-low would have said.
+  # Fail OPEN on a probe hiccup: free_disk_gb stays JSON null, disk_state
+  # stays the default "ok" (never claim "low"/"full" from a reading we
+  # don't actually have).
+  local free_disk_gb="null" disk_state="ok" disk_probe_status
+  if disk_probe_status="$(probe_remote_capacity "$ip" 2>/dev/null)"; then
+    local _st_avail _st_nproc st_free
+    read -r _st_avail _st_nproc st_free <<<"$disk_probe_status"
+    case "$st_free" in
+      ''|*[!0-9]*) : ;;
+      *)
+        free_disk_gb="$st_free"
+        local st_floor="${BURST_DISK_FLOOR_GB:-40}"
+        if [ "$st_free" -le 0 ]; then disk_state="full"
+        elif [ "$st_free" -lt "$st_floor" ]; then disk_state="low"
+        else disk_state="ok"
+        fi
+        ;;
+    esac
+  fi
+
   if [ "$json" -eq 1 ]; then
-    printf '{"active":true,"server_id":"%s","ip":"%s","minutes_alive":%s,"ttl_hours":"%s","sandbox_ok":"%s","concurrent":"%s","dirty":%s}\n' \
-      "$id" "$ip" "$alive" "$ttl" "$sbx" "$conc" "$dirty_json"
+    printf '{"active":true,"server_id":"%s","ip":"%s","minutes_alive":%s,"ttl_hours":"%s","sandbox_ok":"%s","concurrent":"%s","free_disk_gb":%s,"disk_state":"%s","dirty":%s}\n' \
+      "$id" "$ip" "$alive" "$ttl" "$sbx" "$conc" "$free_disk_gb" "$disk_state" "$dirty_json"
   else
-    echo "active: $id ip=$ip alive=${alive}m ttl=${ttl}h sandbox_ok=$sbx concurrent=$conc"
+    echo "active: $id ip=$ip alive=${alive}m ttl=${ttl}h sandbox_ok=$sbx concurrent=$conc disk_state=$disk_state free_disk_gb=$free_disk_gb"
     [ -n "$dirty_lines" ] && printf '%s\n' "$dirty_lines"
   fi
   exit 0
@@ -886,6 +918,30 @@ cmd_run() {
 
   local remote_path; remote_path="$(remote_path_for "$worktree")"
 
+  # PRD-build-burst-remote-disk-guard requirement 3: refuse to route to a
+  # box that cannot receive this worktree, checked BEFORE the (now
+  # known-likely-to-fail) rsync-up rather than discovered from its failure.
+  # Fail OPEN on anything short of a confident "below the floor" reading —
+  # a probe failure or malformed third field here must never itself block
+  # a run that a real disk-full condition would have blocked anyway (the
+  # rsync-up below still catches that case, named per requirement 4).
+  local disk_probe_run
+  if disk_probe_run="$(probe_remote_capacity "$ip" 2>/dev/null)"; then
+    local _run_avail _run_nproc run_free_gb
+    read -r _run_avail _run_nproc run_free_gb <<<"$disk_probe_run"
+    case "$run_free_gb" in
+      ''|*[!0-9]*) : ;;
+      *)
+        local disk_floor_run="${BURST_DISK_FLOOR_GB:-40}"
+        if [ "$run_free_gb" -lt "$disk_floor_run" ]; then
+          journal_line "$(now_iso)  burst-lane  run  fallback  (cause=disk-low free_gb=$run_free_gb floor_gb=$disk_floor_run worktree=$worktree)"
+          echo "fallback: disk-low (free_gb=$run_free_gb floor_gb=$disk_floor_run)"
+          exit 3
+        fi
+        ;;
+    esac
+  fi
+
   # PRD-build-cost-attribution requirement 1: wall-seconds attributed to a
   # slug measure the REMOTE EXEC only; rsync up+down time is tracked
   # separately as sync_s (sizing evidence for the incremental-pull work,
@@ -893,12 +949,22 @@ cmd_run() {
   local t_up_start t_up_end t_remote_end
   t_up_start="$(now_fractional)"
 
-  if ! "$RSYNC_BIN" -az --delete --exclude target --exclude .git --exclude .venv \
+  # PRD-build-burst-remote-disk-guard requirement 4: name the cause instead
+  # of making the operator ssh in and run df/cat the log by hand — the rsync
+  # exit code and the log's own last non-blank line ride into the journal,
+  # and the captured log itself lives under state (survives past $$ exiting,
+  # unlike the old /tmp/burst-lane-rsync-up.$$.log a reboot or tmpwatch
+  # would also silently reap).
+  mkdir -p "$STATE_DIR/logs" 2>/dev/null || true
+  local up_log="$STATE_DIR/logs/rsync-up.$$.log" rsync_up_rc=0
+  "$RSYNC_BIN" -az --delete --exclude target --exclude .git --exclude .venv \
         --rsync-path="mkdir -p '$remote_path' && rsync" \
         -e "$SSH_BIN -o StrictHostKeyChecking=no -i $SSH_KEY" \
-        "$worktree/" "$REMOTE_USER@$ip:$remote_path/" >/tmp/burst-lane-rsync-up.$$.log 2>&1; then
-    journal_line "$(now_iso)  burst-lane  run  fallback  (cause=rsync-up-failed worktree=$worktree)"
-    echo "fallback: rsync to $ip failed (see /tmp/burst-lane-rsync-up.$$.log)"
+        "$worktree/" "$REMOTE_USER@$ip:$remote_path/" >"$up_log" 2>&1 || rsync_up_rc=$?
+  if [ "$rsync_up_rc" -ne 0 ]; then
+    local up_err; up_err="$(grep -v '^[[:space:]]*$' "$up_log" 2>/dev/null | tail -n1)"
+    journal_line "$(now_iso)  burst-lane  run  fallback  (cause=rsync-up-failed rc=$rsync_up_rc err=\"$up_err\" worktree=$worktree)"
+    echo "fallback: rsync to $ip failed rc=$rsync_up_rc (see $up_log)"
     exit 3
   fi
   t_up_end="$(now_fractional)"
@@ -1118,6 +1184,203 @@ except Exception:
   done
 }
 
+# ---- reap (PRD-build-burst-remote-disk-guard requirement 5) -----------------
+# A remote build dir dies with its worktree: `reap` lists $REMOTE_ROOT's
+# immediate children, decodes each `<basename>-<sha1[0:8]>` (the same
+# scheme remote_path_for()/dirty_marker_file() already use — the sha1
+# prefix in a dir name and a dirty marker's filename are the SAME key for
+# the SAME worktree, so "is this dir dirty" is a direct DIRTY_DIR/<hash>.json
+# lookup, never a re-decode) against the local worktree roots this lane
+# knows, and deletes any dir with no live local worktree behind it. The
+# shared checkout(s) in BURST_REAP_KEEP (default "mcphost" — the
+# pre-remote_path_for() legacy layout requirement 7 carries forward) are
+# always protected, hashed or not.
+REAP_KEEP="${BURST_REAP_KEEP:-mcphost}"
+
+# Local roots a worktree basename is looked up under, per requirement 5:
+# worktree-extend.sh's own wt_path convention, the off-root scratch root,
+# and the shared-checkout root attribution_slug_for() already trusts
+# ($ATTR_REPOS_DIR). A worktree living outside all three is still found —
+# reap_plan() below also consults every worktree path a dirty marker or an
+# attribution row has ever recorded, so nothing this lane has ever touched
+# needs a fourth hardcoded root.
+reap_candidate_roots() {
+  printf '%s\n' "$HOME/.cache/build-worktrees" "/mnt/data/jsy/tmp" "$ATTR_REPOS_DIR"
+}
+
+# $1 = newline-separated "<mtime_epoch>\t<basename>" listing (oldest first)
+# on stdin -> stdout one "<basename>\t<action>\t<reason>\t<worktree>" row per
+# entry (action: keep|dirty|live|orphan). Pure classification — no ssh, no
+# deletion; reap_orphans() below executes the plan.
+reap_plan() {
+  python3 -c '
+import sys, os, re, hashlib, json
+
+keep = set(sys.argv[1].split())
+roots = [r for r in sys.argv[2].split("\n") if r]
+dirty_dir = sys.argv[3]
+attr_ledger = sys.argv[4]
+
+def hash8(p):
+    return hashlib.sha1(p.encode()).hexdigest()[:8]
+
+extra_paths = set()
+try:
+    for fn in os.listdir(dirty_dir):
+        if not fn.endswith(".json"):
+            continue
+        try:
+            d = json.load(open(os.path.join(dirty_dir, fn)))
+        except Exception:
+            continue
+        w = d.get("worktree", "")
+        if w:
+            extra_paths.add(w)
+except OSError:
+    pass
+try:
+    with open(attr_ledger) as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                d = json.loads(line)
+            except ValueError:
+                continue
+            w = d.get("worktree", "")
+            if w:
+                extra_paths.add(w)
+except OSError:
+    pass
+
+pat = re.compile(r"^(.*)-([0-9a-f]{8})$")
+for raw in sys.stdin:
+    raw = raw.rstrip("\n")
+    if not raw:
+        continue
+    parts = raw.split("\t", 1)
+    if len(parts) != 2:
+        continue
+    _mtime, name = parts
+    if name in keep:
+        print("%s\tkeep\tkeep-listed\t" % name)
+        continue
+    m = pat.match(name)
+    if m:
+        base, h = m.group(1), m.group(2)
+        marker = os.path.join(dirty_dir, h + ".json")
+        if os.path.exists(marker) and os.path.getsize(marker) > 0:
+            print("%s\tdirty\tdirty-marker\t" % name)
+            continue
+        found = None
+        for root in roots:
+            cand = os.path.join(root, base)
+            if hash8(cand) == h:
+                found = cand
+                break
+        if not found:
+            for w in extra_paths:
+                if os.path.basename(w) == base and hash8(w) == h:
+                    found = w
+                    break
+        if found and os.path.isdir(found):
+            print("%s\tlive\tworktree-present\t%s" % (name, found))
+        elif found:
+            print("%s\torphan\tworktree-gone\t%s" % (name, found))
+        else:
+            print("%s\torphan\tno-local-match\t" % name)
+    else:
+        # Legacy un-hashed dir (requirement 7): live iff some known root
+        # still has a directory of that exact basename.
+        found = None
+        for root in roots:
+            cand = os.path.join(root, name)
+            if os.path.isdir(cand):
+                found = cand
+                break
+        if found:
+            print("%s\tlive\tworktree-present\t%s" % (name, found))
+        else:
+            print("%s\torphan\tlegacy-no-local-match\t" % name)
+' "$REAP_KEEP" "$(reap_candidate_roots)" "$DIRTY_DIR" "$ATTR_LEDGER"
+}
+
+# Executes reap_plan()'s decisions against the live box: deletes each orphan
+# (skipping one whose worktree lock is currently held — a live run in
+# flight on a not-yet-dirty-marked worktree, requirement 5's other named
+# protection besides the dirty marker itself), journals every ok/skip/fail
+# as plain "burst-lane reap <ok|skip|fail>" lines (same shape whether called
+# standalone or from down/watchdog below), never aborts on a single failure
+# (requirement 6). Always exits 0 to its caller — a reap trouble is
+# journaled, never fatal.
+reap_orphans() {
+  local reaped_dirs=0 reaped_bytes=0
+  mkdir -p "$DIRTY_DIR" "$STATE_DIR/locks" 2>/dev/null || true
+  if ! state_active; then
+    echo "reaped_dirs=0 reaped_bytes=0"
+    return 0
+  fi
+  local ip; ip="$(state_read ip)"
+  # -not -name '.*' excludes the lane's own infrastructure dirs (e.g.
+  # cmd_verify's .verify-fixture roundtrip probe) — never a worktree
+  # remnant, so never orphan-eligible.
+  local list_cmd="find '$REMOTE_ROOT' -mindepth 1 -maxdepth 1 -not -name '.*' -printf '%T@\t%f\n' 2>/dev/null"
+  local list_out list_rc=0
+  list_out="$("$SSH_BIN" -o StrictHostKeyChecking=no -o ConnectTimeout=8 -i "$SSH_KEY" \
+      "$REMOTE_USER@$ip" "$list_cmd" 2>/dev/null)" || list_rc=$?
+  if [ "$list_rc" -ne 0 ]; then
+    journal_line "$(now_iso)  burst-lane  reap  fail  (cause=ssh rc=$list_rc)"
+    echo "reaped_dirs=0 reaped_bytes=0"
+    return 0
+  fi
+  if [ -z "$list_out" ]; then
+    echo "reaped_dirs=0 reaped_bytes=0"
+    return 0
+  fi
+
+  local plan; plan="$(printf '%s\n' "$list_out" | sort -n | reap_plan)"
+  local name action reason wt
+  while IFS=$'\t' read -r name action reason wt; do
+    [ -n "$name" ] || continue
+    case "$action" in
+      keep)  journal_line "$(now_iso)  burst-lane  reap  skip  (dir=$name reason=keep)" ;;
+      dirty) journal_line "$(now_iso)  burst-lane  reap  skip  (dir=$name reason=dirty)" ;;
+      live)  : ;;  # untouched, no journal noise on every healthy pass
+      orphan)
+        local busy=0
+        if [ -n "$wt" ] && ! ( exec 207>"$(wt_lock_file "$wt")"; flock -n 207 ); then
+          busy=1
+        fi
+        if [ "$busy" -eq 1 ]; then
+          journal_line "$(now_iso)  burst-lane  reap  skip  (dir=$name reason=busy)"
+          continue
+        fi
+        local bytes
+        bytes="$("$SSH_BIN" -o StrictHostKeyChecking=no -o ConnectTimeout=8 -i "$SSH_KEY" \
+            "$REMOTE_USER@$ip" "du -sb '$REMOTE_ROOT/$name' 2>/dev/null | cut -f1" 2>/dev/null)"
+        bytes="${bytes:-0}"; case "$bytes" in ''|*[!0-9]*) bytes=0 ;; esac
+        if "$SSH_BIN" -o StrictHostKeyChecking=no -o ConnectTimeout=8 -i "$SSH_KEY" \
+             "$REMOTE_USER@$ip" "rm -rf '$REMOTE_ROOT/$name'" 2>/dev/null; then
+          reaped_dirs=$((reaped_dirs + 1)); reaped_bytes=$((reaped_bytes + bytes))
+          journal_line "$(now_iso)  burst-lane  reap  ok  (dir=$name bytes=$bytes reason=$reason)"
+        else
+          journal_line "$(now_iso)  burst-lane  reap  fail  (dir=$name cause=rm-failed)"
+        fi
+        ;;
+    esac
+  done <<<"$plan"
+
+  echo "reaped_dirs=$reaped_dirs reaped_bytes=$reaped_bytes"
+  return 0
+}
+
+cmd_reap() {
+  local out; out="$(reap_orphans)"
+  echo "$out"
+  exit 0
+}
+
 # ---- rust-work-remains (drives down's keep/schedule/delete decision) --------
 rust_work_remains() {
   local dir="$PRD_DIR/build-queue"
@@ -1324,6 +1587,38 @@ print("burst-cost: %.4f across %d slugs; top %s %.4f; pulls skipped %d, saved ~%
       (grand, len(totals), top_slug, top_eur, pulls_skipped_total, gb_saved))
 ' "$today" "$COST_LEDGER")" || return 0
 
+  # PRD-build-burst-remote-disk-guard requirement 8: fold today's reap yield
+  # and disk-low fallback count into the same once-a-day line — these live
+  # in THIS script's own flat $JOURNAL (reap_orphans/cmd_run's own lines),
+  # not the cost ledger the block above reads, so they're pulled from there
+  # instead of taught to cost.jsonl.
+  local reap_stats reaped_dirs reaped_bytes disk_low reaped_gb
+  reap_stats="$(python3 -c '
+import re, sys
+today, path = sys.argv[1], sys.argv[2]
+dirs = 0
+total_bytes = 0
+low = 0
+try:
+    with open(path) as fh:
+        for ln in fh:
+            if not ln.startswith(today):
+                continue
+            if "burst-lane  reap  ok" in ln:
+                dirs += 1
+                m = re.search(r"bytes=(\d+)", ln)
+                if m:
+                    total_bytes += int(m.group(1))
+            elif "burst-lane  run  fallback" in ln and "cause=disk-low" in ln:
+                low += 1
+except OSError:
+    pass
+print(dirs, total_bytes, low)
+' "$today" "$JOURNAL")"
+  read -r reaped_dirs reaped_bytes disk_low <<<"$reap_stats"
+  reaped_gb="$(awk -v b="${reaped_bytes:-0}" 'BEGIN{printf "%.0f", b/1073741824}')"
+  line="$line reaped_dirs=${reaped_dirs:-0} reaped_gb=${reaped_gb:-0} disk_low_fallbacks=${disk_low:-0}"
+
   mkdir -p "$TICK_JOURNAL_DIR" 2>/dev/null || true
   printf '%s\n' "$line" >> "$TICK_JOURNAL_DIR/$today.md"
   printf '%s\n' "$today" > "$ROLLUP_CURSOR"
@@ -1346,6 +1641,14 @@ cmd_down() {
   fi
 
   local id boot_epoch; id="$(state_read server_id)"; boot_epoch="$(state_read boot_epoch)"
+
+  # PRD-build-burst-remote-disk-guard requirement 6: reap runs on every
+  # `down` call, before the keep/scheduled/deleted decision below — disk
+  # hygiene does not wait for a box that is about to die anyway (goal 2:
+  # "reaped on the next down or watchdog pass"). Never blocks/aborts the
+  # decision that follows; a reap trouble (ssh down, rm error) is only ever
+  # journaled by reap_orphans itself.
+  reap_orphans >/dev/null 2>&1 || true
 
   if rust_work_remains || [ "$more_work" -eq 1 ]; then
     if [ "$(state_read teardown_scheduled)" = "true" ]; then
@@ -1427,6 +1730,11 @@ cmd_watchdog() {
     echo "no-active-session"
     exit 0
   fi
+  # PRD-build-burst-remote-disk-guard requirement 6: same as `down` — reap
+  # runs on every watchdog pass, before the due/not-due decision, never
+  # blocking it.
+  reap_orphans >/dev/null 2>&1 || true
+
   local id boot_epoch ttl_hours now age ttl_secs
   id="$(state_read server_id)"; boot_epoch="$(state_read boot_epoch)"
   ttl_hours="$(state_read ttl_hours)"; ttl_hours="${ttl_hours:-$DEFAULT_TTL_HOURS}"
@@ -1480,14 +1788,23 @@ cmd_watchdog() {
 }
 
 # ---- sub-cap (requirement 7 formula) -----------------------------------------
-# Probes the box's available memory and core count over ssh in one round
+# Probes the box's available memory, core count, and (PRD-build-burst-
+# remote-disk-guard requirement 1) free root disk over ssh in one round
 # trip. The `\$2`/`\$(...)` inside the single-quoted remote_cmd are deliberately
 # unescaped from THIS script's perspective (single quotes suppress local
 # expansion) so they evaluate on the remote shell, matching the pattern
-# `run`'s own remote_cmd construction already uses.
-probe_remote_capacity() {  # $1 = ip -> stdout "avail_gb nproc"; rc 1 on failure
+# `run`'s own remote_cmd construction already uses. `$REMOTE_ROOT` is a
+# LOCAL var and is deliberately interpolated into the (otherwise
+# remote-evaluated) command string — the box always builds into
+# `$remote_path/target` under `$REMOTE_ROOT` (cmd_run pins
+# CARGO_TARGET_DIR there regardless of any off-root `.cargo/config.toml`
+# override — see pull_target_incremental's own comment), so `$REMOTE_ROOT`'s
+# filesystem is the one that actually fills up; a second df round trip
+# against a worktree's off-root target-dir would probe a path the remote
+# box never writes to.
+probe_remote_capacity() {  # $1 = ip -> stdout "avail_gb nproc free_disk_gb"; rc 1 on failure
   local ip="$1" out
-  local remote_cmd='avail_kb=$(grep MemAvailable /proc/meminfo | awk "{print \$2}"); echo $((avail_kb/1024/1024)) $(nproc)'
+  local remote_cmd='avail_kb=$(grep MemAvailable /proc/meminfo | awk "{print \$2}"); disk_gb=$(df -BG --output=avail '"$REMOTE_ROOT"' 2>/dev/null | tail -n1 | tr -dc "0-9"); echo $((avail_kb/1024/1024)) $(nproc) ${disk_gb:-}'
   out="$("$SSH_BIN" -o StrictHostKeyChecking=no -o ConnectTimeout=8 -i "$SSH_KEY" \
         "$REMOTE_USER@$ip" "$remote_cmd" 2>/dev/null)" || return 1
   [ -n "$out" ] || return 1
@@ -1532,20 +1849,36 @@ cmd_sub_cap() {
     echo "fallback: could not probe box capacity"
     exit 3
   fi
-  local avail_gb nproc_n
-  read -r avail_gb nproc_n <<<"$probe"
+  local avail_gb nproc_n free_disk_gb
+  read -r avail_gb nproc_n free_disk_gb <<<"$probe"
   case "$avail_gb" in ''|*[!0-9]*) probe_emit burst-subcap could-not-check "bad probe output: $probe" >/dev/null; journal_line "$(now_iso)  burst-lane  sub-cap  fallback  (cause=bad-probe-output out=$probe)"; echo "fallback: bad probe output"; exit 3 ;; esac
   case "$nproc_n"  in ''|*[!0-9]*) probe_emit burst-subcap could-not-check "bad probe output: $probe" >/dev/null; journal_line "$(now_iso)  burst-lane  sub-cap  fallback  (cause=bad-probe-output out=$probe)"; echo "fallback: bad probe output"; exit 3 ;; esac
+  # PRD-build-burst-remote-disk-guard requirement 1: a probe missing the
+  # third (disk) field is the same bad-probe-output fallback as a missing
+  # mem/cpu field — never a silently-skipped disk check.
+  case "$free_disk_gb" in ''|*[!0-9]*) probe_emit burst-subcap could-not-check "bad probe output: $probe" >/dev/null; journal_line "$(now_iso)  burst-lane  sub-cap  fallback  (cause=bad-probe-output out=$probe)"; echo "fallback: bad probe output"; exit 3 ;; esac
 
   local gb_per="${BURST_GB_PER_BRANCH:-6}" cores_per="${BURST_CORES_PER_BRANCH:-4}"
+  # PRD-build-burst-remote-disk-guard requirement 2: disk floor folded into
+  # the same min() the memory/cpu terms already go through — a box below
+  # BURST_DISK_FLOOR_GB (default 40, headroom below which sccache/rustc
+  # scratch and the next few branches' pulls have nowhere to land) admits
+  # zero more branches, same effective width as a bad/no-session probe.
+  local disk_floor="${BURST_DISK_FLOOR_GB:-40}" disk_per="${BURST_GB_DISK_PER_BRANCH:-70}"
   local by_mem=$(( avail_gb / gb_per )) by_cpu=$(( nproc_n / cores_per ))
-  local subcap=$by_mem
-  [ "$by_cpu" -lt "$subcap" ] && subcap=$by_cpu
-  if [ "$candidates" -gt 0 ] && [ "$candidates" -lt "$subcap" ]; then subcap=$candidates; fi
+  local by_disk=$(( (free_disk_gb - disk_floor) / disk_per ))
+  [ "$by_disk" -lt 0 ] && by_disk=0
+  local subcap=$by_mem bound="mem"
+  if [ "$by_cpu" -lt "$subcap" ]; then subcap=$by_cpu; bound="cpu"; fi
+  if [ "$by_disk" -lt "$subcap" ]; then subcap=$by_disk; bound="disk"; fi
+  if [ "$candidates" -gt 0 ] && [ "$candidates" -lt "$subcap" ]; then subcap=$candidates; bound="candidates"; fi
 
-  probe_emit burst-subcap clean "sub-cap=$subcap (avail_gb=$avail_gb nproc=$nproc_n)" >/dev/null
-  journal_line "$(now_iso)  burst-lane  sub-cap  computed  (burst: sub-cap=$subcap (avail_gb=$avail_gb nproc=$nproc_n) local=0)"
-  echo "sub-cap=$subcap local=0 (avail_gb=$avail_gb nproc=$nproc_n)"
+  local bound_suffix=""
+  [ "$bound" = "disk" ] && bound_suffix=" bound=disk"
+
+  probe_emit burst-subcap clean "sub-cap=$subcap (avail_gb=$avail_gb nproc=$nproc_n free_disk_gb=$free_disk_gb)" >/dev/null
+  journal_line "$(now_iso)  burst-lane  sub-cap  computed  (burst: sub-cap=$subcap (avail_gb=$avail_gb nproc=$nproc_n free_disk_gb=$free_disk_gb)${bound_suffix} local=0)"
+  echo "sub-cap=$subcap local=0 (avail_gb=$avail_gb nproc=$nproc_n free_disk_gb=$free_disk_gb)${bound_suffix}"
   exit 0
 }
 
@@ -1677,6 +2010,7 @@ main() {
     cost)      cmd_cost "$@" ;;
     sub-cap)   cmd_sub_cap "$@" ;;
     verify)    cmd_verify "$@" ;;
+    reap)      cmd_reap "$@" ;;
     *) usage ;;
   esac
 }

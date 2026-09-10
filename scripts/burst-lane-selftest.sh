@@ -450,8 +450,11 @@ expect "sub-cap with no session journals it" "grep -q 'burst-lane  sub-cap  no-s
 # min(20,8,10)=8 (AC7).
 subcap8="$(FAKE_SSH_MEMINFO_GB=120 FAKE_SSH_NPROC=32 "$BL" sub-cap --candidates 10)"
 expect "sub-cap admits 8 on a 120GB/32-core box (AC7)" "grep -q '^sub-cap=8 local=0' <<<\"$subcap8\""
+# PRD-build-burst-remote-disk-guard requirement 2 added a trailing
+# free_disk_gb field to this same journal line (the fake ssh's default disk
+# reading, deliberately abundant so it's never the binding term here).
 expect "sub-cap journals the AC7-shaped line" \
-  "grep -q 'burst: sub-cap=8 (avail_gb=120 nproc=32) local=0' \"$BURST_LANE_JOURNAL\""
+  "grep -q 'burst: sub-cap=8 (avail_gb=120 nproc=32 free_disk_gb=100000) local=0' \"$BURST_LANE_JOURNAL\""
 
 # 40 GB avail, 32 cores -> floor(40/6)=6, floor(32/4)=8, min(6,8,10)=6 (AC7).
 subcap6="$(FAKE_SSH_MEMINFO_GB=40 FAKE_SSH_NPROC=32 "$BL" sub-cap --candidates 10)"
@@ -615,6 +618,163 @@ expect "AC6: rollup line names eur/slug-count/top slug" "grep -q '^burst-cost: .
 # against a fresh worktree — no prior pull to estimate from).
 expect "burstpull P1 AC8: daily rollup line names pulls skipped and GB saved" \
   "grep -qE '^burst-cost: .*; pulls skipped [0-9]+, saved ~[0-9.]+ GB' \"$today_file\""
+unset BURST_LANE_NOW
+
+# =============================================================================
+# PRD-build-burst-remote-disk-guard: the burst lane reads its own disk before
+# it routes. (test_prefix: burstdisk)
+# =============================================================================
+
+# ---- burstdisk AC1: sub-cap is disk-bound when free disk is the tightest
+# term — avail_gb=59/nproc=16 alone would admit 4 (floor(16/4)), but
+# free_disk_gb=200 with the default 40 GB floor / 70 GB-per-branch admits
+# only floor((200-40)/70)=2 (requirement 2).
+fresh_env
+"$BL" up >/dev/null
+subcap_disk="$(FAKE_SSH_MEMINFO_GB=59 FAKE_SSH_NPROC=16 FAKE_SSH_DISK_GB=200 "$BL" sub-cap)"
+expect "burstdisk AC1: sub-cap is disk-bound at 2 on a 59GB/16-core/200GB-disk box" \
+  "grep -q '^sub-cap=2 local=0' <<<\"$subcap_disk\""
+expect "burstdisk AC1: stdout names the binding term" "grep -q 'bound=disk' <<<\"$subcap_disk\""
+expect "burstdisk AC1: journal carries free_disk_gb and bound=disk" \
+  "grep -q 'sub-cap=2 (avail_gb=59 nproc=16 free_disk_gb=200) bound=disk' \"$BURST_LANE_JOURNAL\""
+
+# ---- burstdisk AC2: `run` refuses to route below the disk floor, before
+# any rsync is attempted (requirement 3).
+WT_DISK="$T/worktree-disklow"; mkdir -p "$WT_DISK"
+echo 'mkdir -p target && echo built > target/out.txt; exit 0' > "$WT_DISK/build.sh"
+remote_before="$(find "$BURST_LANE_REMOTE_ROOT" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | wc -l)"
+disklow_out="$(FAKE_SSH_DISK_GB=12 "$BL" run "$WT_DISK" -- bash build.sh 2>&1)"; disklow_rc=$?
+remote_after="$(find "$BURST_LANE_REMOTE_ROOT" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | wc -l)"
+expect "burstdisk AC2: run exits 3 below the disk floor" "[ $disklow_rc -eq 3 ]"
+expect "burstdisk AC2: stdout starts fallback: disk-low" "grep -q '^fallback: disk-low' <<<\"$disklow_out\""
+expect "burstdisk AC2: journal carries cause=disk-low free_gb=12 floor_gb=40" \
+  "grep -q 'cause=disk-low free_gb=12 floor_gb=40' \"$BURST_LANE_JOURNAL\""
+expect "burstdisk AC2: no rsync-up was attempted (no new remote dir)" "[ \"$remote_before\" = \"$remote_after\" ]"
+
+# ---- burstdisk AC3: a real rsync-up failure is named — rc and the log's
+# own last stderr line, log captured under state/logs (requirement 4).
+WT_RSYNCFAIL="$T/worktree-rsyncfail"; mkdir -p "$WT_RSYNCFAIL"
+echo 'mkdir -p target && echo built > target/out.txt; exit 0' > "$WT_RSYNCFAIL/build.sh"
+rsyncfail_out="$(FAKE_RSYNC_FAIL=1 FAKE_RSYNC_FAIL_RC=11 \
+  FAKE_RSYNC_FAIL_MSG='rsync: write failed: No space left on device (28)' \
+  "$BL" run "$WT_RSYNCFAIL" -- bash build.sh 2>&1)"; rsyncfail_rc=$?
+expect "burstdisk AC3: run exits 3 on a named rsync-up failure" "[ $rsyncfail_rc -eq 3 ]"
+expect "burstdisk AC3: journal carries rc and the log's last stderr line" \
+  "grep -qF 'cause=rsync-up-failed rc=11 err=\"rsync: write failed: No space left on device (28)\"' \"$BURST_LANE_JOURNAL\""
+expect "burstdisk AC3: the captured log lives under state/logs, not /tmp" \
+  "ls \"$BURST_LANE_STATE_DIR/logs\"/rsync-up.*.log >/dev/null 2>&1"
+
+# ---- burstdisk AC4: reap deletes an orphan, skips a dirty-marked dir and a
+# keep-listed dir, leaves a live worktree's dir untouched (requirement 5).
+fresh_env
+mkdir -p "$BURST_LANE_REPOS_DIR/mcphost"
+"$BL" up >/dev/null
+
+# bar: a real, still-live worktree — synced, then explicitly pulled so it is
+# no longer dirty (reap must find it via candidate-root decoding, not the
+# dirty-marker shortcut).
+WT_BAR="$BURST_LANE_REPOS_DIR/mcphost-bar"; mkdir -p "$WT_BAR"
+echo 'mkdir -p target && echo built > target/out.txt; exit 0' > "$WT_BAR/build.sh"
+"$BL" run "$WT_BAR" -- bash build.sh >/dev/null 2>&1
+"$BL" pull "$WT_BAR" >/dev/null 2>&1
+bar_hash="$(printf '%s' "$WT_BAR" | sha1sum | cut -c1-8)"
+bar_dir="$BURST_LANE_REMOTE_ROOT/mcphost-bar-$bar_hash"
+expect "burstdisk AC4 setup: bar's remote dir exists" "[ -d \"$bar_dir\" ]"
+
+# baz: was synced (dirty marker still present) but its local worktree is
+# now gone — the dirty marker alone must protect it (requirement 5).
+WT_BAZ="$T/mcphost-baz"; mkdir -p "$WT_BAZ"
+echo 'mkdir -p target && echo built > target/out.txt; exit 0' > "$WT_BAZ/build.sh"
+"$BL" run "$WT_BAZ" -- bash build.sh >/dev/null 2>&1
+baz_hash="$(printf '%s' "$WT_BAZ" | sha1sum | cut -c1-8)"
+baz_dir="$BURST_LANE_REMOTE_ROOT/mcphost-baz-$baz_hash"
+rm -rf "$WT_BAZ"
+expect "burstdisk AC4 setup: baz is still dirty-marked" "[ -s \"$BURST_LANE_STATE_DIR/dirty/$baz_hash.json\" ]"
+
+# foo: an orphaned remote dir whose hash suffix decodes to no known local
+# worktree at all.
+foo_dir="$BURST_LANE_REMOTE_ROOT/foo-abcd1234"; mkdir -p "$foo_dir"; echo x > "$foo_dir/f.txt"
+
+# mcphost: the bare, un-hashed legacy shared checkout (requirement 7) —
+# always protected via the BURST_REAP_KEEP default.
+keep_dir="$BURST_LANE_REMOTE_ROOT/mcphost"; mkdir -p "$keep_dir"; echo x > "$keep_dir/f.txt"
+
+reap_out="$("$BL" reap 2>&1)"
+expect "burstdisk AC4: reap reports exactly one reaped dir" "grep -q '^reaped_dirs=1 ' <<<\"$reap_out\""
+expect "burstdisk AC4: foo (no local worktree) is deleted" "[ ! -e \"$foo_dir\" ]"
+expect "burstdisk AC4: bar (live worktree) is untouched" "[ -d \"$bar_dir\" ]"
+expect "burstdisk AC4: baz (dirty marker) is untouched" "[ -d \"$baz_dir\" ]"
+expect "burstdisk AC4: mcphost (keep-listed) is untouched" "[ -d \"$keep_dir\" ]"
+expect "burstdisk AC4: journal has one reap-ok line naming foo, with bytes" \
+  "grep -q 'burst-lane  reap  ok  (dir=foo-abcd1234 bytes=' \"$BURST_LANE_JOURNAL\""
+expect "burstdisk AC4: journal has a reap-skip line for baz (reason=dirty)" \
+  "grep -q \"burst-lane  reap  skip  (dir=mcphost-baz-$baz_hash reason=dirty)\" \"$BURST_LANE_JOURNAL\""
+expect "burstdisk AC4: journal has a reap-skip line for mcphost (reason=keep)" \
+  "grep -q 'burst-lane  reap  skip  (dir=mcphost reason=keep)' \"$BURST_LANE_JOURNAL\""
+
+# ---- burstdisk AC5: a reap-listing ssh failure is journaled and never
+# blocks down's own keep/scheduled/deleted decision (requirement 6).
+fresh_env
+"$BL" up >/dev/null
+down_reapfail_out="$(FAKE_SSH_REAP_FAIL=255 "$BL" down 2>&1)"; down_reapfail_rc=$?
+expect "burstdisk AC5: down still exits 0 despite a failed reap listing" "[ $down_reapfail_rc -eq 0 ]"
+expect "burstdisk AC5: journal names the ssh rc" \
+  "grep -q 'burst-lane  reap  fail  (cause=ssh rc=255)' \"$BURST_LANE_JOURNAL\""
+reapfail_line="$(grep -n 'burst-lane  reap  fail' "$BURST_LANE_JOURNAL" | tail -1 | cut -d: -f1)"
+downdecision_line="$(grep -n 'burst-lane  down  decision=' "$BURST_LANE_JOURNAL" | tail -1 | cut -d: -f1)"
+expect "burstdisk AC5: the reap-fail line precedes down's own decision line" \
+  "[ -n \"$reapfail_line\" ] && [ -n \"$downdecision_line\" ] && [ \"$reapfail_line\" -lt \"$downdecision_line\" ]"
+
+# ---- burstdisk AC6: status --json reports free_disk_gb/disk_state, and the
+# same low-disk reading collapses sub-cap to 0 — the same shape as "no
+# session" — so lane-claim.sh's effective_subcap() (which only ever honors
+# a box number matching [1-9]|[1-9][0-9]) falls straight through to the
+# local cap without any lane-claim.sh code change (requirement 3, AC6).
+fresh_env
+"$BL" up >/dev/null
+status_low_json="$(FAKE_SSH_DISK_GB=15 "$BL" status --json)"
+expect "burstdisk AC6: status --json reports disk_state=low" "grep -q '\"disk_state\":\"low\"' <<<\$status_low_json"
+expect "burstdisk AC6: status --json free_disk_gb is an integer" "grep -qE '\"free_disk_gb\":15,' <<<\$status_low_json"
+subcap_low="$(FAKE_SSH_DISK_GB=15 "$BL" sub-cap)"
+expect "burstdisk AC6: sub-cap collapses to 0 (same shape as no-session) when disk is low" \
+  "grep -q '^sub-cap=0 local=0' <<<\"$subcap_low\""
+ac6lc_rc=0
+( source "$HERE/lane-claim.sh"
+  BURST_LANE_SH="$BL"
+  fake_target="$T/fake-rust-target"; mkdir -p "$fake_target"
+  echo '[package]' > "$fake_target/Cargo.toml"
+  got="$(FAKE_SSH_DISK_GB=15 effective_subcap "$fake_target")"
+  [ "$got" = "$SAME_LANE_SUBCAP" ] || { echo "expected local cap $SAME_LANE_SUBCAP, got '$got'" >&2; exit 1; }
+) 2>"$T/lane-claim-disklow.err" || ac6lc_rc=$?
+[ "$ac6lc_rc" -eq 0 ] || cat "$T/lane-claim-disklow.err" >&2
+expect "burstdisk AC6: lane-claim.sh effective_subcap treats low disk the same as no session" "[ $ac6lc_rc -eq 0 ]"
+
+# ---- burstdisk AC7: the daily rollup folds in reap yield + disk-low
+# fallbacks (requirement 8). Two reap-ok lines totalling 125 GB and one
+# disk-low fallback are injected directly — a real 125 GB reap isn't
+# reproducible offline, and reap_orphans' own ssh/du/rm plumbing is already
+# covered by AC4 above; this block is testing maybe_daily_rollup's own
+# journal scan.
+fresh_env
+mkdir -p "$BURST_LANE_REPOS_DIR/mcphost"
+"$BL" up >/dev/null
+wt7="$T/mcphost-rollup7"; mkdir -p "$wt7"
+echo 'mkdir -p target && echo built > target/out.txt; exit 0' > "$wt7/build.sh"
+"$BL" run "$wt7" -- bash build.sh >/dev/null 2>&1
+bytes_a=$((60 * 1073741824))
+bytes_b=$((65 * 1073741824))
+{
+  echo "$(date -u +%Y-%m-%dT%H:%M:%SZ)  burst-lane  reap  ok  (dir=fake-a bytes=$bytes_a)"
+  echo "$(date -u +%Y-%m-%dT%H:%M:%SZ)  burst-lane  reap  ok  (dir=fake-b bytes=$bytes_b)"
+  echo "$(date -u +%Y-%m-%dT%H:%M:%SZ)  burst-lane  run  fallback  (cause=disk-low free_gb=10 floor_gb=40 worktree=$wt7)"
+} >> "$BURST_LANE_JOURNAL"
+boot_epoch7="$(grep -oE '"boot_epoch":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+export BURST_LANE_NOW=$((boot_epoch7 + 3600 - 60))
+"$BL" down >/dev/null   # tears the box down and writes today's slug rows
+"$BL" down >/dev/null   # today's slug rows now exist -> rollup fires on THIS call
+today7_file="$BURST_LANE_TICK_JOURNAL_DIR/$(date -u -d "@$BURST_LANE_NOW" +%Y-%m-%d 2>/dev/null || date -u +%Y-%m-%d).md"
+expect "burstdisk AC7: rollup line names reaped_dirs, reaped_gb, disk_low_fallbacks" \
+  "grep -qE 'reaped_dirs=2 reaped_gb=125 disk_low_fallbacks=1' \"$today7_file\""
 unset BURST_LANE_NOW
 
 echo "=== $([ $fail -eq 0 ] && echo PASS || echo FAIL) ==="

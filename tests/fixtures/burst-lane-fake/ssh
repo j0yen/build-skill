@@ -2,13 +2,19 @@
 # Fake ssh for burst-lane.sh offline tests. Last arg is the remote command:
 # "true" for reachability probes, the bwrap sandbox-probe one-liner for
 # sandbox_probe (succeeds unless FAKE_SSH_SANDBOX_FAIL=1), the
-# MemAvailable/nproc probe for cmd_sub_cap (canned via FAKE_SSH_MEMINFO_GB/
-# FAKE_SSH_NPROC so AC7's exact avail_gb/nproc scenarios are reproducible
-# without depending on the real test box's own /proc/meminfo), otherwise
-# the "cd <remote_path> && export ...; <cargo cmd>" string, eval'd locally
-# since our "remote" is really the local filesystem under
-# BURST_LANE_REMOTE_ROOT. FAKE_SSH_REMOTE_FAIL=<n> makes the remote command
-# "fail" with exit code n instead of running it.
+# MemAvailable/nproc/disk probe for cmd_sub_cap/cmd_run/cmd_status (canned
+# via FAKE_SSH_MEMINFO_GB/FAKE_SSH_NPROC/FAKE_SSH_DISK_GB so the disk-guard
+# PRD's exact avail_gb/nproc/free_disk_gb scenarios are reproducible without
+# depending on the real test box's own /proc/meminfo or df; FAKE_SSH_DISK_MISSING=1
+# reverts to the old two-field probe output for the bad-probe-output case),
+# the `find ... -printf` reap listing (independently failable via
+# FAKE_SSH_REAP_FAIL=<n>, distinct from FAKE_SSH_REMOTE_FAIL below, so a
+# reap-only ssh failure can be exercised without also failing `run`'s remote
+# exec), otherwise the "cd <remote_path> && export ...; <cargo cmd>" string
+# (also covers reap's own `du -sb`/`rm -rf` calls), eval'd locally since our
+# "remote" is really the local filesystem under BURST_LANE_REMOTE_ROOT.
+# FAKE_SSH_REMOTE_FAIL=<n> makes the remote command "fail" with exit code n
+# instead of running it.
 set -uo pipefail
 args=("$@")
 cmd="${args[-1]}"
@@ -20,8 +26,20 @@ case "$cmd" in
     ;;
   *MemAvailable*)
     [ "${FAKE_SSH_PROBE_FAIL:-0}" = "1" ] && exit 1
-    echo "${FAKE_SSH_MEMINFO_GB:-8} ${FAKE_SSH_NPROC:-4}"
+    if [ "${FAKE_SSH_DISK_MISSING:-0}" = "1" ]; then
+      echo "${FAKE_SSH_MEMINFO_GB:-8} ${FAKE_SSH_NPROC:-4}"
+    else
+      # Default disk is deliberately abundant (never the binding term) so
+      # every pre-existing mem/cpu-only AC7 scenario keeps its old answer
+      # unless a disk-guard test explicitly sets FAKE_SSH_DISK_GB low.
+      echo "${FAKE_SSH_MEMINFO_GB:-8} ${FAKE_SSH_NPROC:-4} ${FAKE_SSH_DISK_GB:-100000}"
+    fi
     exit 0
+    ;;
+  *-printf*)
+    [ "${FAKE_SSH_REAP_FAIL:-0}" != "0" ] && exit "${FAKE_SSH_REAP_FAIL}"
+    eval "$cmd"
+    exit $?
     ;;
 esac
 if [ "${FAKE_SSH_REMOTE_FAIL:-0}" != "0" ]; then exit "${FAKE_SSH_REMOTE_FAIL}"; fi
