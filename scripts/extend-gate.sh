@@ -77,7 +77,12 @@
 #      ship-tag.sh, gate-delta.sh, jq) — cannot even attempt a run
 #   3  dirty tree — refused before any producer ran, nothing under
 #      target/autobuilder/ changed
-#   4  could not acquire the per-repo integration lock within 120s
+#   4  could not acquire the per-repo integration lock within
+#      $EXTEND_GATE_PRODUCER_LOCK_WAIT seconds (default 90 — PRD-build-
+#      extend-gate-concurrent-isolation requirement 2). The message names
+#      the contending pid(s) ("producer-lock-contended, pid=<n>[,<n>...]"),
+#      is refused before any producer ran, and never emits a `gate: ...
+#      pass=.../block=...` verdict line — fail-closed, not fail-wrong.
 #   5  --head <sha> does not match actual HEAD — refused before any
 #      producer ran
 #   6  could not resolve a unique Cargo project root under <build_into>
@@ -117,9 +122,18 @@
 # rule: never `cargo clean` a crate with receipts).
 #
 # Takes the SAME per-repo integration lock `worktree-extend.sh integrate`
-# takes (`<repo>/.git/autobuilder-integrate.lock`, `flock`), so two PRDs
-# landing on one crate in one tick never run producers concurrently — the
-# second run waits, then regenerates receipts at the later HEAD only.
+# takes (`<repo>/.git/autobuilder-integrate.lock`, `flock`), held from
+# BEFORE the first producer runs (scripts/audit.sh) through the final
+# `autobuilder gate` accounting step, so two PRDs landing on one crate in
+# one tick — or N concurrent gate invocations dispatched against one
+# shared build_into in the same tick, PRD-build-extend-gate-concurrent-
+# isolation — never run producers concurrently: the second (and every
+# subsequent) run waits for the lock, then regenerates receipts at the
+# HEAD it sees once it acquires it (the later HEAD, if one landed in the
+# meantime). A run that cannot acquire the lock within
+# $EXTEND_GATE_PRODUCER_LOCK_WAIT seconds (default 90) fails closed — see
+# exit code 4 below — rather than ever reading a receipt set another
+# invocation may still be mid-write on.
 #
 # --dry-run prints the producer sequence, the resolved base tag, and HEAD;
 # writes nothing under target/autobuilder/; never takes the lock; exits 0.
@@ -165,6 +179,15 @@ fi
 # load 21,466 on 2026-09-09 with the sub-cap at 3). Overridable so tests/
 # can point at a fixture wrapper without touching production behavior.
 CARGO_BUDGET="${CARGO_BUDGET:-$BUILD_SCRIPTS/cargo-budget.sh}"
+# PRD-build-extend-gate-concurrent-isolation: the producer-lock wait below
+# (requirement 2 — bounded wait, explicit fail-closed) is its own ceiling,
+# distinct from worktree-extend.sh integrate's own ~120s wait on the SAME
+# lock file and from manifest-set.sh's unrelated 60s manifest-write
+# ceiling — overridable so a selftest can force contention/timeout in
+# seconds instead of minutes without touching production behavior
+# (default unchanged in spirit, just named and shortened from the prior
+# unconditional 120 to the PRD's specified 90).
+EXTEND_GATE_PRODUCER_LOCK_WAIT="${EXTEND_GATE_PRODUCER_LOCK_WAIT:-90}"
 cargo_budgeted() {
   # Runs "$@" through the budget wrapper when it's present+executable;
   # fails open (runs "$@" directly) if cargo-budget.sh is missing so a
@@ -492,11 +515,30 @@ fi
 # this, a child that outlives the script — cargo autostarting the
 # long-lived sccache daemon, or mcphost's bwrap warm-pool sandboxes leaking
 # past `cargo test` — inherits fd 9 and keeps the lock held after this
-# script exits, timing out the NEXT gate run (exit 4, 120s wait) even
-# though the process that opened the lock is long gone. Do not remove the
-# `9>&-` from a producer invocation without re-reading this comment.
-exec 9>"$repo/.git/autobuilder-integrate.lock"
-flock -w 120 9 || die 4 "could not acquire integration lock for $repo (another integrate/gate is running)"
+# script exits, timing out the NEXT gate run (exit 4, $EXTEND_GATE_PRODUCER_LOCK_WAIT
+# wait) even though the process that opened the lock is long gone. Do not
+# remove the `9>&-` from a producer invocation without re-reading this
+# comment.
+lockfile="$repo/.git/autobuilder-integrate.lock"
+exec 9>"$lockfile"
+# PRD-build-extend-gate-concurrent-isolation requirement 8 (P2, journal
+# visibility): every run records how long it waited for producer access —
+# 0 when uncontended — so a future lane-status-style summary can tell
+# whether the ≤5 same-target sub-cap is actually causing gate contention
+# in practice.
+lock_wait_t0=$(date +%s)
+if ! flock -w "$EXTEND_GATE_PRODUCER_LOCK_WAIT" 9; then
+  # PRD-build-extend-gate-concurrent-isolation requirement 2: fail closed
+  # with an unambiguous, actionable message naming the contending PID —
+  # never proceed to read (or start writing into) a receipts dir another
+  # invocation may be mid-write on. `fuser` names every PID holding an
+  # open fd on the lock file; the holder that actually has it flock'd is
+  # normally the sole result, but a race (holder just exited) can leave
+  # none — "unknown" rather than a misleading blank in that case.
+  holder_pid="$(fuser "$lockfile" 2>/dev/null | tr -s ' \t' '\n' | grep -E '^[0-9]+$' | paste -sd, -)"
+  die 4 "producer-lock-contended, pid=${holder_pid:-unknown} (could not acquire integration lock for $repo within ${EXTEND_GATE_PRODUCER_LOCK_WAIT}s — another integrate/gate is running)"
+fi
+lock_wait=$(( $(date +%s) - lock_wait_t0 ))
 
 # --- prune landed worktrees before producing receipts (PRD-build-worktree-targets-off-root) --
 # A gate must never start on a disk full of worktrees whose branches already
@@ -687,9 +729,9 @@ if $record_baseline; then
   rm -f "$gate_out_file"
   echo "extend-gate: recorded baseline to $repo/agent/gate-baseline.json"
   printf '%s\n' "$recorded"
-  printf '%s  gate  %s  record-baseline  (head=%s base=%s %s wall=%ss)\n' \
+  printf '%s  gate  %s  record-baseline  (head=%s base=%s %s wall=%ss lock_wait=%ss)\n' \
     "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$crate_name" "$head_now" "$base_ref" \
-    "${summary:-gate: no-summary-line}" "$wall" >>"$journal"
+    "${summary:-gate: no-summary-line}" "$wall" "$lock_wait" >>"$journal"
   exit 0
 fi
 
@@ -718,12 +760,12 @@ if [ "$baseline_state" = "present" ]; then
 fi
 
 # One journal line per gate run (requirement 8 / AC13): crate, HEAD, base
-# tag, pass/block counts, blocking receipt names, wall seconds. Absent a
-# committed baseline, journal_suffix is empty and this line is
-# byte-for-byte what it was before this PRD (AC4).
-printf '%s  gate  %s  %s  (head=%s base=%s %s blocking=%s wall=%ss)%s\n' \
+# tag, pass/block counts, blocking receipt names, wall seconds, and (PRD-
+# build-extend-gate-concurrent-isolation requirement 8 / P2) how long this
+# run waited for producer access before it started (0 when uncontended).
+printf '%s  gate  %s  %s  (head=%s base=%s %s blocking=%s wall=%ss lock_wait=%ss)%s\n' \
   "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$crate_name" "$outcome" "$head_now" "$base_ref" \
-  "${summary:-gate: no-summary-line}" "${blockers_csv:-none}" "$wall" "$journal_suffix" >>"$journal"
+  "${summary:-gate: no-summary-line}" "${blockers_csv:-none}" "$wall" "$lock_wait" "$journal_suffix" >>"$journal"
 
 # --- write the verdict cache (P1) — every full run, pass/delta-pass/block
 # alike, so a repeat invocation at the same head + same script replays
