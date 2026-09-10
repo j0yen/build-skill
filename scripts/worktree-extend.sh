@@ -18,16 +18,20 @@
 #
 # Model: the EXPENSIVE work (cargo build/clippy/test/deny, or `uv run
 # pytest`/`pybuilder gate`) runs in parallel, each branch in its own git
-# worktree off the target's `main` HEAD. The CHEAP work (merge back [+
-# version bump + changelog, rust only]) is SERIAL, guarded by a per-repo
-# integration flock, so sequential branches get clean incrementing versions
-# (rust) or a clean linear history (python) and never observe each other's
-# uncommitted files.
+# worktree off the target's REAL DEFAULT BRANCH HEAD (resolved via
+# `default_branch()` below — origin/HEAD when the repo has an origin, which
+# every real build_into repo does; NOT always literally `main`, see
+# PRD-build-worktree-default-branch). The CHEAP work (merge back [+ version
+# bump + changelog, rust only]) is SERIAL, guarded by a per-repo integration
+# flock, so sequential branches get clean incrementing versions (rust) or a
+# clean linear history (python) and never observe each other's uncommitted
+# files.
 #
 # Subcommands:
 #   add <repo> <slug>
 #       Create (or reuse) an isolated worktree of <repo> on branch
-#       autobuilder/<slug>, based on <repo>'s current `main` HEAD. The branch
+#       autobuilder/<slug>, based on <repo>'s current resolved-default-branch
+#       HEAD (see `default_branch()` — not a hardcoded `main`). The branch
 #       agent then cwd's into the printed path, edits src/tests, runs the
 #       gate, and commits its IMPLEMENTATION there (no version bump — that
 #       happens at integration, for rust; python commits its own version
@@ -39,24 +43,27 @@
 #       PRD-build-python-worktree-isolation] SERIAL, same per-repo
 #       integration lock as `integrate` below (mutually exclusive with it —
 #       one lock per repo regardless of language). Refuses (exit 4, no
-#       mutation) if <repo>'s main working tree is dirty at land time —
-#       fail-closed, mirroring SKILL.md's `wm-buildtree land` exit-4-on-dirty
-#       contract (distinct from `integrate`'s exit 3 for the same dirty-tree
-#       case, so callers can tell the two land paths apart). Merges
-#       autobuilder/<slug> into main (--no-ff), with the same rebase-retry
-#       fallback `integrate` uses on conflict. Performs NO version-bump, NO
-#       CHANGELOG edit, and NO cargo-lock regen — the branch's own commits
-#       (made by `/pybuild`, or any other writer) already carry whatever
-#       version bump they need; `land`'s only job is getting them onto main
-#       safely. On success, runs `cleanup` (branch kept, worktree freed).
-#       Use this (not `integrate`) for EVERY python-extend PRD, solo or
-#       shared build_into — it is the python `wm-buildtree`-equivalent
-#       (SKILL.md Phase 3/4 python routing, "Worktree isolation" section).
+#       mutation) if <repo>'s default-branch working tree is dirty at land
+#       time — fail-closed, mirroring SKILL.md's `wm-buildtree land`
+#       exit-4-on-dirty contract (distinct from `integrate`'s exit 3 for the
+#       same dirty-tree case, so callers can tell the two land paths apart).
+#       Merges autobuilder/<slug> into the resolved default branch (--no-ff,
+#       NEVER a stale/hardcoded `main` — PRD-build-worktree-default-branch),
+#       with the same rebase-retry fallback `integrate` uses on conflict.
+#       Performs NO version-bump, NO CHANGELOG edit, and NO cargo-lock
+#       regen — the branch's own commits (made by `/pybuild`, or any other
+#       writer) already carry whatever version bump they need; `land`'s only
+#       job is getting them onto the default branch safely. On success, runs
+#       `cleanup` (branch kept, worktree freed). Use this (not `integrate`)
+#       for EVERY python-extend PRD, solo or shared build_into — it is the
+#       python `wm-buildtree`-equivalent (SKILL.md Phase 3/4 python routing,
+#       "Worktree isolation" section).
 #
 #   integrate [--project-root <rel>] <repo> <slug> <bump> <tldr-file>
-#       SERIAL. Takes the per-repo integration lock. Refuses if <repo>'s main
-#       working tree is dirty (exit 3) — never merges into a dirty tree.
-#       Merges autobuilder/<slug> into main (--no-ff), then bumps the version
+#       SERIAL. Takes the per-repo integration lock. Refuses if <repo>'s
+#       default-branch working tree is dirty (exit 3) — never merges into a
+#       dirty tree. Merges autobuilder/<slug> into the resolved default
+#       branch (--no-ff, never a hardcoded `main`), then bumps the version
 #       (<bump>) and prepends the CHANGELOG from <tldr-file> via
 #       extend-handler.sh, committing the bump with the Joe Yen identity.
 #       Exit 4 on merge conflict (merge aborted; branch left for next tick).
@@ -113,6 +120,45 @@ die() { echo "worktree-extend: $2" >&2; exit "$1"; }
 need() { [ -n "${1:-}" ] || die 1 "$2"; }
 
 wt_path() { echo "$WT_ROOT/$(basename "$1")-$2"; }
+
+# PRD-build-worktree-default-branch: resolve <repo>'s REAL default branch
+# instead of assuming it's literally `main`. add/land/integrate all used to
+# hardcode "main" for base resolution and as the checkout+merge target; on
+# 2026-09-10 that silently found (or, via --ensure-main, CREATED) a stale
+# local `main` in a `master`-default repo (synthorg) and merged onto it
+# instead of `master` — exit 0, no error, a same-session commit dropped from
+# the branch that actually got pushed. See the PRD's five-whys.
+#
+# Resolution: prefer `origin/HEAD` (every real build_into repo has an origin
+# remote; this is exactly what `git clone` sets from the remote's advertised
+# default, and what a stale/wrong local branch can never spoof). Only when
+# there is NO origin/HEAD at all (a from-scratch local repo with no remote —
+# true of some disposable test fixtures, never of an actual build_into
+# target) fall back to the literal "main" every call site hardcoded before
+# this fix, so origin-less fixtures keep their prior behavior unchanged.
+default_branch() {
+  local repo="${1:?default_branch: missing repo}"
+  local ref
+  ref="$(git -C "$repo" symbolic-ref -q --short refs/remotes/origin/HEAD 2>/dev/null)"
+  if [ -n "$ref" ]; then
+    printf '%s\n' "${ref#origin/}"
+    return 0
+  fi
+  printf '%s\n' "main"
+}
+
+# Fail-closed guard (PRD-build-worktree-default-branch AC2/AC3): checkout
+# <branch> in <repo> and verify HEAD actually landed there before letting a
+# caller merge anything. The 2026-09-10 incident's root failure was that a
+# checkout of the wrong branch name proceeded SILENTLY (exit 0, no signal) —
+# this makes "checked out something other than the branch we asked for" a
+# loud, non-zero-exit error instead of a silent wrong-branch merge.
+checkout_or_die() {
+  local repo="$1" branch="$2"
+  git -C "$repo" checkout "$branch" >&2 2>/dev/null || git -C "$repo" checkout -q "$branch" 2>/dev/null
+  local cur; cur="$(git -C "$repo" symbolic-ref -q --short HEAD 2>/dev/null)"
+  [ "$cur" = "$branch" ] || die 2 "fail-closed: expected to be on '$branch' after checkout but HEAD is '${cur:-detached}' in $repo; refusing to merge onto the wrong branch"
+}
 
 # Root for worktree cargo target-dirs. $BUILD_TARGET_ROOT wins when set;
 # otherwise /mnt/data/jsy/cargo-targets when the data drive is mounted here,
@@ -224,9 +270,15 @@ cmd_add() {
     print_python_burst_lane_path_reminder "$repo" >&2
     echo "$wt"; return 0
   fi
-  # Base the branch on main's HEAD (clean commit), ignoring any dirty files in
-  # the main working tree.
-  base="$(git -C "$repo" rev-parse --verify -q main 2>/dev/null || git -C "$repo" rev-parse HEAD)"
+  # Base the branch on the repo's REAL default branch HEAD (clean commit),
+  # ignoring any dirty files in the working tree — NOT a hardcoded "main"
+  # (PRD-build-worktree-default-branch AC1). Prefer the local branch of that
+  # name; fall back to origin/<default> (fresh clone with no local branch
+  # checked out yet), then to plain HEAD as a last resort.
+  local default; default="$(default_branch "$repo")"
+  base="$(git -C "$repo" rev-parse --verify -q "$default" 2>/dev/null \
+    || git -C "$repo" rev-parse --verify -q "origin/$default" 2>/dev/null \
+    || git -C "$repo" rev-parse HEAD)"
   if git -C "$repo" show-ref --verify --quiet "refs/heads/$branch"; then
     git -C "$repo" worktree add "$wt" "$branch" >&2 || die 2 "worktree add (existing branch) failed"
   else
@@ -321,6 +373,10 @@ cmd_land() {
   need "$repo" "usage: land [--no-rebase] <repo> <slug>"; need "$slug" "missing slug"
   local branch="autobuilder/$slug"
   local wt; wt="$(wt_path "$repo" "$slug")"
+  # PRD-build-worktree-default-branch AC2: resolve the repo's REAL default
+  # branch instead of hardcoding "main" — a stale local `main` left by an
+  # earlier session must never be silently checked out and merged onto.
+  local default; default="$(default_branch "$repo")"
   # Same per-repo integration lock file as cmd_integrate: land and integrate
   # against the same repo are mutually exclusive, language-agnostic.
   # PRD-extend-gate-lock-cloexec convention: no cargo is invoked in this
@@ -336,7 +392,7 @@ cmd_land() {
     die 4 "target tree dirty; refusing to land $slug (commit-or-revert the working tree first)"
   fi
   git -C "$repo" show-ref --verify --quiet "refs/heads/$branch" || die 2 "no branch $branch to land"
-  git -C "$repo" checkout main >&2 2>/dev/null || git -C "$repo" checkout -q main
+  checkout_or_die "$repo" "$default"
   if ! git -C "$repo" "${GIT_ID[@]}" merge --no-ff --no-edit "$branch" >&2; then
     git -C "$repo" merge --abort 2>/dev/null
     if [ -n "$no_rebase" ] || [ ! -d "$wt" ]; then
@@ -346,8 +402,8 @@ cmd_land() {
       [ -x "$SERIAL_FALLBACK" ] && "$SERIAL_FALLBACK" streak-record "$repo" "$_early_cf" >&2 || true
       die 4 "merge conflict landing $slug; aborted (branch kept for next tick, worktree commits intact)"
     fi
-    echo "worktree-extend: $slug: merge conflict landing — attempting rebase onto current main HEAD" >&2
-    local main_head; main_head="$(git -C "$repo" rev-parse main)"
+    echo "worktree-extend: $slug: merge conflict landing — attempting rebase onto current $default HEAD" >&2
+    local main_head; main_head="$(git -C "$repo" rev-parse "$default")"
     if ! git -C "$wt" "${GIT_ID[@]}" rebase "$main_head" >&2; then
       git -C "$wt" rebase --abort 2>/dev/null
       local conflict_files; conflict_files="$(git -C "$wt" diff --name-only --diff-filter=U 2>/dev/null | tr '\n' ',' | sed 's/,$//')"
@@ -398,6 +454,10 @@ cmd_integrate() {
   need "$repo" "usage: integrate [--no-rebase] [--ensure-main] [--project-root <rel>] <repo> <slug> <bump> <tldr-file>"; need "$slug" "missing slug"
   local branch="autobuilder/$slug"
   local wt; wt="$(wt_path "$repo" "$slug")"
+  # PRD-build-worktree-default-branch AC3: resolve the repo's REAL default
+  # branch instead of hardcoding "main" — same fix as add/land, applied to
+  # integrate's checkout/merge/--ensure-main path.
+  local default; default="$(default_branch "$repo")"
   # PRD-extend-gate-lock-cloexec (2026-09-05 incident class): every cargo
   # invocation below (lock_regen, the post-rebase `cargo check` guard)
   # closes fd 9 (`9>&-`) in its own subshell before exec'ing cargo, so an
@@ -406,13 +466,17 @@ cmd_integrate() {
   exec 9>"$repo/.git/autobuilder-integrate.lock"
   flock -w 120 9 || die 5 "could not acquire integration lock for $repo"
 
-  # --ensure-main: create main from the default-branch HEAD if it does not exist.
-  # This handles repos where a prior tick's branch was never landed (no main yet).
-  if [ -n "$ensure_main" ] && ! git -C "$repo" show-ref --verify --quiet "refs/heads/main"; then
+  # --ensure-main: create the resolved default branch from HEAD if it does
+  # not exist (flag name kept for back-compat; it no longer assumes the
+  # branch is literally named "main" — PRD-build-worktree-default-branch
+  # AC3). This handles repos where a prior tick's branch was never landed
+  # (no default branch yet, e.g. a brand-new build_into with no clone-time
+  # HEAD).
+  if [ -n "$ensure_main" ] && ! git -C "$repo" show-ref --verify --quiet "refs/heads/$default"; then
     local default_head; default_head="$(git -C "$repo" rev-parse HEAD 2>/dev/null)" || die 2 "--ensure-main: cannot resolve HEAD in $repo"
-    git -C "$repo" "${GIT_ID[@]}" branch main "$default_head" >&2 \
-      || die 2 "--ensure-main: failed to create main branch from HEAD in $repo"
-    echo "worktree-extend: created main branch from HEAD ($default_head) in $repo" >&2
+    git -C "$repo" "${GIT_ID[@]}" branch "$default" "$default_head" >&2 \
+      || die 2 "--ensure-main: failed to create $default branch from HEAD in $repo"
+    echo "worktree-extend: created $default branch from HEAD ($default_head) in $repo" >&2
   fi
 
   # Never merge into a dirty tree.
@@ -420,9 +484,10 @@ cmd_integrate() {
     die 3 "target tree dirty; refusing to integrate $slug (commit-or-revert the working tree first)"
   fi
   git -C "$repo" show-ref --verify --quiet "refs/heads/$branch" || die 2 "no branch $branch to integrate"
-  git -C "$repo" checkout main >&2 2>/dev/null || git -C "$repo" checkout -q main
-  # Cargo.lock is a generated artifact: keep main's side on merge (ours driver),
-  # then regenerate canonically below. Set up before the merge so it takes effect.
+  checkout_or_die "$repo" "$default"
+  # Cargo.lock is a generated artifact: keep the default branch's side on
+  # merge (ours driver), then regenerate canonically below. Set up before
+  # the merge so it takes effect.
   lock_merge_setup "$repo"
   if ! git -C "$repo" "${GIT_ID[@]}" merge --no-ff --no-edit "$branch" >&2; then
     git -C "$repo" merge --abort 2>/dev/null
@@ -435,10 +500,11 @@ cmd_integrate() {
       [ -x "$SERIAL_FALLBACK" ] && "$SERIAL_FALLBACK" streak-record "$repo" "$_early_cf" >&2 || true
       die 4 "merge conflict integrating $slug; aborted (branch kept for next tick)"
     fi
-    echo "worktree-extend: $slug: merge conflict — attempting rebase onto current main HEAD" >&2
-    local main_head; main_head="$(git -C "$repo" rev-parse main)"
-    # Rebase runs in the branch's worktree (branch checked out there); main is not
-    # checked out in the worktree so the primary tree stays on main and clean.
+    echo "worktree-extend: $slug: merge conflict — attempting rebase onto current $default HEAD" >&2
+    local main_head; main_head="$(git -C "$repo" rev-parse "$default")"
+    # Rebase runs in the branch's worktree (branch checked out there); the
+    # default branch is not checked out in the worktree so the primary tree
+    # stays on it and clean.
     if ! git -C "$wt" "${GIT_ID[@]}" rebase "$main_head" >&2; then
       git -C "$wt" rebase --abort 2>/dev/null
       # Collect conflicting paths for sidecar telemetry.
