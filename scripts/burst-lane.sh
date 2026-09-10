@@ -37,6 +37,19 @@
 # next session, and `cost --today` unions and prints the slugs served
 # across today's rows.
 #
+# PRD-build-gate-on-casper requirement 1 (gate toolchain provisioning) is
+# also wired: `up` (both the fresh-create and adoption branches) calls
+# `provision_gate_tools()` right after `box_bootstrap`/the sandbox probe —
+# it installs autobuilder/jq/gh/mold/cargo-deny/cargo-nextest/uv/claude on
+# the box if `command -v` doesn't already find them, rsyncs a read-only
+# mirror of build-skill's own scripts/ and rustbuild's scripts/+prompts/,
+# and records `gate_ready`/`gate_tools_missing` into session state (see
+# `GATE_TOOLS_LIST` near the top). `verify` gained a matching `gate-tools`
+# check that fails closed, naming the first missing tool. The remaining
+# gate-on-casper requirements (parity, the `gate` subcommand itself,
+# credentials, concurrency slots, teardown safety) are NOT yet wired — see
+# git log / the PRD's own requirement list for what's landed so far.
+#
 # Subcommands:
 #   burst-lane.sh up
 #       Idempotent (AC1): a live tracked session -> "already-up: <id> <ip>",
@@ -170,6 +183,25 @@ PULLSZ_DIR="$STATE_DIR/pull-sizes"
 ATTR_REPOS_DIR="${BURST_LANE_REPOS_DIR:-$HOME/wintermute}"
 ROLLUP_CURSOR="$STATE_DIR/.rollup-cursor"
 TICK_JOURNAL_DIR="${BURST_LANE_TICK_JOURNAL_DIR:-$HOME/brain/journal/build}"
+# PRD-build-gate-on-casper requirement 1: gate toolchain provisioning. The
+# 8 versioned CLI tools `up` provisions if absent; the two script mirrors
+# (build-skill's own scripts/, rustbuild's scripts/+prompts/) are synced
+# read-only alongside them but aren't "versioned" the same way. Overridable
+# so offline tests never touch the real ~/.cargo/bin or ~/.claude/skills.
+GATE_TOOLS_LIST="autobuilder jq gh mold cargo-deny cargo-nextest uv claude"
+GATE_TOOLS_STATE_FILE="$STATE_DIR/gate-tools.json"
+GATE_TOOLS_BUILD_SCRIPTS_SRC="${BURST_LANE_GATE_BUILD_SCRIPTS:-$HOME/.claude/skills/build/scripts}"
+GATE_TOOLS_RUSTBUILD_SCRIPTS_SRC="${BURST_LANE_GATE_RUSTBUILD_SCRIPTS:-$HOME/.claude/skills/rustbuild/scripts}"
+GATE_TOOLS_RUSTBUILD_PROMPTS_SRC="${BURST_LANE_GATE_RUSTBUILD_PROMPTS:-$HOME/.claude/skills/rustbuild/prompts}"
+GATE_TOOLS_AUTOBUILDER_BIN="${BURST_LANE_AUTOBUILDER_BIN:-$HOME/.cargo/bin/autobuilder}"
+# Absolute (no "~") on purpose — the fake rsync fixture only string-strips a
+# "user@host:" prefix, it never runs a remote shell to expand a tilde, so a
+# literal "~/.cargo/bin" destination would resolve to a relative "~" dir
+# under whatever the test's cwd happens to be instead of a scoped path.
+# Overridable so the offline selftest can point this at a tmpdir instead of
+# the production default (which matches cmd_verify's own hardcoded
+# /root/.cargo/bin PATH entry — this whole lane assumes REMOTE_USER=root).
+GATE_TOOLS_REMOTE_BIN_DIR="${BURST_LANE_GATE_TOOLS_REMOTE_BIN_DIR:-/root/.cargo/bin}"
 
 HCLOUD="${BURST_LANE_HCLOUD_BIN:-hcloud}"
 SSH_BIN="${BURST_LANE_SSH_BIN:-ssh}"
@@ -307,6 +339,140 @@ sandbox_probe() {  # $1 = ip -> echoes true|false
   fi
 }
 
+# ---- gate toolchain provisioning (PRD-build-gate-on-casper requirement 1) --
+# `up` calls provision_gate_tools() after box_bootstrap so a remote gate has
+# everywhere it needs before extend-gate.sh ever runs there: autobuilder
+# (copied from THIS host's ~/.cargo/bin, not apt/cargo-installed — it has no
+# published crate), jq/gh/mold/cargo-deny/cargo-nextest/uv/claude (installed
+# on the box if `command -v` doesn't find them), and the build-skill +
+# rustbuild script/prompt trees (rsynced read-only — the box runs
+# extend-gate.sh against its OWN copy, never writes back into it). The probe
+# command is marked with a `# gate-tools-probe` comment line and each
+# install command with `# gate-tools-install <tool>` SPECIFICALLY so the
+# offline fake-ssh fixture (tests/fixtures/burst-lane-fake/ssh) can
+# intercept them deterministically — see that fixture's own header for the
+# FAKE_SSH_GATE_TOOLS_MISSING / FAKE_GATE_TOOLS_STATE knobs — instead of a
+# real box's bash actually needing to parse a comment (it doesn't; comments
+# are just inert there, the real install shell below the marker runs as
+# normal).
+gate_tools_probe() {  # $1=ip -> stdout: one "tool=version|MISSING" line per tool
+  "$SSH_BIN" -o StrictHostKeyChecking=no -o ConnectTimeout=8 -i "$SSH_KEY" "$REMOTE_USER@$1" "
+# gate-tools-probe
+for t in $GATE_TOOLS_LIST; do
+  if command -v \"\$t\" >/dev/null 2>&1; then
+    v=\"\$(\"\$t\" --version 2>/dev/null | head -n1)\"
+    printf '%s=%s\n' \"\$t\" \"\${v:-unknown}\"
+  else
+    printf '%s=MISSING\n' \"\$t\"
+  fi
+done" 2>/dev/null
+}
+
+gate_tools_install_cmd() {  # $1=tool (never "autobuilder" — that's a push, see below) -> stdout: remote command
+  local tool="$1"
+  case "$tool" in
+    jq)
+      printf '%s\napt-get update -qq && apt-get install -y -qq jq\n' "# gate-tools-install $tool" ;;
+    gh)
+      printf '%s\n%s\n' "# gate-tools-install $tool" \
+        "(curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg -o /usr/share/keyrings/githubcli-archive-keyring.gpg && chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg && echo 'deb [arch=amd64 signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main' > /etc/apt/sources.list.d/github-cli.list && apt-get update -qq && apt-get install -y -qq gh)" ;;
+    mold)
+      printf '%s\napt-get update -qq && apt-get install -y -qq mold\n' "# gate-tools-install $tool" ;;
+    cargo-deny)
+      printf '%s\nexport PATH=/root/.cargo/bin:\$PATH; cargo install --locked cargo-deny\n' "# gate-tools-install $tool" ;;
+    cargo-nextest)
+      printf '%s\nexport PATH=/root/.cargo/bin:\$PATH; cargo install --locked cargo-nextest\n' "# gate-tools-install $tool" ;;
+    uv)
+      printf '%s\ncurl -LsSf https://astral.sh/uv/install.sh | sh\n' "# gate-tools-install $tool" ;;
+    claude)
+      printf '%s\ncurl -fsSL https://claude.ai/install.sh | bash\n' "# gate-tools-install $tool" ;;
+    *)
+      printf '%s\ntrue\n' "# gate-tools-install $tool" ;;
+  esac
+}
+
+# Read-only mirror of the two script trees a remote extend-gate.sh needs
+# (build-skill's own scripts/, rustbuild's scripts/+prompts/) — best-effort,
+# never fatal (a missing local source dir is skipped, not an error: some
+# hosts running this script don't have rustbuild installed at all).
+sync_gate_tools_scripts() {  # $1=ip
+  local ip="$1" src dst
+  for pair in \
+    "$GATE_TOOLS_BUILD_SCRIPTS_SRC:$REMOTE_ROOT/.gate-tools/build-scripts" \
+    "$GATE_TOOLS_RUSTBUILD_SCRIPTS_SRC:$REMOTE_ROOT/.gate-tools/rustbuild-scripts" \
+    "$GATE_TOOLS_RUSTBUILD_PROMPTS_SRC:$REMOTE_ROOT/.gate-tools/rustbuild-prompts"
+  do
+    src="${pair%%:*}"; dst="${pair#*:}"
+    [ -d "$src" ] || continue
+    "$SSH_BIN" -o StrictHostKeyChecking=no -o ConnectTimeout=8 -i "$SSH_KEY" "$REMOTE_USER@$ip" "mkdir -p '$dst'" 2>/dev/null || true
+    "$RSYNC_BIN" -az --delete -e "$SSH_BIN -o StrictHostKeyChecking=no -i $SSH_KEY" \
+      "$src/" "$REMOTE_USER@$ip:$dst/" >/dev/null 2>&1 || true
+    # Files only (never -R on the dirs themselves) — a directory stripped of
+    # its own write bit can no longer have entries added/removed inside it,
+    # which broke both a later re-sync (rsync --delete needs to unlink stale
+    # files) and this selftest's own tmpdir cleanup (rm -rf) the first time
+    # this shipped with a blanket `chmod -R a-w`.
+    "$SSH_BIN" -o StrictHostKeyChecking=no -o ConnectTimeout=8 -i "$SSH_KEY" "$REMOTE_USER@$ip" "find '$dst' -type f -exec chmod a-w {} +" 2>/dev/null || true
+  done
+}
+
+# Sets GATE_READY (true/false) and GATE_TOOLS_MISSING (comma-joined tool
+# names, empty when none) on return; writes the full probe result to
+# $GATE_TOOLS_STATE_FILE for `verify`'s gate-tools check to read back.
+# Never fatal — a total probe failure (ssh unreachable etc.) records every
+# tool MISSING rather than crashing `up`.
+GATE_READY="false"
+GATE_TOOLS_MISSING=""
+provision_gate_tools() {  # $1=ip
+  local ip="$1" probe_out name ver
+
+  probe_out="$(gate_tools_probe "$ip")"
+  while IFS='=' read -r name ver; do
+    [ -n "$name" ] || continue
+    [ "$ver" = "MISSING" ] || continue
+    if [ "$name" = "autobuilder" ]; then
+      if [ -f "$GATE_TOOLS_AUTOBUILDER_BIN" ]; then
+        "$SSH_BIN" -o StrictHostKeyChecking=no -o ConnectTimeout=8 -i "$SSH_KEY" "$REMOTE_USER@$ip" \
+          "$(printf '%s\nmkdir -p '"'"'%s'"'"'\n' "# gate-tools-install autobuilder" "$GATE_TOOLS_REMOTE_BIN_DIR")" >/dev/null 2>&1 || true
+        "$RSYNC_BIN" -az -e "$SSH_BIN -o StrictHostKeyChecking=no -i $SSH_KEY" \
+          "$GATE_TOOLS_AUTOBUILDER_BIN" "$REMOTE_USER@$ip:$GATE_TOOLS_REMOTE_BIN_DIR/autobuilder" >/dev/null 2>&1 || true
+        "$SSH_BIN" -o StrictHostKeyChecking=no -o ConnectTimeout=8 -i "$SSH_KEY" "$REMOTE_USER@$ip" \
+          "chmod +x '$GATE_TOOLS_REMOTE_BIN_DIR/autobuilder'" 2>/dev/null || true
+      fi
+    else
+      "$SSH_BIN" -o StrictHostKeyChecking=no -o ConnectTimeout=8 -i "$SSH_KEY" "$REMOTE_USER@$ip" "$(gate_tools_install_cmd "$name")" >/dev/null 2>&1 || true
+    fi
+  done <<<"$probe_out"
+
+  sync_gate_tools_scripts "$ip"
+
+  local final_out; final_out="$(gate_tools_probe "$ip")"
+  mkdir -p "$STATE_DIR" 2>/dev/null || true
+  if [ -n "$final_out" ]; then
+    python3 -c '
+import json, sys
+lines = sys.argv[1].strip().splitlines()
+tools, missing = {}, []
+for ln in lines:
+    if "=" not in ln:
+        continue
+    k, v = ln.split("=", 1)
+    tools[k] = v
+    if v == "MISSING":
+        missing.append(k)
+json.dump({"tools": tools, "missing": missing}, open(sys.argv[2], "w"))
+' "$final_out" "$GATE_TOOLS_STATE_FILE"
+    GATE_TOOLS_MISSING="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(",".join(d.get("missing",[])))' "$GATE_TOOLS_STATE_FILE" 2>/dev/null || true)"
+  else
+    python3 -c '
+import json, sys
+json.dump({"tools": {}, "missing": sys.argv[1].split()}, open(sys.argv[2], "w"))
+' "$GATE_TOOLS_LIST" "$GATE_TOOLS_STATE_FILE"
+    GATE_TOOLS_MISSING="$GATE_TOOLS_LIST"
+  fi
+  if [ -z "$GATE_TOOLS_MISSING" ]; then GATE_READY="true"; else GATE_READY="false"; fi
+}
+
 cmd_up() {
   if state_active; then
     local id; id="$(state_read server_id)"
@@ -325,12 +491,14 @@ cmd_up() {
     local aid aip; aid="${adopt%% *}"; aip="${adopt##* }"
     box_bootstrap "$aip"
     local sbx; sbx="$(sandbox_probe "$aip")"
+    provision_gate_tools "$aip"
     : > "$SERVED_FILE"
     state_write "server_id=$aid" "ip=$aip" "server_type=$SERVER_TYPE" \
       "boot_ts=$(now_iso)" "boot_epoch=$(now_epoch)" "ttl_hours=$DEFAULT_TTL_HOURS" \
       "hard_ttl_hours=$HARD_TTL_HOURS" "runs_served=0" "sandbox_ok=$sbx" \
-      "teardown_scheduled=false" "teardown_epoch="
-    journal_line "$(now_iso)  burst-lane  up  adopted  (server_id=$aid ip=$aip sandbox_ok=$sbx)"
+      "teardown_scheduled=false" "teardown_epoch=" \
+      "gate_ready=$GATE_READY" "gate_tools_missing=$GATE_TOOLS_MISSING"
+    journal_line "$(now_iso)  burst-lane  up  adopted  (server_id=$aid ip=$aip sandbox_ok=$sbx gate_ready=$GATE_READY)"
     ( cmd_verify >/dev/null 2>&1 ) || journal_line "$(now_iso)  burst-lane  up  verify-failed-after-adopt  (lane unverified — run falls back local)"
     echo "already-up: $aid $aip (adopted)"
     exit 0
@@ -393,12 +561,14 @@ print(d.get("id",""), d.get("public_net",{}).get("ipv4",{}).get("ip",""))
 
   box_bootstrap "$ip"
   local sbx; sbx="$(sandbox_probe "$ip")"
+  provision_gate_tools "$ip"
   : > "$SERVED_FILE"
   state_write "server_id=$id" "ip=$ip" "server_type=$SERVER_TYPE" \
     "boot_ts=$(now_iso)" "boot_epoch=$(now_epoch)" "ttl_hours=$DEFAULT_TTL_HOURS" \
     "hard_ttl_hours=$HARD_TTL_HOURS" "runs_served=0" "sandbox_ok=$sbx" \
-    "teardown_scheduled=false" "teardown_epoch="
-  journal_line "$(now_iso)  burst-lane  up  booted  (server_id=$id ip=$ip type=$SERVER_TYPE sandbox_ok=$sbx)"
+    "teardown_scheduled=false" "teardown_epoch=" \
+    "gate_ready=$GATE_READY" "gate_tools_missing=$GATE_TOOLS_MISSING"
+  journal_line "$(now_iso)  burst-lane  up  booted  (server_id=$id ip=$ip type=$SERVER_TYPE sandbox_ok=$sbx gate_ready=$GATE_READY)"
   ( cmd_verify >/dev/null 2>&1 ) || journal_line "$(now_iso)  burst-lane  up  verify-failed-after-boot  (lane unverified — run falls back local)"
   if [ "$sbx" = false ]; then
     journal_line "$(now_iso)  burst-lane  up  sandbox-unavailable  (server_id=$id — rust selection falls back to local cap for python-kind sandboxed tests this tick)"
@@ -437,6 +607,19 @@ cmd_verify() {
   printf '%s' "$rout" | grep -q "^1$"     || vfail "remote python3"
   [ "$(sandbox_probe "$ip")" = "true" ]   || vfail "bwrap sandbox"
 
+  # Requirement 1's own verify check: fails closed, naming the first missing
+  # tool, rather than a bare "gate-tools FAIL" — an operator staring at the
+  # journal should not have to go re-run provisioning by hand to find out
+  # which one.
+  local gt_ready gt_missing gt_first
+  gt_ready="$(state_read gate_ready)"; gt_missing="$(state_read gate_tools_missing)"
+  if [ "$gt_ready" = "true" ]; then
+    echo "gate-tools ok"
+  else
+    gt_first="${gt_missing%%,*}"
+    vfail "gate-tools (missing: ${gt_first:-unknown})"
+  fi
+
   if [ "$fails" -gt 0 ]; then
     probe_emit burst-verify dirty "$fails check(s) failed — lane stays unverified, all work falls back local" >/dev/null
     journal_line "$(now_iso)  burst-lane  verify  FAILED  ($fails check(s) — lane stays unverified, all work falls back local)"
@@ -447,6 +630,7 @@ cmd_verify() {
     "ttl_hours=$(state_read ttl_hours)" "hard_ttl_hours=$(state_read hard_ttl_hours)" \
     "runs_served=$(state_read runs_served)" "sandbox_ok=$(state_read sandbox_ok)" \
     "teardown_scheduled=$(state_read teardown_scheduled)" "teardown_epoch=$(state_read teardown_epoch)" \
+    "gate_ready=$gt_ready" "gate_tools_missing=$gt_missing" \
     "verified=true"
   probe_emit burst-verify clean "rsync+cargo+uv+python3+sandbox all real" >/dev/null
   journal_line "$(now_iso)  burst-lane  verify  ok  (rsync+cargo+uv+python3+sandbox all real)"
@@ -1113,7 +1297,8 @@ cmd_run() {
     "boot_ts=$(state_read boot_ts)" "boot_epoch=$(state_read boot_epoch)" \
     "ttl_hours=$(state_read ttl_hours)" "hard_ttl_hours=$(state_read hard_ttl_hours)" \
     "runs_served=$runs" "sandbox_ok=$(state_read sandbox_ok)" \
-    "teardown_scheduled=$(state_read teardown_scheduled)" "teardown_epoch=$(state_read teardown_epoch)" "verified=$(state_read verified)"
+    "teardown_scheduled=$(state_read teardown_scheduled)" "teardown_epoch=$(state_read teardown_epoch)" "verified=$(state_read verified)" \
+    "gate_ready=$(state_read gate_ready)" "gate_tools_missing=$(state_read gate_tools_missing)"
 
   # Requirement 13: attribute this run to a PRD slug for the cost ledger.
   # Callers that know their own slug (branch/gate dispatch) should export
@@ -1746,7 +1931,8 @@ cmd_down() {
       state_write "server_id=$id" "ip=$(state_read ip)" "server_type=$(state_read server_type)" \
         "boot_ts=$(state_read boot_ts)" "boot_epoch=$boot_epoch" "ttl_hours=$(state_read ttl_hours)" \
         "hard_ttl_hours=$(state_read hard_ttl_hours)" "runs_served=$(state_read runs_served)" \
-        "sandbox_ok=$(state_read sandbox_ok)" "teardown_scheduled=false" "teardown_epoch=" "verified=$(state_read verified)"
+        "sandbox_ok=$(state_read sandbox_ok)" "teardown_scheduled=false" "teardown_epoch=" "verified=$(state_read verified)" \
+        "gate_ready=$(state_read gate_ready)" "gate_tools_missing=$(state_read gate_tools_missing)"
       journal_line "$(now_iso)  burst-lane  down  decision=keep  (server_id=$id cause=rust-work-arrived, schedule cancelled)"
     else
       journal_line "$(now_iso)  burst-lane  down  decision=keep  (server_id=$id)"
@@ -1806,7 +1992,8 @@ cmd_down() {
   state_write "server_id=$id" "ip=$(state_read ip)" "server_type=$(state_read server_type)" \
     "boot_ts=$(state_read boot_ts)" "boot_epoch=$boot_epoch" "ttl_hours=$(state_read ttl_hours)" \
     "hard_ttl_hours=$(state_read hard_ttl_hours)" "runs_served=$(state_read runs_served)" \
-    "sandbox_ok=$(state_read sandbox_ok)" "teardown_scheduled=true" "teardown_epoch=$window_start" "verified=$(state_read verified)"
+    "sandbox_ok=$(state_read sandbox_ok)" "teardown_scheduled=true" "teardown_epoch=$window_start" "verified=$(state_read verified)" \
+    "gate_ready=$(state_read gate_ready)" "gate_tools_missing=$(state_read gate_tools_missing)"
   journal_line "$(now_iso)  burst-lane  down  decision=scheduled  (server_id=$id teardown_at=$(date -u -d "@$window_start" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "$window_start"))"
   echo "decision=scheduled"
   exit 0

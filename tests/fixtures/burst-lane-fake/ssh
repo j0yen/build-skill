@@ -20,6 +20,40 @@ args=("$@")
 cmd="${args[-1]}"
 if [ "$cmd" = true ]; then exit 0; fi
 case "$cmd" in
+  *'# gate-tools-probe'*)
+    # PRD-build-gate-on-casper requirement 1. Canned tool inventory:
+    # FAKE_SSH_GATE_TOOLS_MISSING is a space-separated list of tool names
+    # that report MISSING; a tool later "installed" via a
+    # '# gate-tools-install <tool>' call in the SAME test run (tracked one
+    # name per line in $FAKE_GATE_TOOLS_STATE) stops reporting MISSING on
+    # every probe from then on — so a test can assert the up -> probe ->
+    # install-missing -> re-probe round trip without any real apt-get/
+    # curl/cargo-install ever running.
+    installed=""
+    if [ -n "${FAKE_GATE_TOOLS_STATE:-}" ] && [ -f "$FAKE_GATE_TOOLS_STATE" ]; then
+      installed="$(cat "$FAKE_GATE_TOOLS_STATE")"
+    fi
+    for t in autobuilder jq gh mold cargo-deny cargo-nextest uv claude; do
+      missing=0
+      for m in ${FAKE_SSH_GATE_TOOLS_MISSING:-}; do [ "$m" = "$t" ] && missing=1; done
+      for i in $installed; do [ "$i" = "$t" ] && missing=0; done
+      if [ "$missing" = "1" ]; then
+        printf '%s=MISSING\n' "$t"
+      else
+        printf '%s=%s-fakeversion\n' "$t" "$t"
+      fi
+    done
+    exit 0
+    ;;
+  *'# gate-tools-install '*)
+    [ "${FAKE_SSH_GATE_TOOLS_INSTALL_FAIL:-0}" = "1" ] && exit 1
+    tool="$(printf '%s\n' "$cmd" | grep -oE '# gate-tools-install [a-zA-Z0-9_-]+' | head -n1 | awk '{print $3}')"
+    if [ -n "$tool" ] && [ -n "${FAKE_GATE_TOOLS_STATE:-}" ]; then
+      mkdir -p "$(dirname "$FAKE_GATE_TOOLS_STATE")" 2>/dev/null || true
+      echo "$tool" >> "$FAKE_GATE_TOOLS_STATE"
+    fi
+    exit 0
+    ;;
   *bwrap*)
     [ "${FAKE_SSH_SANDBOX_FAIL:-0}" = "1" ] && exit 1
     exit 0

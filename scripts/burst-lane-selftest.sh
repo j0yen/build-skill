@@ -81,7 +81,15 @@ fresh_env() {
   export BURST_LANE_ATTR_LEDGER="$T/attribution.jsonl"
   export BURST_LANE_REPOS_DIR="$T/repos"; mkdir -p "$BURST_LANE_REPOS_DIR"
   export BURST_LANE_TICK_JOURNAL_DIR="$T/tick-journal"; mkdir -p "$BURST_LANE_TICK_JOURNAL_DIR"
-  unset FAKE_HCLOUD_AUTH_FAIL FAKE_HCLOUD_CREATE_FAIL FAKE_HCLOUD_DELETE_FAIL FAKE_SSH_REMOTE_FAIL FAKE_SSH_SANDBOX_FAIL FAKE_RSYNC_FAIL BURST_LANE_NOW
+  # PRD-build-gate-on-casper requirement 1: gate-tools provisioning state,
+  # scoped under $T so the fake ssh/rsync fixtures never touch this
+  # machine's real ~/.cargo/bin or /root — see burst-lane.sh's own
+  # GATE_TOOLS_REMOTE_BIN_DIR comment for why the destination must be
+  # test-scoped (the fake rsync fixture never expands a tilde).
+  export FAKE_GATE_TOOLS_STATE="$T/gate-tools-installed"
+  export BURST_LANE_GATE_TOOLS_REMOTE_BIN_DIR="$T/remote-cargo-bin"
+  unset FAKE_HCLOUD_AUTH_FAIL FAKE_HCLOUD_CREATE_FAIL FAKE_HCLOUD_DELETE_FAIL FAKE_SSH_REMOTE_FAIL FAKE_SSH_SANDBOX_FAIL FAKE_RSYNC_FAIL BURST_LANE_NOW \
+        FAKE_SSH_GATE_TOOLS_MISSING FAKE_SSH_GATE_TOOLS_INSTALL_FAIL
 }
 
 # ---- AC1: single-box refusal + adoption ------------------------------------
@@ -885,6 +893,57 @@ unset BURST_LANE_NOW
 cost_by_prd_g7="$("$BL" cost --by-prd)"
 expect "gateroute AC7: cost --by-prd shows a gate-<repo> row for the gate's own cargo cost" \
   "grep -q 'gate-gateroute-repo' <<<\"$cost_by_prd_g7\""
+
+# =============================================================================
+# PRD-build-gate-on-casper: the whole gate runs on casper, not RedBaron.
+# (test_prefix: gatebox)
+# =============================================================================
+
+# ---- gatebox AC1: `up` provisions the gate toolchain when tools are
+# missing, records gate_ready:true with a version for every tool, and
+# `verify` reports "gate-tools ok" (requirement 1).
+fresh_env
+FAKE_AB_SRC="$T/fake-autobuilder-src"; mkdir -p "$FAKE_AB_SRC"
+cat > "$FAKE_AB_SRC/autobuilder" <<'EOF'
+#!/usr/bin/env bash
+echo "autobuilder 9.9.9"
+EOF
+chmod +x "$FAKE_AB_SRC/autobuilder"
+export BURST_LANE_AUTOBUILDER_BIN="$FAKE_AB_SRC/autobuilder"
+export FAKE_SSH_GATE_TOOLS_MISSING="autobuilder jq"
+gatebox1_out="$("$BL" up)"; gatebox1_rc=$?
+expect "gatebox AC1: up succeeds even though autobuilder+jq start missing" "[ $gatebox1_rc -eq 0 ]"
+expect "gatebox AC1: session state records gate_ready:true after provisioning" \
+  "grep -q '\"gate_ready\":\"true\"' \"$BURST_LANE_STATE_DIR/session.json\""
+gt_missing_field="$(grep -oE '"gate_tools_missing":"[^"]*"' "$BURST_LANE_STATE_DIR/session.json" | cut -d'"' -f4)"
+expect "gatebox AC1: gate_tools_missing is empty once provisioning completed" "[ -z \"$gt_missing_field\" ]"
+gatebox1_tools_rc=0
+python3 -c "
+import json
+d = json.load(open('$BURST_LANE_STATE_DIR/gate-tools.json'))
+expected = {'autobuilder', 'jq', 'gh', 'mold', 'cargo-deny', 'cargo-nextest', 'uv', 'claude'}
+got = set(d.get('tools', {}).keys())
+assert got == expected, ('tool set mismatch', got)
+for t, v in d['tools'].items():
+    assert v and v != 'MISSING', (t, v)
+assert d.get('missing') == [], d.get('missing')
+" || gatebox1_tools_rc=1
+expect "gatebox AC1: gate-tools.json records a version for every requirement-1 tool" "[ $gatebox1_tools_rc -eq 0 ]"
+expect "gatebox AC1: the install path actually ran for the two initially-missing tools" \
+  "grep -qx autobuilder \"$FAKE_GATE_TOOLS_STATE\" && grep -qx jq \"$FAKE_GATE_TOOLS_STATE\""
+
+gatebox1_verify_out="$("$BL" verify 2>&1)"; gatebox1_verify_rc=$?
+expect "gatebox AC1: verify exits 0 once gate-tools (and everything else) is provisioned" "[ $gatebox1_verify_rc -eq 0 ]"
+expect "gatebox AC1: verify reports 'gate-tools ok'" "grep -q '^gate-tools ok$' <<<\"$gatebox1_verify_out\""
+
+# A second `up` (adoption path — state cleared but the fake server survives)
+# re-provisions via the adoption branch too, not just the fresh-create one.
+rm -f "$BURST_LANE_STATE_DIR/session.json"
+unset FAKE_SSH_GATE_TOOLS_MISSING
+gatebox1b_out="$("$BL" up)"; gatebox1b_rc=$?
+expect "gatebox AC1: adoption path also succeeds and re-provisions" "[ $gatebox1b_rc -eq 0 ]"
+expect "gatebox AC1: adoption path also records gate_ready:true" \
+  "grep -q '\"gate_ready\":\"true\"' \"$BURST_LANE_STATE_DIR/session.json\""
 
 echo "=== $([ $fail -eq 0 ] && echo PASS || echo FAIL) ==="
 exit $fail
