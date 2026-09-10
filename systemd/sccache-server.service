@@ -15,7 +15,13 @@ Description=Managed sccache compilation-cache server (PRD-build-gate-wall-clock)
 # inside this unit's own cgroup once the ExecStart process exits.
 Type=forking
 Environment=SCCACHE_IDLE_TIMEOUT=0
-Environment=SCCACHE_LOG=info
+# `info` only logs server lifecycle (start/stop) events, not individual
+# compile requests, so a gate step that never wedges would show zero log
+# growth even under heavy use -- indistinguishable from a server that
+# stopped receiving traffic entirely. `sccache=debug` scopes debug-level
+# logging to the sccache crate itself (per-request handling included)
+# without pulling in its dependencies' own debug noise (tokio etc.).
+Environment=SCCACHE_LOG=sccache=debug
 Environment=SCCACHE_ERROR_LOG=%h/.local/state/sccache/server.log
 Environment=SCCACHE_DIR=%h/.cache/sccache
 Environment=SCCACHE_CACHE_SIZE=20G
