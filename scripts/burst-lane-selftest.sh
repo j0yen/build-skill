@@ -55,6 +55,13 @@ fresh_env() {
   # state/probes/ledger.jsonl or ~/brain/journal/build/.
   export BUILD_STATE_DIR="$T/state"
   export PROBE_JOURNAL_DIR="$T/probe-journal"
+  # PRD-build-cost-attribution: sandbox the attribution ledger, the
+  # known-repo root attribution_slug_for() consults, and the tick-journal
+  # directory the daily rollup line lands in — never the real
+  # ~/wintermute or ~/brain/journal/build/.
+  export BURST_LANE_ATTR_LEDGER="$T/attribution.jsonl"
+  export BURST_LANE_REPOS_DIR="$T/repos"; mkdir -p "$BURST_LANE_REPOS_DIR"
+  export BURST_LANE_TICK_JOURNAL_DIR="$T/tick-journal"; mkdir -p "$BURST_LANE_TICK_JOURNAL_DIR"
   unset FAKE_HCLOUD_AUTH_FAIL FAKE_HCLOUD_CREATE_FAIL FAKE_HCLOUD_DELETE_FAIL FAKE_SSH_REMOTE_FAIL FAKE_SSH_SANDBOX_FAIL FAKE_RSYNC_FAIL BURST_LANE_NOW
 }
 
@@ -275,6 +282,127 @@ expect "sub-cap falls back to local cap 2 when sandbox is unavailable (req 6 / A
 expect "sub-cap journals the sandbox-unavailable reason" \
   "grep -q 'burst-lane  sub-cap  sandbox-unavailable' \"$BURST_LANE_JOURNAL\""
 sed -i 's/"sandbox_ok":"false"/"sandbox_ok":"true"/' "$BURST_LANE_STATE_DIR/session.json"
+
+# =============================================================================
+# PRD-build-cost-attribution: every burst euro/box-hour lands on a PRD slug.
+# =============================================================================
+
+# ---- AC1: slug derivation from the build-worktrees basename convention -----
+# `mcphost-mcphost-schedules` under a known-repo root containing "mcphost"
+# -> slug "mcphost-schedules" (everything after "<repo>-").
+fresh_env
+mkdir -p "$BURST_LANE_REPOS_DIR/mcphost"
+WT_AC1="$T/mcphost-mcphost-schedules"; mkdir -p "$WT_AC1"
+echo 'mkdir -p target && echo built > target/out.txt; exit 0' > "$WT_AC1/build.sh"
+"$BL" run "$WT_AC1" -- bash build.sh >/dev/null 2>&1
+expect "AC1: attribution row derives slug=mcphost-schedules from the worktree basename" \
+  "python3 -c \"import json; d=json.loads(open('$BURST_LANE_ATTR_LEDGER').read().strip().splitlines()[-1]); import sys; sys.exit(0 if d.get('slug')=='mcphost-schedules' else 1)\""
+expect "AC1: attribution row has wall_seconds > 0" \
+  "python3 -c \"import json; d=json.loads(open('$BURST_LANE_ATTR_LEDGER').read().strip().splitlines()[-1]); import sys; sys.exit(0 if float(d.get('wall_seconds',0)) > 0 else 1)\""
+expect "AC1: attribution row carries the run's bytes" \
+  "python3 -c \"import json; d=json.loads(open('$BURST_LANE_ATTR_LEDGER').read().strip().splitlines()[-1]); import sys; sys.exit(0 if 'bytes' in d else 1)\""
+
+# ---- AC2: shared-checkout and gate-burst/selftest-fixture derivation -------
+# Nothing is ever dropped: a run against the shared checkout itself (no
+# per-PRD worktree) -> "shared-<repo>"; a run under a gb-ac<N> fixture tmpdir
+# (tests/gate_burst_ac*.sh's own convention) -> "selftest".
+fresh_env
+mkdir -p "$BURST_LANE_REPOS_DIR/mcphost"
+WT_SHARED="$BURST_LANE_REPOS_DIR/mcphost"
+echo 'mkdir -p target && echo built > target/out.txt; exit 0' > "$WT_SHARED/build.sh"
+"$BL" run "$WT_SHARED" -- bash build.sh >/dev/null 2>&1
+expect "AC2: the shared checkout itself is attributed shared-mcphost" \
+  "python3 -c \"import json; d=json.loads(open('$BURST_LANE_ATTR_LEDGER').read().strip().splitlines()[-1]); import sys; sys.exit(0 if d.get('slug')=='shared-mcphost' else 1)\""
+WT_FIXTURE="$T/gb-ac99.fixtureXYZ/repo"; mkdir -p "$WT_FIXTURE"
+echo 'mkdir -p target && echo built > target/out.txt; exit 0' > "$WT_FIXTURE/build.sh"
+"$BL" run "$WT_FIXTURE" -- bash build.sh >/dev/null 2>&1
+expect "AC2: a gb-ac fixture path is attributed selftest" \
+  "python3 -c \"import json; d=json.loads(open('$BURST_LANE_ATTR_LEDGER').read().strip().splitlines()[-1]); import sys; sys.exit(0 if d.get('slug')=='selftest' else 1)\""
+expect "AC2: nothing dropped — both runs landed a row (2 total)" \
+  "[ \"$(wc -l < "$BURST_LANE_ATTR_LEDGER")\" -eq 2 ]"
+
+# ---- AC3: teardown prorates 3 slugs' eur, summing exactly to the session's -
+fresh_env
+mkdir -p "$BURST_LANE_REPOS_DIR/mcphost"
+"$BL" up >/dev/null
+sid3="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+for slug in alpha beta gamma; do
+  wt="$T/mcphost-$slug"; mkdir -p "$wt"
+  echo 'mkdir -p target && echo built > target/out.txt; exit 0' > "$wt/build.sh"
+  "$BL" run "$wt" -- bash build.sh >/dev/null 2>&1
+done
+boot_epoch3="$(grep -oE '"boot_epoch":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+export BURST_LANE_NOW=$((boot_epoch3 + 3600 - 60))
+down_out3="$("$BL" down)"
+expect "AC3: teardown with 3 attributed slugs still deletes cleanly" "[ \"$down_out3\" = 'decision=deleted' ]"
+ac3_rc=0
+python3 <<PY || ac3_rc=$?
+import json, sys
+rows = [json.loads(l) for l in open("$BURST_LANE_COST_LEDGER") if l.strip()]
+sid = "$sid3"
+session_rows = [r for r in rows if r.get("session_id") == sid and "hours" in r]
+slug_rows = [r for r in rows if r.get("kind") == "slug" and r.get("session_id") == sid]
+if len(slug_rows) != 3:
+    print("expected 3 slug rows, got", len(slug_rows), file=sys.stderr); sys.exit(1)
+if not session_rows:
+    print("no session row found for", sid, file=sys.stderr); sys.exit(1)
+total = sum(r["eur"] for r in slug_rows)
+if abs(total - session_rows[-1]["eur"]) > 1e-6:
+    print("conservation mismatch", total, session_rows[-1]["eur"], file=sys.stderr); sys.exit(1)
+sys.exit(0)
+PY
+expect "AC3: cost ledger gains 3 slug rows whose eur sums exactly to the session eur" "[ \"$ac3_rc\" -eq 0 ]"
+
+# ---- AC4: `cost --by-prd --session <id>` lists the 3 slugs + a totals row -
+by_prd_out="$("$BL" cost --by-prd --session "$sid3" 2>&1)"; by_prd_rc=$?
+expect "AC4: cost --by-prd --session exits 0 (conservation check passes)" "[ $by_prd_rc -eq 0 ]"
+expect "AC4: cost --by-prd lists all 3 slugs" \
+  "grep -q '^alpha' <<<\"$by_prd_out\" && grep -q '^beta' <<<\"$by_prd_out\" && grep -q '^gamma' <<<\"$by_prd_out\""
+expect "AC4: cost --by-prd prints a TOTAL row" "grep -q '^TOTAL' <<<\"$by_prd_out\""
+unset BURST_LANE_NOW
+
+# ---- AC5: a crashed prior session's rows roll into the next teardown, ------
+# named in the journal — never silently discarded.
+fresh_env
+mkdir -p "$BURST_LANE_REPOS_DIR/mcphost"
+"$BL" up >/dev/null
+sid5="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+python3 <<PY
+import json
+row = {"date": "2026-09-01T00:00:00Z", "session_id": "crashed-999", "slug": "orphan-work",
+       "wall_seconds": 42.0, "sync_s": 1.0, "bytes": 100, "worktree": "/tmp/orphan"}
+with open("$BURST_LANE_ATTR_LEDGER", "a") as fh:
+    fh.write(json.dumps(row) + "\n")
+PY
+wt5="$T/mcphost-live"; mkdir -p "$wt5"
+echo 'mkdir -p target && echo built > target/out.txt; exit 0' > "$wt5/build.sh"
+"$BL" run "$wt5" -- bash build.sh >/dev/null 2>&1
+boot_epoch5="$(grep -oE '"boot_epoch":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+export BURST_LANE_NOW=$((boot_epoch5 + 3600 - 60))
+down_out5="$("$BL" down)"
+expect "AC5: teardown with an orphaned prior-session row still deletes cleanly" "[ \"$down_out5\" = 'decision=deleted' ]"
+expect "AC5: the orphaned session's slug is included in this teardown's proration" \
+  "python3 -c \"import json; rows=[json.loads(l) for l in open('$BURST_LANE_COST_LEDGER') if l.strip()]; got=[r for r in rows if r.get('kind')=='slug' and r.get('session_id')=='$sid5' and r.get('slug')=='orphan-work']; import sys; sys.exit(0 if got else 1)\""
+expect "AC5: journal names the orphaned session by id, not a silent discard" \
+  "grep -q 'attribution-orphan-included.*session_id=crashed-999' \"$BURST_LANE_JOURNAL\""
+unset BURST_LANE_NOW
+
+# ---- AC6: two `down` calls the same day -> exactly one daily rollup line --
+fresh_env
+mkdir -p "$BURST_LANE_REPOS_DIR/mcphost"
+"$BL" up >/dev/null
+wt6="$T/mcphost-rollupwork"; mkdir -p "$wt6"
+echo 'mkdir -p target && echo built > target/out.txt; exit 0' > "$wt6/build.sh"
+"$BL" run "$wt6" -- bash build.sh >/dev/null 2>&1
+boot_epoch6="$(grep -oE '"boot_epoch":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+export BURST_LANE_NOW=$((boot_epoch6 + 3600 - 60))
+"$BL" down >/dev/null   # tears the box down and writes today's slug rows
+"$BL" down >/dev/null   # today's slug rows now exist -> rollup fires on THIS call
+today_file="$BURST_LANE_TICK_JOURNAL_DIR/$(date -u -d "@$BURST_LANE_NOW" +%Y-%m-%d 2>/dev/null || date -u +%Y-%m-%d).md"
+rollup_count="$(grep -c '^burst-cost:' "$today_file" 2>/dev/null || echo 0)"
+expect "AC6: exactly one daily burst-cost rollup line after two down calls same day" "[ \"$rollup_count\" -eq 1 ]"
+expect "AC6: rollup line names eur/slug-count/top slug" "grep -q '^burst-cost: .* across .* slugs; top ' \"$today_file\""
+unset BURST_LANE_NOW
 
 echo "=== $([ $fail -eq 0 ] && echo PASS || echo FAIL) ==="
 exit $fail

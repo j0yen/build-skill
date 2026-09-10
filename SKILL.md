@@ -1411,6 +1411,21 @@ the Burst-lane PATH directive above (requirement 4). `burst-lane.sh cost
 per `run` call via `BURST_LANE_PRD_SLUG` (or the worktree basename when a
 caller doesn't set it).
 
+**Per-slug cost attribution (PRD-build-cost-attribution, 2026-09-10).** Every
+routed `run` now also lands a row in `state/burst-lane/attribution.jsonl`
+(slug/wall-seconds/sync-seconds/bytes), slug derived from the worktree
+basename (build-worktrees `<repo>-<slug>` convention, the shared checkout
+itself -> `shared-<repo>`, a gate-burst/this-skill's-own AC-fixture path ->
+`selftest`, else `unattributed` — never dropped). `down`'s delete path and
+`watchdog`'s prorate that session's euros across the attributed slugs
+(sharing in any orphaned rows a crashed prior session left behind, journaled
+by name) into `cost.jsonl` `kind:"slug"` rows beside the unchanged
+session-total row. `burst-lane.sh cost --by-prd [--today|--session <id>]`
+prints a slug/runs/box-minutes/eur table (sorted by eur desc, with a
+conservation-checked totals row), and `down` writes a cursor-guarded,
+once-per-day `burst-cost: <eur> across <n> slugs; top <slug> <eur>` line into
+the tick journal (`~/brain/journal/build/<date>.md`).
+
 **Burst-lane PATH, python branches, when a session is up and the suite is
 sandbox-safe (PRD-build-burst-lane-ccx53, requirement 12).**
 `scripts/burst-lane-bin/uv` mirrors the cargo shim: with `BURST_LANE=1`,

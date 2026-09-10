@@ -74,6 +74,12 @@
 #   burst-lane.sh cost --today
 #       Sums state/burst-lane/cost.jsonl rows for today's UTC date and
 #       prints the union of PRD slugs those rows' sessions served (req 13).
+#   burst-lane.sh cost --by-prd [--today|--session <id>]
+#       PRD-build-cost-attribution: table of slug, runs, box-minutes, eur
+#       (sorted by eur desc) plus a totals row, sourced from cost.jsonl's
+#       `kind:"slug"` rows (see below). No flag aggregates all history;
+#       `--today` filters to today's UTC date; `--session <id>` to one
+#       session_id (usually a server_id).
 #   burst-lane.sh sub-cap [--candidates <n>]
 #       Requirement 7's formula. No session -> prints "sub-cap=0 local=3
 #       (no session — local cap applies)" and journals a no-session line.
@@ -85,11 +91,29 @@
 #       "burst: sub-cap=<n> (avail_gb=<n> nproc=<n>)" (AC7). A failed probe
 #       exits 3 with "fallback: ...", never blocking the caller.
 #
+# Cost attribution (PRD-build-cost-attribution, 2026-09-10): every routed
+# `run` now also appends a row to state/burst-lane/attribution.jsonl —
+# {date, session_id, slug, wall_seconds, sync_s, bytes, worktree} — under
+# the same RUN_LOCK `run` already holds. `slug` comes from
+# attribution_slug_for() (worktree basename convention: <repo>-<slug> under
+# build-worktrees, the shared checkout itself -> "shared-<repo>", a
+# gate-burst/this-skill's-own AC-fixture path -> "selftest", else
+# "unattributed" — never dropped). At teardown (`down`'s delete path and
+# `watchdog`'s), prorate_attribution() sums those rows (plus any orphaned
+# rows left by a crashed prior session — journaled by name, not silently
+# folded in) by slug, prorates the session's cost_eur by each slug's share
+# of total attributed wall-seconds, and appends `kind:"slug"` rows to
+# cost.jsonl beside the existing (unchanged-shape) session-total row.
+# `cost --by-prd` reads those rows back into a table. `down` also runs a
+# cursor-guarded once-per-day rollup line into the tick journal
+# (~/brain/journal/build/<date>.md, NOT this script's own burst-lane.log).
+#
 # Env overrides (offline testing only — never set in production):
 #   BURST_LANE_HCLOUD_BIN, BURST_LANE_SSH_BIN, BURST_LANE_RSYNC_BIN,
 #   BURST_LANE_STATE_DIR, BURST_LANE_JOURNAL, BURST_LANE_ENV_FILE,
 #   BURST_LANE_NOW, BURST_LANE_PRD_DIR, BURST_LANE_COST_LEDGER,
-#   BURST_LANE_REMOTE_ROOT, BURST_LANE_SERVER_NAME
+#   BURST_LANE_REMOTE_ROOT, BURST_LANE_SERVER_NAME, BURST_LANE_ATTR_LEDGER,
+#   BURST_LANE_REPOS_DIR, BURST_LANE_TICK_JOURNAL_DIR
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -106,6 +130,15 @@ SERVED_FILE="$STATE_DIR/prds_served"
 ENV_FILE="${BURST_LANE_ENV_FILE:-$HOME/.config/wm-burst/.env}"
 JOURNAL="${BURST_LANE_JOURNAL:-$HOME/brain/journal/build/burst-lane.log}"
 PRD_DIR="${BURST_LANE_PRD_DIR:-$HOME/Documents/PRDs}"
+# PRD-build-cost-attribution: per-run attribution ledger (requirement 1),
+# the known-repo root used to split a worktree basename into <repo>/<slug>
+# (attribution_slug_for below), the once-per-day rollup cursor (requirement
+# 4), and the tick journal directory that rollup line lands in — distinct
+# from $JOURNAL above, which is this script's own flat log.
+ATTR_LEDGER="${BURST_LANE_ATTR_LEDGER:-$STATE_DIR/attribution.jsonl}"
+ATTR_REPOS_DIR="${BURST_LANE_REPOS_DIR:-$HOME/wintermute}"
+ROLLUP_CURSOR="$STATE_DIR/.rollup-cursor"
+TICK_JOURNAL_DIR="${BURST_LANE_TICK_JOURNAL_DIR:-$HOME/brain/journal/build}"
 
 HCLOUD="${BURST_LANE_HCLOUD_BIN:-hcloud}"
 SSH_BIN="${BURST_LANE_SSH_BIN:-ssh}"
@@ -503,6 +536,70 @@ pull_pybuilder_incremental() {  # $1=worktree $2=ip -> stdout: bytes transferred
   return 0
 }
 
+# ---- cost attribution (PRD-build-cost-attribution, requirement 1) -----------
+# Every routed `run` is attributed to the PRD slug whose worktree it served.
+# Derivation (first match wins; never drops a run — falls to "unattributed"):
+#   1. gate-burst / this skill's own AC-fixture tests (tests/gate_burst_ac*.sh
+#      use tmpdirs named gb-ac<N>.XXXXXX; the checked-in fake ssh/rsync/hcloud
+#      fixtures live under */gate-burst-fake/ or */burst-lane-fake/) -> "selftest".
+#   2. The worktree basename IS one of the known repo roots directly (a gate/
+#      extend run against build_into itself — e.g. extend-gate.sh's cargo
+#      invocations run in the shared checkout, not a per-PRD worktree) ->
+#      "shared-<repo>".
+#   3. build-worktrees convention (worktree-extend.sh's `wt_path`, wm-buildtree's
+#      equivalent): basename is `<repo>-<slug>` — find the longest known repo
+#      name under $ATTR_REPOS_DIR that prefixes the basename and strip it.
+#   4. Anything else -> "unattributed" (counted, never dropped).
+attribution_slug_for() {  # $1 = worktree path -> stdout: slug
+  local wt="$1" base cand rest
+  base="$(basename "$wt")"
+
+  case "$wt" in
+    */gb-ac*|*/gate-burst-fake*|*/burst-lane-fake*) echo "selftest"; return ;;
+  esac
+
+  if [ -n "$base" ] && [ -d "$ATTR_REPOS_DIR/$base" ]; then
+    echo "shared-$base"; return
+  fi
+
+  if [ -d "$ATTR_REPOS_DIR" ]; then
+    for cand in $(ls -1 "$ATTR_REPOS_DIR" 2>/dev/null | awk '{ print length"\t"$0 }' | sort -rn | cut -f2-); do
+      case "$base" in
+        "$cand"-*)
+          rest="${base#"$cand"-}"
+          if [ -n "$rest" ]; then echo "$rest"; return; fi
+          ;;
+      esac
+    done
+  fi
+
+  echo "unattributed"
+}
+
+# Sub-second wallclock — now_epoch()'s integer seconds (and its
+# BURST_LANE_NOW test override, needed for hour-boundary teardown math) are
+# too coarse to reliably observe a >0 duration around a near-instant fake-ssh
+# round trip in the offline selftest (AC1: "wall seconds >0").
+now_fractional() { date +%s.%N; }
+
+# Requirement 1 (cont'd): append one NDJSON row to the attribution ledger.
+# Called from inside cmd_run, under the RUN_LOCK it already holds for the
+# whole rsync+ssh+rsync body — no separate lock needed for the append.
+attribution_record() {  # $1=slug $2=session_id $3=wall_s $4=sync_s $5=bytes $6=worktree
+  mkdir -p "$STATE_DIR" 2>/dev/null || true
+  python3 -c '
+import json, sys
+slug, sid, wall_s, sync_s, nbytes, worktree, date, path = sys.argv[1:9]
+row = {
+    "date": date, "session_id": sid, "slug": slug,
+    "wall_seconds": round(float(wall_s), 3), "sync_s": round(float(sync_s), 3),
+    "bytes": int(nbytes or 0), "worktree": worktree,
+}
+with open(path, "a") as fh:
+    fh.write(json.dumps(row) + "\n")
+' "$1" "$2" "$3" "$4" "$5" "$6" "$(now_iso)" "$ATTR_LEDGER"
+}
+
 # ---- run --------------------------------------------------------------------
 RUN_LOCK="$STATE_DIR/run.lock"
 
@@ -534,6 +631,13 @@ cmd_run() {
   fi
   local remote_path="$REMOTE_ROOT/$(basename "$worktree")"
 
+  # PRD-build-cost-attribution requirement 1: wall-seconds attributed to a
+  # slug measure the REMOTE EXEC only; rsync up+down time is tracked
+  # separately as sync_s (sizing evidence for the incremental-pull work,
+  # not this PRD's own cost-share denominator).
+  local t_up_start t_up_end t_remote_end t_down_end
+  t_up_start="$(now_fractional)"
+
   if ! "$RSYNC_BIN" -az --delete --exclude target --exclude .git --exclude .venv \
         --rsync-path="mkdir -p '$remote_path' && rsync" \
         -e "$SSH_BIN -o StrictHostKeyChecking=no -i $SSH_KEY" \
@@ -542,6 +646,7 @@ cmd_run() {
     echo "fallback: rsync to $ip failed (see /tmp/burst-lane-rsync-up.$$.log)"
     exit 3
   fi
+  t_up_end="$(now_fractional)"
 
   # A caller (the PATH shims) may hand us the LOCAL absolute binary path —
   # meaningless on the box. Route by bare name; the remote PATH below finds it.
@@ -554,6 +659,7 @@ cmd_run() {
   local remote_cmd="cd $remote_path && export PATH=/root/.cargo/bin:/root/.local/bin:\$PATH CARGO_HOME=\${CARGO_HOME:-\$HOME/.cargo} CARGO_TARGET_DIR=$remote_path/target RUSTC_WRAPPER=sccache SCCACHE_DIR=/root/.sccache; $first $*"
   local rc=0
   "$SSH_BIN" -o StrictHostKeyChecking=no -i "$SSH_KEY" "$REMOTE_USER@$ip" "$remote_cmd" || rc=$?
+  t_remote_end="$(now_fractional)"
 
   # Remote 127/126 = the command or its interpreter is missing ON THE BOX —
   # an infra failure of this lane, never a result of the caller's tests.
@@ -582,6 +688,7 @@ cmd_run() {
       exit 3
     fi
   fi
+  t_down_end="$(now_fractional)"
 
   local runs; runs="$(state_read runs_served)"; runs=$((runs + 1))
   state_write "server_id=$id" "ip=$ip" "server_type=$(state_read server_type)" \
@@ -600,7 +707,18 @@ cmd_run() {
     grep -qxF "$served_id" "$SERVED_FILE" 2>/dev/null || echo "$served_id" >> "$SERVED_FILE"
   fi
 
-  journal_line "$(now_iso)  burst-lane  run  routed  (server_id=$id worktree=$worktree runs_served=$runs exit=$rc bytes=$bytes)"
+  # PRD-build-cost-attribution requirement 1: attribute this completed run
+  # to a PRD slug in the attribution ledger (independent of, and finer-
+  # grained than, requirement 13's prds_served roster above — that roster
+  # is a per-session dedup list; this ledger is a per-run cost record).
+  local wall_s sync_s slug
+  wall_s="$(awk -v a="$t_remote_end" -v b="$t_up_end" 'BEGIN{printf "%.3f", a-b}')"
+  sync_s="$(awk -v u0="$t_up_start" -v u1="$t_up_end" -v d1="$t_down_end" -v r1="$t_remote_end" \
+             'BEGIN{printf "%.3f", (u1-u0)+(d1-r1)}')"
+  slug="$(attribution_slug_for "$worktree")"
+  attribution_record "$slug" "$id" "$wall_s" "$sync_s" "$bytes" "$worktree"
+
+  journal_line "$(now_iso)  burst-lane  run  routed  (server_id=$id worktree=$worktree runs_served=$runs exit=$rc bytes=$bytes slug=$slug wall_s=$wall_s)"
   exit "$rc"
 }
 
@@ -658,11 +776,13 @@ destroy_verify() {  # $1 = server id -> 0 on verified-gone, 1 on still-present a
   return 1
 }
 
-ledger_append() {  # $1=hours $2=eur; reads $SERVED_FILE (requirement 13:
-                    # PRD slugs this session served), one row per session
+ledger_append() {  # $1=hours $2=eur $3=session_id (PRD-build-cost-attribution,
+                    # additive — old readers keying on hours/eur/prds are
+                    # unaffected); reads $SERVED_FILE (requirement 13: PRD
+                    # slugs this session served), one row per session
   python3 -c '
 import json, sys
-date, hours, eur, served_path = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+date, hours, eur, sid, served_path = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
 prds = []
 try:
     with open(served_path) as f:
@@ -670,14 +790,151 @@ try:
 except OSError:
     pass
 row = {"date": date, "hours": float(hours), "eur": float(eur), "prds": prds}
+if sid:
+    row["session_id"] = sid
 print(json.dumps(row))
-' "$(now_iso)" "$1" "$2" "$SERVED_FILE" >> "$COST_LEDGER"
+' "$(now_iso)" "$1" "$2" "${3:-}" "$SERVED_FILE" >> "$COST_LEDGER"
+}
+
+# ---- teardown proration (PRD-build-cost-attribution requirement 2) ----------
+# Sums $ATTR_LEDGER's rows by slug (across ALL session_ids currently sitting
+# in the file — not just this teardown's own — so a crashed prior session's
+# never-prorated rows roll into this teardown rather than being lost; see
+# Technical considerations), prorates $3 (eur) across slugs by each slug's
+# share of total attributed wall-seconds, and appends one `kind:"slug"` row
+# per slug to $COST_LEDGER (additive — the existing session-total row this
+# is called beside is untouched). The attribution ledger is cleared after a
+# successful prorate (nothing left to double-count next teardown). Prints
+# one `ORPHANED:<session_id>` line per OTHER session_id folded in, for the
+# caller to journal by name. Exits 3 (nothing written, ledger left alone)
+# if the file exists but can't be read — requirement 5 (P2): an unreadable
+# attribution file is could-not-check, never silently zero cost.
+prorate_attribution() {  # $1=this session_id $2=hours $3=eur $4=caller (down|watchdog)
+  [ -s "$ATTR_LEDGER" ] || return 0
+  local out rc
+  out="$(python3 -c '
+import json, sys, collections
+
+sid, eur, date, attr_path, cost_path = sys.argv[1:6]
+eur = float(eur)
+
+try:
+    with open(attr_path) as fh:
+        lines = fh.readlines()
+except OSError:
+    print("COULD_NOT_CHECK")
+    sys.exit(3)
+
+by_slug = collections.OrderedDict()
+sessions = set()
+for line in lines:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        row = json.loads(line)
+    except ValueError:
+        continue
+    slug = row.get("slug") or "unattributed"
+    secs = float(row.get("wall_seconds", 0) or 0)
+    by_slug.setdefault(slug, {"seconds": 0.0, "runs": 0})
+    by_slug[slug]["seconds"] += secs
+    by_slug[slug]["runs"] += 1
+    sessions.add(row.get("session_id", ""))
+
+total_secs = sum(v["seconds"] for v in by_slug.values())
+if total_secs > 0:
+    slugs = sorted(by_slug.keys())
+    running = 0.0
+    out_rows = []
+    for i, slug in enumerate(slugs):
+        v = by_slug[slug]
+        if i == len(slugs) - 1:
+            slug_eur = eur - running
+        else:
+            slug_eur = round(eur * (v["seconds"] / total_secs), 6)
+            running += slug_eur
+        out_rows.append({
+            "date": date, "session_id": sid, "kind": "slug", "slug": slug,
+            "seconds": round(v["seconds"], 3), "runs": v["runs"], "eur": slug_eur,
+        })
+    with open(cost_path, "a") as fh:
+        for row in out_rows:
+            fh.write(json.dumps(row) + "\n")
+
+for s in sessions:
+    if s and s != sid:
+        print("ORPHANED:" + s)
+' "$1" "$3" "$(now_iso)" "$ATTR_LEDGER" "$COST_LEDGER")"
+  rc=$?
+  if [ "$rc" -eq 3 ] || [ "$out" = "COULD_NOT_CHECK" ]; then
+    probe_emit burst-attribution could-not-check "attribution ledger unreadable at teardown ($ATTR_LEDGER)" >/dev/null
+    journal_line "$(now_iso)  burst-lane  ${4:-down}  attribution-could-not-check  ($ATTR_LEDGER unreadable — cost NOT attributed to any slug this teardown)"
+    return 3
+  fi
+  : > "$ATTR_LEDGER"
+  probe_emit burst-attribution clean "prorated $3 eur across attribution rows for session $1" >/dev/null
+  printf '%s\n' "$out"
+  return 0
+}
+
+# ---- daily rollup (PRD-build-cost-attribution requirement 4) ----------------
+# Cursor-guarded so N `down` calls the same UTC day emit exactly one line —
+# into the TICK journal ($TICK_JOURNAL_DIR/<date>.md), not this script's own
+# $JOURNAL flat log. Reads TODAY's kind:"slug" rows from cost.jsonl (written
+# by prorate_attribution above, so this only ever reports slugs that have
+# actually torn down at least once today) and picks the top slug by eur.
+# A day with no slug rows yet (no teardown has happened today) is a no-op —
+# nothing to roll up, cursor not advanced, so the line still lands once a
+# teardown does happen later today.
+maybe_daily_rollup() {
+  local today; today="$(date -u -d "@$(now_epoch)" +%Y-%m-%d 2>/dev/null || date -u +%Y-%m-%d)"
+  local last; last="$(cat "$ROLLUP_CURSOR" 2>/dev/null || true)"
+  [ "$last" = "$today" ] && return 0
+  [ -f "$COST_LEDGER" ] || return 0
+
+  local line
+  line="$(python3 -c '
+import json, sys, collections
+
+today, path = sys.argv[1], sys.argv[2]
+totals = collections.OrderedDict()
+for ln in open(path):
+    ln = ln.strip()
+    if not ln:
+        continue
+    try:
+        d = json.loads(ln)
+    except ValueError:
+        continue
+    if d.get("kind") != "slug" or not str(d.get("date", "")).startswith(today):
+        continue
+    s = d.get("slug", "unattributed")
+    totals[s] = totals.get(s, 0.0) + float(d.get("eur", 0) or 0)
+
+if not totals:
+    sys.exit(1)
+
+grand = sum(totals.values())
+top_slug, top_eur = max(totals.items(), key=lambda kv: kv[1])
+print("burst-cost: %.4f across %d slugs; top %s %.4f" % (grand, len(totals), top_slug, top_eur))
+' "$today" "$COST_LEDGER")" || return 0
+
+  mkdir -p "$TICK_JOURNAL_DIR" 2>/dev/null || true
+  printf '%s\n' "$line" >> "$TICK_JOURNAL_DIR/$today.md"
+  printf '%s\n' "$today" > "$ROLLUP_CURSOR"
 }
 
 # ---- down ---------------------------------------------------------------------
 cmd_down() {
   local more_work=0
   [ "${1:-}" = "--more-work-queued" ] && more_work=1
+
+  # PRD-build-cost-attribution requirement 4: cursor-guarded, so this is a
+  # no-op after the first `down` call of the UTC day — independent of
+  # today's keep/scheduled/deleted decision below, since the wrapper may
+  # call `down` many times a day but the rollup line must land exactly once.
+  maybe_daily_rollup
 
   if ! state_active; then
     echo "no-active-session"
@@ -717,7 +974,23 @@ cmd_down() {
       local hrs; hrs="$(awk -v m="$alive" 'BEGIN{printf "%.4f", m/60.0}')"
       local eur; eur="$(awk -v h="$hrs" -v r="$COST_PER_HOUR_EUR" 'BEGIN{printf "%.4f", h*r}')"
       local served; served="$( [ -f "$SERVED_FILE" ] && paste -sd, "$SERVED_FILE" 2>/dev/null || true)"
-      ledger_append "$hrs" "$eur"
+      # PRD-build-cost-attribution requirement 2: prorate this session's
+      # cost across the slugs that were actually attributed to it (plus any
+      # orphaned rows a crashed prior session left behind — named below).
+      # Runs BEFORE ledger_append so the session-total row this teardown
+      # writes stays the LAST line in cost.jsonl (existing readers of
+      # requirement 13's row assume that positionally, e.g. "the row I just
+      # wrote is the tail").
+      local prorate_out orphan_sid
+      prorate_out="$(prorate_attribution "$id" "$hrs" "$eur" down)" || true
+      while IFS= read -r orphan_sid; do
+        case "$orphan_sid" in
+          ORPHANED:*)
+            journal_line "$(now_iso)  burst-lane  down  attribution-orphan-included  (session_id=${orphan_sid#ORPHANED:} — crashed prior session's rows folded into this teardown's proration)"
+            ;;
+        esac
+      done <<<"$prorate_out"
+      ledger_append "$hrs" "$eur" "$id"
       journal_line "$(now_iso)  burst-lane  down  decision=deleted  (server_id=$id minutes=$alive cost_eur=$eur prds=${served:-none})"
       state_clear
       echo "decision=deleted"
@@ -772,7 +1045,18 @@ cmd_watchdog() {
     hrs="$(awk -v m="$alive" 'BEGIN{printf "%.4f", m/60.0}')"
     eur="$(awk -v h="$hrs" -v r="$COST_PER_HOUR_EUR" 'BEGIN{printf "%.4f", h*r}')"
     local served; served="$( [ -f "$SERVED_FILE" ] && paste -sd, "$SERVED_FILE" 2>/dev/null || true)"
-    ledger_append "$hrs" "$eur"
+    # See cmd_down's matching comment: prorate BEFORE ledger_append so the
+    # session-total row stays the last line in cost.jsonl.
+    local prorate_out orphan_sid
+    prorate_out="$(prorate_attribution "$id" "$hrs" "$eur" watchdog)" || true
+    while IFS= read -r orphan_sid; do
+      case "$orphan_sid" in
+        ORPHANED:*)
+          journal_line "$(now_iso)  burst-lane  watchdog  attribution-orphan-included  (session_id=${orphan_sid#ORPHANED:} — crashed prior session's rows folded into this teardown's proration)"
+          ;;
+      esac
+    done <<<"$prorate_out"
+    ledger_append "$hrs" "$eur" "$id"
     journal_line "$(now_iso)  burst-lane  watchdog  teardown  (server_id=$id uptime=${alive}m cost_eur=$eur prds=${served:-none})"
     state_clear
     echo "watchdog teardown: $id (${alive}m)"
@@ -855,7 +1139,12 @@ cmd_sub_cap() {
 
 # ---- cost -------------------------------------------------------------------
 cmd_cost() {
-  [ "${1:-}" = "--today" ] || { echo "usage: burst-lane.sh cost --today" >&2; exit 2; }
+  if [ "${1:-}" = "--by-prd" ]; then
+    shift
+    cmd_cost_by_prd "$@"
+    return $?
+  fi
+  [ "${1:-}" = "--today" ] || { echo "usage: burst-lane.sh cost --today | cost --by-prd [--today|--session <id>]" >&2; exit 2; }
   [ -f "$COST_LEDGER" ] || { echo "hours=0.00 eur=0.00"; exit 0; }
   local today; today="$(date -u -d "@$(now_epoch)" +%Y-%m-%d 2>/dev/null || date -u +%Y-%m-%d)"
   python3 -c '
@@ -871,6 +1160,11 @@ for line in open(path):
         d = json.loads(line)
     except ValueError:
         continue
+    # Requirement 2/3 (PRD-build-cost-attribution): kind:"slug" rows are the
+    # per-slug proration of a session-total row already counted below —
+    # summing them here too would double the day total.
+    if d.get("kind") == "slug":
+        continue
     if d.get("date", "").startswith(today):
         hours += float(d.get("hours", 0))
         eur += float(d.get("eur", 0))
@@ -880,6 +1174,71 @@ for line in open(path):
 prds_str = ",".join(prds) if prds else "none"
 print(f"hours={hours:.2f} eur={eur:.2f} prds={prds_str}")
 ' "$today" "$COST_LEDGER"
+}
+
+# ---- cost --by-prd (PRD-build-cost-attribution requirement 3) ---------------
+# Table of slug/runs/box-minutes/eur sorted by eur desc, plus a totals row.
+# No flag: all history. --today: today's UTC date. --session <id>: one
+# session_id. Source is cost.jsonl's kind:"slug" rows (written by
+# prorate_attribution at teardown); the totals row is compared against the
+# matching session-total row(s) as an in-code conservation check (P3
+# success metric: "proration conservation error ... 0.00").
+cmd_cost_by_prd() {
+  local mode="all" filt=""
+  case "${1:-}" in
+    --today) mode="today" ;;
+    --session)
+      mode="session"; filt="${2:-}"
+      [ -n "$filt" ] || { echo "usage: burst-lane.sh cost --by-prd --session <id>" >&2; exit 2; }
+      ;;
+    "") mode="all" ;;
+    *) echo "usage: burst-lane.sh cost --by-prd [--today|--session <id>]" >&2; exit 2 ;;
+  esac
+  [ -f "$COST_LEDGER" ] || { echo "no cost data"; exit 0; }
+  local today; today="$(date -u -d "@$(now_epoch)" +%Y-%m-%d 2>/dev/null || date -u +%Y-%m-%d)"
+  python3 -c '
+import json, sys, collections
+
+mode, filt, today, path = sys.argv[1:5]
+slug_totals = collections.OrderedDict()
+session_eur_total = 0.0
+for line in open(path):
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        d = json.loads(line)
+    except ValueError:
+        continue
+    if mode == "today" and not str(d.get("date", "")).startswith(today):
+        continue
+    if mode == "session" and d.get("session_id") != filt:
+        continue
+    if d.get("kind") == "slug":
+        s = d.get("slug", "unattributed")
+        slug_totals.setdefault(s, {"runs": 0, "seconds": 0.0, "eur": 0.0})
+        slug_totals[s]["runs"] += int(d.get("runs", 0) or 0)
+        slug_totals[s]["seconds"] += float(d.get("seconds", 0) or 0)
+        slug_totals[s]["eur"] += float(d.get("eur", 0) or 0)
+    else:
+        session_eur_total += float(d.get("eur", 0) or 0)
+
+rows = sorted(slug_totals.items(), key=lambda kv: -kv[1]["eur"])
+print("{:<28}{:>6}{:>12}{:>10}".format("slug", "runs", "box-min", "eur"))
+grand_eur = grand_min = 0.0
+grand_runs = 0
+for slug, v in rows:
+    mins = v["seconds"] / 60.0
+    grand_eur += v["eur"]; grand_min += mins; grand_runs += v["runs"]
+    print("{:<28}{:>6}{:>12.2f}{:>10.4f}".format(slug, v["runs"], mins, v["eur"]))
+print("{:<28}{:>6}{:>12.2f}{:>10.4f}".format("TOTAL", grand_runs, grand_min, grand_eur))
+
+# Conservation check (in-code, per the success-metrics table): the sum of
+# printed slug eur must equal the session-total eur it was prorated from.
+if session_eur_total and abs(grand_eur - session_eur_total) > 1e-6:
+    print("conservation-error: slug total {:.6f} != session total {:.6f}".format(grand_eur, session_eur_total), file=sys.stderr)
+    sys.exit(1)
+' "$mode" "$filt" "$today" "$COST_LEDGER"
 }
 
 main() {
