@@ -1558,6 +1558,92 @@ json.dump(out, open(sys.argv[4], "w"), indent=2)
   exit 0
 }
 
+# ---- gate in-flight tracking (PRD-build-gate-on-casper requirement 7) ------
+# One marker file per repo currently mid-remote-gate, keyed the same
+# sha1-prefix way remote_path_for()/dirty_marker_file() key theirs — written
+# by cmd_gate right before the remote extend-gate.sh call starts, removed
+# the instant it returns (any outcome). GATE_WALL_BUDGET_S is the "wait up
+# to the gate's wall-clock budget" ceiling requirement 7 asks for; the
+# PRD's own note ("gate budgets from gate-wall-clock") points at another
+# PRD's budget figures this pass does not yet read — 1800s (30 min, this
+# PRD's own "expected gate wall" target) is a reasonable default until
+# that's wired. GATE_WAIT_POLL_S is the poll interval while waiting.
+GATE_INFLIGHT_DIR="$STATE_DIR/gate-inflight"
+GATE_WALL_BUDGET_S="${BURST_LANE_GATE_WALL_BUDGET_S:-1800}"
+GATE_WAIT_POLL_S="${BURST_LANE_GATE_WAIT_POLL_S:-2}"
+
+gate_inflight_marker_file() {  # $1=repo -> stdout path
+  local rkey; rkey="$(printf '%s' "$1" | sha1sum | cut -c1-8)"
+  printf '%s/%s.json\n' "$GATE_INFLIGHT_DIR" "$rkey"
+}
+
+gate_inflight_write() {  # $1=marker_file $2=repo $3=ip
+  mkdir -p "$GATE_INFLIGHT_DIR" 2>/dev/null || true
+  python3 -c '
+import json, sys
+path, repo, host, started, budget = sys.argv[1:6]
+json.dump({"repo": repo, "host": host, "started_epoch": int(started), "budget_s": int(budget)}, open(path, "w"))
+' "$1" "$2" "$3" "$(now_epoch)" "$GATE_WALL_BUDGET_S"
+}
+
+# `down`/`watchdog` call this right before their own destroy_verify: for
+# every repo still marked in-flight, wait (polling the SAME wt-lock
+# `cmd_gate` holds for its whole remote round trip) up to that gate's own
+# recorded budget. Finishes-in-time -> one more explicit receipts pull (a
+# safety net independent of whatever cmd_gate's own process — which may be
+# a completely different, now-exited invocation — already did) and a
+# `gate  <repo>  <verdict>` line. Past budget -> `gate  abandoned`,
+# last-verdict.json is removed (never a stale cache the next tick could
+# mistake for a completed gate at this HEAD), the marker is dropped either
+# way. Never blocks/aborts the teardown itself past the budget ceiling.
+gate_wait_for_inflight() {  # $1=caller(down|watchdog)
+  local caller="$1" marker
+  mkdir -p "$GATE_INFLIGHT_DIR" 2>/dev/null || true
+  for marker in "$GATE_INFLIGHT_DIR"/*.json; do
+    [ -f "$marker" ] || continue
+    local repo ip started_epoch budget_s
+    repo="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("repo",""))' "$marker" 2>/dev/null)"
+    ip="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("host",""))' "$marker" 2>/dev/null)"
+    started_epoch="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("started_epoch",0))' "$marker" 2>/dev/null)"
+    budget_s="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("budget_s",1800))' "$marker" 2>/dev/null)"
+    if [ -z "$repo" ]; then rm -f "$marker"; continue; fi
+
+    local lockfile; lockfile="$(wt_lock_file "$repo")"
+    local finished=0 now age
+    while :; do
+      now="$(now_epoch)"; age=$(( now - started_epoch ))
+      if ( exec 214>"$lockfile"; flock -n 214 ) 2>/dev/null; then
+        finished=1
+        break
+      fi
+      [ "$age" -ge "$budget_s" ] && break
+      sleep "$GATE_WAIT_POLL_S"
+    done
+
+    if [ "$finished" -eq 1 ]; then
+      local remote_path; remote_path="$(remote_path_for "$repo")"
+      mkdir -p "$repo/target/autobuilder" 2>/dev/null || true
+      "$RSYNC_BIN" -az --delete -e "$SSH_BIN -o StrictHostKeyChecking=no -i $SSH_KEY" \
+        "$REMOTE_USER@$ip:$remote_path/target/autobuilder/" "$repo/target/autobuilder/" >/dev/null 2>&1 || true
+      "$RSYNC_BIN" -az -e "$SSH_BIN -o StrictHostKeyChecking=no -i $SSH_KEY" \
+        "$REMOTE_USER@$ip:$remote_path/.gate-burst-host" "$repo/.gate-burst-host" >/dev/null 2>&1 || true
+      local verdict; verdict="$(python3 -c '
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+    print("block" if d.get("block", 0) else "pass")
+except Exception:
+    print("unknown")
+' "$repo/target/autobuilder/last-verdict.json" 2>/dev/null)"
+      journal_line "$(now_iso)  burst-lane  $caller  gate  $verdict  (repo=$repo host=$ip waited=true age=${age}s)"
+    else
+      journal_line "$(now_iso)  burst-lane  $caller  gate  abandoned  (repo=$repo host=$ip age=${age}s budget=${budget_s}s)"
+      rm -f "$repo/target/autobuilder/last-verdict.json"
+    fi
+    rm -f "$marker"
+  done
+}
+
 # ---- gate (PRD-build-gate-on-casper requirement 3, + requirement 5's -------
 # fallback contract in full, + requirement 6's SAME-REPO half only) ----------
 # `gate <repo> --head <sha> [extend-gate args...]` rsyncs <repo> to the box
@@ -1658,11 +1744,23 @@ sys.exit(0 if d.get("head_sha") == sys.argv[2] and d.get("diff") == [] else 1)
     exit 3
   fi
 
+  # PRD-build-gate-on-casper requirement 7: from here on, a real remote
+  # process is running — record it so `down`/`watchdog` can wait for (or,
+  # past budget, abandon) it instead of destroying the box out from under
+  # a gate mid-run. Removed unconditionally the instant this ssh call
+  # returns, on EVERY path (success, block, or the 126/127 fallback below)
+  # — a marker that outlives this function only means the process running
+  # this script itself died mid-remote-call, which is exactly the case
+  # gate_wait_for_inflight()'s own budget-based abandonment exists for.
+  local inflight_marker; inflight_marker="$(gate_inflight_marker_file "$repo")"
+  gate_inflight_write "$inflight_marker" "$repo" "$ip"
+
   local t0 t1 rc=0
   t0="$(now_fractional)"
   local remote_cmd="cd $remote_path && export PATH=\$PATH:/root/.cargo/bin:/root/.local/bin:$REMOTE_ROOT/.gate-tools/build-scripts RUSTC_WRAPPER=sccache BURST_LANE=0 RUSTBUILD_SCRIPTS=$REMOTE_ROOT/.gate-tools/rustbuild-scripts REVIEWER_PROMPT=$REMOTE_ROOT/.gate-tools/rustbuild-prompts/reviewer-agent.md; extend-gate.sh . $(printf '%q ' "${extra_args[@]}")"
   "$SSH_BIN" -o StrictHostKeyChecking=no -i "$SSH_KEY" "$REMOTE_USER@$ip" "bash -lc $(printf '%q' "$remote_cmd")" || rc=$?
   t1="$(now_fractional)"
+  rm -f "$inflight_marker"
 
   if [ "$rc" -eq 127 ] || [ "$rc" -eq 126 ]; then
     flock -u 212
@@ -1928,6 +2026,26 @@ reap_orphans() {
   fi
 
   local plan; plan="$(printf '%s\n' "$list_out" | sort -n | reap_plan)"
+  # PRD-build-gate-on-casper requirement 7: a repo currently mid-remote-gate
+  # (tracked the same way gate_wait_for_inflight() reads it) is protected
+  # from reap regardless of whether reap_plan's own candidate-root decoding
+  # ever found a local worktree for it — the marker names its OWN repo path
+  # directly, so this is computed from remote_path_for() rather than from
+  # `wt` (empty for any repo path reap_plan's fixed candidate-root list
+  # doesn't happen to search). Without this, a gate whose repo isn't under
+  # one of those roots could be reaped out from under gate_wait_for_inflight
+  # moments later in the SAME down/watchdog call, before it ever gets a
+  # chance to wait for or pull the very directory reap just deleted.
+  local inflight_names=""
+  mkdir -p "$GATE_INFLIGHT_DIR" 2>/dev/null || true
+  local im_marker im_repo
+  for im_marker in "$GATE_INFLIGHT_DIR"/*.json; do
+    [ -f "$im_marker" ] || continue
+    im_repo="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("repo",""))' "$im_marker" 2>/dev/null)"
+    [ -n "$im_repo" ] || continue
+    inflight_names="$inflight_names$(basename "$(remote_path_for "$im_repo")")"$'\n'
+  done
+
   local name action reason wt
   while IFS=$'\t' read -r name action reason wt; do
     [ -n "$name" ] || continue
@@ -1936,6 +2054,10 @@ reap_orphans() {
       dirty) journal_line "$(now_iso)  burst-lane  reap  skip  (dir=$name reason=dirty)" ;;
       live)  : ;;  # untouched, no journal noise on every healthy pass
       orphan)
+        if grep -qxF "$name" <<<"$inflight_names"; then
+          journal_line "$(now_iso)  burst-lane  reap  skip  (dir=$name reason=gate-inflight)"
+          continue
+        fi
         local busy=0
         if [ -n "$wt" ] && ! ( exec 207>"$(wt_lock_file "$wt")"; flock -n 207 ); then
           busy=1
@@ -2270,6 +2392,10 @@ cmd_down() {
     # worktree gets pulled (or goes cold) before the box that would strand
     # its artifacts is destroyed. Never blocks/aborts the teardown itself.
     sweep_dirty_worktrees down
+    # PRD-build-gate-on-casper requirement 7: wait for (or, past budget,
+    # abandon) any remote gate still running before the box that's running
+    # it is destroyed.
+    gate_wait_for_inflight down
     # PRD-build-gate-on-casper requirement 4: shred the reviewer credential
     # (if one was ever placed — a no-op, un-journaled, otherwise) before the
     # box that would carry it away is destroyed.
@@ -2354,6 +2480,9 @@ cmd_watchdog() {
   # delete path — the watchdog is a teardown path too and must not strand
   # artifacts either.
   sweep_dirty_worktrees watchdog
+  # PRD-build-gate-on-casper requirement 7: same in-flight gate wait/abandon
+  # as `down`'s delete path — the watchdog is a teardown path too.
+  gate_wait_for_inflight watchdog
   # PRD-build-gate-on-casper requirement 4: same credential shred as
   # `down`'s delete path — the watchdog is a teardown path too.
   shred_gate_credential "$(state_read ip)" watchdog

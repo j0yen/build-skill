@@ -1138,5 +1138,81 @@ expect "gatebox AC4: the credential is gone from the fake box after down" "[ ! -
 expect "gatebox AC4: journal has 'cred  shredded'" "grep -q 'burst-lane  down  cred  shredded' \"$BURST_LANE_JOURNAL\""
 expect "gatebox AC4: the sentinel token never appears in the journal" "! grep -q 'SENTINEL-GATEBOX-TOKEN-XYZ123' \"$BURST_LANE_JOURNAL\""
 
+# ---- gatebox AC7: teardown waits for (or abandons) a still-in-flight
+# remote gate instead of destroying the box out from under it (requirement
+# 7). Both scenarios hand-craft a gate-inflight marker (rather than driving
+# a real `gate` call) so the wait loop's own two outcomes are exercised
+# directly and fast: a background holder of the SAME per-repo worktree
+# lock `cmd_gate` itself takes stands in for "the gate is still running".
+# started_epoch is pinned to the SAME frozen $BURST_LANE_NOW the `down`
+# call below uses (not real wall-clock) so `age` is deterministic even
+# though the wait loop's own polling still uses a real `sleep`.
+fresh_env
+"$BL" up >/dev/null
+ip7="$(grep -oE '"ip":"[^"]*"' "$BURST_LANE_STATE_DIR/session.json" | cut -d'"' -f4)"
+boot_epoch7="$(grep -oE '"boot_epoch":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+export BURST_LANE_NOW=$((boot_epoch7 + 3600 - 60))
+export BURST_LANE_GATE_WAIT_POLL_S=0.1
+
+# Scenario A: the gate finishes WITHIN budget — down waits (polling the
+# real lock release), pulls receipts as a safety net, journals the
+# verdict, then still deletes the box.
+WT_GATE7A="$T/gate7a-repo"; mkdir -p "$WT_GATE7A"
+remote_path_7a="$BURST_LANE_REMOTE_ROOT/$(basename "$WT_GATE7A")-$(printf '%s' "$WT_GATE7A" | sha1sum | cut -c1-8)"
+mkdir -p "$remote_path_7a/target/autobuilder/receipts"
+echo '{"pass": 25, "block": 0}' > "$remote_path_7a/target/autobuilder/last-verdict.json"
+echo "receipt" > "$remote_path_7a/target/autobuilder/receipts/some.json"
+echo "$ip7" > "$remote_path_7a/.gate-burst-host"
+marker_7a="$BURST_LANE_STATE_DIR/gate-inflight/$(printf '%s' "$WT_GATE7A" | sha1sum | cut -c1-8).json"
+mkdir -p "$(dirname "$marker_7a")"
+python3 -c "import json; json.dump({'repo': '$WT_GATE7A', 'host': '$ip7', 'started_epoch': $BURST_LANE_NOW, 'budget_s': 30}, open('$marker_7a', 'w'))"
+lockfile_7a="$BURST_LANE_STATE_DIR/locks/wt-$(python3 -c "import hashlib,sys; print(hashlib.sha1(sys.argv[1].encode()).hexdigest()[:16])" "$WT_GATE7A").lock"
+mkdir -p "$(dirname "$lockfile_7a")"
+( exec 220>"$lockfile_7a"; flock 220; sleep 1 ) &
+holder7a_pid=$!
+sleep 0.2   # let the holder actually take the lock first
+
+down7a_out="$("$BL" down)"; down7a_rc=$?
+wait "$holder7a_pid" 2>/dev/null || true
+expect "gatebox AC7 (finishes in time): down still deletes the box" "[ \"$down7a_out\" = 'decision=deleted' ]"
+expect "gatebox AC7 (finishes in time): receipts pulled as a safety net" \
+  "[ -f \"$WT_GATE7A/target/autobuilder/receipts/some.json\" ]"
+expect "gatebox AC7 (finishes in time): journal has 'gate  pass' with waited=true" \
+  "grep -qE 'burst-lane  down  gate  pass  \(repo='\"$WT_GATE7A\"' host='\"$ip7\"' waited=true' \"$BURST_LANE_JOURNAL\""
+expect "gatebox AC7 (finishes in time): the in-flight marker was cleared" "[ ! -e \"$marker_7a\" ]"
+
+unset BURST_LANE_NOW BURST_LANE_GATE_WAIT_POLL_S
+
+# Scenario B: the gate is still running PAST its budget — down abandons it
+# (no wait beyond the budget), invalidates the local verdict cache so the
+# next tick re-gates, journals `gate  abandoned`, and still deletes. Fresh
+# session — scenario A's `down` already deleted its own box above.
+fresh_env
+"$BL" up >/dev/null
+ip7="$(grep -oE '"ip":"[^"]*"' "$BURST_LANE_STATE_DIR/session.json" | cut -d'"' -f4)"
+boot_epoch7="$(grep -oE '"boot_epoch":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+export BURST_LANE_NOW=$((boot_epoch7 + 3600 - 60))
+export BURST_LANE_GATE_WAIT_POLL_S=0.1
+WT_GATE7B="$T/gate7b-repo"; mkdir -p "$WT_GATE7B/target/autobuilder"
+echo '{"pass": 25, "block": 0, "stale": true}' > "$WT_GATE7B/target/autobuilder/last-verdict.json"
+marker_7b="$BURST_LANE_STATE_DIR/gate-inflight/$(printf '%s' "$WT_GATE7B" | sha1sum | cut -c1-8).json"
+mkdir -p "$(dirname "$marker_7b")"
+python3 -c "import json; json.dump({'repo': '$WT_GATE7B', 'host': '$ip7', 'started_epoch': $((BURST_LANE_NOW - 999)), 'budget_s': 30}, open('$marker_7b', 'w'))"
+lockfile_7b="$BURST_LANE_STATE_DIR/locks/wt-$(python3 -c "import hashlib,sys; print(hashlib.sha1(sys.argv[1].encode()).hexdigest()[:16])" "$WT_GATE7B").lock"
+mkdir -p "$(dirname "$lockfile_7b")"
+( exec 221>"$lockfile_7b"; flock 221; sleep 2 ) &
+holder7b_pid=$!
+sleep 0.2
+
+down7b_out="$("$BL" down)"; down7b_rc=$?
+expect "gatebox AC7 (past budget): down still deletes the box" "[ \"$down7b_out\" = 'decision=deleted' ]"
+expect "gatebox AC7 (past budget): journal has 'gate  abandoned' naming host and age" \
+  "grep -qE 'burst-lane  down  gate  abandoned  \(repo='\"$WT_GATE7B\"' host='\"$ip7\"' age=[0-9]+s budget=30s' \"$BURST_LANE_JOURNAL\""
+expect "gatebox AC7 (past budget): the stale last-verdict.json was invalidated" "[ ! -e \"$WT_GATE7B/target/autobuilder/last-verdict.json\" ]"
+expect "gatebox AC7 (past budget): the in-flight marker was cleared" "[ ! -e \"$marker_7b\" ]"
+kill "$holder7b_pid" 2>/dev/null || true
+wait "$holder7b_pid" 2>/dev/null || true
+unset BURST_LANE_NOW BURST_LANE_GATE_WAIT_POLL_S
+
 echo "=== $([ $fail -eq 0 ] && echo PASS || echo FAIL) ==="
 exit $fail
