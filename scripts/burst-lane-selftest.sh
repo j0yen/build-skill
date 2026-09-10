@@ -1323,5 +1323,68 @@ subcap_gates="$(FAKE_SSH_MEMINFO_GB=120 FAKE_SSH_NPROC=32 "$BL" sub-cap --candid
 expect "gatebox req6: one active gate subtracts 2 from sub-cap (8 -> 6)" "grep -q '^sub-cap=6 local=0' <<<\"$subcap_gates\""
 expect "gatebox req6: sub-cap names the gates bound and count" "grep -q 'bound=gates gates_active=1' <<<\"$subcap_gates\""
 
+# ---- gatebox AC9: two remote gates and one local gate the same day ->
+# the daily rollup line carries gates_remote=2 gates_local=1 (requirement
+# 9), and each remote gate's own attribution row is slug=gate-<repo>,
+# remote=true (the PRD-build-gate-cargo-route-attest slug convention).
+# Uses real wall-clock time (no BURST_LANE_NOW override) so a hand-appended
+# extend-gate.sh-shaped local-gate line's own timestamp genuinely matches
+# "today" the same way maybe_daily_rollup computes it.
+fresh_env
+"$BL" up >/dev/null
+FAKEBIN_R9="$T/fakebin-r9"; mkdir -p "$FAKEBIN_R9"
+cat > "$FAKEBIN_R9/extend-gate.sh" <<'EOF'
+#!/usr/bin/env bash
+mkdir -p target/autobuilder
+echo '{"pass": 25, "block": 0}' > target/autobuilder/last-verdict.json
+exit 0
+EOF
+chmod +x "$FAKEBIN_R9/extend-gate.sh"
+
+WT_R1="$T/r9-repo-one"; mkdir -p "$WT_R1/target/autobuilder/receipts"
+( cd "$WT_R1" && git init -q && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init )
+head_r1="$(git -C "$WT_R1" rev-parse HEAD)"
+echo "{\"head_sha\": \"$head_r1\", \"box_host\": \"x\", \"suites\": {}, \"diff\": []}" > "$WT_R1/target/autobuilder/receipts/box-parity.json"
+PATH="$FAKEBIN_R9:$PATH" "$BL" gate "$WT_R1" --head "$head_r1" >/dev/null 2>&1
+
+WT_R2="$T/r9-repo-two"; mkdir -p "$WT_R2/target/autobuilder/receipts"
+( cd "$WT_R2" && git init -q && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init )
+head_r2="$(git -C "$WT_R2" rev-parse HEAD)"
+echo "{\"head_sha\": \"$head_r2\", \"box_host\": \"x\", \"suites\": {}, \"diff\": []}" > "$WT_R2/target/autobuilder/receipts/box-parity.json"
+PATH="$FAKEBIN_R9:$PATH" "$BL" gate "$WT_R2" --head "$head_r2" >/dev/null 2>&1
+
+r9_attr_rc=0
+python3 -c "
+import json
+rows = [json.loads(l) for l in open('$BURST_LANE_ATTR_LEDGER') if l.strip()]
+gate_rows = [r for r in rows if r.get('kind') == 'gate']
+assert len(gate_rows) == 2, gate_rows
+for r in gate_rows:
+    assert r.get('remote') is True, r
+    assert r.get('slug', '').startswith('gate-r9-repo-'), r
+" || r9_attr_rc=1
+expect "gatebox AC9: each remote gate attributes slug=gate-<repo> remote=true" "[ $r9_attr_rc -eq 0 ]"
+
+today_r9="$(date -u +%Y-%m-%d)"
+mkdir -p "$BURST_LANE_TICK_JOURNAL_DIR"
+printf '%s  gate  somecrate  pass  (head=abc123 base=v1.0.0 gate: head=abc123 pass=25 block=0 verdict=pass blocking=none wall=42s lock_wait=0s cargo=burst:0/local:5)\n' \
+  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$BURST_LANE_TICK_JOURNAL_DIR/$today_r9.md"
+
+# force a real teardown (hour boundary) so prorate_attribution folds the
+# two gate attribution rows into today's cost.jsonl slug rows — same
+# two-`down`-calls pattern the existing cost-rollup AC6 test above uses:
+# the FIRST down does the actual delete (and writes the slug rows) but
+# fires maybe_daily_rollup too early to see them; the SECOND (no-op,
+# no-active-session) down sees them and emits the real rollup line.
+boot_epoch_r9="$(grep -oE '"boot_epoch":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+export BURST_LANE_NOW=$((boot_epoch_r9 + 3600 - 60))
+"$BL" down >/dev/null
+"$BL" down >/dev/null
+unset BURST_LANE_NOW
+
+rollup_line_r9="$(grep '^burst-cost:' "$BURST_LANE_TICK_JOURNAL_DIR/$today_r9.md" | tail -1)"
+expect "gatebox AC9: the daily rollup line carries gates_remote=2 gates_local=1" \
+  "grep -q 'gates_remote=2 gates_local=1' <<<\"$rollup_line_r9\""
+
 echo "=== $([ $fail -eq 0 ] && echo PASS || echo FAIL) ==="
 exit $fail

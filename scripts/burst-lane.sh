@@ -1028,6 +1028,13 @@ row = {
 }
 if kind == "pull":
     row["trigger"] = trigger
+elif kind == "gate":
+    # PRD-build-gate-on-casper requirement 9: a completed remote gate run
+    # attributes as its own row (slug=gate-<repo>, per PRD-build-gate-
+    # cargo-route-attest convention for a gate dispatch) rather than the
+    # pulls_skipped/bytes_saved/estimate fields a plain cargo run carries
+    # -- those describe lazy target pull-back, not a gate.
+    row["remote"] = True
 else:
     row["pulls_skipped"] = int(pulls_skipped or 0)
     row["bytes_saved"] = int(bytes_saved or 0)
@@ -1830,6 +1837,11 @@ json.dump(d, open(path, "w"), indent=2)
     1) verdict="block" ;;
     *) verdict="error($rc)" ;;
   esac
+  # PRD-build-gate-on-casper requirement 9: attributed under gate-<repo> —
+  # PRD-build-gate-cargo-route-attest's own convention for a gate dispatch
+  # (attribution_slug_for's header documents the same "gate-<repo>" shape
+  # for the OLDER per-cargo-call routing; this is the gate run AS A WHOLE).
+  attribution_record "gate-$(basename "$repo")" "$id" "$wall_s" 0 0 "$repo" gate
   journal_line "$(now_iso)  burst-lane  gate  $verdict  (repo=$repo host=$ip wall=${wall_s}s head=$head_now exit=$rc)"
   exit "$rc"
 }
@@ -2359,6 +2371,51 @@ print(dirs, total_bytes, low)
   read -r reaped_dirs reaped_bytes disk_low <<<"$reap_stats"
   reaped_gb="$(awk -v b="${reaped_bytes:-0}" 'BEGIN{printf "%.0f", b/1073741824}')"
   line="$line reaped_dirs=${reaped_dirs:-0} reaped_gb=${reaped_gb:-0} disk_low_fallbacks=${disk_low:-0}"
+
+  # PRD-build-gate-on-casper requirement 9: gates_remote counts today's
+  # completed remote gates — any "burst-lane ... gate ..." line (cmd_gate's
+  # own, or a down/watchdog teardown-path line from gate_wait_for_inflight)
+  # that reached a real host (a "host=" token) and isn't a "fallback"
+  # (fallback means the remote gate never actually started; requirement 5
+  # runs the tick's gate locally instead when that happens). gates_local
+  # counts today's LOCAL gate runs — extend-gate.sh's own journal line,
+  # which lands in this SAME tick-journal file (its header: "writes one
+  # thing outside the repo, the daily journal under ~/brain/journal/
+  # build/"), never in this script's own $JOURNAL — distinguished from a
+  # route-mismatch/record-baseline line by requiring the 4th field to be a
+  # real verdict (pass/block/delta-pass).
+  local gate_stats gates_remote gates_local
+  gate_stats="$(python3 -c '
+import sys
+today, burst_journal, tick_journal = sys.argv[1], sys.argv[2], sys.argv[3]
+remote = 0
+try:
+    with open(burst_journal) as fh:
+        for ln in fh:
+            if not ln.startswith(today):
+                continue
+            if "burst-lane" not in ln or "  gate  " not in ln:
+                continue
+            if "fallback" in ln or "host=" not in ln:
+                continue
+            remote += 1
+except OSError:
+    pass
+local_ = 0
+try:
+    with open(tick_journal) as fh:
+        for ln in fh:
+            if not ln.startswith(today):
+                continue
+            parts = ln.split()
+            if len(parts) >= 4 and parts[1] == "gate" and parts[3] in ("pass", "block", "delta-pass"):
+                local_ += 1
+except OSError:
+    pass
+print(remote, local_)
+' "$today" "$JOURNAL" "$TICK_JOURNAL_DIR/$today.md")"
+  read -r gates_remote gates_local <<<"$gate_stats"
+  line="$line gates_remote=${gates_remote:-0} gates_local=${gates_local:-0}"
 
   mkdir -p "$TICK_JOURNAL_DIR" 2>/dev/null || true
   printf '%s\n' "$line" >> "$TICK_JOURNAL_DIR/$today.md"
