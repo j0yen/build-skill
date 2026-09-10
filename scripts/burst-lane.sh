@@ -469,7 +469,10 @@ pull_target_incremental() {  # $1=worktree $2=ip -> stdout: bytes transferred; r
     local_target="$worktree/target"
   fi
   mkdir -p "$local_target" 2>/dev/null || true
-  if ! stats="$("$RSYNC_BIN" -az --delete --stats -e "$SSH_BIN -o StrictHostKeyChecking=no -i $SSH_KEY" \
+  # --exclude autobuilder: gate receipts/verdicts live at target/autobuilder/
+  # LOCALLY ONLY (producers run here; the box only runs cargo) — without this,
+  # --delete erased the gate's own evidence on every routed shared-checkout run.
+  if ! stats="$("$RSYNC_BIN" -az --delete --stats --exclude autobuilder -e "$SSH_BIN -o StrictHostKeyChecking=no -i $SSH_KEY" \
         "$REMOTE_USER@$ip:$remote_target/" "$local_target/" 2>&1)"; then
     return 1
   fi
