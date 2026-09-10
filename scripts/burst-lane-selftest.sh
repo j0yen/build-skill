@@ -1415,5 +1415,24 @@ assert 'gate_ready' in d, d
 " "$status_json_r8" || r8_json_rc=1
 expect "gatebox req8: status --json carries the gate with repo/head_sha/slot/age_seconds and gate_ready" "[ $r8_json_rc -eq 0 ]"
 
+# ---- gatebox AC5: an ssh/rsync-level failure BEFORE the remote extend-
+# gate.sh ever starts refuses cleanly — the PRD's own literal scenario
+# ("the fake ssh fails before the remote gate starts"), distinct from the
+# parity/head-mismatch fallbacks already covered under the AC2 block above
+# (those also print "fallback: <cause>" and exit 3, but this is the one
+# that exercises the rsync-up-failed path specifically).
+fresh_env
+"$BL" up >/dev/null
+WT_AC5="$T/ac5-repo"; mkdir -p "$WT_AC5/target/autobuilder/receipts"
+( cd "$WT_AC5" && git init -q && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init )
+head_ac5="$(git -C "$WT_AC5" rev-parse HEAD)"
+echo "{\"head_sha\": \"$head_ac5\", \"box_host\": \"x\", \"suites\": {}, \"diff\": []}" > "$WT_AC5/target/autobuilder/receipts/box-parity.json"
+
+ac5_out="$(FAKE_RSYNC_FAIL=1 FAKE_RSYNC_FAIL_RC=11 FAKE_RSYNC_FAIL_MSG='rsync: fake gate rsync failure' "$BL" gate "$WT_AC5" --head "$head_ac5" 2>&1)"; ac5_rc=$?
+expect "gatebox AC5: gate exits 3 when the rsync-up itself fails before the remote gate starts" "[ $ac5_rc -eq 3 ]"
+expect "gatebox AC5: gate prints fallback: <cause>" "grep -q '^fallback: rsync to .* failed' <<<\"$ac5_out\""
+expect "gatebox AC5: exactly one gate fallback journal line naming the cause" \
+  "[ \"\$(grep -c 'burst-lane  gate  fallback.*cause=rsync-up-failed' \"$BURST_LANE_JOURNAL\")\" -eq 1 ]"
+
 echo "=== $([ $fail -eq 0 ] && echo PASS || echo FAIL) ==="
 exit $fail
