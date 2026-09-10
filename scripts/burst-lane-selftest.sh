@@ -1052,9 +1052,59 @@ expect "gatebox AC2: gate journaled the fallback with cause" "grep -q 'burst-lan
 # same refusal, a different named cause.
 WT_NOPARITY="$T/noparity-repo"; mkdir -p "$WT_NOPARITY"
 ( cd "$WT_NOPARITY" && git init -q && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init )
-gate_unknown_out="$("$BL" gate "$WT_NOPARITY" --head x 2>&1)"; gate_unknown_rc=$?
+gate_unknown_out="$("$BL" gate "$WT_NOPARITY" --head "$(git -C "$WT_NOPARITY" rev-parse HEAD)" 2>&1)"; gate_unknown_rc=$?
 expect "gatebox AC2: gate refuses on no parity receipt at all (exit 3)" "[ $gate_unknown_rc -eq 3 ]"
 expect "gatebox AC2: gate names the parity-unknown cause" "grep -q '^fallback: parity-unknown$' <<<\"$gate_unknown_out\""
+
+# ---- gatebox AC3: given parity ok, `gate` actually invokes extend-gate.sh
+# on the box (once, with --head <sha>), rsyncs back ONLY target/autobuilder/
+# and .gate-burst-host, patches "host" onto the pulled-back last-verdict.json,
+# and propagates the remote exit code (requirement 3). A fake extend-gate.sh
+# stands in for the real one (armed ahead of the requirement-1 synced copy
+# on $PATH, per cmd_gate's own append-not-prepend convention) so this stays
+# offline and deterministic.
+fresh_env
+"$BL" up >/dev/null
+WT_GATE="$T/gate-repo"; mkdir -p "$WT_GATE"
+( cd "$WT_GATE" && git init -q && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init )
+head_gate="$(git -C "$WT_GATE" rev-parse HEAD)"
+mkdir -p "$WT_GATE/target/autobuilder/receipts"
+cat > "$WT_GATE/target/autobuilder/receipts/box-parity.json" <<EOF
+{"head_sha": "$head_gate", "box_host": "127.0.0.1", "suites": {}, "diff": []}
+EOF
+
+FAKEBIN_GATE="$T/fakebin-gate"; mkdir -p "$FAKEBIN_GATE"
+EXTEND_GATE_CALLLOG="$T/extend-gate-calls.log"
+cat > "$FAKEBIN_GATE/extend-gate.sh" <<EOF
+#!/usr/bin/env bash
+echo "\$*" >> "$EXTEND_GATE_CALLLOG"
+mkdir -p target/autobuilder/receipts
+echo '{"pass": 24, "block": 1}' > target/autobuilder/last-verdict.json
+echo "receipt" > target/autobuilder/receipts/some-producer.json
+echo "should-not-sync" > should-not-sync.txt
+exit "\${FAKE_EXTEND_GATE_EXIT:-0}"
+EOF
+chmod +x "$FAKEBIN_GATE/extend-gate.sh"
+
+gate3_out="$(PATH="$FAKEBIN_GATE:$PATH" FAKE_EXTEND_GATE_EXIT=1 "$BL" gate "$WT_GATE" --head "$head_gate" 2>&1)"; gate3_rc=$?
+expect "gatebox AC3: gate propagates the remote extend-gate.sh's own exit code" "[ $gate3_rc -eq 1 ]"
+expect "gatebox AC3: fake extend-gate.sh was invoked exactly once" "[ \"\$(wc -l < "$EXTEND_GATE_CALLLOG")\" -eq 1 ]"
+expect "gatebox AC3: fake extend-gate.sh was invoked with --head <sha>" "grep -qF -- '--head '\"$head_gate\" \"$EXTEND_GATE_CALLLOG\""
+expect "gatebox AC3: target/autobuilder/ was rsynced back (receipts present locally)" \
+  "[ -f \"$WT_GATE/target/autobuilder/receipts/some-producer.json\" ]"
+expect "gatebox AC3: .gate-burst-host was rsynced back" "[ -s \"$WT_GATE/.gate-burst-host\" ]"
+expect "gatebox AC3: only target/autobuilder/ and .gate-burst-host were rsynced back (nothing else)" \
+  "[ ! -e \"$WT_GATE/should-not-sync.txt\" ]"
+gate3_verdict_rc=0
+python3 -c "
+import json
+d = json.load(open('$WT_GATE/target/autobuilder/last-verdict.json'))
+assert d.get('host'), d
+assert d.get('pass') == 24 and d.get('block') == 1, d
+" || gate3_verdict_rc=1
+expect "gatebox AC3: last-verdict.json carries a host field (extend-gate.sh itself never touched)" "[ $gate3_verdict_rc -eq 0 ]"
+expect "gatebox AC3: journal gate line names the verdict, host, and wall time" \
+  "grep -qE 'burst-lane  gate  block  \(repo=.*host=[0-9.]+ wall=[0-9.]+s head='\"$head_gate\" \"$BURST_LANE_JOURNAL\""
 
 echo "=== $([ $fail -eq 0 ] && echo PASS || echo FAIL) ==="
 exit $fail

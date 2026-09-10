@@ -1510,23 +1510,60 @@ json.dump(out, open(sys.argv[4], "w"), indent=2)
   exit 0
 }
 
-# ---- gate (PRD-build-gate-on-casper requirement 3 — STUB) -------------------
-# Only requirement 5's fallback contract is wired so far: refuses to route
-# (exit 3, "fallback: parity-diff|parity-unknown") unless `parity` has
-# already recorded a clean receipt AT THE REPO'S CURRENT HEAD — the parity
-# receipt lives inside the repo itself (target/autobuilder/receipts/
-# box-parity.json, written by cmd_parity above), so this check needs no
-# separate session-state field: a repo's own receipts tree is already the
-# single source of truth extend-gate.sh's other producers read. The actual
-# remote invocation (rsync repo up, run extend-gate.sh on the box, rsync
-# receipts back, propagate the exit code) is requirement 3 and NOT yet
-# implemented — see the PRD's own requirement list.
+# ---- gate (PRD-build-gate-on-casper requirement 3, + requirement 5's -------
+# fallback contract in full, + requirement 6's SAME-REPO half only) ----------
+# `gate <repo> --head <sha> [extend-gate args...]` rsyncs <repo> to the box
+# (same excludes as `run`/`parity`), runs extend-gate.sh THERE via
+# `bash -lc` (RUSTC_WRAPPER=sccache, BURST_LANE=0 — cargo stays local to the
+# box, there is no further burst hop from a burst box), rsyncs back ONLY
+# target/autobuilder/ and .gate-burst-host, patches a "host" field onto the
+# pulled-back last-verdict.json (extend-gate.sh itself is never modified —
+# a PRD non-goal — so it has no notion of "host" to write on its own), and
+# propagates the remote exit code as this command's own. Any failure before
+# the remote extend-gate.sh actually starts (no HEAD, head mismatch, dirty/
+# unknown parity, `up` failing, the rsync-up itself, or ssh/bash/extend-
+# gate.sh not being runnable on the box at all) prints "fallback: <cause>",
+# exits 3, and journals a `gate  fallback` line naming the cause — never a
+# fabricated verdict. Once the remote script has actually started, its exit
+# code IS the verdict (0 pass, 1 block, else error(<rc>)), carried through
+# unchanged. extend-gate.sh is resolved off $PATH with the box's normal
+# PATH first and the requirement-1 synced copy APPENDED last (never
+# prepended) — the identical append-not-prepend convention extend-gate.sh's
+# own P0 PATH-order guard already uses, so a caller-armed override always
+# wins; this also lets the offline selftest arm a fake extend-gate.sh ahead
+# of the real synced one without touching this function.
+#
+# Requirement 6 is only PARTIALLY wired here: the per-repo worktree lock
+# `run`/`parity` already take also serializes two gates on the SAME repo
+# (the "still serializes gates on the same repo" half). Cross-repo
+# concurrency via acquire_run_slot (the "gates on different repos... may run
+# concurrently" half, weighted 2 in the sub-cap formula) is a later step —
+# see the PRD's own requirement list.
 cmd_gate() {
   local repo="${1:-}"
   [ -n "$repo" ] && [ -d "$repo" ] || { echo "usage: burst-lane.sh gate <repo> --head <sha> [extend-gate args...]" >&2; exit 2; }
   shift || true
 
+  local head_arg="" extra_args=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --head) head_arg="${2:-}"; extra_args+=("$1" "$2"); shift 2 ;;
+      *) extra_args+=("$1"); shift ;;
+    esac
+  done
+
   local head_now; head_now="$(git -C "$repo" rev-parse HEAD 2>/dev/null || true)"
+  if [ -z "$head_now" ]; then
+    journal_line "$(now_iso)  burst-lane  gate  fallback  (cause=no-head repo=$repo)"
+    echo "fallback: no-head"
+    exit 3
+  fi
+  if [ -n "$head_arg" ] && [ "$head_arg" != "$head_now" ]; then
+    journal_line "$(now_iso)  burst-lane  gate  fallback  (cause=head-mismatch repo=$repo requested=$head_arg actual=$head_now)"
+    echo "fallback: head-mismatch (requested=$head_arg actual=$head_now)"
+    exit 3
+  fi
+
   local parity_file="$repo/target/autobuilder/receipts/box-parity.json"
   local cause=""
   if [ ! -f "$parity_file" ]; then
@@ -1544,8 +1581,80 @@ sys.exit(0 if d.get("head_sha") == sys.argv[2] and d.get("diff") == [] else 1)
     exit 3
   fi
 
-  echo "gate: parity clean at head=$head_now — remote invocation not yet implemented (PRD-build-gate-on-casper requirement 3)" >&2
-  exit 2
+  if ! state_active; then
+    local up_out; up_out="$(cmd_up 2>&1)"; local up_rc=$?
+    if [ "$up_rc" -ne 0 ]; then
+      journal_line "$(now_iso)  burst-lane  gate  fallback  (cause=up-failed repo=$repo)"
+      echo "$up_out"
+      exit 3
+    fi
+  fi
+  local id ip; id="$(state_read server_id)"; ip="$(state_read ip)"
+
+  mkdir -p "$STATE_DIR/locks" 2>/dev/null || true
+  exec 212>"$(wt_lock_file "$repo")"
+  flock 212
+
+  local remote_path; remote_path="$(remote_path_for "$repo")"
+  mkdir -p "$STATE_DIR/logs" 2>/dev/null || true
+  local up_log="$STATE_DIR/logs/rsync-gate.$$.log" rsync_up_rc=0
+  "$RSYNC_BIN" -az --delete --exclude target --exclude .git --exclude .venv \
+        --rsync-path="mkdir -p '$remote_path' && rsync" \
+        -e "$SSH_BIN -o StrictHostKeyChecking=no -i $SSH_KEY" \
+        "$repo/" "$REMOTE_USER@$ip:$remote_path/" >"$up_log" 2>&1 || rsync_up_rc=$?
+  if [ "$rsync_up_rc" -ne 0 ]; then
+    flock -u 212
+    local up_err; up_err="$(grep -v '^[[:space:]]*$' "$up_log" 2>/dev/null | tail -n1)"
+    journal_line "$(now_iso)  burst-lane  gate  fallback  (cause=rsync-up-failed rc=$rsync_up_rc err=\"$up_err\" repo=$repo)"
+    echo "fallback: rsync to $ip failed rc=$rsync_up_rc (see $up_log)"
+    exit 3
+  fi
+
+  local t0 t1 rc=0
+  t0="$(now_fractional)"
+  local remote_cmd="cd $remote_path && export PATH=\$PATH:/root/.cargo/bin:/root/.local/bin:$REMOTE_ROOT/.gate-tools/build-scripts RUSTC_WRAPPER=sccache BURST_LANE=0 RUSTBUILD_SCRIPTS=$REMOTE_ROOT/.gate-tools/rustbuild-scripts REVIEWER_PROMPT=$REMOTE_ROOT/.gate-tools/rustbuild-prompts/reviewer-agent.md; extend-gate.sh . $(printf '%q ' "${extra_args[@]}")"
+  "$SSH_BIN" -o StrictHostKeyChecking=no -i "$SSH_KEY" "$REMOTE_USER@$ip" "bash -lc $(printf '%q' "$remote_cmd")" || rc=$?
+  t1="$(now_fractional)"
+
+  if [ "$rc" -eq 127 ] || [ "$rc" -eq 126 ]; then
+    flock -u 212
+    journal_line "$(now_iso)  burst-lane  gate  fallback  (cause=remote-extend-gate-not-runnable rc=$rc repo=$repo)"
+    echo "fallback: remote extend-gate.sh not runnable on box (rc=$rc)"
+    exit 3
+  fi
+
+  "$SSH_BIN" -o StrictHostKeyChecking=no -i "$SSH_KEY" "$REMOTE_USER@$ip" "echo $ip > $remote_path/.gate-burst-host" 2>/dev/null || true
+
+  mkdir -p "$repo/target/autobuilder" 2>/dev/null || true
+  "$RSYNC_BIN" -az --delete -e "$SSH_BIN -o StrictHostKeyChecking=no -i $SSH_KEY" \
+    "$REMOTE_USER@$ip:$remote_path/target/autobuilder/" "$repo/target/autobuilder/" >/dev/null 2>&1 || true
+  "$RSYNC_BIN" -az -e "$SSH_BIN -o StrictHostKeyChecking=no -i $SSH_KEY" \
+    "$REMOTE_USER@$ip:$remote_path/.gate-burst-host" "$repo/.gate-burst-host" >/dev/null 2>&1 || true
+  flock -u 212
+
+  local verdict_file="$repo/target/autobuilder/last-verdict.json"
+  if [ -f "$verdict_file" ]; then
+    python3 -c '
+import json, sys
+path, host = sys.argv[1], sys.argv[2]
+try:
+    d = json.load(open(path))
+except Exception:
+    d = {}
+d["host"] = host
+json.dump(d, open(path, "w"), indent=2)
+' "$verdict_file" "$ip" || true
+  fi
+
+  local wall_s verdict
+  wall_s="$(awk -v a="$t1" -v b="$t0" 'BEGIN{printf "%.3f", a-b}')"
+  case "$rc" in
+    0) verdict="pass" ;;
+    1) verdict="block" ;;
+    *) verdict="error($rc)" ;;
+  esac
+  journal_line "$(now_iso)  burst-lane  gate  $verdict  (repo=$repo host=$ip wall=${wall_s}s head=$head_now exit=$rc)"
+  exit "$rc"
 }
 
 # ---- ensure-fresh (PRD-build-burst-pull-on-demand requirement 2) -----------
