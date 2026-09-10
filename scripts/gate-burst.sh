@@ -352,9 +352,23 @@ cmd_run() {
     exit 3
   fi
 
-  local remote_cmd="cd $remote_path && RUSTC_WRAPPER=sccache $*"
+  # PRD-build-gate-wall-clock requirement 2: assert the remote sccache
+  # server answers before $* ever compiles under RUSTC_WRAPPER=sccache —
+  # same guard, same rationale, as burst-lane.sh run's (this box is also
+  # an ephemeral root ssh session with no systemd-user unit, so the check
+  # is inlined rather than shelling out to the local-only sccache-assert.sh).
+  local remote_cmd="cd $remote_path && export RUSTC_WRAPPER=sccache; timeout 5 sccache --show-stats >/dev/null 2>&1 || { sccache --stop-server >/dev/null 2>&1; sccache --start-server >/dev/null 2>&1; sleep 1; }; timeout 5 sccache --show-stats >/dev/null 2>&1 || { echo 'gate-burst: sccache_unreachable on remote box' >&2; exit 97; }; $*"
   local rc=0
   "$SSH_BIN" -o StrictHostKeyChecking=no -i "$SSH_KEY" "$REMOTE_USER@$ip" "$remote_cmd" || rc=$?
+
+  if [ "$rc" -eq 97 ]; then
+    state_write "server_id=$id" "ip=$ip" "unavailable=true" \
+      "boot_ts=$(state_read boot_ts)" "boot_epoch=$(state_read boot_epoch)" \
+      "runs_served=$(state_read runs_served)" "server_type=$(state_read server_type)"
+    journal_line "$(now_iso)  gate-burst  run  sccache-unreachable  (repo=$repo — falling back local)"
+    echo "fallback: remote sccache did not answer after one restart attempt (rc=97)"
+    exit 3
+  fi
 
   if ! "$RSYNC_BIN" -az -e "$SSH_BIN -o StrictHostKeyChecking=no -i $SSH_KEY" \
         "$REMOTE_USER@$ip:$remote_path/target/" "$repo/target/" >/tmp/gate-burst-rsync-down.$$.log 2>&1; then

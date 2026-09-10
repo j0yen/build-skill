@@ -911,7 +911,17 @@ cmd_run() {
   # what .cargo/config.toml the worktree synced up (an off-root target-dir
   # override in that file sent remote builds to a box-local absolute path the
   # pull could never find — 2026-09-09 21:38Z; env beats config in cargo).
-  local remote_cmd="cd $remote_path && export PATH=/root/.cargo/bin:/root/.local/bin:\$PATH CARGO_HOME=\${CARGO_HOME:-\$HOME/.cargo} CARGO_TARGET_DIR=$remote_path/target RUSTC_WRAPPER=sccache SCCACHE_DIR=/root/.sccache; $first $*"
+  # PRD-build-gate-wall-clock requirement 2: never run a compile against a
+  # remote sccache server that does not answer (this box's own version of
+  # the 2026-09-10 RedBaron incident — an unmanaged sccache restarting
+  # mid-request orphans clients for the whole gate's wall clock). This box
+  # is an ephemeral root ssh session with no systemd-user unit to manage,
+  # so the equivalent guard is inlined here rather than shelling out to
+  # scripts/sccache-assert.sh (which drives a local systemd-user unit that
+  # does not exist on this remote): assert once, restart-once on failure
+  # via a plain `sccache --stop-server && --start-server` (self-contained,
+  # no sudo, no unit), assert again, else refuse before $first ever runs.
+  local remote_cmd="cd $remote_path && export PATH=/root/.cargo/bin:/root/.local/bin:\$PATH CARGO_HOME=\${CARGO_HOME:-\$HOME/.cargo} CARGO_TARGET_DIR=$remote_path/target RUSTC_WRAPPER=sccache SCCACHE_DIR=/root/.sccache; timeout 5 sccache --show-stats >/dev/null 2>&1 || { sccache --stop-server >/dev/null 2>&1; sccache --start-server >/dev/null 2>&1; sleep 1; }; timeout 5 sccache --show-stats >/dev/null 2>&1 || { echo 'burst-lane: sccache_unreachable on remote box' >&2; exit 97; }; $first $*"
   local rc=0
   "$SSH_BIN" -o StrictHostKeyChecking=no -i "$SSH_KEY" "$REMOTE_USER@$ip" "$remote_cmd" || rc=$?
   t_remote_end="$(now_fractional)"
@@ -920,10 +930,18 @@ cmd_run() {
   # an infra failure of this lane, never a result of the caller's tests.
   # Report fallback (exit 3) so shims re-run locally; a missing remote binary
   # must never masquerade as a red test suite (2026-09-09: 14 "routed" runs
-  # were all exit=127 and nobody noticed until the journal was read).
+  # were all exit=127 and nobody noticed until the journal was read). Remote
+  # 97 = the sccache-unreachable guard above refused before $first ran —
+  # same fallback treatment, never a compile run against a server that
+  # never answered.
   if [ "$rc" -eq 127 ] || [ "$rc" -eq 126 ]; then
     journal_line "$(now_iso)  burst-lane  run  infra-fail  (server_id=$id worktree=$worktree remote_rc=$rc cmd=$first — falling back local)"
     echo "fallback: remote $first not runnable on box (rc=$rc)"
+    exit 3
+  fi
+  if [ "$rc" -eq 97 ]; then
+    journal_line "$(now_iso)  burst-lane  run  sccache-unreachable  (server_id=$id worktree=$worktree cmd=$first — falling back local)"
+    echo "fallback: remote sccache did not answer after one restart attempt (rc=97)"
     exit 3
   fi
 

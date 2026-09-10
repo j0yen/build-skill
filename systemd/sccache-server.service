@@ -1,0 +1,29 @@
+[Unit]
+Description=Managed sccache compilation-cache server (PRD-build-gate-wall-clock)
+# 2026-09-10 incident: the sccache server's lifecycle was unmanaged (no
+# unit, no log, default 600s idle exit) — it restarted mid-request while
+# compiles were in flight and orphaned four cargo clients for 60+ minutes.
+# This unit removes the idle exit and gives the server a log + a name a
+# gate step can assert against before it compiles (see
+# scripts/sccache-assert.sh).
+
+[Service]
+# sccache --start-server double-forks a detached background server and
+# the invoking process exits 0 immediately once the socket is ready —
+# there is no long-lived foreground process to be Type=simple's MainPID.
+# Type=forking + systemd's default GuessMainPID finds the detached child
+# inside this unit's own cgroup once the ExecStart process exits.
+Type=forking
+Environment=SCCACHE_IDLE_TIMEOUT=0
+Environment=SCCACHE_LOG=info
+Environment=SCCACHE_ERROR_LOG=%h/.local/state/sccache/server.log
+Environment=SCCACHE_DIR=%h/.cache/sccache
+Environment=SCCACHE_CACHE_SIZE=20G
+ExecStartPre=/bin/mkdir -p %h/.local/state/sccache
+ExecStart=%h/.cargo/bin/sccache --start-server
+ExecStop=%h/.cargo/bin/sccache --stop-server
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target
