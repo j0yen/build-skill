@@ -488,7 +488,7 @@ cargo_target_dir_for() {  # $1=worktree -> stdout: absolute override, or ""
 # a prior run on the same worktree) don't get re-counted or re-copied.
 pull_target_incremental() {  # $1=worktree $2=ip -> stdout: bytes transferred; rc 0/1
   local worktree="$1" ip="$2" remote_path stats local_target remote_target override
-  remote_path="$REMOTE_ROOT/$(basename "$worktree")"
+  remote_path="$(remote_path_for "$worktree")"
   override="$(cargo_target_dir_for "$worktree")"
   # The BOX always builds into $remote_path/target (cmd_run sets no remote
   # CARGO_TARGET_DIR); only the LOCAL side honors the off-root override.
@@ -524,7 +524,7 @@ pull_target_incremental() {  # $1=worktree $2=ip -> stdout: bytes transferred; r
 # contract for pybuilder's own `.pybuilder/` receipt directory instead.
 pull_pybuilder_incremental() {  # $1=worktree $2=ip -> stdout: bytes transferred; rc 0/1
   local worktree="$1" ip="$2" remote_path stats local_target remote_target
-  remote_path="$REMOTE_ROOT/$(basename "$worktree")"
+  remote_path="$(remote_path_for "$worktree")"
   local_target="$worktree/.pybuilder"; remote_target="$remote_path/.pybuilder"
   mkdir -p "$local_target" 2>/dev/null || true
   if ! stats="$("$RSYNC_BIN" -az --delete --stats -e "$SSH_BIN -o StrictHostKeyChecking=no -i $SSH_KEY" \
@@ -603,12 +603,54 @@ with open(path, "a") as fh:
 # ---- run --------------------------------------------------------------------
 RUN_LOCK="$STATE_DIR/run.lock"
 
+# PRD-build-burst-parallel-runs: remote dirs are disjoint PER LOCAL PATH, not
+# per basename — ~/repos/synthorg and a worktree both named "synthorg" must
+# never share (and --delete-shred) one remote dir. Every sync site derives
+# the remote path from this one helper.
+remote_path_for() {  # $1=worktree -> stdout remote dir
+  local wkey; wkey="$(printf '%s' "$1" | sha1sum | cut -c1-8)"
+  printf '%s/%s-%s\n' "$REMOTE_ROOT" "$(basename "$1")" "$wkey"
+}
+worktree_lock_key() { printf '%s' "$1" | sha1sum | cut -c1-16; }
+
+# Concurrency slots (cargo-budget pattern): different-worktree runs proceed in
+# parallel up to BURST_MAX_CONCURRENT_RUNS; a full table waits (journaled after
+# 120s), never fails the caller. Acquired on fd 202; released with the process.
+# MUST be called directly (never in $(...) — a command substitution is a
+# subshell and the flock dies with it, which is exactly the bug the selftest
+# caught on first run). Sets SLOT_HELD="held/cap"; holds fd 202 on return.
+SLOT_HELD=""
+acquire_run_slot() {
+  local cap="${BURST_MAX_CONCURRENT_RUNS:-4}" i waited=0
+  mkdir -p "$STATE_DIR/slots" 2>/dev/null || true
+  while :; do
+    for i in $(seq 1 "$cap"); do
+      exec 202>"$STATE_DIR/slots/$i.lock"
+      if flock -n 202; then
+        local held=0 j
+        for j in $(seq 1 "$cap"); do
+          [ "$j" = "$i" ] && { held=$((held+1)); continue; }
+          ( exec 210>"$STATE_DIR/slots/$j.lock"; flock -n 210 ) 2>/dev/null || held=$((held+1))
+        done
+        SLOT_HELD="$held/$cap"
+        return 0
+      fi
+    done
+    sleep 2; waited=$((waited+2))
+    if [ "$waited" -eq 120 ]; then
+      journal_line "$(now_iso)  burst-lane  run  slot-wait  (worktree=$1 cap=$cap waited=${waited}s)"
+    fi
+  done
+}
+
 cmd_run() {
   local worktree="${1:-}"; shift || true
   while [ "${1:-}" = "--" ]; do shift; done  # guard: doubled -- from stacked wrappers
   [ -n "$worktree" ] && [ $# -ge 1 ] || { echo "usage: burst-lane.sh run <worktree> -- <cargo args...>" >&2; exit 2; }
   [ -d "$worktree" ] || die "no such worktree: $worktree" 2
 
+  # Global lock (201) held ONLY for session ensure/verify — the old
+  # whole-run hold serialized the box to width-1 (2026-09-10 5-whys).
   exec 201>"$RUN_LOCK"
   flock 201
 
@@ -629,7 +671,17 @@ cmd_run() {
       exit 3
     fi
   fi
-  local remote_path="$REMOTE_ROOT/$(basename "$worktree")"
+  flock -u 201
+
+  acquire_run_slot "$worktree"
+  local slot_held="$SLOT_HELD"
+  # Same-worktree runs still serialize: two --delete syncs of one remote dir
+  # would shred each other. Different worktrees hold different locks.
+  mkdir -p "$STATE_DIR/locks" 2>/dev/null || true
+  exec 203>"$STATE_DIR/locks/wt-$(worktree_lock_key "$worktree").lock"
+  flock 203
+
+  local remote_path; remote_path="$(remote_path_for "$worktree")"
 
   # PRD-build-cost-attribution requirement 1: wall-seconds attributed to a
   # slug measure the REMOTE EXEC only; rsync up+down time is tracked
@@ -690,6 +742,8 @@ cmd_run() {
   fi
   t_down_end="$(now_fractional)"
 
+  # Read-modify-write of session state back under the brief global lock.
+  flock 201
   local runs; runs="$(state_read runs_served)"; runs=$((runs + 1))
   state_write "server_id=$id" "ip=$ip" "server_type=$(state_read server_type)" \
     "boot_ts=$(state_read boot_ts)" "boot_epoch=$(state_read boot_epoch)" \
@@ -718,7 +772,9 @@ cmd_run() {
   slug="$(attribution_slug_for "$worktree")"
   attribution_record "$slug" "$id" "$wall_s" "$sync_s" "$bytes" "$worktree"
 
-  journal_line "$(now_iso)  burst-lane  run  routed  (server_id=$id worktree=$worktree runs_served=$runs exit=$rc bytes=$bytes slug=$slug wall_s=$wall_s)"
+  flock -u 201
+
+  journal_line "$(now_iso)  burst-lane  run  routed  (server_id=$id worktree=$worktree runs_served=$runs exit=$rc bytes=$bytes slug=$slug wall_s=$wall_s concurrent=$slot_held)"
   exit "$rc"
 }
 
