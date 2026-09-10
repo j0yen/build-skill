@@ -47,7 +47,8 @@
 #       writes state/burst-lane/session.json, runs one sandboxed
 #       `python3 -c print(1)` over ssh and records sandbox_ok (AC5).
 #   burst-lane.sh status [--json]
-#       Prints active session id/ip/minutes-alive/ttl/sandbox_ok, or
+#       Prints active session id/ip/minutes-alive/ttl/sandbox_ok/concurrent
+#       (live run slots held/cap — PRD-build-burst-parallel-runs AC6), or
 #       "no active session".
 #   burst-lane.sh run <worktree> -- <cargo args...>
 #       Ensures a session is up (booting one if needed), rsyncs <worktree>
@@ -450,15 +451,19 @@ cmd_status() {
     if [ "$json" -eq 1 ]; then echo '{"active":false,"could_not_check":true}'; else echo "could-not-check: session.json corrupted — treating as no active session"; fi
     exit 0
   fi
-  local id ip alive ttl sbx
+  local id ip alive ttl sbx conc
   id="$(state_read server_id)"; ip="$(state_read ip)"; alive="$(minutes_alive)"
   ttl="$(state_read ttl_hours)"; sbx="$(state_read sandbox_ok)"
+  # PRD-build-burst-parallel-runs AC6: live concurrency, so an operator can
+  # see utilization ("3/4") at a glance instead of inferring it from journal
+  # `concurrent=` fields scattered across `run` lines.
+  conc="$(count_held_slots)"
   probe_emit burst-status dirty "active session $id ip=$ip alive=${alive}m" >/dev/null
   if [ "$json" -eq 1 ]; then
-    printf '{"active":true,"server_id":"%s","ip":"%s","minutes_alive":%s,"ttl_hours":"%s","sandbox_ok":"%s"}\n' \
-      "$id" "$ip" "$alive" "$ttl" "$sbx"
+    printf '{"active":true,"server_id":"%s","ip":"%s","minutes_alive":%s,"ttl_hours":"%s","sandbox_ok":"%s","concurrent":"%s"}\n' \
+      "$id" "$ip" "$alive" "$ttl" "$sbx" "$conc"
   else
-    echo "active: $id ip=$ip alive=${alive}m ttl=${ttl}h sandbox_ok=$sbx"
+    echo "active: $id ip=$ip alive=${alive}m ttl=${ttl}h sandbox_ok=$sbx concurrent=$conc"
   fi
   exit 0
 }
@@ -612,6 +617,21 @@ remote_path_for() {  # $1=worktree -> stdout remote dir
   printf '%s/%s-%s\n' "$REMOTE_ROOT" "$(basename "$1")" "$wkey"
 }
 worktree_lock_key() { printf '%s' "$1" | sha1sum | cut -c1-16; }
+
+# PRD-build-burst-parallel-runs AC6: non-blocking peek at how many run slots
+# are currently held, for `status` to report `concurrent=<held>/<cap>`. Never
+# acquires a slot itself (a peek that took one would lie about capacity to
+# any run racing it) — same try-and-release-immediately probe
+# acquire_run_slot already uses to count the OTHER held slots once it has
+# taken its own.
+count_held_slots() {  # -> stdout "<held>/<cap>"
+  local cap="${BURST_MAX_CONCURRENT_RUNS:-4}" held=0 j
+  mkdir -p "$STATE_DIR/slots" 2>/dev/null || true
+  for j in $(seq 1 "$cap"); do
+    ( exec 211>"$STATE_DIR/slots/$j.lock"; flock -n 211 ) 2>/dev/null || held=$((held+1))
+  done
+  printf '%s/%s\n' "$held" "$cap"
+}
 
 # Concurrency slots (cargo-budget pattern): different-worktree runs proceed in
 # parallel up to BURST_MAX_CONCURRENT_RUNS; a full table waits (journaled after
