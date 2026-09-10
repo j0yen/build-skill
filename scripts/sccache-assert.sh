@@ -38,11 +38,24 @@
 #                             no embedded spaces works exactly like the
 #                             two-word production default)
 #   SCCACHE_ASSERT_UNIT       (sccache-server.service)
+#   SCCACHE_ASSERT_RESTART_LOG (<skill-dir>/state/sccache-assert/restarts.log)
+#                             — PRD-build-gate-wall-clock requirement 8: one
+#                             flock-appended NDJSON line per SUCCESSFUL
+#                             restart (never for a plain "ok", never for a
+#                             sccache_unreachable failure — that already has
+#                             its own journal line from the caller), so
+#                             gate-wedge-rollup.sh can count "sccache
+#                             restarts by the assert path" without re-deriving
+#                             it from ledger pid deltas.
 set -uo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+SKILL_DIR="${BUILD_SKILL_DIR:-$(cd "$HERE/.." && pwd)}"
 
 SCCACHE_BIN="${SCCACHE_BIN:-sccache}"
 SYSTEMCTL="${SCCACHE_ASSERT_SYSTEMCTL:-systemctl --user}"
 UNIT="${SCCACHE_ASSERT_UNIT:-sccache-server.service}"
+RESTART_LOG="${SCCACHE_ASSERT_RESTART_LOG:-$SKILL_DIR/state/sccache-assert/restarts.log}"
 timeout_s=5
 
 usage() { echo "usage: sccache-assert.sh [--unit <name>] [--timeout <secs>]" >&2; exit 2; }
@@ -89,6 +102,20 @@ restart_once() {
   fi
 }
 
+# Appends one NDJSON line to $RESTART_LOG under flock — best-effort, never
+# fails the assert if the log directory can't be created/written (a
+# read-only or missing state dir must not turn a successful restart into a
+# failed step).
+log_restart() {
+  local pid="$1" iso="$2"
+  mkdir -p "$(dirname "$RESTART_LOG")" 2>/dev/null || return 0
+  (
+    flock -x 201 2>/dev/null || exit 0
+    printf '{"ts":"%s","unit":"%s","pid":"%s","started_at":"%s"}\n' \
+      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$UNIT" "$pid" "$iso" >> "$RESTART_LOG"
+  ) 201>>"$RESTART_LOG.lock" 2>/dev/null || true
+}
+
 if check_answering; then
   read -r pid iso <<<"$(server_identity)"
   echo "sccache-assert: ok pid=$pid started_at=$iso"
@@ -102,6 +129,7 @@ sleep 1
 if check_answering; then
   read -r pid iso <<<"$(server_identity)"
   echo "sccache-assert: ok pid=$pid started_at=$iso (restarted)"
+  log_restart "$pid" "$iso"
   exit 0
 fi
 
