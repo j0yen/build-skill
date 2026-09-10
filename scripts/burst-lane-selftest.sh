@@ -4,9 +4,13 @@
 # tests/fixtures/burst-lane-fake/. No network calls, no real Hetzner spend.
 #
 # Covers: single-box refusal + session adoption (AC1), run's exit-code
-# passthrough (AC2), the incremental target/ pull-back and its shrinking
-# byte count across two consecutive runs on the same worktree (AC11,
-# requirement 10), watchdog TTL teardown (AC6), down's keep/scheduled/
+# passthrough (AC2 — updated by PRD-build-burst-pull-on-demand: `run` no
+# longer pulls target/ back itself, it marks the worktree dirty and an
+# explicit `pull` fetches it), the incremental pull-back's shrinking byte
+# count across two explicit pulls of the same worktree (AC11, requirement
+# 10 — the scenario moved from "two consecutive runs" to "two explicit
+# pulls separated by a re-dirtying run", since runs themselves no longer
+# pull), watchdog TTL teardown (AC6), down's keep/scheduled/
 # deleted decision as rust work does/doesn't remain in build-queue/ (AC8),
 # the never-poweroff/shutdown/stop invariant (AC14), the cargo shim's
 # local fallback when no session exists (AC3, partial — the routed-through
@@ -118,10 +122,23 @@ expect "run's journal line marks the worktree dirty instead of pulling (burstpul
   "grep -q 'burst-lane  run  routed.*dirty=1' \"$BURST_LANE_JOURNAL\""
 expect "run leaves the worktree listed dirty by status (burstpull req 3)" "dirty_has \"$WT\""
 
+# requirement 3 / AC3: `status` (text mode, the operator-facing one) lists
+# each dirty worktree with its age in seconds — "dirty: <worktree> age=<n>s"
+# per cmd_status's own dirty_lines formatting.
+status_txt="$("$BL" status 2>&1)"
+expect "status lists the dirty worktree with age (burstpull req 3 / AC3)" \
+  "grep -qF \"dirty: $WT age=\" <<<\"\$status_txt\""
+
 pull_out="$("$BL" pull "$WT" 2>&1)"; pull_rc=$?
 expect "explicit pull succeeds (burstpull req 3)" "[ $pull_rc -eq 0 ] && [ \"$pull_out\" = pulled ]"
 expect "explicit pull fetched target/ back (burstpull req 3)" "[ -f \"$WT/target/out.txt\" ]"
 expect "explicit pull cleared the dirty marker (burstpull req 3)" "! dirty_has \"$WT\""
+# requirement 10 / AC11 (first half): this explicit pull is the FIRST rsync
+# --stats call against $WT's destination (the fake rsync's per-dst call
+# counter starts at 1 here) — bytes1 is the baseline the re-dirtied pull
+# below must come in under.
+bytes1="$(grep 'burst-lane  pull  ok' "$BURST_LANE_JOURNAL" | tail -1 | grep -oE 'bytes=[0-9]+' | cut -d= -f2)"
+expect "first explicit pull journaled a byte count (req 10)" "[ -n \"$bytes1\" ] && [ \"$bytes1\" -gt 0 ]"
 
 # ---- burstpull AC1: two consecutive remote runs on one worktree pull ZERO
 # times between them — the marker stays dirty across both, and both
@@ -145,7 +162,16 @@ for r in last_two:
     assert r.get('estimate') is True, r
 " || ac1_rc=1
 expect "both consecutive-run attribution rows carry pulls_skipped + estimate=true (AC1)" "[ $ac1_rc -eq 0 ]"
+# requirement 10 / AC11 (second half): $WT is dirty again (the two runs
+# above), so this pull is a real second rsync --stats call against the same
+# destination — the fake rsync's per-dst counter is now at 2, so it must
+# report fewer bytes than bytes1 above, proving pull_target_incremental's
+# delta reuse still holds under the new lazy-pull contract (only the call
+# site moved, per the PRD's own "Technical considerations").
 "$BL" pull "$WT" >/dev/null 2>&1   # leave the worktree clean for the next block
+bytes2="$(grep 'burst-lane  pull  ok' "$BURST_LANE_JOURNAL" | tail -1 | grep -oE 'bytes=[0-9]+' | cut -d= -f2)"
+expect "second explicit pull journaled a byte count (req 10)" "[ -n \"$bytes2\" ] && [ \"$bytes2\" -gt 0 ]"
+expect "second explicit pull's bytes are fewer than the first's (AC11, incremental delta reuse)" "[ \"$bytes2\" -lt \"$bytes1\" ]"
 
 # ---- requirement 13: cost-ledger PRD-served attribution ---------------------
 # A caller that knows its own PRD slug (branch/gate dispatch) exports

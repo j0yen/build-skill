@@ -61,6 +61,14 @@ out="$(cd "$WT" && "$BL" run "$WT" -- bash -c '
 rc=$?
 expect "gate-shaped run exits 0" "[ $rc -eq 0 ]"
 
+# PRD-build-burst-pull-on-demand: `run` no longer pulls target/ back
+# itself — it marks the worktree remote-dirty and returns. extend-gate.sh's
+# real cargo_budgeted() choke point (requirement 2's ensure-fresh guard)
+# is what pulls before any local read; here `pull` stands in for that
+# guard, same as it does for AC2's wrapper.
+pull_out="$("$BL" pull "$WT" 2>&1)"; pull_rc=$?
+expect "pull (standing in for the ensure-fresh guard) succeeds" "[ $pull_rc -eq 0 ]"
+
 receipt_count=$(find "$WT/target/autobuilder/receipts" -name 'r*.json' 2>/dev/null | wc -l)
 expect "all 25 receipts pulled back to the worktree on RedBaron" "[ \"$receipt_count\" -eq 25 ]"
 

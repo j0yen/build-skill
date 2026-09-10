@@ -6,7 +6,15 @@
 # RUSTC_WRAPPER=sccache (asserted structurally: cmd_run's remote command
 # always exports it — see scripts/burst-lane.sh), its exit code is
 # returned, and target/ in the worktree contains the remote build's
-# artifacts afterwards.
+# artifacts once something local actually reads it.
+#
+# Updated for PRD-build-burst-pull-on-demand: `run` itself no longer pulls
+# target/ back synchronously (that was the eager behavior this PRD
+# replaced — see baseline session 165331692 in that PRD's TL;DR). It marks
+# the worktree remote-dirty and returns immediately; the artifact still
+# ends up in the worktree "afterwards", just lazily, at the next pull
+# (explicit here, standing in for the shim's local-read trigger this AC's
+# own scenario doesn't otherwise exercise).
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 source "$HERE/fixtures/burst-lane-ac-common.sh"
@@ -21,5 +29,6 @@ echo "ok  remote command always exports RUSTC_WRAPPER=sccache"
 
 run_suite_and_expect_labels \
   "ok  run propagates the remote exit code" \
-  "ok  run pulled target/ back to the worktree" \
+  "ok  run does NOT pull target/ back itself (burstpull req 1)" \
+  "ok  explicit pull fetched target/ back (burstpull req 3)" \
   "ok  run journaled the routed call"
