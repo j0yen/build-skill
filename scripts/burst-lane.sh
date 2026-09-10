@@ -778,11 +778,33 @@ for r in json.loads(sys.argv[1]):
     esac
   fi
 
+  # PRD-build-gate-on-casper requirement 6/8: currently-running remote
+  # gates, straight from the same gate-inflight markers cmd_gate writes and
+  # gate_wait_for_inflight() reads — so `status --json` (and a tick
+  # deciding whether to dispatch another gate) never has to ssh in or
+  # reverse-engineer it from the journal.
+  mkdir -p "$GATE_INFLIGHT_DIR" 2>/dev/null || true
+  local gates_json
+  gates_json="$(python3 -c '
+import json, glob, sys
+now = int(sys.argv[1])
+rows = []
+for f in sorted(glob.glob(sys.argv[2] + "/*.json")):
+    try:
+        d = json.load(open(f))
+    except Exception:
+        continue
+    d["age_seconds"] = max(0, now - d.get("started_epoch", now))
+    rows.append(d)
+print(json.dumps(rows))
+' "$(now_epoch)" "$GATE_INFLIGHT_DIR")"
+
   if [ "$json" -eq 1 ]; then
-    printf '{"active":true,"server_id":"%s","ip":"%s","minutes_alive":%s,"ttl_hours":"%s","sandbox_ok":"%s","concurrent":"%s","free_disk_gb":%s,"disk_state":"%s","dirty":%s}\n' \
-      "$id" "$ip" "$alive" "$ttl" "$sbx" "$conc" "$free_disk_gb" "$disk_state" "$dirty_json"
+    printf '{"active":true,"server_id":"%s","ip":"%s","minutes_alive":%s,"ttl_hours":"%s","sandbox_ok":"%s","concurrent":"%s","free_disk_gb":%s,"disk_state":"%s","dirty":%s,"gates":%s,"gate_ready":"%s"}\n' \
+      "$id" "$ip" "$alive" "$ttl" "$sbx" "$conc" "$free_disk_gb" "$disk_state" "$dirty_json" "$gates_json" "$(state_read gate_ready)"
   else
-    echo "active: $id ip=$ip alive=${alive}m ttl=${ttl}h sandbox_ok=$sbx concurrent=$conc disk_state=$disk_state free_disk_gb=$free_disk_gb"
+    local gate_count; gate_count="$(python3 -c 'import json,sys; print(len(json.loads(sys.argv[1])))' "$gates_json")"
+    echo "active: $id ip=$ip alive=${alive}m ttl=${ttl}h sandbox_ok=$sbx concurrent=$conc disk_state=$disk_state free_disk_gb=$free_disk_gb gates:${gate_count}"
     [ -n "$dirty_lines" ] && printf '%s\n' "$dirty_lines"
   fi
   exit 0
@@ -1725,6 +1747,15 @@ sys.exit(0 if d.get("head_sha") == sys.argv[2] and d.get("diff") == [] else 1)
   fi
   local id ip; id="$(state_read server_id)"; ip="$(state_read ip)"
 
+  # Requirement 6: a burst run slot per gate (same acquire_run_slot()
+  # semaphore `run` uses, one slot, held for this whole function's
+  # lifetime) is what lets gates on DIFFERENT repos proceed concurrently up
+  # to BURST_MAX_CONCURRENT_RUNS; the per-repo worktree lock right below is
+  # what still SERIALIZES two gates on the SAME repo regardless of slot
+  # availability — a third caller for a repo already gating blocks there,
+  # not here.
+  acquire_run_slot "$repo"
+
   mkdir -p "$STATE_DIR/locks" 2>/dev/null || true
   exec 212>"$(wt_lock_file "$repo")"
   flock 212
@@ -2597,10 +2628,30 @@ cmd_sub_cap() {
   local subcap=$by_mem bound="mem"
   if [ "$by_cpu" -lt "$subcap" ]; then subcap=$by_cpu; bound="cpu"; fi
   if [ "$by_disk" -lt "$subcap" ]; then subcap=$by_disk; bound="disk"; fi
+
+  # PRD-build-gate-on-casper requirement 6: a running remote gate is
+  # heavier than a plain branch's cargo run (cargo test --workspace, the
+  # full producer sequence, the reviewer) — weighted 2 against this same
+  # formula so a tick doesn't admit as many NEW branches while gates are
+  # already consuming the box. Applied before the `candidates` clamp (an
+  # orthogonal "don't offer more than N candidates" cap, not a resource
+  # reading) and after mem/cpu/disk (an already-consumed resource, not a
+  # ceiling those three compete against).
+  mkdir -p "$GATE_INFLIGHT_DIR" 2>/dev/null || true
+  local active_gates=0 gm
+  for gm in "$GATE_INFLIGHT_DIR"/*.json; do [ -f "$gm" ] && active_gates=$((active_gates + 1)); done
+  local gate_weight=$((active_gates * 2))
+  if [ "$gate_weight" -gt 0 ]; then
+    subcap=$((subcap - gate_weight))
+    [ "$subcap" -lt 0 ] && subcap=0
+    bound="gates"
+  fi
+
   if [ "$candidates" -gt 0 ] && [ "$candidates" -lt "$subcap" ]; then subcap=$candidates; bound="candidates"; fi
 
   local bound_suffix=""
   [ "$bound" = "disk" ] && bound_suffix=" bound=disk"
+  [ "$bound" = "gates" ] && bound_suffix=" bound=gates gates_active=$active_gates"
 
   probe_emit burst-subcap clean "sub-cap=$subcap (avail_gb=$avail_gb nproc=$nproc_n free_disk_gb=$free_disk_gb)" >/dev/null
   journal_line "$(now_iso)  burst-lane  sub-cap  computed  (burst: sub-cap=$subcap (avail_gb=$avail_gb nproc=$nproc_n free_disk_gb=$free_disk_gb)${bound_suffix} local=0)"

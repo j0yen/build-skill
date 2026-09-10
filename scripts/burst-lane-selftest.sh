@@ -1214,5 +1214,114 @@ kill "$holder7b_pid" 2>/dev/null || true
 wait "$holder7b_pid" 2>/dev/null || true
 unset BURST_LANE_NOW BURST_LANE_GATE_WAIT_POLL_S
 
+# ---- gatebox AC6: gates on different repos proceed concurrently (each
+# taking one acquire_run_slot() slot, same semaphore `run` uses) and
+# status --json lists them; a third call for one of the SAME repos still
+# waits on that repo's own lock (requirement 6). Three REAL `gate`
+# invocations run in the background against a fake extend-gate.sh that
+# sleeps, so overlap (or its absence) is observable from real start/end
+# timestamps rather than asserted from hand-crafted state.
+fresh_env
+"$BL" up >/dev/null
+CONC_CALLLOG="$T/conc-calls.log"; : > "$CONC_CALLLOG"
+FAKEBIN_CONC="$T/fakebin-conc"; mkdir -p "$FAKEBIN_CONC"
+cat > "$FAKEBIN_CONC/extend-gate.sh" <<EOF
+#!/usr/bin/env bash
+echo "start \$(date +%s.%N) \$PWD" >> "$CONC_CALLLOG"
+mkdir -p target/autobuilder
+echo '{"pass": 25, "block": 0}' > target/autobuilder/last-verdict.json
+sleep "\${FAKE_EXTEND_GATE_SLEEP:-1.2}"
+echo "end \$(date +%s.%N) \$PWD" >> "$CONC_CALLLOG"
+exit 0
+EOF
+chmod +x "$FAKEBIN_CONC/extend-gate.sh"
+
+WT_C1="$T/conc1-repo"; mkdir -p "$WT_C1/target/autobuilder/receipts"
+( cd "$WT_C1" && git init -q && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init )
+head_c1="$(git -C "$WT_C1" rev-parse HEAD)"
+echo "{\"head_sha\": \"$head_c1\", \"box_host\": \"x\", \"suites\": {}, \"diff\": []}" > "$WT_C1/target/autobuilder/receipts/box-parity.json"
+
+WT_C2="$T/conc2-repo"; mkdir -p "$WT_C2/target/autobuilder/receipts"
+( cd "$WT_C2" && git init -q && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init )
+head_c2="$(git -C "$WT_C2" rev-parse HEAD)"
+echo "{\"head_sha\": \"$head_c2\", \"box_host\": \"x\", \"suites\": {}, \"diff\": []}" > "$WT_C2/target/autobuilder/receipts/box-parity.json"
+
+export BURST_MAX_CONCURRENT_RUNS=7   # AC6's own "sub-cap 7" — comfortably >= 2
+PATH="$FAKEBIN_CONC:$PATH" "$BL" gate "$WT_C1" --head "$head_c1" >"$T/gate-c1.out" 2>&1 &
+pid_c1=$!
+PATH="$FAKEBIN_CONC:$PATH" "$BL" gate "$WT_C2" --head "$head_c2" >"$T/gate-c2.out" 2>&1 &
+pid_c2=$!
+sleep 0.5   # let both acquire their slot+lock and start the fake remote gate
+
+status_conc="$("$BL" status --json 2>&1)"
+gates_count_mid="$(python3 -c "import json,sys; d=json.loads(sys.argv[1]); print(len(d.get('gates', [])))" "$status_conc" 2>/dev/null || echo 0)"
+expect "gatebox AC6: status --json lists two gates while both are in flight" "[ \"$gates_count_mid\" -eq 2 ]"
+
+# A third call for the SAME repo as c1 — must wait on c1's own worktree
+# lock, launched now so its own start (once unblocked) lands in the log.
+PATH="$FAKEBIN_CONC:$PATH" "$BL" gate "$WT_C1" --head "$head_c1" >"$T/gate-c3.out" 2>&1 &
+pid_c3=$!
+
+wait "$pid_c1"; rc_c1=$?
+wait "$pid_c2"; rc_c2=$?
+wait "$pid_c3"; rc_c3=$?
+unset BURST_MAX_CONCURRENT_RUNS
+
+expect "gatebox AC6: all three gate calls eventually exit 0" "[ $rc_c1 -eq 0 ] && [ $rc_c2 -eq 0 ] && [ $rc_c3 -eq 0 ]"
+expect "gatebox AC6: extend-gate.sh was invoked exactly 3 times (c1, c2, c3)" "[ \"$(grep -c '^start ' "$CONC_CALLLOG")\" -eq 3 ]"
+
+conc_check_rc=0
+python3 -c "
+import sys
+starts = {}
+for line in open('$CONC_CALLLOG'):
+    parts = line.split()
+    if parts[0] != 'start':
+        continue
+    ts, pwd = float(parts[1]), parts[2]
+    if 'conc1-repo' in pwd and 'c1' not in starts:
+        starts['c1'] = ts
+    elif 'conc2-repo' in pwd and 'c2' not in starts:
+        starts['c2'] = ts
+if 'c1' not in starts or 'c2' not in starts:
+    sys.exit(1)
+# concurrency: both different-repo starts land close together — well under
+# one gate's own sleep duration — rather than one waiting for the other.
+sys.exit(0 if abs(starts['c1'] - starts['c2']) < 1.0 else 1)
+" || conc_check_rc=1
+expect "gatebox AC6: the two different-repo gates actually overlapped (concurrent, not serialized)" "[ $conc_check_rc -eq 0 ]"
+
+serial_check_rc=0
+python3 -c "
+import sys
+starts_c1, ends_c1 = [], []
+for line in open('$CONC_CALLLOG'):
+    parts = line.split()
+    kind, ts, pwd = parts[0], float(parts[1]), parts[2]
+    if 'conc1-repo' in pwd:
+        (starts_c1 if kind == 'start' else ends_c1).append(ts)
+if len(starts_c1) != 2 or len(ends_c1) != 2:
+    sys.exit(1)
+starts_c1.sort(); ends_c1.sort()
+# no overlap on the SAME repo: the second (c3's) start must be at or after
+# the first (c1's) end.
+sys.exit(0 if starts_c1[1] >= ends_c1[0] else 1)
+" || serial_check_rc=1
+expect "gatebox AC6: a third call for the SAME repo waited for the first to finish (no overlap)" "[ $serial_check_rc -eq 0 ]"
+
+# ---- gatebox requirement 6 (sub-cap weighting, unit-level): one active
+# in-flight gate marker subtracts 2 from sub-cap's own mem/cpu/disk-derived
+# width, floored at 0 — checked directly against a hand-crafted marker
+# (fast, no need to drive a real multi-second gate for this part).
+fresh_env
+"$BL" up >/dev/null
+mkdir -p "$BURST_LANE_STATE_DIR/gate-inflight"
+python3 -c "import json; json.dump({'repo': '/fake/repo', 'host': '127.0.0.1', 'started_epoch': 0, 'budget_s': 1800}, open('$BURST_LANE_STATE_DIR/gate-inflight/fakegate.json', 'w'))"
+subcap_gates="$(FAKE_SSH_MEMINFO_GB=120 FAKE_SSH_NPROC=32 "$BL" sub-cap --candidates 10)"
+# 120GB/32cores -> floor(120/6)=20, floor(32/4)=8 -> unweighted sub-cap=8
+# (AC7's own baseline); one active gate subtracts 2 -> 6.
+expect "gatebox req6: one active gate subtracts 2 from sub-cap (8 -> 6)" "grep -q '^sub-cap=6 local=0' <<<\"$subcap_gates\""
+expect "gatebox req6: sub-cap names the gates bound and count" "grep -q 'bound=gates gates_active=1' <<<\"$subcap_gates\""
+
 echo "=== $([ $fail -eq 0 ] && echo PASS || echo FAIL) ==="
 exit $fail
