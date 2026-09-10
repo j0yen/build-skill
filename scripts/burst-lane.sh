@@ -1727,6 +1727,23 @@ cmd_gate() {
   [ -n "$repo" ] && [ -d "$repo" ] || { echo "usage: burst-lane.sh gate <repo> --head <sha> [extend-gate args...]" >&2; exit 2; }
   shift || true
 
+  # PRD-build-gate-on-casper migration: ships dark behind BURST_GATE_REMOTE
+  # (default 0 = every gate stays local, today's behavior unchanged). The
+  # tick can call this subcommand unconditionally — the on/off decision
+  # lives here, in ONE place, rather than duplicated as prose in every
+  # caller — and reuses requirement 5's own fallback contract (print
+  # "fallback: <cause>", exit 3, caller runs extend-gate.sh locally) so a
+  # caller already handling that contract needs no separate branch for
+  # "routing disabled" versus "routing tried and failed". Nothing here
+  # touches parity, ssh, or rsync, and the journaled line carries no
+  # host= field — only the requirement-3 routed-success shape does — so
+  # AC8's "no gate remote line is journaled" holds.
+  if [ "${BURST_GATE_REMOTE:-0}" != "1" ]; then
+    journal_line "$(now_iso)  burst-lane  gate  fallback  (cause=remote-disabled repo=$repo)"
+    echo "fallback: remote-disabled"
+    exit 3
+  fi
+
   local head_arg="" extra_args=()
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -1815,7 +1832,15 @@ sys.exit(0 if d.get("head_sha") == sys.argv[2] and d.get("diff") == [] else 1)
 
   local t0 t1 rc=0
   t0="$(now_fractional)"
-  local remote_cmd="cd $remote_path && export PATH=\$PATH:/root/.cargo/bin:/root/.local/bin:$REMOTE_ROOT/.gate-tools/build-scripts RUSTC_WRAPPER=sccache BURST_LANE=0 RUSTBUILD_SCRIPTS=$REMOTE_ROOT/.gate-tools/rustbuild-scripts REVIEWER_PROMPT=$REMOTE_ROOT/.gate-tools/rustbuild-prompts/reviewer-agent.md; extend-gate.sh . $(printf '%q ' "${extra_args[@]}")"
+  # PRD-build-gate-on-casper "extend-gate.sh remote-aware invocation": the
+  # ONE thing extend-gate.sh writes outside the repo is the daily journal
+  # (default $HOME/brain/journal/build/<date>.md) — on the box that's
+  # root's own $HOME, not RedBaron's, so it's redirected here into
+  # target/autobuilder/ (already an rsync-back path) and appended onto
+  # RedBaron's real tick journal below, keeping the journal single-writer
+  # per the PRD's technical considerations.
+  local remote_journal="$remote_path/target/autobuilder/gate-journal.md"
+  local remote_cmd="cd $remote_path && export PATH=\$PATH:/root/.cargo/bin:/root/.local/bin:$REMOTE_ROOT/.gate-tools/build-scripts RUSTC_WRAPPER=sccache BURST_LANE=0 RUSTBUILD_SCRIPTS=$REMOTE_ROOT/.gate-tools/rustbuild-scripts REVIEWER_PROMPT=$REMOTE_ROOT/.gate-tools/rustbuild-prompts/reviewer-agent.md EXTEND_GATE_JOURNAL=$remote_journal; extend-gate.sh . $(printf '%q ' "${extra_args[@]}")"
   "$SSH_BIN" -o StrictHostKeyChecking=no -i "$SSH_KEY" "$REMOTE_USER@$ip" "bash -lc $(printf '%q' "$remote_cmd")" || rc=$?
   t1="$(now_fractional)"
   rm -f "$inflight_marker"
@@ -1834,6 +1859,19 @@ sys.exit(0 if d.get("head_sha") == sys.argv[2] and d.get("diff") == [] else 1)
     "$REMOTE_USER@$ip:$remote_path/target/autobuilder/" "$repo/target/autobuilder/" >/dev/null 2>&1 || true
   "$RSYNC_BIN" -az -e "$SSH_BIN -o StrictHostKeyChecking=no -i $SSH_KEY" \
     "$REMOTE_USER@$ip:$remote_path/.gate-burst-host" "$repo/.gate-burst-host" >/dev/null 2>&1 || true
+
+  # Fold the box's redirected extend-gate.sh journal onto RedBaron's real
+  # tick journal (single-writer: this is the only place a remote gate's
+  # journal lines land), then clear it on the box so a later gate on the
+  # same persistent remote_path doesn't re-append lines already folded in.
+  local pulled_journal="$repo/target/autobuilder/gate-journal.md"
+  if [ -s "$pulled_journal" ]; then
+    local tj_today; tj_today="$(date -u -d "@$(now_epoch)" +%Y-%m-%d 2>/dev/null || date -u +%Y-%m-%d)"
+    mkdir -p "$TICK_JOURNAL_DIR" 2>/dev/null || true
+    cat "$pulled_journal" >> "$TICK_JOURNAL_DIR/$tj_today.md"
+    rm -f "$pulled_journal"
+    "$SSH_BIN" -o StrictHostKeyChecking=no -i "$SSH_KEY" "$REMOTE_USER@$ip" "rm -f $remote_journal" 2>/dev/null || true
+  fi
   flock -u 212
 
   local verdict_file="$repo/target/autobuilder/last-verdict.json"

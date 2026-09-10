@@ -687,6 +687,38 @@ read it before assuming a step is "the last one this tick".
   burst failure mode (precondition absent, boot failure, rsync/ssh
   failure) by printing `fallback: <cause>` and exiting 3 — the tick must
   treat that exit code as "fall back to local", never as a gate block.
+
+  **Full-gate remote routing (2026-09-10, PRD-build-gate-on-casper).**
+  `gate-burst.sh`/`should-route` above only ever routed the cargo
+  producers — orchestration, the reviewer, and the verdict stayed here,
+  because the box had no build-skill scripts, no autobuilder, and no
+  reviewer. PRD-build-gate-on-casper's `burst-lane.sh` now provisions all
+  of that at `up` (requirement 1), so when `BURST_GATE_REMOTE=1` the tick
+  calls this INSTEAD of the local `extend-gate.sh` invocation above:
+  ```
+  scripts/burst-lane.sh gate <build_into> --head <landed sha>
+  ```
+  This is unconditional to call — `burst-lane.sh gate` itself checks
+  `BURST_GATE_REMOTE` first and, when it isn't `1` (the ships-dark
+  default), immediately prints `fallback: remote-disabled` and exits 3
+  without touching parity, ssh, or rsync, so the tick can call it every
+  time and branch only on the exit code, exactly as it already does for
+  `gate-burst.sh run`. Its own exit code (0 pass, 1 block) is the gate
+  verdict in the same shape `extend-gate.sh` returns locally — receipts
+  land at the same `target/autobuilder/receipts` path with `host: <box>`
+  added to `last-verdict.json` — so the ship rule, verdict cache, and
+  `Receipts:` line below are all unchanged. Any failure before the remote
+  gate starts (routing disabled, parity unknown/diff, provisioning, ssh,
+  rsync) prints `fallback: <cause>` and exits 3: treat exactly like
+  `gate-burst.sh run`'s own fallback — run the LOCAL command:
+  ```
+  scripts/extend-gate.sh <build_into> --head <landed sha>
+  ```
+  A failure AFTER the remote gate starts is a normal gate verdict (0 or
+  1), carried in the synced-back receipts, not a fallback. Default is
+  `BURST_GATE_REMOTE=0` — until this is turned on, the tick keeps running
+  the mixed-tick burst routing / local `extend-gate.sh` path documented
+  above, unchanged.
   **Precondition, verified 2026-09-06:** no `/cloudbuild` skill exists on
   this machine (checked directly — not under a renamed pre-fleet-sync
   backup either) and `hcloud` itself is not on `$PATH`, so

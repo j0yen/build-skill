@@ -96,6 +96,11 @@ fresh_env() {
   # placement (and BURST_CLAUDE_CRED_SRC keeps pointing at its real default
   # of ~/.claude/.credentials.json) unless a test opts in explicitly.
   export BURST_LANE_GATE_CRED_REMOTE_PATH="$T/remote-cred/.credentials.json"
+  # PRD-build-gate-on-casper AC8: production ships dark (BURST_GATE_REMOTE
+  # unset/0 keeps every gate local) but every OTHER gatebox test here wants
+  # to exercise the routed path, so default it on per-block and let the
+  # dedicated AC8 block below override it back to unset for its own case.
+  export BURST_GATE_REMOTE=1
   unset FAKE_HCLOUD_AUTH_FAIL FAKE_HCLOUD_CREATE_FAIL FAKE_HCLOUD_DELETE_FAIL FAKE_SSH_REMOTE_FAIL FAKE_SSH_SANDBOX_FAIL FAKE_RSYNC_FAIL BURST_LANE_NOW \
         FAKE_SSH_GATE_TOOLS_MISSING FAKE_SSH_GATE_TOOLS_INSTALL_FAIL BURST_GATE_REVIEWER BURST_CLAUDE_CRED_SRC
 }
@@ -1090,6 +1095,10 @@ mkdir -p target/autobuilder/receipts
 echo '{"pass": 24, "block": 1}' > target/autobuilder/last-verdict.json
 echo "receipt" > target/autobuilder/receipts/some-producer.json
 echo "should-not-sync" > should-not-sync.txt
+# "extend-gate.sh remote-aware invocation": the real script writes its one
+# outside-the-repo line to \$EXTEND_GATE_JOURNAL when set (cmd_gate arms
+# this on the box); this fake stands in for that behavior too.
+[ -n "\${EXTEND_GATE_JOURNAL:-}" ] && { mkdir -p "\$(dirname "\$EXTEND_GATE_JOURNAL")"; echo "fake-extend-gate-journal-line-AC3" >> "\$EXTEND_GATE_JOURNAL"; }
 exit "\${FAKE_EXTEND_GATE_EXIT:-0}"
 EOF
 chmod +x "$FAKEBIN_GATE/extend-gate.sh"
@@ -1113,6 +1122,10 @@ assert d.get('pass') == 24 and d.get('block') == 1, d
 expect "gatebox AC3: last-verdict.json carries a host field (extend-gate.sh itself never touched)" "[ $gate3_verdict_rc -eq 0 ]"
 expect "gatebox AC3: journal gate line names the verdict, host, and wall time" \
   "grep -qE 'burst-lane  gate  block  \(repo=.*host=[0-9.]+ wall=[0-9.]+s head='\"$head_gate\" \"$BURST_LANE_JOURNAL\""
+expect "gatebox AC3 (extend-gate.sh remote-aware): the box's redirected journal folded onto RedBaron's tick journal" \
+  "grep -qF 'fake-extend-gate-journal-line-AC3' \"$BURST_LANE_TICK_JOURNAL_DIR/$(date -u +%Y-%m-%d).md\""
+expect "gatebox AC3 (extend-gate.sh remote-aware): the folded journal was not left behind under target/autobuilder/" \
+  "[ ! -e \"$WT_GATE/target/autobuilder/gate-journal.md\" ]"
 
 # ---- gatebox AC4: BURST_GATE_REVIEWER=1 places the reviewer credential at
 # `up` (mode 0600) and shreds it at `down`, and the sentinel token never
@@ -1137,6 +1150,43 @@ expect "gatebox AC4: down deletes cleanly with the reviewer credential in play" 
 expect "gatebox AC4: the credential is gone from the fake box after down" "[ ! -e \"$BURST_LANE_GATE_CRED_REMOTE_PATH\" ]"
 expect "gatebox AC4: journal has 'cred  shredded'" "grep -q 'burst-lane  down  cred  shredded' \"$BURST_LANE_JOURNAL\""
 expect "gatebox AC4: the sentinel token never appears in the journal" "! grep -q 'SENTINEL-GATEBOX-TOKEN-XYZ123' \"$BURST_LANE_JOURNAL\""
+
+# ---- gatebox AC8: BURST_GATE_REMOTE=0 (the ships-dark default) keeps a
+# gate entirely local -- cmd_gate refuses before touching parity, ssh, or
+# rsync at all, reusing requirement 5's own fallback contract (print
+# "fallback: <cause>", exit 3), and the journal line it writes carries no
+# host= field (only the requirement-3 routed-success shape does), so
+# nothing here reads as "a gate ran remotely".
+fresh_env
+"$BL" up >/dev/null
+WT_AC8="$T/ac8-repo"; mkdir -p "$WT_AC8/target/autobuilder/receipts"
+( cd "$WT_AC8" && git init -q && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init )
+head_ac8="$(git -C "$WT_AC8" rev-parse HEAD)"
+echo "{\"head_sha\": \"$head_ac8\", \"box_host\": \"x\", \"suites\": {}, \"diff\": []}" > "$WT_AC8/target/autobuilder/receipts/box-parity.json"
+FAKEBIN_AC8="$T/fakebin-ac8"; mkdir -p "$FAKEBIN_AC8"
+AC8_CALLLOG="$T/ac8-extend-gate-calls.log"
+cat > "$FAKEBIN_AC8/extend-gate.sh" <<EOF
+#!/usr/bin/env bash
+echo called >> "$AC8_CALLLOG"
+exit 0
+EOF
+chmod +x "$FAKEBIN_AC8/extend-gate.sh"
+
+unset BURST_GATE_REMOTE
+ac8_out="$(PATH="$FAKEBIN_AC8:$PATH" "$BL" gate "$WT_AC8" --head "$head_ac8" 2>&1)"; ac8_rc=$?
+expect "gatebox AC8: gate exits 3 when BURST_GATE_REMOTE is unset (ships dark)" "[ $ac8_rc -eq 3 ]"
+expect "gatebox AC8: gate prints fallback: remote-disabled" "grep -q '^fallback: remote-disabled$' <<<\"$ac8_out\""
+expect "gatebox AC8: journal has a gate fallback line naming cause=remote-disabled" \
+  "grep -q 'burst-lane  gate  fallback  (cause=remote-disabled' \"$BURST_LANE_JOURNAL\""
+expect "gatebox AC8: that journal line carries no host= field (it's not a remote line)" \
+  "! grep 'cause=remote-disabled' \"$BURST_LANE_JOURNAL\" | grep -q 'host='"
+expect "gatebox AC8: the remote extend-gate.sh was never invoked" "[ ! -f \"$AC8_CALLLOG\" ]"
+
+export BURST_GATE_REMOTE=0
+ac8b_out="$(PATH="$FAKEBIN_AC8:$PATH" "$BL" gate "$WT_AC8" --head "$head_ac8" 2>&1)"; ac8b_rc=$?
+expect "gatebox AC8: BURST_GATE_REMOTE=0 (explicit) behaves the same as unset" \
+  "[ $ac8b_rc -eq 3 ] && [ \"\$ac8b_out\" = 'fallback: remote-disabled' ]"
+export BURST_GATE_REMOTE=1
 
 # ---- gatebox AC7: teardown waits for (or abandons) a still-in-flight
 # remote gate instead of destroying the box out from under it (requirement
