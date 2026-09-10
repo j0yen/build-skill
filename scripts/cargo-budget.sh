@@ -14,9 +14,13 @@
 #       Waits for a slot (see gates below), then execs <cmd...> with
 #       CARGO_BUILD_JOBS/RUST_TEST_THREADS set (unless the caller already
 #       set them), samples /proc/loadavg every 5s while <cmd...> runs, and
-#       appends one row to state/cargo-budget/ledger.jsonl. Exits with
-#       <cmd...>'s own exit code, or 3 if the combined wait exceeded
-#       CARGO_BUDGET_WAIT_MAX before a slot/gate cleared.
+#       appends one row to state/cargo-budget/ledger.jsonl (now including
+#       a sccache_server:{pid,started_at} field — PRD-build-gate-wall-
+#       clock requirement 5). Exits with <cmd...>'s own exit code, 3 if
+#       the combined wait exceeded CARGO_BUDGET_WAIT_MAX before a
+#       slot/gate cleared, or 4 if the managed sccache server did not
+#       answer even after one restart attempt (sccache_unreachable —
+#       <cmd...> never runs; no ledger row is written for a refused run).
 #   cargo-budget.sh summary [--since <epoch>] [--no-cursor]
 #       Prints `cargo-budget: peak_load=<n> min_avail_gb=<n> waits=<n>
 #       max_wait_s=<n>` aggregated from ledger rows at or after <epoch>.
@@ -53,6 +57,11 @@
 #     `"$@"` call site below for why (output buffering).
 #   GATE_WEDGE_SH (<skill-dir>/scripts/gate-wedge.sh)
 #   CARGO_BUDGET_STEP_NAME (cargo-budget) — step name on wedge receipts
+#   CARGO_BUDGET_SCCACHE_ASSERT (auto) — auto/1/on/0/off; see the
+#     sccache-assert.sh call site below (PRD-build-gate-wall-clock
+#     requirement 2/5: never compile against an unreachable sccache
+#     server; every ledger row's exit_code 4 means this refused the run).
+#   SCCACHE_ASSERT_SH (<skill-dir>/scripts/sccache-assert.sh)
 # Test-only hooks (never set these in production use):
 #   CARGO_BUDGET_STATE_DIR  CARGO_BUDGET_JOURNAL  CARGO_BUDGET_MEMINFO
 #   CARGO_BUDGET_LOADAVG  CARGO_BUDGET_HOSTNAME  CARGO_BUDGET_NPROC
@@ -204,6 +213,55 @@ cmd_run() {
   local sampler_pid=$!
   disown "$sampler_pid" 2>/dev/null || true
 
+  # PRD-build-gate-wall-clock requirement 2/5: assert the managed sccache
+  # server answers BEFORE this budgeted command ever compiles — the
+  # actual local-RedBaron path the 2026-09-10 incident hit (RUSTC_WRAPPER
+  # is set fleet-wide via ~/.cargo/config.toml, not by any single script,
+  # so this shared cargo-invoking choke point is the right place, not a
+  # per-script edit). Only runs when sccache is actually on $PATH — a box
+  # with no sccache configured is unaffected (never a hard dependency).
+  # Read-only in the common case (show-stats succeeds — the assert never
+  # touches the server unless it is provably unreachable, so this is safe
+  # to run unconditionally against a server other concurrent callers may
+  # be using right now); only escalates to a restart when genuinely
+  # unreachable, which is exactly this PRD's fix, not a new risk. Fails
+  # the run closed (rc 4, before "$@" ever executes) on sccache_unreachable
+  # — never compiles against a server we could not prove was up.
+  # $CARGO_BUDGET_SCCACHE_ASSERT: auto (default) | 1/on (force even
+  # without sccache on PATH, for tests) | 0/off (force-disable).
+  local sccache_assert_bin="${SCCACHE_ASSERT_SH:-$SKILL_DIR/scripts/sccache-assert.sh}"
+  local sccache_pid="unknown" sccache_started_at="unknown"
+  local assert_mode="${CARGO_BUDGET_SCCACHE_ASSERT:-auto}"
+  local should_assert=0
+  case "$assert_mode" in
+    1|on)  should_assert=1 ;;
+    0|off) should_assert=0 ;;
+    *)     command -v sccache >/dev/null 2>&1 && should_assert=1 ;;
+  esac
+  if [ "$should_assert" -eq 1 ] && [ -x "$sccache_assert_bin" ]; then
+    local assert_out
+    if assert_out="$("$sccache_assert_bin" 2>&1)"; then
+      sccache_pid="$(printf '%s\n' "$assert_out" | sed -n 's/.*pid=\([^ ]*\).*/\1/p' | head -1)"
+      sccache_started_at="$(printf '%s\n' "$assert_out" | sed -n 's/.*started_at=\([^ ]*\).*/\1/p' | head -1)"
+      [ -n "$sccache_pid" ] || sccache_pid="unknown"
+      [ -n "$sccache_started_at" ] || sccache_started_at="unknown"
+    else
+      # NOTE: a bare `exec ... 2>/dev/null` redirection applies to the
+      # CURRENT SHELL PERMANENTLY (there is no command word for the
+      # redirection to be scoped to) — `2>/dev/null` here would silently
+      # blackhole every later stderr write for the rest of this process,
+      # including die()'s own message a few lines down. Close the fd
+      # unguarded; closing an already-valid bash-allocated fd does not
+      # error in the cases this branch runs in.
+      exec {slot_fd}>&- || true
+      kill "$sampler_pid" 2>/dev/null || true
+      wait "$sampler_pid" 2>/dev/null || true
+      rm -f "$peak_file" "$peak_file.tmp" 2>/dev/null || true
+      journal "sccache_unreachable cmd=[$*]"
+      die "$assert_out (refusing to run: $*)" 4
+    fi
+  fi
+
   local run_start_iso; run_start_iso="$(now_iso)"
   # PRD-build-gate-wall-clock requirement 3: opt-in per-step wall-clock
   # budget + CPU-delta wedge probe (see gate-wedge.sh's own header — this
@@ -246,7 +304,9 @@ cmd_run() {
     --arg cmd "$*" \
     --argjson exit_code "$rc" \
     --argjson mem_avail_gb_start "$avail_gb" \
-    '{ts_start:$ts_start, ts_end:$ts_end, wait_s:$wait_s, peak_load:$peak_load, slot:$slot, pid:$pid, cmd:$cmd, exit_code:$exit_code, mem_avail_gb_start:$mem_avail_gb_start}')"
+    --arg sccache_pid "$sccache_pid" \
+    --arg sccache_started_at "$sccache_started_at" \
+    '{ts_start:$ts_start, ts_end:$ts_end, wait_s:$wait_s, peak_load:$peak_load, slot:$slot, pid:$pid, cmd:$cmd, exit_code:$exit_code, mem_avail_gb_start:$mem_avail_gb_start, sccache_server:{pid:$sccache_pid, started_at:$sccache_started_at}}')"
   {
     exec {lfd}>>"$LEDGER.lock"
     flock -x "$lfd"
