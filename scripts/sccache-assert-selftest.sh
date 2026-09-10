@@ -79,13 +79,16 @@ exit 1
 EOF
 chmod +x "$FAKE_SYSTEMCTL"
 
+RESTART_LOG="$T/restarts.log"
+
 reset_fixture() {
-  rm -f "$T/answering" "$T/unit-known" "$T/starts" "$T/restarts"
+  rm -f "$T/answering" "$T/unit-known" "$T/starts" "$T/restarts" "$RESTART_LOG" "$RESTART_LOG.lock"
 }
 
 run_assert() {
   SCCACHE_BIN="$FAKE_SCCACHE" SCCACHE_ASSERT_SYSTEMCTL="$FAKE_SYSTEMCTL" \
     SCCACHE_ASSERT_UNIT="sccache-server.service" \
+    SCCACHE_ASSERT_RESTART_LOG="$RESTART_LOG" \
     "$ASSERT" --timeout 2
 }
 
@@ -97,6 +100,7 @@ out="$(run_assert)"; rc=$?
 expect "case1 exit 0"                 "[ $rc -eq 0 ]"
 expect "case1 ok line"                "[[ \"$out\" == *'sccache-assert: ok pid=424242 started_at=2026-09-10T04:00:01Z'* ]]"
 expect "case1 no restart attempted"   "[ ! -f '$T/restarts' ]"
+expect "case1 no restart-log line (never restarted)" "[ ! -e '$RESTART_LOG' ]"
 
 # --- case 2: unreachable, unit known -> restart via systemctl -----------
 reset_fixture
@@ -106,6 +110,9 @@ expect "case2 exit 0"                 "[ $rc -eq 0 ]"
 expect "case2 restarted-once"         "[ \"\$(cat '$T/restarts')\" = 1 ]"
 expect "case2 no direct start-server" "[ ! -f '$T/starts' ]"
 expect "case2 ok restarted line"      "[[ \"$out\" == *'(restarted)'* ]]"
+expect "case2 restart-log gets exactly one line (req 8)" "[ \$(wc -l < '$RESTART_LOG') -eq 1 ]"
+expect "case2 restart-log line names pid+unit" \
+  "grep -qF 'pid\":\"424242' '$RESTART_LOG' && grep -qF 'sccache-server.service' '$RESTART_LOG'"
 
 # --- case 3: unreachable, unit NOT known -> self-heal via --start-server -
 reset_fixture
@@ -114,6 +121,7 @@ expect "case3 exit 0"                 "[ $rc -eq 0 ]"
 expect "case3 direct-start-once"      "[ \"\$(cat '$T/starts')\" = 1 ]"
 expect "case3 no systemctl restart"   "[ ! -f '$T/restarts' ]"
 expect "case3 pid unknown"            "[[ \"$out\" == *'pid=unknown'* ]]"
+expect "case3 restart-log still records the self-heal restart" "[ \$(wc -l < '$RESTART_LOG') -eq 1 ]"
 
 # --- case 4: stays unreachable after the one restart attempt ------------
 reset_fixture
@@ -138,11 +146,15 @@ fi
 exit 1
 EOF
 chmod +x "$FAKE_SYSTEMCTL_NOOP"
+reset_fixture
+: > "$T/unit-known"
 err="$(SCCACHE_BIN="$FAKE_SCCACHE" SCCACHE_ASSERT_SYSTEMCTL="$FAKE_SYSTEMCTL_NOOP" \
-       SCCACHE_ASSERT_UNIT="sccache-server.service" "$ASSERT" --timeout 2 2>&1 1>/dev/null)"; rc=$?
+       SCCACHE_ASSERT_UNIT="sccache-server.service" SCCACHE_ASSERT_RESTART_LOG="$RESTART_LOG" \
+       "$ASSERT" --timeout 2 2>&1 1>/dev/null)"; rc=$?
 expect "case4 exit 1"                 "[ $rc -eq 1 ]"
 expect "case4 restarted-exactly-once" "[ \"\$(cat '$T/restarts')\" = 1 ]"
 expect "case4 sccache_unreachable"    "[[ \"$err\" == *sccache_unreachable* ]]"
+expect "case4 no restart-log line (restart attempted but never answered)" "[ ! -e '$RESTART_LOG' ]"
 
 if [ "$fail" -eq 0 ]; then
   echo "sccache-assert-selftest: all cases passed"
