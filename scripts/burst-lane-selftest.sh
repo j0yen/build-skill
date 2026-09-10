@@ -777,5 +777,114 @@ expect "burstdisk AC7: rollup line names reaped_dirs, reaped_gb, disk_low_fallba
   "grep -qE 'reaped_dirs=2 reaped_gb=125 disk_low_fallbacks=1' \"$today7_file\""
 unset BURST_LANE_NOW
 
+# =============================================================================
+# PRD-build-gate-cargo-route-attest: the gate proves where its cargo ran.
+# "gateroute" cases (requirement 7): shim-first resolution under a fake
+# session, intended-local with no session, a mismatch event when a fake
+# real cargo is forced first on PATH, and per-gate route log isolation
+# between two concurrent fake gates.
+# =============================================================================
+
+# ---- gateroute: shim-first resolution under a fake session -----------------
+# route-check reads the CURRENT $PATH/session state without ever touching
+# cmd_run (no rsync/ssh round trip, so no interaction with the fake-ssh
+# stub's own environment-inheritance quirks — see the isolation block below
+# for why `run`'s own literal-"cargo" remote command is unsafe to replay
+# through this offline fixture) — this is exactly the check extend-gate.sh
+# runs at gate start.
+fresh_env
+"$BL" up >/dev/null
+FAKEBIN_GR="$T/fakebin-gateroute"; mkdir -p "$FAKEBIN_GR"
+cat > "$FAKEBIN_GR/cargo" <<'EOF'
+#!/usr/bin/env bash
+echo "fake-real-cargo: $*"
+exit 0
+EOF
+chmod +x "$FAKEBIN_GR/cargo"
+
+rc_shim_first="$(PATH="$HERE/burst-lane-bin:$FAKEBIN_GR:$FAKE:$PATH" "$BL" route-check --repo "$T" 2>&1)"
+expect "gateroute: shim-first resolution reports intended=burst" "grep -q 'intended=burst' <<<\"$rc_shim_first\""
+expect "gateroute: shim-first resolution resolves to the shim itself" "grep -q \"resolved=$HERE/burst-lane-bin/cargo\" <<<\"$rc_shim_first\""
+expect "gateroute: shim-first resolution is state=clean" "grep -q 'state=clean' <<<\"$rc_shim_first\""
+expect "gateroute: shim-first resolution probed the gate-cargo-route probe clean" \
+  "grep -q '\"probe\": \"gate-cargo-route\", \"reason\": \"intended=burst' \"$BUILD_STATE_DIR/probes/ledger.jsonl\""
+
+# ---- gateroute: intended-local with no session ------------------------------
+fresh_env
+rc_nosession="$(PATH="$HERE/burst-lane-bin:$FAKEBIN_GR:$FAKE:$PATH" "$BL" route-check --repo "$T" 2>&1)"
+expect "gateroute: no session reports intended=local" "grep -q 'intended=local' <<<\"$rc_nosession\""
+expect "gateroute: no session is state=clean regardless of PATH order" "grep -q 'state=clean' <<<\"$rc_nosession\""
+
+# ---- gateroute: mismatch when a fake real-cargo is forced first on PATH ----
+# The exact 2026-09-10 defect, reproduced structurally: a session is up
+# (intended=burst) but something (the pre-fix extend-gate.sh, here just a
+# fake real-cargo directory) sits ahead of the shim on $PATH.
+fresh_env
+"$BL" up >/dev/null
+ROUTE_LOG_MISMATCH="$T/route-mismatch.log"
+rc_mismatch="$(BURST_ROUTE_LOG="$ROUTE_LOG_MISMATCH" PATH="$FAKEBIN_GR:$HERE/burst-lane-bin:$FAKE:$PATH" "$BL" route-check --repo "$T" 2>&1)"
+expect "gateroute: shadowed shim reports intended=burst" "grep -q 'intended=burst' <<<\"$rc_mismatch\""
+expect "gateroute: shadowed shim resolves to the fake real cargo, not the shim" "grep -q \"resolved=$FAKEBIN_GR/cargo\" <<<\"$rc_mismatch\""
+expect "gateroute: shadowed shim is state=mismatch cause=shim-not-first" "grep -q 'state=mismatch cause=shim-not-first' <<<\"$rc_mismatch\""
+expect "gateroute: mismatch seeded a synthetic local/shim-not-first route-log line" \
+  "[ -f \"$ROUTE_LOG_MISMATCH\" ] && awk '\$4==\"local\" && \$5==\"shim-not-first\"' \"$ROUTE_LOG_MISMATCH\" | grep -q ."
+expect "gateroute: mismatch probed the gate-cargo-route probe dirty (library's dirty == this probe's mismatch)" \
+  "grep -q '\"probe\": \"gate-cargo-route\", \"reason\": \"route-mismatch intended=burst' \"$BUILD_STATE_DIR/probes/ledger.jsonl\""
+
+# ---- gateroute: per-gate route log isolation between two concurrent fake
+# gates (requirement 2's own "counts are per gate, not global") — two shim
+# invocations against two different worktrees, each with its own
+# BURST_ROUTE_LOG, launched together; neither's log gains the other's line.
+# Uses `check` (always passthrough) and an unrouted-by-omission `build`
+# (BURST_LANE unset -> local, no session needed) so neither call ever
+# reaches cmd_run's rsync/ssh path — deliberately avoiding a real routed
+# ("burst") call here: `run`'s remote command reduces an absolute cargo
+# path to the bare name "cargo" (meaningless on a real box, resolved by
+# the REMOTE's own PATH there), but this offline fixture's fake ssh is
+# just a local `eval` that inherits the CALLING process's own $PATH — with
+# this shim's directory still on it, that bare "cargo" would recurse back
+# into the shim forever. A real remote box's PATH never has this shim on
+# it, so this is a fake-ssh-fixture-only hazard, not a production one; the
+# "burst" decision path itself is already covered by the shim-first
+# resolution case above (which asserts the shim is what gets EXECed,
+# without following that exec through a live round trip).
+fresh_env
+WT_G1="$T/gate1-wt"; mkdir -p "$WT_G1"
+WT_G2="$T/gate2-wt"; mkdir -p "$WT_G2"
+LOG_G1="$T/gate1-route.log"
+LOG_G2="$T/gate2-route.log"
+( cd "$WT_G1" && PATH="$HERE/burst-lane-bin:$FAKEBIN_GR:$FAKE:$PATH" BURST_ROUTE_LOG="$LOG_G1" "$SHIM" check ) >/dev/null 2>&1 &
+pid_g1=$!
+( cd "$WT_G2" && PATH="$HERE/burst-lane-bin:$FAKEBIN_GR:$FAKE:$PATH" BURST_ROUTE_LOG="$LOG_G2" "$SHIM" build ) >/dev/null 2>&1 &
+pid_g2=$!
+wait "$pid_g1" "$pid_g2" 2>/dev/null
+expect "gateroute isolation: gate1's log has exactly one passthrough line" \
+  "[ \"\$(awk '\$4==\"passthrough\"' \"$LOG_G1\" 2>/dev/null | wc -l)\" -eq 1 ]"
+expect "gateroute isolation: gate2's log has exactly one local line (BURST_LANE unset -> local)" \
+  "[ \"\$(awk '\$4==\"local\"' \"$LOG_G2\" 2>/dev/null | wc -l)\" -eq 1 ]"
+expect "gateroute isolation: gate1's log does not contain gate2's worktree" "! grep -q \"$WT_G2\" \"$LOG_G1\" 2>/dev/null"
+expect "gateroute isolation: gate2's log does not contain gate1's worktree" "! grep -q \"$WT_G1\" \"$LOG_G2\" 2>/dev/null"
+
+# ---- gateroute AC7 (P1, requirement 6): a caller that exports
+# BURST_LANE_PRD_SLUG=gate-<repo> (extend-gate.sh's own convention) is
+# attributed under that exact slug — not attribution_slug_for()'s
+# worktree-basename guess — in attribution.jsonl, and that slug's own row
+# survives into `cost --by-prd`.
+fresh_env
+mkdir -p "$BURST_LANE_REPOS_DIR/gateroute-repo"
+WT_G7="$BURST_LANE_REPOS_DIR/gateroute-repo"
+echo 'mkdir -p target && echo built > target/out.txt; exit 0' > "$WT_G7/build.sh"
+BURST_LANE_PRD_SLUG="gate-gateroute-repo" "$BL" run "$WT_G7" -- bash build.sh >/dev/null 2>&1
+expect "gateroute AC7: attribution row uses the explicit gate-<repo> slug, not the worktree-basename guess" \
+  "python3 -c \"import json; d=json.loads(open('$BURST_LANE_ATTR_LEDGER').read().strip().splitlines()[-1]); import sys; sys.exit(0 if d.get('slug')=='gate-gateroute-repo' else 1)\""
+
+boot_epoch_g7="$(grep -oE '"boot_epoch":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+export BURST_LANE_NOW=$((boot_epoch_g7 + 3600 - 60))
+"$BL" down >/dev/null
+unset BURST_LANE_NOW
+cost_by_prd_g7="$("$BL" cost --by-prd)"
+expect "gateroute AC7: cost --by-prd shows a gate-<repo> row for the gate's own cargo cost" \
+  "grep -q 'gate-gateroute-repo' <<<\"$cost_by_prd_g7\""
+
 echo "=== $([ $fail -eq 0 ] && echo PASS || echo FAIL) ==="
 exit $fail

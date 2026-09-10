@@ -12,10 +12,41 @@
 # Always local (never routed, session or not):
 #   check, metadata — cheap/read-only, not the OOM source, and cargo
 #   check's fast turnaround is worth more than a round-trip to the box.
+#
+# PRD-build-gate-cargo-route-attest requirement 2: every invocation of this
+# shim — routed or not — appends one line to $BURST_ROUTE_LOG (default
+# state/burst-lane/route.log) recording its decision (burst|local|
+# passthrough) and cause, so a caller (extend-gate.sh) can attest where its
+# own cargo calls actually went instead of assuming PATH order did its job.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 WRAPPER="$HERE/../burst-lane.sh"
+# PRD-build-gate-cargo-route-attest requirement 2: one line per invocation,
+# flock-guarded, so a gate (or anything else) can attest exactly where its
+# own cargo calls actually went instead of hoping. Default mirrors
+# burst-lane.sh's own STATE_DIR convention (../state/burst-lane relative to
+# this dir); BURST_ROUTE_LOG lets a caller (the gate) point at a per-run
+# file so counts are per-gate, not global (AC6).
+STATE_DIR="${BURST_LANE_STATE_DIR:-$HERE/../../state/burst-lane}"
+ROUTE_LOG="${BURST_ROUTE_LOG:-$STATE_DIR/route.log}"
+
+# route_log <subcommand> <decision: burst|local|passthrough> <cause>
+# SIGPIPE-safe (plain file append under flock, never a pipe destination) and
+# never fatal to the caller — a route-log write failure must never turn
+# into a cargo call that silently didn't run.
+route_log() {
+  local sub="${1:--}" decision="$2" cause="${3:--}"
+  mkdir -p "$(dirname "$ROUTE_LOG")" 2>/dev/null || return 0
+  # Subshell (not a bare `{ }` group) so a failed/timed-out flock's `exit 0`
+  # only ends the subshell, never this function's caller.
+  (
+    flock -w 2 204 2>/dev/null || exit 0
+    printf '%s %s %s %s %s %s\n' \
+      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$$" "$sub" "$decision" "$cause" "$PWD" >&204
+  ) 204>>"$ROUTE_LOG" 2>/dev/null || true
+  return 0
+}
 
 # Find the next real cargo behind this shim on PATH: skip this shim's own
 # directory *and every other known cargo shim directory* (currently just
@@ -63,16 +94,27 @@ fi
 
 route=0
 sub="${1:-}"
+sub_disp="${sub:--}"
 case "$sub" in
   build|test|clippy|deny|nextest) route=1 ;;
 esac
 
-if [ "$route" -eq 1 ] && [ "${BURST_LANE:-0}" = "1" ] && [ -x "$WRAPPER" ]; then
-  status_out="$("$WRAPPER" status 2>/dev/null)"
-  if [ "$status_out" != "no active session" ] && [ -n "$status_out" ]; then
-    exec "$WRAPPER" run "$PWD" -- "$REAL_CARGO" "$@"
+if [ "$route" -eq 1 ]; then
+  if [ "${BURST_LANE:-0}" = "1" ] && [ -x "$WRAPPER" ]; then
+    status_out="$("$WRAPPER" status 2>/dev/null)"
+    if [ "$status_out" != "no active session" ] && [ -n "$status_out" ]; then
+      route_log "$sub_disp" burst routed
+      exec "$WRAPPER" run "$PWD" -- "$REAL_CARGO" "$@"
+    fi
+    route_log "$sub_disp" local no-session
+    echo "burst-lane: no session, local" >&2
+  else
+    cause="burst-lane-disabled"
+    [ ! -x "$WRAPPER" ] && cause="wrapper-missing"
+    route_log "$sub_disp" local "$cause"
   fi
-  echo "burst-lane: no session, local" >&2
+else
+  route_log "$sub_disp" passthrough unrouted-subcommand
 fi
 
 # PRD-build-burst-pull-on-demand requirement 2: every local-cargo path this

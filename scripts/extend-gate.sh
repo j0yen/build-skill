@@ -148,7 +148,49 @@
 # tick that ends mid-gate leaves a partial receipt set, which is never
 # read as green; the next tick reruns this script from the start.
 set -uo pipefail
-export PATH="$HOME/.cargo/bin:$HOME/.local/bin:$PATH"
+BUILD_SCRIPTS="$(cd "$(dirname "$0")" && pwd)"
+
+# --- PATH order guard (P0 requirement 1, PRD-build-gate-cargo-route-attest) --
+# Previously this unconditionally prepended the real cargo/local-bin dirs
+# ahead of whatever $PATH the caller armed, silently shadowing the
+# burst-lane shim (scripts/burst-lane-bin/cargo) even when a caller had
+# already exported it first per SKILL.md's "mixed-tick burst routing"
+# section — the root cause of 53 autobuilder loops + 34 gate `cargo test`
+# runs all landing on RedBaron on 2026-09-10 while casper sat idle at 3%
+# utilization for EUR9.59. Now: $HOME/.cargo/bin and $HOME/.local/bin are
+# APPENDED (never prepended), so any shim directory the caller already
+# armed ahead of them on $PATH stays ahead. If BURST_LANE=1 and NEITHER
+# shim directory (burst-lane-bin, cargo-budget-bin) is already anywhere on
+# the inherited $PATH, this script arms burst-lane-bin itself, so a caller
+# that merely sets BURST_LANE=1 without separately exporting $PATH still
+# routes (AC1) — it does not reorder an already-present-but-shadowed shim
+# (see the route-check call below for that case; requirement 1 is a guard
+# against re-shadowing, not a guarantee of correct ordering the caller
+# already got wrong). The resolved cargo path is logged once, right here,
+# before any producer — before even repo validation — runs.
+_extend_gate_path_has_dir() {  # $1=dir -> rc0 if present on $PATH (resolved, order-independent)
+  local want resolved d saved_ifs
+  want="$(cd "$1" 2>/dev/null && pwd -P || true)"
+  [ -n "$want" ] || return 1
+  saved_ifs="$IFS"; IFS=:
+  for d in $PATH; do
+    IFS="$saved_ifs"
+    [ -n "$d" ] || continue
+    resolved="$(cd "$d" 2>/dev/null && pwd -P || true)"
+    if [ "$resolved" = "$want" ]; then IFS="$saved_ifs"; return 0; fi
+  done
+  IFS="$saved_ifs"
+  return 1
+}
+if [ "${BURST_LANE:-0}" = "1" ] \
+   && ! _extend_gate_path_has_dir "$BUILD_SCRIPTS/burst-lane-bin" \
+   && ! _extend_gate_path_has_dir "$BUILD_SCRIPTS/cargo-budget-bin"; then
+  export PATH="$BUILD_SCRIPTS/burst-lane-bin:$PATH"
+fi
+export PATH="$PATH:$HOME/.cargo/bin:$HOME/.local/bin"
+unset -f _extend_gate_path_has_dir
+_extend_gate_resolved_cargo="$(command -v cargo 2>/dev/null || true)"
+echo "extend-gate: cargo=${_extend_gate_resolved_cargo:-not-found}"
 
 # Overridable so tests/ can point at a fixture dir of fake binaries
 # without touching production behavior (default unchanged).
@@ -162,7 +204,6 @@ REVIEWER_PROMPT="${REVIEWER_PROMPT:-$HOME/.claude/skills/rustbuild/prompts/revie
 # repo's nested crate root, matching this fleet's `--project-root
 # autobuilder` convention).
 AUTOBUILDER_CANONICAL_CARGO_TOML="${AUTOBUILDER_CANONICAL_CARGO_TOML:-$HOME/wintermute/autobuilder/autobuilder/Cargo.toml}"
-BUILD_SCRIPTS="$(cd "$(dirname "$0")" && pwd)"
 GATE_DELTA="$BUILD_SCRIPTS/gate-delta.sh"
 # Three-state retrofit (PRD-build-three-state-probes): fail-open sourcing so
 # an unshipped/missing library never breaks a gate run.
@@ -598,6 +639,47 @@ if ! $record_baseline && ! $force && [ -f "$cache_file" ]; then
   fi
 fi
 
+# --- cargo-route attestation setup (P0 requirements 2/3/6, PRD-build-gate-
+# cargo-route-attest) ------------------------------------------------------
+# Captured HERE, before producer 1 runs, so `intended` reflects the session
+# state at gate start rather than whatever state a routed producer itself
+# might leave behind. Every cargo-invoking producer below (cargo_budgeted's
+# `autobuilder loop` and extended-receipts.sh's 17 producers) shells
+# through the burst-lane cargo shim when it's armed on $PATH, and the shim
+# appends one line per invocation to $BURST_ROUTE_LOG — truncated fresh for
+# THIS run so counts are per-gate, not global (requirement 2's own
+# "per-gate route log isolation", AC6). BURST_LANE_PRD_SLUG attributes any
+# routed cargo cost to THIS gate's own slug (requirement 6) instead of
+# whatever attribution_slug_for()'s worktree-basename convention would
+# otherwise guess for a main checkout that isn't a worktree at all.
+crate_name="$(basename "$repo")"
+route_log_file="$project_abs/target/autobuilder/route.log"
+mkdir -p "$(dirname "$route_log_file")" 2>/dev/null || true
+: > "$route_log_file"
+export BURST_ROUTE_LOG="$route_log_file"
+export BURST_LANE_PRD_SLUG="gate-$crate_name"
+
+route_intended="local"
+route_host="local"
+if [ -x "$BURST_LANE_SH" ]; then
+  route_status_json="$("$BURST_LANE_SH" status --json 2>/dev/null || true)"
+  case "$route_status_json" in
+    *'"active":true'*)
+      route_intended="burst"
+      route_host="$(printf '%s' "$route_status_json" | sed -n 's/.*"ip":"\([^"]*\)".*/\1/p')"
+      [ -n "$route_host" ] || route_host="unknown"
+      ;;
+  esac
+  # Structural check (ties requirement 1's PATH guard to requirement 4's
+  # postcondition): does a `cargo` call under THIS process's own $PATH
+  # actually reach the shim right now? Seeds $BURST_ROUTE_LOG with a
+  # synthetic local/shim-not-first line when it doesn't, so the
+  # postcondition below still sees the failure even in the full-bypass
+  # case where the shim never runs at all to log anything about itself —
+  # the exact "shim forced behind a fake real cargo" fixture (AC4).
+  "$BURST_LANE_SH" route-check --repo "$repo" >&2 || true
+fi
+
 t0=$(date +%s)
 blocking_notes=()
 note_block() { blocking_notes+=("$1"); echo "extend-gate: $1" >&2; }
@@ -721,8 +803,30 @@ gate_rc=$?
 printf '%s\n' "$gate_out"
 summary="$(printf '%s\n' "$gate_out" | grep -m1 '^gate: ' || true)"
 
+# --- cargo-route postcondition (P0 requirement 4, AC4) --------------------
+# Route log fields (requirement 2): <ts> <pid> <subcommand> <decision>
+# <cause> <cwd>. A routed subcommand that stayed local while intended=burst
+# is a silent regression — the whole reason this PRD exists — so it is
+# journaled by name (never just a block, per the PRD's Non-goals: "a route
+# mismatch is a journaled guard event, never a block").
+route_burst_n=0; route_local_n=0; route_passthrough_n=0; route_first_local_cause=""
+if [ -f "$route_log_file" ]; then
+  route_burst_n="$(awk '$4=="burst"{n++} END{print n+0}' "$route_log_file")"
+  route_local_n="$(awk '$4=="local"{n++} END{print n+0}' "$route_log_file")"
+  route_passthrough_n="$(awk '$4=="passthrough"{n++} END{print n+0}' "$route_log_file")"
+  route_first_local_cause="$(awk '$4=="local"{print $5; exit}' "$route_log_file")"
+fi
+route_mismatch=false
+if [ "$route_intended" = "burst" ] && [ "$route_local_n" -gt 0 ]; then
+  route_mismatch=true
+  probe_emit gate-cargo-route dirty "route-mismatch intended=$route_intended burst=$route_burst_n local=$route_local_n cause=${route_first_local_cause:-unknown}" >/dev/null
+elif [ "$route_intended" = "burst" ]; then
+  probe_emit gate-cargo-route clean "intended=burst burst=$route_burst_n local=0" >/dev/null
+else
+  probe_emit gate-cargo-route clean "intended=local — nothing to route" >/dev/null
+fi
+
 wall=$(( $(date +%s) - t0 ))
-crate_name="$(basename "$repo")"
 blockers_csv=""
 if [ "${#blocking_notes[@]}" -gt 0 ]; then
   blockers_csv="$(IFS='|'; echo "${blocking_notes[*]}")"
@@ -743,9 +847,13 @@ if $record_baseline; then
   rm -f "$gate_out_file"
   echo "extend-gate: recorded baseline to $repo/agent/gate-baseline.json"
   printf '%s\n' "$recorded"
-  printf '%s  gate  %s  record-baseline  (head=%s base=%s %s wall=%ss lock_wait=%ss)\n' \
+  printf '%s  gate  %s  record-baseline  (head=%s base=%s %s wall=%ss lock_wait=%ss cargo=burst:%s/local:%s)\n' \
     "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$crate_name" "$head_now" "$base_ref" \
-    "${summary:-gate: no-summary-line}" "$wall" "$lock_wait" >>"$journal"
+    "${summary:-gate: no-summary-line}" "$wall" "$lock_wait" "$route_burst_n" "$route_local_n" >>"$journal"
+  if $route_mismatch; then
+    printf '%s  gate  route-mismatch  (intended=%s burst=%s local=%s cause=%s)\n' \
+      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$route_intended" "$route_burst_n" "$route_local_n" "${route_first_local_cause:-unknown}" >>"$journal"
+  fi
   exit 0
 fi
 
@@ -774,28 +882,67 @@ if [ "$baseline_state" = "present" ]; then
 fi
 
 # One journal line per gate run (requirement 8 / AC13): crate, HEAD, base
-# tag, pass/block counts, blocking receipt names, wall seconds, and (PRD-
+# tag, pass/block counts, blocking receipt names, wall seconds, (PRD-
 # build-extend-gate-concurrent-isolation requirement 8 / P2) how long this
-# run waited for producer access before it started (0 when uncontended).
-printf '%s  gate  %s  %s  (head=%s base=%s %s blocking=%s wall=%ss lock_wait=%ss)%s\n' \
+# run waited for producer access before it started (0 when uncontended),
+# and (requirement 5 / AC5, PRD-build-gate-cargo-route-attest) how many of
+# this run's routed cargo calls actually reached the box vs stayed local.
+printf '%s  gate  %s  %s  (head=%s base=%s %s blocking=%s wall=%ss lock_wait=%ss cargo=burst:%s/local:%s)%s\n' \
   "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$crate_name" "$outcome" "$head_now" "$base_ref" \
-  "${summary:-gate: no-summary-line}" "${blockers_csv:-none}" "$wall" "$lock_wait" "$journal_suffix" >>"$journal"
+  "${summary:-gate: no-summary-line}" "${blockers_csv:-none}" "$wall" "$lock_wait" \
+  "$route_burst_n" "$route_local_n" "$journal_suffix" >>"$journal"
+
+# A route mismatch is a journaled guard event, never a block (Non-goals) —
+# the verdict computed above is unaffected either way (requirement 4, AC4).
+if $route_mismatch; then
+  printf '%s  gate  route-mismatch  (intended=%s burst=%s local=%s cause=%s)\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$route_intended" "$route_burst_n" "$route_local_n" "${route_first_local_cause:-unknown}" >>"$journal"
+fi
 
 # --- write the verdict cache (P1) — every full run, pass/delta-pass/block
 # alike, so a repeat invocation at the same head + same script replays
-# instead of regenerating. ------------------------------------------------
+# instead of regenerating. Now also carries `cargo_route` (P0 requirement
+# 3, PRD-build-gate-cargo-route-attest) so a cache hit still replays an
+# accurate attestation instead of silently dropping it. ------------------
 cache_verdict_val="$outcome"
 mkdir -p "$(dirname "$cache_file")"
 jq -n --arg head "$head_now" --arg hash "$self_hash" --arg verdict "$cache_verdict_val" \
-     --argjson rc "$final_rc" --arg new "$new_blocks" --arg inh "$inherited_blocks" '
+     --argjson rc "$final_rc" --arg new "$new_blocks" --arg inh "$inherited_blocks" \
+     --arg intended "$route_intended" --argjson burst "$route_burst_n" \
+     --argjson local "$route_local_n" --argjson passthrough "$route_passthrough_n" \
+     --arg host "$route_host" '
   {
     head_sha: $head,
     script_sha256: $hash,
     verdict: $verdict,
     exit_code: $rc,
     new_blocks: ($new | if . == "" then [] else split(",") end),
-    inherited_blocks: ($inh | if . == "" then [] else split(",") end)
+    inherited_blocks: ($inh | if . == "" then [] else split(",") end),
+    cargo_route: {intended: $intended, burst: $burst, local: $local, passthrough: $passthrough, host: $host}
   }
 ' > "$cache_file" 2>/dev/null || true
+
+# --- best-effort: merge cargo_route into autobuilder's own release
+# receipt too (target/autobuilder/receipts/<head_sha>.json — gate.rs's
+# ReceiptPath::HeadShaJson), when the `autobuilder gate` run above actually
+# wrote one, so a reviewer reading the receipt directly (not just
+# last-verdict.json) sees the same attestation (P0 requirement 3). autobuilder
+# itself is a separate crate this PRD's Engineering target does not touch —
+# this is a non-destructive jq merge onto whatever it already wrote, never a
+# schema change, and fails open (never blocks the gate) if the file is
+# absent or jq can't merge it.
+release_receipt="$project_abs/target/autobuilder/receipts/${head_now}.json"
+if [ -f "$release_receipt" ]; then
+  release_receipt_tmp="$(mktemp "${TMPDIR:-/tmp}/extend-gate-receipt.XXXXXX")"
+  if jq --arg intended "$route_intended" --argjson burst "$route_burst_n" \
+        --argjson local "$route_local_n" --argjson passthrough "$route_passthrough_n" \
+        --arg host "$route_host" \
+        '. + {cargo_route: {intended: $intended, burst: $burst, local: $local, passthrough: $passthrough, host: $host}}' \
+        "$release_receipt" > "$release_receipt_tmp" 2>/dev/null; then
+    mv "$release_receipt_tmp" "$release_receipt"
+  else
+    rm -f "$release_receipt_tmp"
+  fi
+fi
 
 exit "$final_rc"

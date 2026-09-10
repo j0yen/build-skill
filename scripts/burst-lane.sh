@@ -99,15 +99,29 @@
 #       automatically by `down` and `watchdog` before their own
 #       keep/delete decision (requirement 6) — a reap trouble is journaled,
 #       never fatal.
+#   burst-lane.sh route-check [--repo <path>]
+#       PRD-build-gate-cargo-route-attest: attests whether a `cargo` call
+#       under the CURRENT $PATH would actually reach the burst-lane shim or
+#       silently run local. Prints "route: intended=<burst|local>
+#       resolved=<path> shim=<path> state=<clean|mismatch|could-not-check>
+#       [cause=<c>]", emits the `gate-cargo-route` three-state probe, and —
+#       on mismatch — appends a synthetic local/shim-not-first line to
+#       $BURST_ROUTE_LOG (if set) so a downstream route-log scan sees the
+#       failure even when the shim itself never ran to log it. Called by
+#       extend-gate.sh at gate start; see that script's own header.
 #
 # Cost attribution (PRD-build-cost-attribution, 2026-09-10): every routed
 # `run` now also appends a row to state/burst-lane/attribution.jsonl —
 # {date, session_id, slug, wall_seconds, sync_s, bytes, worktree} — under
-# the same RUN_LOCK `run` already holds. `slug` comes from
-# attribution_slug_for() (worktree basename convention: <repo>-<slug> under
-# build-worktrees, the shared checkout itself -> "shared-<repo>", a
-# gate-burst/this-skill's-own AC-fixture path -> "selftest", else
-# "unattributed" — never dropped). At teardown (`down`'s delete path and
+# the same RUN_LOCK `run` already holds. `slug` is $BURST_LANE_PRD_SLUG when
+# the caller exported one (PRD-build-gate-cargo-route-attest requirement 6 —
+# a gate dispatch sets this to "gate-<repo>" since its main checkout is
+# never a <repo>-<slug> worktree attribution_slug_for() could otherwise
+# guess from), else attribution_slug_for() (worktree basename convention:
+# <repo>-<slug> under build-worktrees, the shared checkout itself ->
+# "shared-<repo>", a gate-burst/this-skill's-own AC-fixture path ->
+# "selftest", else "unattributed" — never dropped). At teardown (`down`'s
+# delete path and
 # `watchdog`'s), prorate_attribution() sums those rows (plus any orphaned
 # rows left by a crashed prior session — journaled by name, not silently
 # folded in) by slug, prorates the session's cost_eur by each slug's share
@@ -180,7 +194,7 @@ COST_PER_HOUR_EUR="0.47"
 REMOTE_ROOT="${BURST_LANE_REMOTE_ROOT:-/root/build}"
 
 die() { echo "burst-lane: $*" >&2; exit "${2:-1}"; }
-usage() { echo "usage: burst-lane.sh {up|status|run|sync-back|pull|ensure-fresh|down|watchdog|cost|sub-cap|verify|reap} ..." >&2; exit 2; }
+usage() { echo "usage: burst-lane.sh {up|status|run|sync-back|pull|ensure-fresh|down|watchdog|cost|sub-cap|verify|reap|route-check} ..." >&2; exit 2; }
 
 now_epoch() { echo "${BURST_LANE_NOW:-$(date -u +%s)}"; }
 now_iso()   { date -u -d "@$(now_epoch)" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ; }
@@ -539,6 +553,77 @@ for r in json.loads(sys.argv[1]):
     echo "active: $id ip=$ip alive=${alive}m ttl=${ttl}h sandbox_ok=$sbx concurrent=$conc disk_state=$disk_state free_disk_gb=$free_disk_gb"
     [ -n "$dirty_lines" ] && printf '%s\n' "$dirty_lines"
   fi
+  exit 0
+}
+
+# ---- route-check (PRD-build-gate-cargo-route-attest) ------------------------
+# Attests whether a `cargo` call made under the CURRENT $PATH — the same
+# $PATH a cargo-invoking producer inherits from its caller — would actually
+# reach the burst-lane shim (scripts/burst-lane-bin/cargo) or silently fall
+# straight through to a real cargo ahead of it on PATH (the exact 2026-09-10
+# defect: extend-gate.sh re-prepending $HOME/.cargo/bin ahead of an
+# already-armed shim, so 53 autobuilder loops + 34 gate `cargo test` runs
+# all landed on RedBaron with casper idle). `intended` mirrors extend-
+# gate.sh's own definition: burst iff `status --json` reports an active
+# session RIGHT NOW; local otherwise. `resolved` is `command -v cargo`
+# under THIS process's own $PATH — the same resolution a real `cargo test`
+# call would get. `state` is clean when intended=local (nothing to route)
+# or resolved IS the shim; mismatch when intended=burst and resolved is
+# something else (the shim is present but shadowed, or entirely absent
+# from PATH — same observable symptom either way: the box never sees this
+# run); could-not-check when no cargo resolves at all. On mismatch, also
+# appends one synthetic route-log line (decision=local cause=shim-not-first)
+# to $BURST_ROUTE_LOG when that env var is set, so a caller scanning the
+# route log for local-decision causes (extend-gate.sh's own postcondition)
+# still sees this failure mode even though the shim itself never ran to log
+# anything about itself. Emits the shared three-state probe `gate-cargo-
+# route` (dirty for mismatch — the library only knows clean/dirty/could-
+# not-check; "mismatch" is this probe's own name for its dirty state, named
+# in the printed line and journal below).
+cmd_route_check() {
+  local repo="$PWD"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --repo) repo="${2:?route-check: --repo needs a value}"; shift 2 ;;
+      *) echo "usage: burst-lane.sh route-check [--repo <path>]" >&2; exit 2 ;;
+    esac
+  done
+  local shim="$HERE/burst-lane-bin/cargo"
+  local status_json intended="local"
+  status_json="$("$0" status --json 2>/dev/null || true)"
+  case "$status_json" in *'"active":true'*) intended="burst" ;; esac
+
+  local resolved resolved_dir shim_dir
+  resolved="$(command -v cargo 2>/dev/null || true)"
+  resolved_dir=""
+  [ -n "$resolved" ] && resolved_dir="$(cd "$(dirname "$resolved")" 2>/dev/null && pwd -P || true)"
+  shim_dir="$(cd "$(dirname "$shim")" 2>/dev/null && pwd -P || true)"
+
+  local state cause=""
+  if [ -z "$resolved" ]; then
+    state="could-not-check"
+  elif [ "$intended" = "burst" ] && [ -n "$shim_dir" ] && [ "$resolved_dir" != "$shim_dir" ]; then
+    state="mismatch"; cause="shim-not-first"
+  else
+    state="clean"
+  fi
+
+  if [ "$state" = "mismatch" ] && [ -n "${BURST_ROUTE_LOG:-}" ]; then
+    mkdir -p "$(dirname "$BURST_ROUTE_LOG")" 2>/dev/null || true
+    (
+      flock -w 2 205 2>/dev/null || exit 0
+      printf '%s %s - local %s %s\n' "$(now_iso)" "$$" "$cause" "$repo" >&205
+    ) 205>>"$BURST_ROUTE_LOG" 2>/dev/null || true
+  fi
+
+  case "$state" in
+    clean)           probe_emit gate-cargo-route clean "intended=$intended resolved=${resolved:-none}" >/dev/null ;;
+    mismatch)        probe_emit gate-cargo-route dirty "route-mismatch intended=$intended resolved=${resolved:-none} shim=$shim cause=$cause" >/dev/null ;;
+    could-not-check) probe_emit gate-cargo-route could-not-check "no cargo resolved on \$PATH" >/dev/null ;;
+  esac
+
+  printf 'route: intended=%s resolved=%s shim=%s state=%s%s\n' \
+    "$intended" "${resolved:-none}" "$shim" "$state" "${cause:+ cause=$cause}"
   exit 0
 }
 
@@ -1053,7 +1138,13 @@ cmd_run() {
   local wall_s sync_s slug bytes_saved
   wall_s="$(awk -v a="$t_remote_end" -v b="$t_up_end" 'BEGIN{printf "%.3f", a-b}')"
   sync_s="$(awk -v u0="$t_up_start" -v u1="$t_up_end" 'BEGIN{printf "%.3f", u1-u0}')"
-  slug="$(attribution_slug_for "$worktree")"
+  # PRD-build-gate-cargo-route-attest requirement 6: a caller that knows its
+  # own cost-attribution slug (the gate dispatch, exporting BURST_LANE_PRD_SLUG
+  # exactly as it already does for served_id above) wins over the worktree-
+  # basename guess — a gate's main checkout is never a <repo>-<slug>
+  # worktree, so attribution_slug_for() alone would always misattribute a
+  # gate's own cargo cost as "unattributed" or the bare repo name.
+  slug="${BURST_LANE_PRD_SLUG:-$(attribution_slug_for "$worktree")}"
   bytes_saved="$(last_pull_size "$worktree")"
   attribution_record "$slug" "$id" "$wall_s" "$sync_s" 0 "$worktree" run 1 "$bytes_saved" true
 
@@ -2011,6 +2102,7 @@ main() {
     sub-cap)   cmd_sub_cap "$@" ;;
     verify)    cmd_verify "$@" ;;
     reap)      cmd_reap "$@" ;;
+    route-check) cmd_route_check "$@" ;;
     *) usage ;;
   esac
 }
