@@ -64,6 +64,22 @@ fresh_env() {
   export BURST_LANE_JOURNAL="$T/journal.log"
   export BURST_LANE_ENV_FILE="$T/env"; echo "SNAPSHOT_ID=427125061" > "$BURST_LANE_ENV_FILE"
   export BURST_LANE_REMOTE_ROOT="$T/remote"
+  # PRD-build-burst-unprivileged-user: $REMOTE_USER now defaults to `build`,
+  # and create_remote_user() does a real (offline-safe, but still real)
+  # `mkdir -p $REMOTE_HOME/.ssh` — scope it under $T like every other
+  # remote-path override, or every `up` in this whole file would attempt to
+  # touch this machine's actual /home/build.
+  export BURST_LANE_REMOTE_HOME="$T/remote-home"
+  # PRD-build-burst-unprivileged-user requirement 2: every remote cargo
+  # invocation now exports RUSTUP_HOME/CARGO_HOME pointing at root's shared
+  # toolchain (/root/.rustup, /root/.cargo in production) — this offline
+  # fixture's "remote" is really this machine's own filesystem, so pointing
+  # those at a real /root (unreadable to this test-runner) would break every
+  # real `cargo --version`/`cargo test` the fake ssh eval's for real.
+  # Pointing them at THIS machine's own real toolchain instead exercises the
+  # exact same code path (an env override, read-only) without a real /root.
+  export BURST_LANE_ROOT_RUSTUP_HOME="$HOME/.rustup"
+  export BURST_LANE_ROOT_CARGO_HOME="$HOME/.cargo"
   export BURST_LANE_PRD_DIR="$T/prds"; mkdir -p "$BURST_LANE_PRD_DIR/build-queue"
   export FAKE_HCLOUD_STATE="$T/hcloud.state"
   export FAKE_HCLOUD_CALLLOG="$T/hcloud.calls"; : > "$FAKE_HCLOUD_CALLLOG"
@@ -1742,6 +1758,190 @@ assert 'extra::src/extra.rs' not in d['diff'], d['diff']
 assert d['suites']['extra::src/extra.rs'] == {'box': 'ok', 'local': 'ok'}, d['suites']['extra::src/extra.rs']
 " || gtc4_json_rc=1
 expect "gatetc AC4: box-parity.json compares the extra suite ok/ok, not baseline-incomplete" "[ $gtc4_json_rc -eq 0 ]"
+
+# =============================================================================
+# PRD-build-burst-unprivileged-user: every remote step of the lane (up
+# provisioning, rsync, cargo, gate-tools install, credential placement/
+# shred, verify) runs as an unprivileged `build` user, never root — mcphost
+# refuses to run its own integration suite as real uid 0 (its
+# `refuse_to_serve_as_root` guard), which makes root an invalid identity for
+# a remote gate. FAKE_SSH_CALL_LOG/FAKE_RSYNC_CALL_LOG (both
+# "<user@host>\t<cmd>" lines, one per invocation — see the fixtures' own
+# headers) let these cases prove ROUTING directly, rather than trusting
+# burst-lane.sh's own claims about who it called.
+# (test_prefix: burstuser)
+# =============================================================================
+
+# ---- burstuser AC1: `up` creates the user + key, session state records
+# remote_user=build, every later call targets build@.
+fresh_env
+export FAKE_SSH_CALL_LOG="$T/ssh.calls"; : > "$FAKE_SSH_CALL_LOG"
+bu1_out="$("$BL" up 2>&1)"; bu1_rc=$?
+expect "burstuser AC1: up exits 0" "[ $bu1_rc -eq 0 ]"
+expect "burstuser AC1: root ssh received the user-creation call" \
+  "grep -P '^root@\\S+\\t.*# user-create' \"$FAKE_SSH_CALL_LOG\" >/dev/null"
+expect "burstuser AC1: the same root call installs the ssh key (authorized_keys)" \
+  "grep -P '^root@\\S+\\t.*authorized_keys' \"$FAKE_SSH_CALL_LOG\" >/dev/null"
+expect "burstuser AC1: session.json records remote_user=build" \
+  "grep -q '\"remote_user\":\"build\"' \"$BURST_LANE_STATE_DIR/session.json\""
+expect "burstuser AC1: booted journal line names remote_user=build" \
+  "grep -q 'burst-lane  up  booted.*remote_user=build' \"$BURST_LANE_JOURNAL\""
+# Every OTHER call this `up` made — sandbox probe, gate-tools probe, the
+# uv-install/mkdir step — targeted build@, not root@ (the sysctl/apt/
+# user-create root calls are the only allow-listed exceptions, asserted
+# above by name rather than by absence here).
+expect "burstuser AC1: at least one later call targeted build@ (sandbox/gate-tools probes)" \
+  "grep -qP '^build@' \"$FAKE_SSH_CALL_LOG\""
+
+# ---- burstuser AC1 (default literal check): every OTHER case in this
+# block deliberately overrides REMOTE_ROOT/GATE_TOOLS_REMOTE_BIN_DIR/
+# GATE_CRED_REMOTE_PATH to a tmpdir for safety (same reason fresh_env
+# always has) — which masks requirement 1/5's own literal default values.
+# `_debug-remote-config` does no ssh/rsync/filesystem work beyond $STATE_DIR
+# (already tmpdir-scoped), so it is safe to call with those three specific
+# overrides unset, proving the literal defaults for real instead of by
+# code inspection alone.
+bu1b_state="$T/debug-config-state"; mkdir -p "$bu1b_state"
+bu1b_out="$(BURST_LANE_STATE_DIR="$bu1b_state" \
+            BURST_LANE_REMOTE_ROOT= BURST_LANE_GATE_TOOLS_REMOTE_BIN_DIR= BURST_LANE_GATE_CRED_REMOTE_PATH= BURST_LANE_REMOTE_HOME= \
+            "$BL" _debug-remote-config 2>&1)"
+expect "burstuser AC1: the literal default remote_root is /home/build/build" \
+  "grep -qx 'remote_root=/home/build/build' <<<\"\$bu1b_out\""
+expect "burstuser AC1: the literal default gate_tools_bin is /home/build/.local/bin" \
+  "grep -qx 'gate_tools_bin=/home/build/.local/bin' <<<\"\$bu1b_out\""
+expect "burstuser AC1: the literal default gate_cred_path is /home/build/.claude/.credentials.json" \
+  "grep -qx 'gate_cred_path=/home/build/.claude/.credentials.json' <<<\"\$bu1b_out\""
+
+# ---- burstuser AC2: `verify`'s cargo/uv/python3/sandbox/gate-tools probes
+# all execute as build.
+: > "$FAKE_SSH_CALL_LOG"
+bu2_out="$("$BL" verify 2>&1)"; bu2_rc=$?
+expect "burstuser AC2: verify exits 0 (gate-tools-missing is informational only)" "[ $bu2_rc -eq 0 ]"
+expect "burstuser AC2: the cargo/uv/python3 probe ran as build@" \
+  "grep -P '^build@\\S+\\t.*cargo --version' \"$FAKE_SSH_CALL_LOG\" >/dev/null"
+expect "burstuser AC2: the bwrap sandbox probe ran as build@" \
+  "grep -P '^build@\\S+\\t.*bwrap' \"$FAKE_SSH_CALL_LOG\" >/dev/null"
+expect "burstuser AC2: no verify probe call targeted root@" \
+  "! grep -qP '^root@' \"$FAKE_SSH_CALL_LOG\""
+
+# ---- burstuser AC3: `run <worktree> -- cargo test` routes as build under
+# $REMOTE_HOME/build/<key>, and no fake root call ever carries cargo.
+WT_BU="$T/wt-burstuser"; mkdir -p "$WT_BU"
+export FAKE_RSYNC_CALL_LOG="$T/rsync.calls"; : > "$FAKE_RSYNC_CALL_LOG"
+: > "$FAKE_SSH_CALL_LOG"
+bu3_out="$("$BL" run "$WT_BU" -- cargo test 2>&1)"
+expect "burstuser AC3: the remote cargo call targeted build@" \
+  "grep -P '^build@\\S+\\t.*cargo test' \"$FAKE_SSH_CALL_LOG\" >/dev/null"
+expect "burstuser AC3: the remote path is under \$REMOTE_ROOT (which itself defaults to \$REMOTE_HOME/build — see the _debug-remote-config check below)" \
+  "grep -P '^build@\\S+\\t.*cd '\"\$BURST_LANE_REMOTE_ROOT\"'/' \"$FAKE_SSH_CALL_LOG\" >/dev/null"
+expect "burstuser AC3: no fake root ssh call carries cargo" \
+  "! grep -P '^root@[^\\t]*\\t' \"$FAKE_SSH_CALL_LOG\" | grep -q cargo"
+expect "burstuser AC3: no fake root ssh call happened at all during run" \
+  "! grep -qP '^root@' \"$FAKE_SSH_CALL_LOG\""
+expect "burstuser AC3: the worktree rsync-up targeted build@" \
+  "grep -q 'build@' \"$FAKE_RSYNC_CALL_LOG\""
+expect "burstuser AC3: no rsync call targeted root@" \
+  "! grep -q 'root@' \"$FAKE_RSYNC_CALL_LOG\""
+
+# ---- burstuser AC4 (light — full suite-diff correctness is gatebox AC2's
+# job): parity's remote `cargo test --workspace` call routes as build.
+WT_BU_PAR="$T/wt-burstuser-parity"; mkdir -p "$WT_BU_PAR"
+( cd "$WT_BU_PAR" && git init -q && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init )
+: > "$FAKE_SSH_CALL_LOG"
+"$BL" parity "$WT_BU_PAR" >/dev/null 2>&1
+expect "burstuser AC4: parity's remote cargo test call routed as build@" \
+  "grep -P '^build@\\S+\\t.*cargo test --workspace' \"$FAKE_SSH_CALL_LOG\" >/dev/null"
+expect "burstuser AC4: no fake root ssh call happened during parity" \
+  "! grep -qP '^root@' \"$FAKE_SSH_CALL_LOG\""
+
+# ---- burstuser AC5: BURST_GATE_REVIEWER=1 places the credential under
+# $REMOTE_HOME/.claude/.credentials.json (build's own home, not root's) and
+# shreds it on down.
+fresh_env
+export FAKE_SSH_CALL_LOG="$T/ssh.calls"; : > "$FAKE_SSH_CALL_LOG"
+export FAKE_RSYNC_CALL_LOG="$T/rsync.calls"; : > "$FAKE_RSYNC_CALL_LOG"
+export BURST_GATE_REVIEWER=1
+export BURST_CLAUDE_CRED_SRC="$T/fake-credentials.json"
+echo '{"token":"fake-token-not-real"}' > "$BURST_CLAUDE_CRED_SRC"
+bu5_up_out="$("$BL" up 2>&1)"
+# fresh_env pins BURST_LANE_GATE_CRED_REMOTE_PATH to its own tmpdir (same
+# isolation reason as REMOTE_ROOT/GATE_TOOLS_REMOTE_BIN_DIR) — this IS the
+# resolved $REMOTE_HOME/.claude/.credentials.json path when unoverridden
+# (proven separately by the _debug-remote-config check below); what this
+# case actually proves is that the push landed there AND ran as build@.
+cred_path_default="$BURST_LANE_GATE_CRED_REMOTE_PATH"
+expect "burstuser AC5: the credential landed at the resolved cred path" \
+  "[ -f \"$cred_path_default\" ]"
+cred_dirname="$(dirname "$BURST_LANE_GATE_CRED_REMOTE_PATH")"
+expect "burstuser AC5: the credential mkdir+chmod over ssh targeted build@" \
+  "grep -F \"build@\" \"$FAKE_SSH_CALL_LOG\" | grep -qF \"$cred_dirname\""
+expect "burstuser AC5: the credential rsync push targeted build@" \
+  "grep -qF \"build@\" \"$FAKE_RSYNC_CALL_LOG\""
+expect "burstuser AC5: journal names the placement (no token bytes)" \
+  "grep -q 'burst-lane  up  cred  placed' \"$BURST_LANE_JOURNAL\" && ! grep -q 'fake-token-not-real' \"$BURST_LANE_JOURNAL\""
+# Force an immediate teardown (1 minute before the hour boundary, same
+# convention every other down/watchdog case in this file uses) so
+# shred_gate_credential actually runs instead of merely scheduling.
+bu5_boot_epoch="$(python3 -c "import json; print(json.load(open('$BURST_LANE_STATE_DIR/session.json'))['boot_epoch'])")"
+export BURST_LANE_NOW=$((bu5_boot_epoch + 3600 - 60))
+"$BL" down >/dev/null 2>&1 || true
+unset BURST_LANE_NOW
+expect "burstuser AC5: the credential file is gone after down" "[ ! -f \"$cred_path_default\" ]"
+expect "burstuser AC5: journal records the shred, still no token bytes" \
+  "grep -q 'cred  shredded' \"$BURST_LANE_JOURNAL\" && ! grep -q 'fake-token-not-real' \"$BURST_LANE_JOURNAL\""
+unset BURST_GATE_REVIEWER BURST_CLAUDE_CRED_SRC
+
+# ---- burstuser AC6: `provision` migrates a live ROOT-ONLY session (one
+# that booted before this PRD shipped, or is running the documented
+# BURST_LANE_REMOTE_USER=root rollback) onto build without a reboot: the
+# user gets created, a still-dirty worktree's remote tree is copied from
+# the old root-owned path into the new one, and a following `run` routes as
+# build with no second `up`.
+fresh_env
+export FAKE_SSH_CALL_LOG="$T/ssh.calls"; : > "$FAKE_SSH_CALL_LOG"
+"$BL" up >/dev/null 2>&1
+bu6_sid="$(python3 -c "import json; print(json.load(open('$BURST_LANE_STATE_DIR/session.json'))['server_id'])")"
+# Simulate a pre-ship (or rolled-back) root-only session: hand-edit
+# remote_user back to root, and fabricate a dirty marker + remote artifact
+# shaped like one a root-routed `run` would have left behind.
+sed -i 's/"remote_user":"build"/"remote_user":"root"/' "$BURST_LANE_STATE_DIR/session.json"
+WT_MIG="$T/wt-migrate"; mkdir -p "$WT_MIG"
+OLD_REMOTE_MIG="$T/old-root-remote-tree"; mkdir -p "$OLD_REMOTE_MIG"
+echo "pre-existing build artifact" > "$OLD_REMOTE_MIG/artifact.txt"
+mkdir -p "$BURST_LANE_STATE_DIR/dirty"
+bu6_wkey="$(printf '%s' "$WT_MIG" | sha1sum | cut -c1-8)"
+python3 -c "
+import json
+json.dump({'worktree': '$WT_MIG', 'session_id': '$bu6_sid', 'remote_path': '$OLD_REMOTE_MIG', 'kind': 'target', 'marked_ts': '2026-01-01T00:00:00Z'},
+           open('$BURST_LANE_STATE_DIR/dirty/$bu6_wkey.json', 'w'))
+"
+: > "$FAKE_SSH_CALL_LOG"
+bu6_prov_out="$("$BL" provision 2>&1)"
+expect "burstuser AC6: session.json now records remote_user=build" \
+  "grep -q '\"remote_user\":\"build\"' \"$BURST_LANE_STATE_DIR/session.json\""
+expect "burstuser AC6: journal records the user migration (root -> build)" \
+  "grep -q 'burst-lane  provision  user-migrated.*from=root to=build' \"$BURST_LANE_JOURNAL\""
+expect "burstuser AC6: journal records the worktree's tree migrated, not gone cold" \
+  "grep -qF \"provision  migrated  (worktree=$WT_MIG\" \"$BURST_LANE_JOURNAL\""
+bu6_new_remote="$BURST_LANE_REMOTE_ROOT/$(basename "$WT_MIG")-$bu6_wkey"
+expect "burstuser AC6: the worktree's remote artifact landed in the NEW (build) tree" \
+  "[ -f \"$bu6_new_remote/artifact.txt\" ]"
+expect "burstuser AC6: the migration copy ran over root ssh (only user who can read the old tree)" \
+  "grep -P '^root@\\S+\\t.*cp -a' \"$FAKE_SSH_CALL_LOG\" >/dev/null"
+: > "$FAKE_SSH_CALL_LOG"
+bu6_run_out="$("$BL" run "$WT_MIG" -- bash -c 'exit 0' 2>&1)"; bu6_run_rc=$?
+expect "burstuser AC6: a following run exits cleanly without a second up" "[ $bu6_run_rc -eq 0 ]"
+expect "burstuser AC6: that run routed as build@, no reboot needed" \
+  "grep -qP '^build@' \"$FAKE_SSH_CALL_LOG\""
+expect "burstuser AC6: that run made no root@ call" \
+  "! grep -qP '^root@' \"$FAKE_SSH_CALL_LOG\""
+
+# ---- burstuser AC7: the fixture set (this file) exits 0 and names the
+# burstuser cases — checked here as an explicit, in-band assertion (rather
+# than only by the exit code the harness wrapper around this file checks)
+# so tests/burstuser_ac7_*.sh has a real "ok" line of its own to grep for,
+# matching every sibling AC's own convention.
+expect "burstuser AC7: every burstuser case above ran green (fail=0 through AC1-AC6)" "[ $fail -eq 0 ]"
 
 echo "=== $([ $fail -eq 0 ] && echo PASS || echo FAIL) ==="
 exit $fail

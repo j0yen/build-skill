@@ -185,6 +185,16 @@ setup_fake_burst_env() {
   export BURST_LANE_JOURNAL="$base/burst-journal.log"
   export BURST_LANE_ENV_FILE="$base/env"; echo "SNAPSHOT_ID=427125061" > "$BURST_LANE_ENV_FILE"
   export BURST_LANE_REMOTE_ROOT="$base/remote"
+  # PRD-build-burst-unprivileged-user: scope $REMOTE_HOME too (same reason
+  # as burst-lane-selftest.sh's own fresh_env) — `up` now runs
+  # create_remote_user()'s `mkdir -p $REMOTE_HOME/.ssh` for real.
+  export BURST_LANE_REMOTE_HOME="$base/remote-home"
+  # PRD-build-burst-unprivileged-user: point the shared-toolchain env vars
+  # at this real machine's own working toolchain (see burst-lane-
+  # selftest.sh's fresh_env for the full rationale) instead of a real
+  # /root this test-runner cannot read.
+  export BURST_LANE_ROOT_RUSTUP_HOME="$HOME/.rustup"
+  export BURST_LANE_ROOT_CARGO_HOME="$HOME/.cargo"
   export BURST_LANE_PRD_DIR="$base/prds"; mkdir -p "$BURST_LANE_PRD_DIR/build-queue"
   export FAKE_HCLOUD_STATE="$base/hcloud.state"
   export FAKE_HCLOUD_CALLLOG="$base/hcloud.calls"; : > "$FAKE_HCLOUD_CALLLOG"

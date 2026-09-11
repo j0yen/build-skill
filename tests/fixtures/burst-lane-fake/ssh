@@ -18,6 +18,15 @@
 set -uo pipefail
 args=("$@")
 cmd="${args[-1]}"
+# PRD-build-burst-unprivileged-user: every invocation's "user@host" target
+# (always the arg immediately before the trailing command — every call site
+# in burst-lane.sh follows `ssh -o ... -i key user@host cmd`) is logged
+# alongside a one-line flattening of the command, so a selftest can prove
+# WHO actually received each call (root@ vs build@) instead of trusting
+# burst-lane.sh's own claims about its routing.
+if [ -n "${FAKE_SSH_CALL_LOG:-}" ]; then
+  printf '%s\t%s\n' "${args[-2]:-}" "$(printf '%s' "$cmd" | tr '\n' ' ')" >> "$FAKE_SSH_CALL_LOG"
+fi
 if [ "$cmd" = true ]; then exit 0; fi
 case "$cmd" in
   *'# gate-tools-probe'*)
@@ -89,6 +98,17 @@ case "$cmd" in
     fi
     rm -f "$errfile"
     exit "$rc"
+    ;;
+  *'# user-create'*)
+    # PRD-build-burst-unprivileged-user: useradd/chmod/chown are real
+    # system-mutating ops this fixture never has real root for — and must
+    # never touch this dev machine's actual /root or $HOME even on a test
+    # that points ROOT_CARGO_HOME/ROOT_RUSTUP_HOME at a real, working
+    # toolchain for the cargo/rustup-invoking cases below. No-op them (in a
+    # subshell so the overrides never leak out), keep mkdir/cat/id/touch
+    # real against the tmpdir REMOTE_HOME/REMOTE_ROOT a test already scopes.
+    ( useradd() { :; }; chmod() { :; }; chown() { :; }; eval "$cmd" )
+    exit 0
     ;;
   *bwrap*)
     [ "${FAKE_SSH_SANDBOX_FAIL:-0}" = "1" ] && exit 1

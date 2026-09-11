@@ -25,6 +25,14 @@ src="${*: -2:1}"
 dst="${*: -1:1}"
 local_dst="${dst#*:}"
 local_src="${src#*:}"
+# PRD-build-burst-unprivileged-user: log both src and dst (whichever one
+# carries "user@host:" is the remote side) so a selftest can prove no
+# rsync call ever targeted root@ except this PRD's own allow-list (there
+# is none for rsync — every real rsync in burst-lane.sh routes through
+# $REMOTE_USER, which defaults to build).
+if [ -n "${FAKE_RSYNC_CALL_LOG:-}" ]; then
+  printf '%s\t%s\n' "$src" "$dst" >> "$FAKE_RSYNC_CALL_LOG"
+fi
 # PRD-build-gate-on-casper requirement 4: a FILE source (the single
 # credential push, no trailing slash on either side — a real rsync copies
 # a plain file to a plain file just fine) needs a plain file copy, not the

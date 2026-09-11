@@ -50,6 +50,41 @@
 # credentials, concurrency slots, teardown safety) are NOT yet wired — see
 # git log / the PRD's own requirement list for what's landed so far.
 #
+# PRD-build-burst-unprivileged-user: mcphost refuses to run as real uid 0
+# (`refuse_to_serve_as_root`, src/sandbox.rs) — every remote step used to run
+# as root, which made root an invalid test identity the instant a remote
+# gate started exercising mcphost's own integration suite. `$REMOTE_USER`
+# now defaults to `build` (an unprivileged account `up`/`provision` create
+# on the box, uid stable across boots, home mode 700); `$REMOTE_ROOT`,
+# `$GATE_TOOLS_REMOTE_BIN_DIR`, and `$GATE_CRED_REMOTE_PATH` all resolve
+# under that user's own `$REMOTE_HOME` (`/home/build` by default) instead of
+# `/root`. Root now runs exactly three things (requirement 3's allow-list):
+# the apparmor sysctl, the two apt-based package installs (bwrap, python3,
+# and gate-tools' own jq/gh/mold), and user creation/migration — bundled one
+# ssh call each, tagged `# user-create` — everything else (rsync, cargo,
+# uv, claude, extend-gate.sh, the credential push) runs as `build@`.
+# Toolchain decision (requirement 2): rather than a second, slower per-user
+# rustup+toolchain install, `build` shares root's ALREADY-WARM
+# `/root/.rustup` (read+execute, granted once at user-creation time via
+# `chmod o+x /root` + `chmod -R o+rX /root/.cargo /root/.rustup` — the one
+# necessary crack in root's home) via `RUSTUP_HOME=/root/.rustup
+# CARGO_HOME=/root/.cargo` exported on every remote cargo invocation; new
+# cargo-installed gate tools (cargo-deny, cargo-nextest) still land under
+# `$REMOTE_HOME/.local` via `cargo install --root`, never written into
+# root's shared tree, so no cargo/rsync call ever needs to be root. sccache
+# gets its own per-user cache (`$REMOTE_HOME/.cache/sccache`) rather than
+# sharing root's — a cold first-run cache is a perf cost, not a permissions
+# problem. `BURST_LANE_REMOTE_USER=root` remains a full rollback (matching
+# `REMOTE_ROOT=/root/build` and friends exactly, byte-for-byte the pre-PRD
+# behavior) — see `create_remote_user()`'s early return and the
+# `REMOTE_HOME`/default-path block right after `load_env`. `provision`
+# additionally migrates a LIVE root-only session onto `build` in place (no
+# reboot): `migrate_remote_user()` runs the same user-creation call, then
+# `cp -a`s each still-dirty worktree's remote tree from the old root-owned
+# path into the new one (root-only, bucketed with user creation — it is
+# the only user who can read the old tree), marking a worktree cold instead
+# of blocking migration if that copy fails.
+#
 # Subcommands:
 #   burst-lane.sh up
 #       Idempotent (AC1): a live tracked session -> "already-up: <id> <ip>",
@@ -206,20 +241,12 @@ GATE_TOOLS_BUILD_SCRIPTS_SRC="${BURST_LANE_GATE_BUILD_SCRIPTS:-$HOME/.claude/ski
 GATE_TOOLS_RUSTBUILD_SCRIPTS_SRC="${BURST_LANE_GATE_RUSTBUILD_SCRIPTS:-$HOME/.claude/skills/rustbuild/scripts}"
 GATE_TOOLS_RUSTBUILD_PROMPTS_SRC="${BURST_LANE_GATE_RUSTBUILD_PROMPTS:-$HOME/.claude/skills/rustbuild/prompts}"
 GATE_TOOLS_AUTOBUILDER_BIN="${BURST_LANE_AUTOBUILDER_BIN:-$HOME/.cargo/bin/autobuilder}"
-# Absolute (no "~") on purpose — the fake rsync fixture only string-strips a
-# "user@host:" prefix, it never runs a remote shell to expand a tilde, so a
-# literal "~/.cargo/bin" destination would resolve to a relative "~" dir
-# under whatever the test's cwd happens to be instead of a scoped path.
-# Overridable so the offline selftest can point this at a tmpdir instead of
-# the production default (which matches cmd_verify's own hardcoded
-# /root/.cargo/bin PATH entry — this whole lane assumes REMOTE_USER=root).
-GATE_TOOLS_REMOTE_BIN_DIR="${BURST_LANE_GATE_TOOLS_REMOTE_BIN_DIR:-/root/.cargo/bin}"
+# GATE_TOOLS_REMOTE_BIN_DIR/GATE_CRED_REMOTE_PATH/REMOTE_ROOT are computed
+# further down, right after load_env resolves $REMOTE_USER (PRD-build-burst-
+# unprivileged-user requirement 1) — their defaults key off which user's
+# home they land in, so they can't be pinned until $REMOTE_USER is known.
 # PRD-build-gate-on-casper requirement 4: reviewer credential placement.
-# Absolute (no "~") for the same reason as GATE_TOOLS_REMOTE_BIN_DIR above —
-# the fake rsync fixture never expands a tilde. Overridable so the offline
-# selftest never touches this machine's real /root.
 GATE_CRED_SRC="${BURST_CLAUDE_CRED_SRC:-$HOME/.claude/.credentials.json}"
-GATE_CRED_REMOTE_PATH="${BURST_LANE_GATE_CRED_REMOTE_PATH:-/root/.claude/.credentials.json}"
 
 HCLOUD="${BURST_LANE_HCLOUD_BIN:-hcloud}"
 SSH_BIN="${BURST_LANE_SSH_BIN:-ssh}"
@@ -241,7 +268,6 @@ DEFAULT_SNAPSHOT_ID="427125061"
 DEFAULT_TTL_HOURS="6"
 HARD_TTL_HOURS="12"
 COST_PER_HOUR_EUR="0.47"
-REMOTE_ROOT="${BURST_LANE_REMOTE_ROOT:-/root/build}"
 
 die() { echo "burst-lane: $*" >&2; exit "${2:-1}"; }
 usage() { echo "usage: burst-lane.sh {up|status|run|sync-back|pull|ensure-fresh|down|watchdog|cost|sub-cap|verify|provision|reap|route-check|parity|gate} ..." >&2; exit 2; }
@@ -257,7 +283,12 @@ load_env() {
   SNAPSHOT_ID="$DEFAULT_SNAPSHOT_ID"
   LOCATION="$DEFAULT_LOCATION"
   SSH_KEY="$HOME/.ssh/id_ed25519"
-  REMOTE_USER="root"
+  # PRD-build-burst-unprivileged-user requirement 1: unprivileged by default.
+  # BURST_LANE_REMOTE_USER=root (the selftest fixture's override point, and
+  # an operator's documented rollback — see the header note) is the only way
+  # back to the old all-root behavior; an env-file REMOTE_USER= line (none
+  # ship today) can still override it, same as every other load_env var.
+  REMOTE_USER="${BURST_LANE_REMOTE_USER:-build}"
   if [ -f "$ENV_FILE" ]; then
     # shellcheck disable=SC1090
     source "$ENV_FILE"
@@ -269,6 +300,46 @@ load_env() {
   SERVER_TYPE="${BURST_SERVER_TYPE:-$SERVER_TYPE}"
 }
 load_env
+
+# PRD-build-burst-unprivileged-user requirement 2: where root's ALREADY-WARM
+# toolchain actually lives — always real root's home in production, but
+# overridable so the offline selftest can point RUSTUP_HOME/CARGO_HOME at
+# THIS machine's own real, working toolchain (its normal default location
+# anyway) instead of a real /root no test-runner here can read. Never used
+# for anything but read+execute lookups (see create_remote_user's chmod
+# grant, and every RUSTUP_HOME=/CARGO_HOME= export below) — nothing ever
+# writes through these two vars; a gate tool's `cargo install` always
+# targets $GATE_TOOLS_REMOTE_BIN_DIR's own writable tree via `--root`.
+ROOT_RUSTUP_HOME="${BURST_LANE_ROOT_RUSTUP_HOME:-/root/.rustup}"
+ROOT_CARGO_HOME="${BURST_LANE_ROOT_CARGO_HOME:-/root/.cargo}"
+
+# ---- remote paths (PRD-build-burst-unprivileged-user requirement 1) -------
+# Computed only now that $REMOTE_USER is resolved. root keeps its historical
+# /root-rooted defaults exactly (the documented rollback restores today's
+# behavior byte-for-byte); build resolves everything under its own home.
+# GATE_TOOLS_REMOTE_BIN_DIR differs in KIND, not just path, between the two:
+# root's cargo-installed gate tools land in its own (already writable)
+# CARGO_HOME/bin; build's land under $REMOTE_HOME/.local/bin via `cargo
+# install --root` (see gate_tools_install_cmd) because build's CARGO_HOME is
+# root's shared, READ-ONLY toolchain (requirement 2) — it cannot receive a
+# `cargo install`'s own writes.
+if [ "$REMOTE_USER" = "root" ]; then
+  REMOTE_HOME="/root"
+  GATE_TOOLS_REMOTE_BIN_DIR_DEFAULT="$ROOT_CARGO_HOME/bin"
+  REMOTE_SCCACHE_DIR_DEFAULT="/root/.sccache"
+else
+  # Absolute (no "~") — the fake rsync fixture only string-strips a
+  # "user@host:" prefix, it never runs a remote shell to expand a tilde.
+  REMOTE_HOME="${BURST_LANE_REMOTE_HOME:-/home/$REMOTE_USER}"
+  GATE_TOOLS_REMOTE_BIN_DIR_DEFAULT="$REMOTE_HOME/.local/bin"
+  REMOTE_SCCACHE_DIR_DEFAULT="$REMOTE_HOME/.cache/sccache"
+fi
+REMOTE_ROOT="${BURST_LANE_REMOTE_ROOT:-$REMOTE_HOME/build}"
+GATE_TOOLS_REMOTE_BIN_DIR="${BURST_LANE_GATE_TOOLS_REMOTE_BIN_DIR:-$GATE_TOOLS_REMOTE_BIN_DIR_DEFAULT}"
+# PRD-build-gate-on-casper requirement 4 / PRD-build-burst-unprivileged-user
+# requirement 5: reviewer credential placement, now under $REMOTE_HOME.
+GATE_CRED_REMOTE_PATH="${BURST_LANE_GATE_CRED_REMOTE_PATH:-$REMOTE_HOME/.claude/.credentials.json}"
+REMOTE_SCCACHE_DIR="${BURST_LANE_REMOTE_SCCACHE_DIR:-$REMOTE_SCCACHE_DIR_DEFAULT}"
 
 # ---- state (flat JSON, jq if present else grep fallback — matches
 # gate-burst.sh's convention so both scripts are readable the same way) ---
@@ -338,13 +409,58 @@ precondition() {  # stdout = message; rc 0 pass, 1 fail
 }
 
 # ---- up -------------------------------------------------------------------
+# ---- unprivileged remote user (PRD-build-burst-unprivileged-user --------
+# requirement 1) -------------------------------------------------------------
+# Idempotent: creates $REMOTE_USER if absent, installs this lane's own ssh
+# public key into its authorized_keys (mode 700 home, 600 authorized_keys),
+# and grants it read+execute — never write — into root's already-warm
+# rustup/cargo toolchain (requirement 2's chosen approach: sharing root's
+# installs is cheaper than a second per-user rustup install, and this is
+# what the PRD's own Technical Considerations names as the "cheaper path").
+# `o+x` on /root itself is the one necessary crack in its 700 default —
+# without directory traversal the read+execute grant on .cargo/.rustup below
+# is unreachable by anyone but root. Bundled into ONE root ssh call (tagged
+# `# user-create`) alongside the useradd itself, matching requirement 3's
+# "root only for ... user creation" allow-list. A no-op for the
+# BURST_LANE_REMOTE_USER=root rollback — skipping the call entirely means
+# root's own `up` is byte-for-byte what it was before this PRD.
+create_remote_user() {  # $1=ip
+  local ip="$1"
+  [ "$REMOTE_USER" = "root" ] && return 0
+  local toolchain_parent; toolchain_parent="$(dirname "$ROOT_CARGO_HOME")"
+  local setup="
+# user-create
+id -u $REMOTE_USER >/dev/null 2>&1 || useradd -m -d $REMOTE_HOME -s /bin/bash $REMOTE_USER
+mkdir -p $REMOTE_HOME/.ssh $REMOTE_ROOT
+chmod o+x $toolchain_parent 2>/dev/null || true
+chmod -R o+rX $ROOT_CARGO_HOME $ROOT_RUSTUP_HOME 2>/dev/null || true
+chmod 700 $REMOTE_HOME $REMOTE_HOME/.ssh
+chown -R $REMOTE_USER:$REMOTE_USER $REMOTE_HOME $REMOTE_ROOT"
+  if [ -f "${SSH_KEY}.pub" ]; then
+    "$SSH_BIN" -o StrictHostKeyChecking=no -o ConnectTimeout=8 -i "$SSH_KEY" "root@$ip" "$setup
+[ -f $REMOTE_HOME/.ssh/.burst-lane-key-installed ] || { cat >> $REMOTE_HOME/.ssh/authorized_keys && chown $REMOTE_USER:$REMOTE_USER $REMOTE_HOME/.ssh/authorized_keys && touch $REMOTE_HOME/.ssh/.burst-lane-key-installed; }
+chmod 600 $REMOTE_HOME/.ssh/authorized_keys 2>/dev/null || true
+true" < "${SSH_KEY}.pub" 2>/dev/null || true
+  else
+    "$SSH_BIN" -o StrictHostKeyChecking=no -o ConnectTimeout=8 -i "$SSH_KEY" "root@$ip" "$setup
+true" 2>/dev/null || true
+  fi
+}
+
 box_bootstrap() {  # $1 = ip — make a snapshot box ready (idempotent, ~1s when already done)
-  "$SSH_BIN" -o StrictHostKeyChecking=no -o ConnectTimeout=8 -i "$SSH_KEY" "$REMOTE_USER@$1" "
-    mkdir -p $REMOTE_ROOT
+  # Requirement 3: root only for the apparmor sysctl and apt-based installs.
+  "$SSH_BIN" -o StrictHostKeyChecking=no -o ConnectTimeout=8 -i "$SSH_KEY" "root@$1" "
     sysctl -qw kernel.apparmor_restrict_unprivileged_userns=0 2>/dev/null || true
     command -v bwrap >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y -qq bubblewrap; } >/dev/null 2>&1
     command -v python3 >/dev/null 2>&1 || apt-get install -y -qq python3-minimal python3 >/dev/null 2>&1
-    command -v uv >/dev/null 2>&1 || [ -x /root/.local/bin/uv ] || (curl -LsSf https://astral.sh/uv/install.sh | sh) >/dev/null 2>&1
+    true" 2>/dev/null || true
+  create_remote_user "$1"
+  # Everything else — requirement 3's "everything else uses build@$ip" —
+  # including uv, which has no business running as root just to land a
+  # binary in a user's own $HOME/.local/bin.
+  "$SSH_BIN" -o StrictHostKeyChecking=no -o ConnectTimeout=8 -i "$SSH_KEY" "$REMOTE_USER@$1" "
+    mkdir -p $REMOTE_ROOT
+    command -v uv >/dev/null 2>&1 || [ -x $REMOTE_HOME/.local/bin/uv ] || (curl -LsSf https://astral.sh/uv/install.sh | sh) >/dev/null 2>&1
     true" 2>/dev/null || true
 }
 
@@ -374,13 +490,21 @@ sandbox_probe() {  # $1 = ip -> echoes true|false
 # are just inert there, the real install shell below the marker runs as
 # normal).
 gate_tools_probe() {  # $1=ip -> stdout: one "tool=version|MISSING" line per tool
+  # PRD-build-burst-unprivileged-user requirement 2: probing needs no root —
+  # reading a tool's own --version never writes anything — so this runs as
+  # $REMOTE_USER like everything but the requirement-3 allow-list.
   "$SSH_BIN" -o StrictHostKeyChecking=no -o ConnectTimeout=8 -i "$SSH_KEY" "$REMOTE_USER@$1" "
 # gate-tools-probe
 # PRD-build-burst-gate-tools-scope requirement 1: a non-login ssh shell's
-# PATH lacks /root/.cargo/bin and /root/.local/bin (cargo-installed tools,
-# uv, claude), so a correctly-installed tool read back MISSING without
-# this export — the exact box 165449166 failure mode.
-export PATH=/root/.cargo/bin:/root/.local/bin:\$PATH
+# PATH lacks the cargo-installed tools/uv/claude dirs, so a correctly-
+# installed tool read back MISSING without this export — the exact box
+# 165449166 failure mode. PRD-build-burst-unprivileged-user: build's own
+# \$GATE_TOOLS_REMOTE_BIN_DIR comes first — that is where cargo-deny/
+# cargo-nextest/uv/claude/autobuilder actually land for build (requirement
+# 2) — root's shared /root/.cargo/bin:/root/.local/bin stays as a fallback
+# (a no-op second listing for the REMOTE_USER=root rollback, since
+# GATE_TOOLS_REMOTE_BIN_DIR already equals /root/.cargo/bin there).
+export PATH=$GATE_TOOLS_REMOTE_BIN_DIR:\$PATH:$ROOT_CARGO_HOME/bin:/root/.local/bin
 for t in $GATE_TOOLS_LIST; do
   if command -v \"\$t\" >/dev/null 2>&1; then
     v=\"\$(\"\$t\" --version 2>/dev/null | head -n1)\"
@@ -401,6 +525,15 @@ _gate_tools_cargo_toolchain_pick='tc="$(rustup toolchain list 2>/dev/null | grep
 
 gate_tools_install_cmd() {  # $1=tool (never "autobuilder" — that's a push, see below) -> stdout: remote command
   local tool="$1"
+  # PRD-build-burst-unprivileged-user requirement 2/3: this whole call now
+  # runs as build (never root — see provision_gate_tools' per-tool routing),
+  # so `cargo install` must never write into root's shared, READ-ONLY
+  # CARGO_HOME — `--root` redirects the installed binary+metadata into
+  # build's own tree instead (its parent dir, since `--root X` installs
+  # into `X/bin`). For the REMOTE_USER=root rollback this resolves to
+  # `--root /root/.cargo`, i.e. cargo's own default — a no-op flag, not a
+  # behavior change.
+  local install_root; install_root="$(dirname "$GATE_TOOLS_REMOTE_BIN_DIR")"
   case "$tool" in
     jq)
       # apt-get update already ran once for this provision (see the
@@ -425,11 +558,15 @@ gate_tools_install_cmd() {  # $1=tool (never "autobuilder" — that's a push, se
       # characters "$PATH" instead of this host's real search path —
       # harmless for `cargo` itself (found via the /root/.cargo/bin prefix
       # regardless) but it silently broke `rustup`/grep/sort/tail lookups.
-      printf '%s\nexport PATH=/root/.cargo/bin:$PATH; %s; if [ -n "$tc" ]; then cargo +"$tc" install --locked cargo-deny@%s; else cargo install --locked cargo-deny@%s; fi\n' \
-        "# gate-tools-install $tool" "$_gate_tools_cargo_toolchain_pick" "$GATE_TOOLS_CARGO_DENY_VERSION" "$GATE_TOOLS_CARGO_DENY_VERSION" ;;
+      # RUSTUP_HOME/CARGO_HOME (requirement 2) point `cargo`/`rustup` — both
+      # only ever readable, never written, here — at root's shared toolchain
+      # regardless of who's running this; `--root` (see above) is what
+      # keeps the actual `install` write off of it.
+      printf '%s\nexport PATH=$PATH:%s/bin RUSTUP_HOME=%s CARGO_HOME=%s; %s; if [ -n "$tc" ]; then cargo +"$tc" install --locked --root %s cargo-deny@%s; else cargo install --locked --root %s cargo-deny@%s; fi\n' \
+        "# gate-tools-install $tool" "$ROOT_CARGO_HOME" "$ROOT_RUSTUP_HOME" "$ROOT_CARGO_HOME" "$_gate_tools_cargo_toolchain_pick" "$install_root" "$GATE_TOOLS_CARGO_DENY_VERSION" "$install_root" "$GATE_TOOLS_CARGO_DENY_VERSION" ;;
     cargo-nextest)
-      printf '%s\nexport PATH=/root/.cargo/bin:$PATH; %s; if [ -n "$tc" ]; then cargo +"$tc" install --locked cargo-nextest@%s; else cargo install --locked cargo-nextest@%s; fi\n' \
-        "# gate-tools-install $tool" "$_gate_tools_cargo_toolchain_pick" "$GATE_TOOLS_CARGO_NEXTEST_VERSION" "$GATE_TOOLS_CARGO_NEXTEST_VERSION" ;;
+      printf '%s\nexport PATH=$PATH:%s/bin RUSTUP_HOME=%s CARGO_HOME=%s; %s; if [ -n "$tc" ]; then cargo +"$tc" install --locked --root %s cargo-nextest@%s; else cargo install --locked --root %s cargo-nextest@%s; fi\n' \
+        "# gate-tools-install $tool" "$ROOT_CARGO_HOME" "$ROOT_RUSTUP_HOME" "$ROOT_CARGO_HOME" "$_gate_tools_cargo_toolchain_pick" "$install_root" "$GATE_TOOLS_CARGO_NEXTEST_VERSION" "$install_root" "$GATE_TOOLS_CARGO_NEXTEST_VERSION" ;;
     uv)
       printf '%s\ncurl -LsSf https://astral.sh/uv/install.sh | sh\n' "# gate-tools-install $tool" ;;
     claude)
@@ -492,7 +629,10 @@ provision_gate_tools() {  # $1=ip
   done <<<"$probe_out"
   if [ "$need_apt_update" = "1" ]; then
     local apt_log="$STATE_DIR/logs/gate-tools-apt-update.$$.log" apt_rc=0
-    "$SSH_BIN" -o StrictHostKeyChecking=no -o ConnectTimeout=8 -i "$SSH_KEY" "$REMOTE_USER@$ip" \
+    # Requirement 3: apt-get is root's job, never build's — hardcoded root@,
+    # not $REMOTE_USER@, regardless of which user the rest of this function
+    # routes to.
+    "$SSH_BIN" -o StrictHostKeyChecking=no -o ConnectTimeout=8 -i "$SSH_KEY" "root@$ip" \
       "$(printf '%s\napt-get update -qq\n' "# gate-tools-apt-update")" >"$apt_log" 2>&1 || apt_rc=$?
     journal_line "$(now_iso)  burst-lane  gate-tools  apt-update  (ran=true rc=$apt_rc)"
     rm -f "$apt_log" 2>/dev/null || true
@@ -520,7 +660,12 @@ provision_gate_tools() {  # $1=ip
         printf 'local autobuilder binary not found at %s\n' "$GATE_TOOLS_AUTOBUILDER_BIN" >"$err_log"
       fi
     else
-      "$SSH_BIN" -o StrictHostKeyChecking=no -o ConnectTimeout=8 -i "$SSH_KEY" "$REMOTE_USER@$ip" "$(gate_tools_install_cmd "$name")" >"$err_log" 2>&1 || rc=$?
+      # Requirement 3: apt-based tools (jq, gh, mold) install as root — the
+      # only allow-listed reason to leave $REMOTE_USER here — everything
+      # else (cargo-deny, cargo-nextest, uv, claude) installs as build.
+      local install_user="$REMOTE_USER"
+      gate_tools_is_apt "$name" && install_user="root"
+      "$SSH_BIN" -o StrictHostKeyChecking=no -o ConnectTimeout=8 -i "$SSH_KEY" "$install_user@$ip" "$(gate_tools_install_cmd "$name")" >"$err_log" 2>&1 || rc=$?
     fi
     secs="$(( $(now_epoch) - start_ts ))"
     journal_line "$(now_iso)  burst-lane  gate-tools  install  (tool=$name rc=$rc secs=$secs)"
@@ -656,7 +801,7 @@ cmd_up() {
     state_write "server_id=$aid" "ip=$aip" "server_type=$SERVER_TYPE" \
       "boot_ts=$(now_iso)" "boot_epoch=$(now_epoch)" "ttl_hours=$DEFAULT_TTL_HOURS" \
       "hard_ttl_hours=$HARD_TTL_HOURS" "runs_served=0" "sandbox_ok=$sbx" \
-      "teardown_scheduled=false" "teardown_epoch=" \
+      "teardown_scheduled=false" "teardown_epoch=" "remote_user=$REMOTE_USER" \
       "gate_ready=$GATE_READY" "gate_tools_missing=$GATE_TOOLS_MISSING"
     journal_line "$(now_iso)  burst-lane  up  adopted  (server_id=$aid ip=$aip sandbox_ok=$sbx gate_ready=$GATE_READY)"
     ( cmd_verify >/dev/null 2>&1 ) || journal_line "$(now_iso)  burst-lane  up  verify-failed-after-adopt  (lane unverified — run falls back local)"
@@ -703,11 +848,13 @@ print(d.get("id",""), d.get("public_net",{}).get("ipv4",{}).get("ip",""))
     exit 3
   fi
 
-  # Wait for ssh (bounded — never hang a tick forever).
+  # Wait for ssh (bounded — never hang a tick forever). Hardcoded root@, not
+  # $REMOTE_USER@ — on a truly fresh snapshot boot $REMOTE_USER (build) does
+  # not exist yet, only root does; box_bootstrap below is what creates it.
   local tries=0
   while [ "$tries" -lt 30 ]; do
     if "$SSH_BIN" -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=no \
-         -i "$SSH_KEY" "$REMOTE_USER@$ip" true >/dev/null 2>&1; then
+         -i "$SSH_KEY" "root@$ip" true >/dev/null 2>&1; then
       break
     fi
     tries=$((tries + 1)); sleep 1
@@ -727,9 +874,9 @@ print(d.get("id",""), d.get("public_net",{}).get("ipv4",{}).get("ip",""))
   state_write "server_id=$id" "ip=$ip" "server_type=$SERVER_TYPE" \
     "boot_ts=$(now_iso)" "boot_epoch=$(now_epoch)" "ttl_hours=$DEFAULT_TTL_HOURS" \
     "hard_ttl_hours=$HARD_TTL_HOURS" "runs_served=0" "sandbox_ok=$sbx" \
-    "teardown_scheduled=false" "teardown_epoch=" \
+    "teardown_scheduled=false" "teardown_epoch=" "remote_user=$REMOTE_USER" \
     "gate_ready=$GATE_READY" "gate_tools_missing=$GATE_TOOLS_MISSING"
-  journal_line "$(now_iso)  burst-lane  up  booted  (server_id=$id ip=$ip type=$SERVER_TYPE sandbox_ok=$sbx gate_ready=$GATE_READY)"
+  journal_line "$(now_iso)  burst-lane  up  booted  (server_id=$id ip=$ip type=$SERVER_TYPE sandbox_ok=$sbx gate_ready=$GATE_READY remote_user=$REMOTE_USER)"
   ( cmd_verify >/dev/null 2>&1 ) || journal_line "$(now_iso)  burst-lane  up  verify-failed-after-boot  (lane unverified — run falls back local)"
   if [ "$sbx" = false ]; then
     journal_line "$(now_iso)  burst-lane  up  sandbox-unavailable  (server_id=$id — rust selection falls back to local cap for python-kind sandboxed tests this tick)"
@@ -757,16 +904,24 @@ cmd_verify() {
   local rpath="$REMOTE_ROOT/.verify-fixture"
   "$RSYNC_BIN" -az --delete --rsync-path="mkdir -p '$rpath' && rsync" \
       -e "$SSH_BIN -o StrictHostKeyChecking=no -i $SSH_KEY" \
-      "$fx/" "$REMOTE_USER@$ip:$rpath/" >/dev/null 2>&1 || vfail "rsync roundtrip"
+      "$fx/" "$REMOTE_USER@$ip:$rpath/" >/dev/null 2>&1 || vfail "rsync roundtrip (user=$REMOTE_USER)"
   rm -rf "$fx"
 
+  # PRD-build-burst-unprivileged-user requirement 2/4: cargo/uv/python3 all
+  # probed as $REMOTE_USER — RUSTUP_HOME/CARGO_HOME point at root's shared,
+  # read-only toolchain (requirement 2) regardless of who's asking, so this
+  # is a no-op for the REMOTE_USER=root rollback.
   local rout
   rout="$("$SSH_BIN" -o StrictHostKeyChecking=no -i "$SSH_KEY" "$REMOTE_USER@$ip" \
-    'export PATH=/root/.cargo/bin:/root/.local/bin:$PATH; cargo --version && uv --version && python3 -c "print(1)"' 2>/dev/null)"
-  printf '%s' "$rout" | grep -q "^cargo " || vfail "remote cargo"
-  printf '%s' "$rout" | grep -q "^uv "    || vfail "remote uv"
-  printf '%s' "$rout" | grep -q "^1$"     || vfail "remote python3"
-  [ "$(sandbox_probe "$ip")" = "true" ]   || vfail "bwrap sandbox"
+    "export PATH=$GATE_TOOLS_REMOTE_BIN_DIR:\$PATH:$ROOT_CARGO_HOME/bin:/root/.local/bin RUSTUP_HOME=$ROOT_RUSTUP_HOME CARGO_HOME=$ROOT_CARGO_HOME; cargo --version && uv --version && python3 -c \"print(1)\"" 2>/dev/null)"
+  printf '%s' "$rout" | grep -q "^cargo " || vfail "remote cargo (user=$REMOTE_USER)"
+  printf '%s' "$rout" | grep -q "^uv "    || vfail "remote uv (user=$REMOTE_USER)"
+  printf '%s' "$rout" | grep -q "^1$"     || vfail "remote python3 (user=$REMOTE_USER)"
+  # Requirement 4: the sandbox probe (and the mcphost python-kind suites
+  # `run` routes the same way) executes as $REMOTE_USER — a probe failure
+  # names the user so an operator isn't left guessing which identity's
+  # bwrap access is broken.
+  [ "$(sandbox_probe "$ip")" = "true" ]   || vfail "bwrap sandbox (user=$REMOTE_USER)"
 
   # Requirement 1's own verify check: fails closed, naming the first missing
   # tool, rather than a bare "gate-tools FAIL" — an operator staring at the
@@ -799,12 +954,68 @@ cmd_verify() {
     "ttl_hours=$(state_read ttl_hours)" "hard_ttl_hours=$(state_read hard_ttl_hours)" \
     "runs_served=$(state_read runs_served)" "sandbox_ok=$(state_read sandbox_ok)" \
     "teardown_scheduled=$(state_read teardown_scheduled)" "teardown_epoch=$(state_read teardown_epoch)" \
+    "remote_user=$(state_read remote_user)" \
     "gate_ready=$gt_ready" "gate_tools_missing=$gt_missing" \
     "verified=true"
   probe_emit burst-verify clean "rsync+cargo+uv+python3+sandbox all real" >/dev/null
   journal_line "$(now_iso)  burst-lane  verify  ok  (rsync+cargo+uv+python3+sandbox all real)"
   echo "verify: ok"
   exit 0
+}
+
+# ---- migrate a live session onto the unprivileged user (PRD-build-burst- --
+# unprivileged-user requirement 6) ------------------------------------------
+# `provision` on a session that booted before this PRD shipped (or is
+# running the BURST_LANE_REMOTE_USER=root rollback and is switching back) is
+# still root-only; this brings it up to $REMOTE_USER without a reboot: the
+# same create_remote_user() call `up` uses, then a remote-side `cp -a` (as
+# root — the only user who can read the OLD root-owned tree — bucketed with
+# user creation for the same "root only for provisioning" reason) of every
+# still-dirty worktree's remote dir from the old tree into the new one, so a
+# following `run` does not silently start from an empty $REMOTE_ROOT. A
+# worktree whose copy fails goes cold (marker cleared) rather than blocking
+# migration — the next run/pull just re-syncs it fresh, exactly like a
+# worktree's first-ever run would.
+migrate_remote_user() {  # $1=ip $2=prior_user
+  local ip="$1" prior_user="$2"
+  create_remote_user "$ip"
+
+  local prior_home; [ "$prior_user" = "root" ] && prior_home="/root" || prior_home="/home/$prior_user"
+
+  mkdir -p "$DIRTY_DIR" 2>/dev/null || true
+  local f wt old_remote_path new_remote_path kind
+  for f in "$DIRTY_DIR"/*.json; do
+    [ -e "$f" ] || continue
+    wt="$(python3 -c '
+import json, sys
+try:
+    print(json.load(open(sys.argv[1])).get("worktree", ""))
+except Exception:
+    print("")
+' "$f" 2>/dev/null)"
+    [ -n "$wt" ] || continue
+    old_remote_path="$(dirty_field "$wt" remote_path)"
+    [ -n "$old_remote_path" ] || old_remote_path="$prior_home/build/$(basename "$wt")-$(printf '%s' "$wt" | sha1sum | cut -c1-8)"
+    new_remote_path="$(remote_path_for "$wt")"
+    if [ "$old_remote_path" = "$new_remote_path" ]; then
+      continue  # BURST_LANE_REMOTE_ROOT is pinned identically either way
+    fi
+    kind="$(dirty_field "$wt" kind)"; kind="${kind:-target}"
+    # chown is best-effort and never gates migrated-vs-cold on its own — the
+    # copy having landed is what matters for correctness (a later `run`
+    # re-syncs the worktree as build anyway, fixing ownership as a side
+    # effect even if this chown failed); only mkdir+cp's own exit code
+    # decides migrated vs cold, preserved past the chown via `exit $rc`.
+    if "$SSH_BIN" -o StrictHostKeyChecking=no -o ConnectTimeout=8 -i "$SSH_KEY" "root@$ip" \
+         "mkdir -p '$new_remote_path' && cp -a '$old_remote_path/.' '$new_remote_path/' 2>/dev/null; rc=\$?; chown -R '$REMOTE_USER:$REMOTE_USER' '$new_remote_path' 2>/dev/null || true; exit \$rc" >/dev/null 2>&1; then
+      mark_dirty "$wt" "$(state_read server_id)" "$new_remote_path" "$kind"
+      journal_line "$(now_iso)  burst-lane  provision  migrated  (worktree=$wt from=$old_remote_path to=$new_remote_path)"
+    else
+      clear_dirty "$wt"
+      journal_line "$(now_iso)  burst-lane  provision  migrate-cold  (worktree=$wt cause=copy-failed old=$old_remote_path new=$new_remote_path)"
+    fi
+  done
+  journal_line "$(now_iso)  burst-lane  provision  user-migrated  (server_id=$(state_read server_id) from=$prior_user to=$REMOTE_USER)"
 }
 
 # ---- provision --------------------------------------------------------------
@@ -819,15 +1030,24 @@ cmd_provision() {
     echo "provision: no active session"; exit 1
   fi
   local ip; ip="$(state_read ip)"
+
+  # PRD-build-burst-unprivileged-user requirement 6: migrate a root-only
+  # session in place. A session with no remote_user field at all predates
+  # this PRD and reads as "root" — this lane's pre-ship-only identity.
+  local prior_user; prior_user="$(state_read remote_user)"; prior_user="${prior_user:-root}"
+  if [ "$prior_user" != "$REMOTE_USER" ]; then
+    migrate_remote_user "$ip" "$prior_user"
+  fi
+
   provision_gate_tools "$ip"
   state_write "server_id=$(state_read server_id)" "ip=$ip" "server_type=$(state_read server_type)" \
     "boot_ts=$(state_read boot_ts)" "boot_epoch=$(state_read boot_epoch)" \
     "ttl_hours=$(state_read ttl_hours)" "hard_ttl_hours=$(state_read hard_ttl_hours)" \
     "runs_served=$(state_read runs_served)" "sandbox_ok=$(state_read sandbox_ok)" \
     "teardown_scheduled=$(state_read teardown_scheduled)" "teardown_epoch=$(state_read teardown_epoch)" \
-    "verified=$(state_read verified)" \
+    "verified=$(state_read verified)" "remote_user=$REMOTE_USER" \
     "gate_ready=$GATE_READY" "gate_tools_missing=$GATE_TOOLS_MISSING"
-  journal_line "$(now_iso)  burst-lane  provision  done  (server_id=$(state_read server_id) gate_ready=$GATE_READY gate_tools_missing=${GATE_TOOLS_MISSING:-none})"
+  journal_line "$(now_iso)  burst-lane  provision  done  (server_id=$(state_read server_id) gate_ready=$GATE_READY gate_tools_missing=${GATE_TOOLS_MISSING:-none} remote_user=$REMOTE_USER)"
   echo "provision: gate_ready=$GATE_READY missing=${GATE_TOOLS_MISSING:-}"
   [ "$GATE_READY" = "true" ] && exit 0
   exit 1
@@ -1501,7 +1721,12 @@ cmd_run() {
   # does not exist on this remote): assert once, restart-once on failure
   # via a plain `sccache --stop-server && --start-server` (self-contained,
   # no sudo, no unit), assert again, else refuse before $first ever runs.
-  local remote_cmd="cd $remote_path && export PATH=/root/.cargo/bin:/root/.local/bin:\$PATH CARGO_HOME=\${CARGO_HOME:-\$HOME/.cargo} CARGO_TARGET_DIR=$remote_path/target RUSTC_WRAPPER=sccache SCCACHE_DIR=/root/.sccache; timeout 5 sccache --show-stats >/dev/null 2>&1 || { sccache --stop-server >/dev/null 2>&1; sccache --start-server >/dev/null 2>&1; sleep 1; }; timeout 5 sccache --show-stats >/dev/null 2>&1 || { echo 'burst-lane: sccache_unreachable on remote box' >&2; exit 97; }; $first $*"
+  # PRD-build-burst-unprivileged-user requirement 2: RUSTUP_HOME/CARGO_HOME
+  # hardcoded at root's shared, read-only toolchain regardless of who's
+  # running this (a no-op for the REMOTE_USER=root rollback, since that's
+  # already root's own default there); SCCACHE_DIR is $REMOTE_USER's OWN
+  # cache, never root's — sccache's cache dir needs write, not just read.
+  local remote_cmd="cd $remote_path && export PATH=$GATE_TOOLS_REMOTE_BIN_DIR:\$PATH:$ROOT_CARGO_HOME/bin:/root/.local/bin RUSTUP_HOME=$ROOT_RUSTUP_HOME CARGO_HOME=$ROOT_CARGO_HOME CARGO_TARGET_DIR=$remote_path/target RUSTC_WRAPPER=sccache SCCACHE_DIR=$REMOTE_SCCACHE_DIR; timeout 5 sccache --show-stats >/dev/null 2>&1 || { sccache --stop-server >/dev/null 2>&1; sccache --start-server >/dev/null 2>&1; sleep 1; }; timeout 5 sccache --show-stats >/dev/null 2>&1 || { echo 'burst-lane: sccache_unreachable on remote box' >&2; exit 97; }; $first $*"
   local rc=0
   "$SSH_BIN" -o StrictHostKeyChecking=no -i "$SSH_KEY" "$REMOTE_USER@$ip" "$remote_cmd" || rc=$?
   t_remote_end="$(now_fractional)"
@@ -1543,6 +1768,7 @@ cmd_run() {
     "ttl_hours=$(state_read ttl_hours)" "hard_ttl_hours=$(state_read hard_ttl_hours)" \
     "runs_served=$runs" "sandbox_ok=$(state_read sandbox_ok)" \
     "teardown_scheduled=$(state_read teardown_scheduled)" "teardown_epoch=$(state_read teardown_epoch)" "verified=$(state_read verified)" \
+    "remote_user=$(state_read remote_user)" \
     "gate_ready=$(state_read gate_ready)" "gate_tools_missing=$(state_read gate_tools_missing)"
 
   # Requirement 13: attribute this run to a PRD slug for the cost ledger.
@@ -1709,8 +1935,12 @@ cmd_parity() {
     exit 3
   fi
 
+  # PRD-build-burst-unprivileged-user: this is the exact call
+  # `checkcompat_ac02_ac03` failed under — mcphost's own root-guard makes
+  # $REMOTE_USER=root an invalid identity to run its integration suite
+  # under, hence build (RUSTUP_HOME/CARGO_HOME per requirement 2).
   local box_log; box_log="$("$SSH_BIN" -o StrictHostKeyChecking=no -i "$SSH_KEY" "$REMOTE_USER@$ip" \
-    "cd $remote_path && export PATH=/root/.cargo/bin:/root/.local/bin:\$PATH CARGO_TARGET_DIR=$remote_path/target; cargo test --workspace --no-fail-fast" 2>&1)"
+    "cd $remote_path && export PATH=$GATE_TOOLS_REMOTE_BIN_DIR:\$PATH:$ROOT_CARGO_HOME/bin:/root/.local/bin RUSTUP_HOME=$ROOT_RUSTUP_HOME CARGO_HOME=$ROOT_CARGO_HOME CARGO_TARGET_DIR=$remote_path/target; cargo test --workspace --no-fail-fast" 2>&1)"
   flock -u 206
   local box_suites; box_suites="$(printf '%s\n' "$box_log" | cargo_test_suites_json)"
 
@@ -2027,12 +2257,15 @@ sys.exit(0 if d.get("head_sha") == sys.argv[2] and d.get("diff") == [] else 1)
   # PRD-build-gate-on-casper "extend-gate.sh remote-aware invocation": the
   # ONE thing extend-gate.sh writes outside the repo is the daily journal
   # (default $HOME/brain/journal/build/<date>.md) — on the box that's
-  # root's own $HOME, not RedBaron's, so it's redirected here into
+  # $REMOTE_USER's own $HOME, not RedBaron's, so it's redirected here into
   # target/autobuilder/ (already an rsync-back path) and appended onto
   # RedBaron's real tick journal below, keeping the journal single-writer
-  # per the PRD's technical considerations.
+  # per the PRD's technical considerations. PRD-build-burst-unprivileged-
+  # user requirement 2: RUSTUP_HOME/CARGO_HOME point extend-gate.sh's own
+  # cargo/rustup calls at root's shared, read-only toolchain the same way
+  # every other remote cargo invocation does.
   local remote_journal="$remote_path/target/autobuilder/gate-journal.md"
-  local remote_cmd="cd $remote_path && export PATH=\$PATH:/root/.cargo/bin:/root/.local/bin:$REMOTE_ROOT/.gate-tools/build-scripts RUSTC_WRAPPER=sccache BURST_LANE=0 RUSTBUILD_SCRIPTS=$REMOTE_ROOT/.gate-tools/rustbuild-scripts REVIEWER_PROMPT=$REMOTE_ROOT/.gate-tools/rustbuild-prompts/reviewer-agent.md EXTEND_GATE_JOURNAL=$remote_journal; extend-gate.sh . $(printf '%q ' "${extra_args[@]}")"
+  local remote_cmd="cd $remote_path && export PATH=\$PATH:$GATE_TOOLS_REMOTE_BIN_DIR:$ROOT_CARGO_HOME/bin:/root/.local/bin:$REMOTE_ROOT/.gate-tools/build-scripts RUSTUP_HOME=$ROOT_RUSTUP_HOME CARGO_HOME=$ROOT_CARGO_HOME RUSTC_WRAPPER=sccache SCCACHE_DIR=$REMOTE_SCCACHE_DIR BURST_LANE=0 RUSTBUILD_SCRIPTS=$REMOTE_ROOT/.gate-tools/rustbuild-scripts REVIEWER_PROMPT=$REMOTE_ROOT/.gate-tools/rustbuild-prompts/reviewer-agent.md EXTEND_GATE_JOURNAL=$remote_journal; extend-gate.sh . $(printf '%q ' "${extra_args[@]}")"
   "$SSH_BIN" -o StrictHostKeyChecking=no -i "$SSH_KEY" "$REMOTE_USER@$ip" "bash -lc $(printf '%q' "$remote_cmd")" || rc=$?
   t1="$(now_fractional)"
   rm -f "$inflight_marker"
@@ -2704,6 +2937,7 @@ cmd_down() {
         "boot_ts=$(state_read boot_ts)" "boot_epoch=$boot_epoch" "ttl_hours=$(state_read ttl_hours)" \
         "hard_ttl_hours=$(state_read hard_ttl_hours)" "runs_served=$(state_read runs_served)" \
         "sandbox_ok=$(state_read sandbox_ok)" "teardown_scheduled=false" "teardown_epoch=" "verified=$(state_read verified)" \
+        "remote_user=$(state_read remote_user)" \
         "gate_ready=$(state_read gate_ready)" "gate_tools_missing=$(state_read gate_tools_missing)"
       journal_line "$(now_iso)  burst-lane  down  decision=keep  (server_id=$id cause=rust-work-arrived, schedule cancelled)"
     else
@@ -2773,6 +3007,7 @@ cmd_down() {
     "boot_ts=$(state_read boot_ts)" "boot_epoch=$boot_epoch" "ttl_hours=$(state_read ttl_hours)" \
     "hard_ttl_hours=$(state_read hard_ttl_hours)" "runs_served=$(state_read runs_served)" \
     "sandbox_ok=$(state_read sandbox_ok)" "teardown_scheduled=true" "teardown_epoch=$window_start" "verified=$(state_read verified)" \
+    "remote_user=$(state_read remote_user)" \
     "gate_ready=$(state_read gate_ready)" "gate_tools_missing=$(state_read gate_tools_missing)"
   journal_line "$(now_iso)  burst-lane  down  decision=scheduled  (server_id=$id teardown_at=$(date -u -d "@$window_start" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "$window_start"))"
   echo "decision=scheduled"
@@ -3099,6 +3334,18 @@ main() {
     route-check) cmd_route_check "$@" ;;
     parity)    cmd_parity "$@" ;;
     gate)      cmd_gate "$@" ;;
+    # Undocumented/hidden — PRD-build-burst-unprivileged-user requirement 1:
+    # a pure read-only print of the resolved remote identity/paths, no ssh,
+    # no filesystem writes outside $STATE_DIR's own mkdir at file top. Exists
+    # so the offline selftest can assert the literal DEFAULT values (e.g.
+    # $REMOTE_ROOT=/home/build/build) without a test override masking them —
+    # every other subcommand needs BURST_LANE_REMOTE_ROOT etc. pinned to a
+    # tmpdir for safety, which is exactly what would hide this.
+    _debug-remote-config)
+      printf 'remote_user=%s\nremote_home=%s\nremote_root=%s\ngate_tools_bin=%s\ngate_cred_path=%s\nsccache_dir=%s\n' \
+        "$REMOTE_USER" "$REMOTE_HOME" "$REMOTE_ROOT" "$GATE_TOOLS_REMOTE_BIN_DIR" "$GATE_CRED_REMOTE_PATH" "$REMOTE_SCCACHE_DIR"
+      exit 0
+      ;;
     *) usage ;;
   esac
 }
