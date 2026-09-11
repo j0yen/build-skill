@@ -10,6 +10,48 @@
 #   verified-completed.sh <PRD-path> [--derive|--no-derive] [--verify-run]
 #       [--paired N,N,...] [--format text|json|table]
 #       [--doctor] [--paired-with N=<evidence>]... [--reasons-json '{...}']
+#       [--check-deferral-premises] [--check-receipt-claim]
+#
+# Archive-gate additions (PRD-build-post-ship-reality-check requirements
+# 3-4): a shipped PRD's `mock_justifications:` and its own `Receipts:`
+# frontmatter line are TESTABLE CLAIMS, not prose to trust. Each of these
+# two flags runs ONE archive-time check standalone (skips AC
+# classification entirely — a separate invocation from the normal C5 run)
+# and is meant to be called from the archive step alongside the existing
+# --derive pass, both required to pass before an archive proceeds:
+#
+#   --check-deferral-premises
+#       For each AC in `deferred_acs:`, finds its `mock_justifications:`
+#       bullet (matched by a leading `AC<N>` token) and classifies what it
+#       claims is unreachable/absent: a box/lane ("reachable", "sandboxed
+#       build session", "burst-lane", "box"), a URL, a `command -v`-able
+#       tool ("no `<x>` binary", "<x> is not installed"), or a path ("does
+#       not exist"). Re-tests the SAME claim for real (burst-lane.sh
+#       status --json / curl -I / command -v / test -e) and requires the
+#       premise still hold. A deferred AC with no matching justification
+#       bullet is reported `premise-unchecked` (a prd-lint concern, not
+#       this gate's) and does not by itself fail the check.
+#       Exit 0: every classified premise still holds (or nothing to
+#         classify). Exit 1: stderr has one
+#         `deferral-premise-false: AC<N> (<evidence>)` line per AC whose
+#         claim the real probe just contradicted.
+#       Probes are overridable for selftests:
+#         $VC_BURST_LANE (default: burst-lane.sh next to this script)
+#         $VC_CURL (default: curl)
+#
+#   --check-receipt-claim
+#       Reads this PRD's own `Receipts:` frontmatter line, extracts a
+#       `<script> <n>/<n> ok` or `<n>/<n> FAIL`-shaped selftest claim (the
+#       first one found), re-runs that exact script (resolved next to this
+#       one, or via `--receipt-script <path>` to override, e.g. a
+#       selftest's fake harness), and parses its own `<n> ok`/`<n>
+#       FAIL`-shaped summary line from the fresh run's output.
+#       Exit 0: the fresh count matches the claimed count.
+#       Exit 1: stderr has `receipt-claim-mismatch: claimed <n>/<n> actual
+#         <m>/<m>` (or `0 FAIL` vs `<k> FAIL`).
+#       `--receipt-text '<text>'` overrides the frontmatter line entirely
+#       (selftests use this to avoid depending on a real PRD's Receipts
+#       line format).
 #
 # Inputs:
 #   <PRD-path>             absolute or relative path to a PRD-*.md file.
@@ -169,6 +211,10 @@ doctor=false
 reasons_json=""
 derive_mode=auto   # auto | on | off
 verify_run=false
+check_premises=false
+check_receipt=false
+receipt_text_override=""
+receipt_script_override=""
 declare -a paired_with_kv=()
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -184,6 +230,12 @@ while [ "$#" -gt 0 ]; do
     --paired-with=*) paired_with_kv+=("${1#--paired-with=}"); shift ;;
     --reasons-json) reasons_json="${2:-}"; shift 2 ;;
     --reasons-json=*) reasons_json="${1#--reasons-json=}"; shift ;;
+    --check-deferral-premises) check_premises=true; shift ;;
+    --check-receipt-claim) check_receipt=true; shift ;;
+    --receipt-text) receipt_text_override="${2:-}"; shift 2 ;;
+    --receipt-text=*) receipt_text_override="${1#--receipt-text=}"; shift ;;
+    --receipt-script) receipt_script_override="${2:-}"; shift 2 ;;
+    --receipt-script=*) receipt_script_override="${1#--receipt-script=}"; shift ;;
     -h|--help) usage ;;
     --) shift; break ;;
     -*) echo "verified-completed: unknown flag $1" >&2; exit 2 ;;
@@ -215,6 +267,165 @@ deferred="$("$JQ" -c --arg s "$slug" '.[] | select(.slug==$s) | .deferred_acs //
 [ -n "$deferred" ] || deferred="[]"
 deferred_unparsed="$("$JQ" -r --arg s "$slug" '.[] | select(.slug==$s) | .deferred_acs_unparsed // false' <<<"$json")"
 [ -n "$deferred_unparsed" ] || deferred_unparsed="false"
+
+# ---- --check-deferral-premises (PRD-build-post-ship-reality-check req 3) --
+# Extract `mock_justifications:` bullets keyed by leading `AC<N>` token.
+# Lives here (not scan-prds.sh) because the field is free prose, not a
+# structured contract value scan-prds.sh's other keys are.
+extract_mock_justifications() {
+  python3 - "$prd" <<'PY'
+import json, re, sys
+path = sys.argv[1]
+with open(path, encoding="utf-8", errors="replace") as fh:
+    lines = fh.readlines()
+key_re = re.compile(r'^(?:-\s*)?mock_justifications\s*:\s*$', re.I)
+start = None
+for i, ln in enumerate(lines[:200]):
+    if key_re.match(ln.strip()):
+        start = i + 1
+        break
+result = {}
+if start is not None:
+    item_re = re.compile(r'^\s*-\s*(.*)$')
+    ac_re = re.compile(r'^"?AC\s*(\d+)\b', re.I)
+    cur = None
+    for ln in lines[start:]:
+        s = ln.rstrip("\n")
+        if not s.strip():
+            break
+        m = item_re.match(s)
+        if not m:
+            break
+        text = m.group(1).strip()
+        if len(text) >= 2 and text[0] == text[-1] == '"':
+            text = text[1:-1]
+        am = ac_re.match(text)
+        if am:
+            cur = am.group(1)
+            result[cur] = text
+        elif cur is not None:
+            result[cur] += " " + text
+print(json.dumps(result))
+PY
+}
+
+# classify_and_test_premise <text> — prints "true|false|unchecked\t<evidence>"
+classify_and_test_premise() {
+  local text="$1" burst_cmd="${VC_BURST_LANE:-$HERE/burst-lane.sh}" curl_cmd="${VC_CURL:-curl}"
+  local url tool path out
+  if printf '%s' "$text" | grep -qiE 'reachable|sandboxed build session|burst.?lane|\bbox\b|\block'; then
+    out="$("$burst_cmd" status --json 2>/dev/null)" || out='{"active":false}'
+    if printf '%s' "$out" | "$JQ" -e '.active == true' >/dev/null 2>&1; then
+      local sid; sid="$(printf '%s' "$out" | "$JQ" -r '.server_id // "unknown"' 2>/dev/null)"
+      printf 'false\tbox reachable (server_id=%s): %s\n' "$sid" "$out"
+    else
+      printf 'true\tbox not reachable: %s\n' "$out"
+    fi
+    return
+  fi
+  url="$(printf '%s' "$text" | grep -oE 'https?://[^[:space:]`)]+' | head -n1)"
+  if [ -n "$url" ]; then
+    local code; code="$("$curl_cmd" -m 8 -sS -o /dev/null -w '%{http_code}' "$url" 2>/dev/null)" || code="000"
+    case "$code" in
+      2??|3??) printf 'false\tendpoint reachable (http_code=%s): %s\n' "$code" "$url" ;;
+      *)       printf 'true\tendpoint unreachable (http_code=%s): %s\n' "$code" "$url" ;;
+    esac
+    return
+  fi
+  tool="$(printf '%s' "$text" | grep -oE '`[A-Za-z0-9_-]+`' | head -n1 | tr -d '`')"
+  if [ -n "$tool" ] && printf '%s' "$text" | grep -qiE 'not installed|no .* binary|absent|missing'; then
+    if command -v "$tool" >/dev/null 2>&1; then
+      printf 'false\ttool present: %s\n' "$tool"
+    else
+      printf 'true\ttool absent: %s\n' "$tool"
+    fi
+    return
+  fi
+  path="$(printf '%s' "$text" | grep -oE '/[A-Za-z0-9_./-]+' | head -n1)"
+  if [ -n "$path" ] && printf '%s' "$text" | grep -qiE 'does not exist|not exist|absent|missing'; then
+    if [ -e "$path" ]; then
+      printf 'false\tpath exists: %s\n' "$path"
+    else
+      printf 'true\tpath absent: %s\n' "$path"
+    fi
+    return
+  fi
+  printf 'unchecked\tno probeable claim recognized in justification text\n'
+}
+
+if [ "$check_premises" = true ]; then
+  just_json="$(extract_mock_justifications)"
+  any_false=false
+  while IFS= read -r ac; do
+    [ -n "$ac" ] || continue
+    text="$("$JQ" -r --arg a "$ac" '.[$a] // empty' <<<"$just_json")"
+    if [ -z "$text" ]; then
+      echo "AC$ac: premise-unchecked — no mock_justifications bullet found for AC$ac"
+      continue
+    fi
+    IFS=$'\t' read -r verdict evidence < <(classify_and_test_premise "$text")
+    case "$verdict" in
+      true)  echo "AC$ac: premise-true — $evidence" ;;
+      false) echo "AC$ac: premise-false — $evidence"; any_false=true
+             echo "deferral-premise-false: AC$ac ($evidence)" >&2 ;;
+      *)     echo "AC$ac: premise-unchecked — $evidence" ;;
+    esac
+  done < <("$JQ" -r '.[]?' <<<"$deferred")
+  $any_false && exit 1
+  exit 0
+fi
+
+# ---- --check-receipt-claim (PRD-build-post-ship-reality-check req 4) ------
+if [ "$check_receipt" = true ]; then
+  receipt_text="$receipt_text_override"
+  if [ -z "$receipt_text" ]; then
+    receipt_text="$(python3 - "$prd" <<'PY'
+import re, sys
+path = sys.argv[1]
+with open(path, encoding="utf-8", errors="replace") as fh:
+    lines = fh.readlines()[:80]
+key_re = re.compile(r'^(?:-\s*Receipts:|Receipts:|\*\*Receipts:\*\*)\s*(.*)$')
+for ln in lines:
+    m = key_re.match(ln.rstrip("\n"))
+    if m:
+        print(m.group(1).strip())
+        break
+PY
+)"
+  fi
+  [ -n "$receipt_text" ] || { echo "verified-completed: no Receipts: line found and no --receipt-text given" >&2; exit 2; }
+
+  # Parse "<script> <n>/<n> ... <k> FAIL" or "<n> ok/<k> FAIL" out of the claim.
+  claim_script="$(printf '%s' "$receipt_text" | grep -oE '[A-Za-z0-9_-]+\.sh' | head -n1)"
+  claim_pass="$(printf '%s' "$receipt_text" | grep -oE '[0-9]+/[0-9]+' | head -n1)"
+  claim_fail="$(printf '%s' "$receipt_text" | grep -oiE '[0-9]+[[:space:]]*FAIL' | head -n1 | grep -oE '[0-9]+')"
+  [ -n "$claim_pass" ] || [ -n "$claim_fail" ] || { echo "verified-completed: no <n>/<n> or <k> FAIL claim found in: $receipt_text" >&2; exit 2; }
+
+  script_path="${receipt_script_override:-}"
+  if [ -z "$script_path" ] && [ -n "$claim_script" ]; then
+    [ -x "$HERE/$claim_script" ] && script_path="$HERE/$claim_script"
+  fi
+  [ -n "$script_path" ] || { echo "verified-completed: could not resolve receipt script (claimed: ${claim_script:-none}); pass --receipt-script" >&2; exit 2; }
+
+  fresh_out="$("$script_path" 2>&1)"; fresh_rc=$?
+  fresh_pass="$(printf '%s' "$fresh_out" | grep -oE '[0-9]+/[0-9]+' | tail -n1)"
+  fresh_fail="$(printf '%s' "$fresh_out" | grep -oiE '[0-9]+[[:space:]]*FAIL' | tail -n1 | grep -oE '[0-9]+')"
+  [ -n "$fresh_fail" ] || fresh_fail=0
+
+  mismatch=false
+  if [ -n "$claim_pass" ] && [ "$claim_pass" != "${fresh_pass:-}" ]; then mismatch=true; fi
+  if [ -n "$claim_fail" ] && [ "$claim_fail" != "$fresh_fail" ]; then mismatch=true; fi
+  # A script exiting nonzero while claiming a clean pass is itself a mismatch,
+  # even if the count-scrape happened to line up.
+  if [ "${claim_fail:-0}" = 0 ] && [ "$fresh_rc" -ne 0 ]; then mismatch=true; fi
+
+  if [ "$mismatch" = true ]; then
+    echo "receipt-claim-mismatch: claimed ${claim_pass:-?}${claim_fail:+ / ${claim_fail} FAIL} actual ${fresh_pass:-?}${fresh_fail:+ / ${fresh_fail} FAIL} (script: $script_path)" >&2
+    exit 1
+  fi
+  echo "receipt-claim-match: claimed ${claim_pass:-?}${claim_fail:+ / ${claim_fail} FAIL} == actual ${fresh_pass:-?} / ${fresh_fail} FAIL (script: $script_path)"
+  exit 0
+fi
 
 if [ "$doctor" = true ]; then
   if [ -n "$reasons_json" ]; then
