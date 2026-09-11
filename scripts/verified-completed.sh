@@ -53,6 +53,16 @@
 #       (selftests use this to avoid depending on a real PRD's Receipts
 #       line format).
 #
+#   --check-fixture-negative-case [--since <git-ref>]
+#       Diffs `<repo>/**/*selftest*.sh` between --since (default: the
+#       repo's newest tag, else HEAD~1) and HEAD for newly ADDED
+#       `echo "== <description> =="` case headers (this repo's own
+#       selftest convention). Exit 1 with `fixture-negative-case-missing:
+#       <case>` if new cases were added and NONE of their descriptions
+#       contain a failure-mode word (fail/reject/block/mismatch/missing/
+#       unreachable/...); exit 0 (no new cases, or at least one new case
+#       is a failure-mode case).
+#
 # Inputs:
 #   <PRD-path>             absolute or relative path to a PRD-*.md file.
 #   --derive               Derive AC->test pairing from the repo (see
@@ -213,8 +223,10 @@ derive_mode=auto   # auto | on | off
 verify_run=false
 check_premises=false
 check_receipt=false
+check_fixture_negative_case=false
 receipt_text_override=""
 receipt_script_override=""
+fixture_since=""
 declare -a paired_with_kv=()
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -236,6 +248,9 @@ while [ "$#" -gt 0 ]; do
     --receipt-text=*) receipt_text_override="${1#--receipt-text=}"; shift ;;
     --receipt-script) receipt_script_override="${2:-}"; shift 2 ;;
     --receipt-script=*) receipt_script_override="${1#--receipt-script=}"; shift ;;
+    --check-fixture-negative-case) check_fixture_negative_case=true; shift ;;
+    --since) fixture_since="${2:-}"; shift 2 ;;
+    --since=*) fixture_since="${1#--since=}"; shift ;;
     -h|--help) usage ;;
     --) shift; break ;;
     -*) echo "verified-completed: unknown flag $1" >&2; exit 2 ;;
@@ -760,6 +775,44 @@ if [ "$derive_mode" = on ]; then
       collision_owner_slug[$i]="$other"
     fi
   done
+fi
+
+# ---- --check-fixture-negative-case (PRD-build-post-ship-reality-check
+# req 6, block half; the warn half is prd-lint.sh's selftest-no-negative-
+# case check on the PRD's own text — this is the shipped-fixture-diff
+# check at archive time, on the real repo). Convention observed across
+# this repo's own *-selftest.sh files: each case is announced with
+# `echo "== <description> =="` before its assertions. A diff that ADDS a
+# new such header with no OTHER added header in the same diff naming a
+# failure-mode word is exactly the "new subcommand, only a success case"
+# defect this requirement closes (PRD's own worked example: a receipt
+# claiming 251/251 when the tree had 245 — a class of gap a selftest with
+# only ever-green cases can't catch).
+if [ "$check_fixture_negative_case" = true ]; then
+  [ -n "$repo" ] || repo="$(resolve_repo)"
+  [ -d "$repo/.git" ] || { echo "verified-completed: not a git repo, cannot diff: $repo" >&2; exit 2; }
+  since="${fixture_since:-}"
+  if [ -z "$since" ]; then
+    since="$(git -C "$repo" describe --tags --abbrev=0 2>/dev/null)"
+    [ -n "$since" ] || since="HEAD~1"
+  fi
+  added_headers="$(git -C "$repo" diff --unified=0 "$since"...HEAD -- '*selftest*.sh' 2>/dev/null \
+    | grep -E '^\+[^+]' | grep -oE 'echo[[:space:]]+"==[^"]*=="' \
+    | sed -E 's/^echo[[:space:]]+"==[[:space:]]*//; s/[[:space:]]*=="$//')"
+  if [ -z "$added_headers" ]; then
+    echo "verified-completed: no new selftest cases in diff $since...HEAD — nothing to check"
+    exit 0
+  fi
+  neg_re='fail|failing|reject|block|mismatch|missing|unreachable|false|negative|deny|refuse|error|invalid|bad|corrupt|stale'
+  if printf '%s\n' "$added_headers" | grep -qiE "$neg_re"; then
+    echo "verified-completed: new selftest case(s) include a failure-mode case — ok"
+    printf '%s\n' "$added_headers"
+    exit 0
+  fi
+  first_case="$(printf '%s\n' "$added_headers" | head -n1)"
+  echo "fixture-negative-case-missing: $first_case" >&2
+  printf 'new cases (no failure-mode case among them):\n%s\n' "$added_headers" >&2
+  exit 1
 fi
 
 if [ -n "$paired_csv" ]; then
