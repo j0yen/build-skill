@@ -8,10 +8,16 @@
 # install built binary.
 #
 # Subcommands:
-#   validate <slug>                  — exit 0 if the PRD has a usable
+#   validate <slug> [--project-root <rel>]
+#                                    — exit 0 if the PRD has a usable
 #                                      build_into rust repo; print JSON
-#                                      { slug, build_into, version,
-#                                        bump, bin_name|null } to stdout.
+#                                      { slug, build_into, project_root|null,
+#                                        version, bump, bin_name|null } to
+#                                      stdout. --project-root is for repos
+#                                      whose Cargo.toml lives under a
+#                                      subdirectory of build_into (e.g. a
+#                                      post-source-unify split repo) — same
+#                                      flag as the other subcommands below.
 #   current-version <build_into> [--project-root <rel>]
 #                                    — print the Cargo.toml [package].version
 #                                      of that repo to stdout. Exit 1 if missing.
@@ -69,31 +75,46 @@ read_cargo_version() {
 }
 
 cmd_validate() {
-  [ -n "${1:-}" ] || die "usage: validate <slug>" 1
-  local slug="$1" json build_into bump
+  local slug="" project_root=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --project-root) project_root="${2:?extend-handler: --project-root needs a value}"; shift 2 ;;
+      *) [ -z "$slug" ] && slug="$1"; shift ;;
+    esac
+  done
+  [ -n "$slug" ] || die "usage: validate <slug> [--project-root <rel>]" 1
+  local json build_into bump
   json="$(read_prd_json "$slug")"
   build_into="$(printf '%s' "$json" | "$JQ" -r '.build_into // ""')"
   bump="$(printf '%s' "$json" | "$JQ" -r '.build_version_bump // "minor"')"
   [ -n "$build_into" ] || die "PRD '$slug' has no build_into" 2
   [ -d "$build_into" ] || die "build_into '$build_into' is not a directory" 2
-  [ -f "$build_into/Cargo.toml" ] || die "no Cargo.toml in '$build_into'" 2
+  local root="$build_into"
+  if [ -n "$project_root" ]; then
+    root="$build_into/$project_root"
+    [ -d "$root" ] || die "no directory at --project-root $project_root (looked in $root)" 2
+  fi
+  [ -f "$root/Cargo.toml" ] || die "no Cargo.toml in '$root'" 2
   local version bin_name
-  version="$(read_cargo_version "$build_into")"
-  [ -n "$version" ] || die "could not read version from $build_into/Cargo.toml" 2
+  version="$(read_cargo_version "$root")"
+  [ -n "$version" ] || die "could not read version from $root/Cargo.toml" 2
   bin_name="$(awk '
     /^[[:space:]]*\[\[bin\]\]/ { in_bin = 1; next }
     /^[[:space:]]*\[/ { in_bin = 0 }
     in_bin && /^[[:space:]]*name[[:space:]]*=/ {
       v = $0; sub(/^[^=]*=/, "", v); gsub(/[[:space:]"]/, "", v); print v; exit
     }
-  ' "$build_into/Cargo.toml")"
+  ' "$root/Cargo.toml")"
   "$JQ" -cn \
     --arg slug "$slug" \
     --arg build_into "$build_into" \
+    --arg project_root "$project_root" \
     --arg version "$version" \
     --arg bump "$bump" \
     --arg bin_name "$bin_name" \
-    '{slug:$slug, build_into:$build_into, version:$version, bump:$bump,
+    '{slug:$slug, build_into:$build_into,
+      project_root: (if $project_root == "" then null else $project_root end),
+      version:$version, bump:$bump,
       bin_name: (if $bin_name == "" then null else $bin_name end)}'
 }
 
@@ -307,7 +328,7 @@ case "${1:-}" in
   ""|-h|--help)
     cat <<'EOF'
 extend-handler.sh — rust-extend mechanical helpers
-  validate <slug>
+  validate <slug> [--project-root <rel>]
   current-version <build_into> [--project-root <rel>]
   bump-version <build_into> <patch|minor|major> [--project-root <rel>]
   install <build_into>
