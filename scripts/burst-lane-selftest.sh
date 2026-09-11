@@ -31,10 +31,76 @@ FAKE="$HERE/../tests/fixtures/burst-lane-fake"
 SHIM="$HERE/burst-lane-bin/cargo"
 [ -x "$BL" ] || { echo "selftest: $BL not executable" >&2; exit 2; }
 
+# PRD-build-burst-selftest-isolation requirement 1: this whole process runs
+# under the sentinel from the very first line, not just inside fresh_env's
+# per-case setup — belt-and-suspenders against a future test block that
+# calls burst-lane.sh (or a helper that shells to it) before ever calling
+# fresh_env. Refuses to start rather than silently running unguarded if,
+# for any reason, the export below didn't take.
+export BURST_LANE_TEST=1
+[ "${BURST_LANE_TEST:-}" = "1" ] || {
+  echo "burst-lane-selftest: BURST_LANE_TEST not set in own environment — refusing to start" >&2
+  exit 2
+}
+
 fail=0
 ALL_TMPDIRS=()
 cleanup() { for d in "${ALL_TMPDIRS[@]:-}"; do rm -rf "$d"; done; }
 trap cleanup EXIT
+
+# ---- Live audit (PRD-build-burst-selftest-isolation requirement 3) --------
+# audit_snapshot: sha256sum of every file under a state dir + the last 200
+# lines of a journal, as one comparable text blob. Generic over its paths
+# (not hardcoded to the real live ones) so isolate_ac3/isolate_ac5 below can
+# exercise the mechanism against disposable fixtures instead of ever
+# planting a real change into the actual live tree to prove it works.
+# audit_diff: rc 0 if two snapshots are byte-identical, else prints
+# `isolation-breach: <name(s)>` naming what changed and returns 1.
+audit_snapshot() {  # $1 = state dir, $2 = journal file -> stdout
+  local state_dir="$1" journal_file="$2"
+  if [ -d "$state_dir" ]; then
+    find "$state_dir" -type f -print0 2>/dev/null | sort -z | xargs -0 sha256sum 2>/dev/null
+  fi
+  echo "---journal-tail---"
+  tail -n 200 "$journal_file" 2>/dev/null
+}
+audit_diff() {  # $1 = before-snapshot-file, $2 = after-snapshot-file
+  diff -q "$1" "$2" >/dev/null 2>&1 && return 0
+  local changed
+  changed="$(diff "$1" "$2" 2>/dev/null | grep -E '^[<>]' | awk '{print $NF}' | sort -u | tr '\n' ' ')"
+  echo "isolation-breach: ${changed:-live tree differs}"
+  return 1
+}
+
+# AC2/requirement 3's real top-level wrap: snapshot the ACTUAL live
+# burst-lane state dir + journal now, before this suite's own (fully
+# sandboxed, per fresh_env) work runs, and diff again at the very end —
+# this suite touching its own $T fixtures all day must never move a single
+# byte under the real live paths. Scoped to burst-lane's own state
+# subdirectory and journal file specifically (not the whole shared
+# build-skill state/ or brain/journal/ tree), since other concurrent
+# /build lanes and PRDs legitimately touch unrelated parts of those during
+# a real tick — this audit is about THIS mechanism's own blast radius, not
+# a claim that nothing else on the host is running.
+ISO_LIVE_STATE_DIR="$HOME/.claude/skills/build/state/burst-lane"
+ISO_LIVE_JOURNAL="$HOME/brain/journal/build/burst-lane.log"
+iso_audit_before="$(mktemp "${TMPDIR:-/tmp}/bl-audit-before.XXXXXX")"
+iso_audit_after="$(mktemp "${TMPDIR:-/tmp}/bl-audit-after.XXXXXX")"
+ALL_TMPDIRS+=("$iso_audit_before" "$iso_audit_after")
+# A REAL, independently-running burst-lane session (this host's own live
+# lane serving other PRDs/gates right now — session.json present BEFORE
+# this suite starts) legitimately mutates its own state/journal the whole
+# time this suite runs (a pull, a run, a teardown from an unrelated tick).
+# The audit below cannot distinguish that from a leak by diffing alone; it
+# is scoped to "did the fixtures in THIS FILE ever touch the live tree",
+# not "did anything on the host". Record whether one was already up so the
+# final check below reports skipped-not-failed in that case, rather than
+# perpetually false-failing this suite on every host that has a live lane
+# in normal production use (Technical considerations: this audit's zero-
+# diff guarantee only holds absent independent concurrent live activity).
+iso_audit_live_session_pre="false"
+[ -f "$ISO_LIVE_STATE_DIR/session.json" ] && iso_audit_live_session_pre="true"
+audit_snapshot "$ISO_LIVE_STATE_DIR" "$ISO_LIVE_JOURNAL" > "$iso_audit_before"
 
 expect() {
   local label="$1" cond="$2"
@@ -60,8 +126,20 @@ fresh_env() {
   T="$(mktemp -d "${TMPDIR:-/tmp}/bl-selftest.XXXXXX")"
   ALL_TMPDIRS+=("$T")
   export PATH="$FAKE:$PATH"
+  # PRD-build-burst-selftest-isolation requirement 1: every fixture here
+  # runs under the sentinel, so a future path this function forgets to
+  # override fails closed (exit 9) instead of silently falling through to
+  # the live default — isolation becomes a property of burst-lane.sh
+  # itself, not of this function staying exhaustive forever.
+  export BURST_LANE_TEST=1
   export BURST_LANE_STATE_DIR="$T/state"; mkdir -p "$BURST_LANE_STATE_DIR"
   export BURST_LANE_JOURNAL="$T/journal.log"
+  # isolation-guard.sh's OWN refusal record (a deliberate exception to
+  # "everything under the sentinel is sandboxed" — see its header) defaults
+  # to the real live journal; point it at this fixture's journal too so
+  # this suite's own isolate_ac* cases (and every other case here) never
+  # read or write the real ~/brain/journal/build/burst-lane.log.
+  export BURST_ISOLATION_LIVE_JOURNAL="$BURST_LANE_JOURNAL"
   export BURST_LANE_ENV_FILE="$T/env"; echo "SNAPSHOT_ID=427125061" > "$BURST_LANE_ENV_FILE"
   export BURST_LANE_REMOTE_ROOT="$T/remote"
   # PRD-build-burst-unprivileged-user: $REMOTE_USER now defaults to `build`,
@@ -2167,6 +2245,135 @@ expect "parityr AC6: every parityr case above ran green" "[ $fail -eq 0 ]"
 # so tests/burstuser_ac7_*.sh has a real "ok" line of its own to grep for,
 # matching every sibling AC's own convention.
 expect "burstuser AC7: every burstuser case above ran green (fail=0 through AC1-AC6)" "[ $fail -eq 0 ]"
+
+# ================================================================
+# isolate AC1-6 (PRD-build-burst-selftest-isolation) — every fixture in
+# this section is fully self-contained (its own tmpdir "fake home" or
+# fixture paths, never the real live tree) EXCEPT the top-of-file/
+# bottom-of-file live audit wrap, which deliberately targets the real
+# $HOME/.claude/skills/build/state/burst-lane + $HOME/brain/journal/build/
+# burst-lane.log — the whole point being that THIS suite's own extensive
+# fixture-based work above never moved a single byte there.
+# ================================================================
+
+# ---- isolate AC1: sentinel + a forgotten override -> exit 9, zero side
+# effect (PRD requirement 2, AC1). Built against a scratch "fake home" with
+# burst-lane.sh + isolation-guard.sh copied into the SAME relative layout
+# real production uses ($FAKEHOME/.claude/skills/build/scripts/) so
+# STATE_DIR's own $SKILL_DIR-derived default and isolation-guard.sh's
+# hardcoded $HOME-derived live root coincide exactly the way they do once
+# this repo is installed at ~/.claude/skills/build (the real symlink
+# target) — independent of whether THIS invocation happens to be running
+# from a development worktree or the real install.
+iso_fakehome="$(mktemp -d "${TMPDIR:-/tmp}/bl-iso-fakehome.XXXXXX")"
+ALL_TMPDIRS+=("$iso_fakehome")
+mkdir -p "$iso_fakehome/.claude/skills/build/scripts" "$iso_fakehome/brain/journal/build"
+cp "$HERE/burst-lane.sh" "$HERE/isolation-guard.sh" "$iso_fakehome/.claude/skills/build/scripts/"
+iso_fake_bl="$iso_fakehome/.claude/skills/build/scripts/burst-lane.sh"
+iso_fake_session="$iso_fakehome/.claude/skills/build/state/burst-lane/session.json"
+mkdir -p "$(dirname "$iso_fake_session")"
+printf '{}' > "$iso_fake_session"
+iso_ac1_before="$(stat -c %Y "$iso_fake_session" 2>/dev/null || stat -f %m "$iso_fake_session" 2>/dev/null)"
+iso_ac1_out="$(env -i HOME="$iso_fakehome" PATH="/usr/bin:/bin" BURST_LANE_TEST=1 "$iso_fake_bl" status 2>&1)"; iso_ac1_rc=$?
+iso_ac1_after="$(stat -c %Y "$iso_fake_session" 2>/dev/null || stat -f %m "$iso_fake_session" 2>/dev/null)"
+expect "isolate AC1: burst-lane.sh status exits 9 under the sentinel with no overrides" "[ $iso_ac1_rc -eq 9 ]"
+expect "isolate AC1: refusal names the live state path" "grep -qE 'test-isolation: live path .*state/burst-lane' <<<\"\$iso_ac1_out\""
+expect "isolate AC1: the live session file's mtime is unchanged" "[ \"\$iso_ac1_before\" = \"\$iso_ac1_after\" ]"
+
+# ---- isolate AC3: the audit mechanism itself catches a planted change to
+# a "live" journal, mid-run — exercised against a disposable fixture pair
+# (never the real live tree) so proving the DETECTOR works never itself
+# requires touching production.
+iso_ac3_state="$(mktemp -d "${TMPDIR:-/tmp}/bl-iso-ac3-state.XXXXXX")"
+iso_ac3_journal="$(mktemp "${TMPDIR:-/tmp}/bl-iso-ac3-journal.XXXXXX")"
+ALL_TMPDIRS+=("$iso_ac3_state")
+printf 'line one\nline two\n' > "$iso_ac3_journal"
+iso_ac3_before="$(mktemp "${TMPDIR:-/tmp}/bl-iso-ac3-before.XXXXXX")"
+iso_ac3_after="$(mktemp "${TMPDIR:-/tmp}/bl-iso-ac3-after.XXXXXX")"
+ALL_TMPDIRS+=("$iso_ac3_before" "$iso_ac3_after")
+audit_snapshot "$iso_ac3_state" "$iso_ac3_journal" > "$iso_ac3_before"
+printf 'X' >> "$iso_ac3_journal"   # the "one byte, mid-run" plant
+audit_snapshot "$iso_ac3_state" "$iso_ac3_journal" > "$iso_ac3_after"
+iso_ac3_out="$(audit_diff "$iso_ac3_before" "$iso_ac3_after" 2>&1)"; iso_ac3_rc=$?
+expect "isolate AC3: the audit detects a one-byte planted change (nonzero exit)" "[ $iso_ac3_rc -ne 0 ]"
+expect "isolate AC3: it reports isolation-breach naming the journal" "grep -q 'isolation-breach:' <<<\"\$iso_ac3_out\""
+rm -f "$iso_ac3_journal"
+
+# ---- isolate AC4: the live-side counter — a caller that exports
+# BURST_LANE_TEST=1 "by mistake" (every other override left at its live
+# default) is refused, the refusal is journaled, and the daily rollup's
+# isolation_refusals field counts it (requirement 4). Same fakehome
+# technique as isolate AC1 so this never touches the REAL live journal.
+iso_ac4_fakehome="$(mktemp -d "${TMPDIR:-/tmp}/bl-iso-ac4-fakehome.XXXXXX")"
+ALL_TMPDIRS+=("$iso_ac4_fakehome")
+mkdir -p "$iso_ac4_fakehome/.claude/skills/build/scripts" "$iso_ac4_fakehome/brain/journal/build"
+cp "$HERE/burst-lane.sh" "$HERE/isolation-guard.sh" "$iso_ac4_fakehome/.claude/skills/build/scripts/"
+iso_ac4_bl="$iso_ac4_fakehome/.claude/skills/build/scripts/burst-lane.sh"
+iso_ac4_journal="$iso_ac4_fakehome/brain/journal/build/burst-lane.log"
+iso_ac4_state="$iso_ac4_fakehome/.claude/skills/build/state/burst-lane"
+
+env -i HOME="$iso_ac4_fakehome" PATH="/usr/bin:/bin" BURST_LANE_TEST=1 \
+  "$iso_ac4_bl" run /tmp -- bash -c true >/dev/null 2>&1
+iso_ac4_rc=$?
+expect "isolate AC4: a mistaken sentinel on run refuses (exit 9)" "[ $iso_ac4_rc -eq 9 ]"
+expect "isolate AC4: the refusal is journaled (isolation  refused)" "grep -q 'isolation  refused' \"$iso_ac4_journal\""
+
+# Give the daily rollup something to fire on (a same-day cost row — its
+# real-world trigger is a leak attempt during otherwise-normal burst-lane
+# use, not an idle day), then invoke `down` (sentinel OFF for this call —
+# it's the ordinary live path, exactly like the real rollup caller) so
+# maybe_daily_rollup runs and folds in the refusal count from the journal
+# line just written above.
+today="$(date -u +%Y-%m-%d)"
+# The refused call above has NO side effect by design (that's AC1's own
+# point), so $iso_ac4_state was never created — make it now.
+mkdir -p "$iso_ac4_state"
+printf '{"date":"%sT00:00:00Z","kind":"slug","slug":"isolate-ac4","eur":0.01}\n' "$today" > "$iso_ac4_state/cost.jsonl"
+env -i HOME="$iso_ac4_fakehome" PATH="/usr/bin:/bin" \
+  BURST_LANE_STATE_DIR="$iso_ac4_state" BURST_LANE_TICK_JOURNAL_DIR="$iso_ac4_fakehome/tick-journal" \
+  "$iso_ac4_bl" down >/dev/null 2>&1
+iso_ac4_rollup_file="$iso_ac4_fakehome/tick-journal/$today.md"
+expect "isolate AC4: the daily rollup line carries isolation_refusals>=1" \
+  "grep -qE 'isolation_refusals=[1-9]' \"$iso_ac4_rollup_file\" 2>/dev/null"
+
+# ---- isolate AC5: a fixture-named directory on the box fails the check
+# while a session is active. Exercises box_isolation_check() end-to-end
+# against the fake ssh/hcloud fixtures already used above (fresh_env),
+# with one extra fixture-named dir seeded into the fake remote root.
+fresh_env
+mkdir -p "$BURST_LANE_REPOS_DIR/mcphost"
+"$BL" up >/dev/null
+# The fake ssh fixture resolves its "remote root" onto this machine's own
+# filesystem (per its own header — see fresh_env's BURST_LANE_REMOTE_ROOT);
+# seed the fixture-named directory it should now flag.
+mkdir -p "$BURST_LANE_REMOTE_ROOT/gb-ac3.deadbe"
+iso_ac5_out="$("$BL" box-isolation-check 2>&1)"; iso_ac5_rc=$?
+expect "isolate AC5: box-isolation-check fails with a fixture-named box dir present" "[ $iso_ac5_rc -ne 0 ]"
+expect "isolate AC5: it names the offending directory" "grep -q 'isolation-breach: box dir gb-ac3.deadbe' <<<\"\$iso_ac5_out\""
+rm -rf "$BURST_LANE_REMOTE_ROOT/gb-ac3.deadbe"
+iso_ac5b_out="$("$BL" box-isolation-check 2>&1)"; iso_ac5b_rc=$?
+expect "isolate AC5: clean once the fixture-named dir is gone" "[ $iso_ac5b_rc -eq 0 ]"
+
+# ---- isolate AC6 (P1): this fixture set exits 0 and names the isolate
+# cases — matching every sibling AC's own "does the suite name its own
+# coverage" convention (parityr AC6, burstuser AC7 above).
+expect "isolate AC6: every isolate case above ran green" "[ $fail -eq 0 ]"
+
+# ---- isolate AC2 / requirement 3: the real top-level audit wrap (snapshot
+# taken at the very top of this file) closes here — every fixture case in
+# this ~2000-line suite ran against its own $T tmpdir, never the real
+# live burst-lane state or journal. Skipped (not failed) when a real
+# session was already up before this suite started — see the note at the
+# snapshot site above.
+audit_snapshot "$ISO_LIVE_STATE_DIR" "$ISO_LIVE_JOURNAL" > "$iso_audit_after"
+iso_audit_out="$(audit_diff "$iso_audit_before" "$iso_audit_after" 2>&1)"; iso_audit_rc=$?
+if [ "$iso_audit_live_session_pre" = "true" ]; then
+  echo "ok  isolate AC2: skipped — a real burst-lane session was already active before this suite started (cannot distinguish its own legitimate activity from a leak by diffing alone)"
+  [ $iso_audit_rc -eq 0 ] || echo "$iso_audit_out (informational only, not counted — pre-existing live session)" >&2
+else
+  expect "isolate AC2: the live burst-lane state/journal are unchanged after this whole suite ran" "[ $iso_audit_rc -eq 0 ]"
+  [ $iso_audit_rc -eq 0 ] || echo "$iso_audit_out" >&2
+fi
 
 echo "=== $([ $fail -eq 0 ] && echo PASS || echo FAIL) ==="
 exit $fail

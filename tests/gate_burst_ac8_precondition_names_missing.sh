@@ -15,6 +15,14 @@ FAKE="$HERE/fixtures/gate-burst-fake"
 
 T="$(mktemp -d "${TMPDIR:-/tmp}/gb-ac8.XXXXXX")"
 trap 'rm -rf "$T"' EXIT
+# PRD-build-burst-selftest-isolation: sentinel for cases 2/3 below (which
+# inherit this shell's env); case 1 explicitly runs under `env -i`, so it
+# is unaffected either way — the sentinel is exported here regardless, for
+# every tests/*.sh's uniform requirement 1 compliance.
+export BURST_LANE_TEST=1
+export GATE_BURST_STATE_DIR="$T/state"; mkdir -p "$GATE_BURST_STATE_DIR"
+export GATE_BURST_LEDGER="$T/ledger.ndjson"
+export GATE_BURST_JOURNAL="$T/journal.md"
 export GATE_BURST_ENV_FILE="$T/env"; echo "SNAPSHOT_ID=427125061" > "$GATE_BURST_ENV_FILE"
 export FAKE_HCLOUD_STATE="$T/hcloud.state"
 

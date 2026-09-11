@@ -185,6 +185,12 @@
 #   BURST_LANE_NOW, BURST_LANE_PRD_DIR, BURST_LANE_COST_LEDGER,
 #   BURST_LANE_REMOTE_ROOT, BURST_LANE_SERVER_NAME, BURST_LANE_ATTR_LEDGER,
 #   BURST_LANE_REPOS_DIR, BURST_LANE_TICK_JOURNAL_DIR
+#
+# Test isolation (PRD-build-burst-selftest-isolation): BURST_LANE_TEST=1
+# marks a test run — every override above is then REQUIRED, not optional;
+# any one of STATE_DIR/JOURNAL/COST_LEDGER/ATTR_LEDGER/hcloud/ssh/rsync that
+# still resolves to a live path/binary fails closed (exit 9) instead of
+# silently touching production. See isolation-guard.sh.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -261,6 +267,27 @@ else
   probe_emit() { :; }
 fi
 
+# PRD-build-burst-selftest-isolation: default-deny under BURST_LANE_TEST=1.
+# Every path/binary below is checked AFTER override resolution but BEFORE
+# the first mkdir/write (the mkdir just below this block), so a refusal has
+# zero side effect (Requirement 2, AC1). Fail-open sourcing matches the
+# probe-result convention above — a missing library never breaks a real
+# (sentinel-off) invocation, it only means an offline test loses its guard.
+if [ -r "$HERE/isolation-guard.sh" ]; then
+  # shellcheck source=isolation-guard.sh
+  source "$HERE/isolation-guard.sh"
+else
+  isolation_guard_path() { :; }
+  isolation_guard_bin() { :; }
+fi
+isolation_guard_path "$STATE_DIR" "burst-lane.sh"
+isolation_guard_path "$JOURNAL" "burst-lane.sh"
+isolation_guard_path "$COST_LEDGER" "burst-lane.sh"
+isolation_guard_path "$ATTR_LEDGER" "burst-lane.sh"
+isolation_guard_bin "$(command -v "$HCLOUD" 2>/dev/null)" "burst-lane.sh(hcloud)"
+isolation_guard_bin "$(command -v "$SSH_BIN" 2>/dev/null)" "burst-lane.sh(ssh)"
+isolation_guard_bin "$(command -v "$RSYNC_BIN" 2>/dev/null)" "burst-lane.sh(rsync)"
+
 SERVER_NAME="${BURST_LANE_SERVER_NAME:-wm-burst-lane}"
 SERVER_TYPE="${BURST_SERVER_TYPE:-ccx53}"
 DEFAULT_LOCATION="nbg1"
@@ -270,7 +297,7 @@ HARD_TTL_HOURS="12"
 COST_PER_HOUR_EUR="0.47"
 
 die() { echo "burst-lane: $*" >&2; exit "${2:-1}"; }
-usage() { echo "usage: burst-lane.sh {up|status|run|sync-back|pull|ensure-fresh|down|watchdog|cost|sub-cap|verify|provision|reap|route-check|parity|gate} ..." >&2; exit 2; }
+usage() { echo "usage: burst-lane.sh {up|status|run|sync-back|pull|ensure-fresh|down|watchdog|cost|sub-cap|verify|provision|reap|box-isolation-check|route-check|parity|gate} ..." >&2; exit 2; }
 
 now_epoch() { echo "${BURST_LANE_NOW:-$(date -u +%s)}"; }
 now_iso()   { date -u -d "@$(now_epoch)" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ; }
@@ -2964,6 +2991,41 @@ cmd_reap() {
   exit 0
 }
 
+# ---- box isolation check (PRD-build-burst-selftest-isolation req 3) --------
+# While a session is active, lists the box's remote root (same listing
+# reap_orphans uses) and refuses if any entry looks like a test fixture
+# name that should never have reached a real box: the `burst-*`/`gb-ac*`
+# prefixes this suite's own tmpdirs use, or a bare mktemp-style
+# `<name>.<6-random-chars>` suffix. A real worktree dir is named
+# `<repo>-<slug>` (worktree-extend.sh's own convention) and never matches
+# either shape, so this has no false positives against legitimate box
+# contents. Read-only: never deletes anything (that's reap's job).
+box_isolation_check() {
+  state_active || { echo "ok: no active session"; return 0; }
+  local ip; ip="$(state_read ip)"
+  local list_cmd="find '$REMOTE_ROOT' -mindepth 1 -maxdepth 1 -not -name '.*' -printf '%f\n' 2>/dev/null"
+  local list_out
+  list_out="$("$SSH_BIN" -o StrictHostKeyChecking=no -o ConnectTimeout=8 -i "$SSH_KEY" \
+      "$REMOTE_USER@$ip" "$list_cmd" 2>/dev/null)" || { echo "ok: box unreachable, nothing to check"; return 0; }
+  local name breach=0
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    case "$name" in
+      burst-*|gb-ac*|*.[A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9])
+        echo "isolation-breach: box dir $name" >&2
+        breach=1
+        ;;
+    esac
+  done <<<"$list_out"
+  [ "$breach" -eq 0 ] && echo "ok: no fixture-named directories on the box"
+  return "$breach"
+}
+
+cmd_box_isolation_check() {
+  box_isolation_check
+  exit $?
+}
+
 # ---- rust-work-remains (drives down's keep/schedule/delete decision) --------
 rust_work_remains() {
   local dir="$PRD_DIR/build-queue"
@@ -3132,6 +3194,22 @@ maybe_daily_rollup() {
   local today; today="$(date -u -d "@$(now_epoch)" +%Y-%m-%d 2>/dev/null || date -u +%Y-%m-%d)"
   local last; last="$(cat "$ROLLUP_CURSOR" 2>/dev/null || true)"
   [ "$last" = "$today" ] && return 0
+
+  # PRD-build-burst-selftest-isolation requirement 4: computed unconditionally
+  # (harmless if zero), ahead of the cost-ledger gate below, so it's ready to
+  # fold into whichever rollup line actually fires below. Deliberately does
+  # NOT fire its own early/extra rollup line or consume $ROLLUP_CURSOR on its
+  # own — the existing "no slug rows yet -> no-op, cursor untouched, so the
+  # line still lands once a teardown does happen later today" invariant
+  # (comment above) must survive this addition: an early attempt at that
+  # (now removed) starved the very next `down` call's real cost-based rollup
+  # of its cursor slot the day this file changed, since $ROLLUP_CURSOR is a
+  # once-per-day, not once-per-metric, gate.
+  local isolation_refusals=0
+  if [ -f "$ISOLATION_LIVE_JOURNAL_FILE" ]; then
+    isolation_refusals="$(grep -c "^${today}.*  isolation  refused  " "$ISOLATION_LIVE_JOURNAL_FILE" 2>/dev/null || echo 0)"
+  fi
+
   [ -f "$COST_LEDGER" ] || return 0
 
   local line
@@ -3246,6 +3324,11 @@ print(remote, local_)
 ' "$today" "$JOURNAL" "$TICK_JOURNAL_DIR/$today.md")"
   read -r gates_remote gates_local <<<"$gate_stats"
   line="$line gates_remote=${gates_remote:-0} gates_local=${gates_local:-0}"
+
+  # isolation_refusals was already computed above (before the cost-ledger
+  # gate), so a refusal count is visible in this line the same as any other
+  # metric here (PRD-build-burst-selftest-isolation requirement 4).
+  line="$line isolation_refusals=${isolation_refusals:-0}"
 
   mkdir -p "$TICK_JOURNAL_DIR" 2>/dev/null || true
   printf '%s\n' "$line" >> "$TICK_JOURNAL_DIR/$today.md"
@@ -3678,6 +3761,7 @@ main() {
     verify)    cmd_verify "$@" ;;
     provision) cmd_provision "$@" ;;
     reap)      cmd_reap "$@" ;;
+    box-isolation-check) cmd_box_isolation_check "$@" ;;
     route-check) cmd_route_check "$@" ;;
     parity)    cmd_parity "$@" ;;
     gate)      cmd_gate "$@" ;;

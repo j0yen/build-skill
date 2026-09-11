@@ -836,6 +836,17 @@ if [ "${#blocking_notes[@]}" -gt 0 ]; then
 fi
 # Overridable so tests/ never writes into the real journal (default unchanged).
 journal="${EXTEND_GATE_JOURNAL:-$HOME/brain/journal/build/$(date -u +%Y-%m-%d).md}"
+# PRD-build-burst-selftest-isolation: default-deny under BURST_LANE_TEST=1 —
+# same sentinel + shared guard burst-lane.sh/gate-burst.sh use. A test that
+# forgot EXTEND_GATE_JOURNAL now fails closed instead of appending into the
+# real shared tick journal every other script here also writes to.
+if [ -r "$BUILD_SCRIPTS/isolation-guard.sh" ]; then
+  # shellcheck source=isolation-guard.sh
+  source "$BUILD_SCRIPTS/isolation-guard.sh"
+else
+  isolation_guard_path() { :; }
+fi
+isolation_guard_path "$journal" "extend-gate.sh"
 mkdir -p "$(dirname "$journal")"
 
 # --- record-baseline: write agent/gate-baseline.json from THIS run's

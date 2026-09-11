@@ -30,9 +30,23 @@ cat > "$T/rsync" <<'EOF2'
 echo "Total transferred file size: 100"
 exit 0
 EOF2
-chmod +x "$T/ssh" "$T/rsync"
+# PRD-build-burst-selftest-isolation: BURST_LANE_HCLOUD_BIN is never
+# actually invoked by this suite (the fixture session.json above is
+# planted, not `up`-created), but burst-lane.sh's top-of-script isolation
+# guard resolves+checks it unconditionally under BURST_LANE_TEST=1
+# regardless of which subcommand runs — an unset override here would
+# resolve to this machine's REAL hcloud (/home/jsy/.local/bin/hcloud) and
+# trip the guard. A stub that's never called is enough.
+cat > "$T/hcloud" <<'EOF2'
+#!/usr/bin/env bash
+echo "hcloud: not used by burstpar-selftest.sh" >&2
+exit 1
+EOF2
+chmod +x "$T/ssh" "$T/rsync" "$T/hcloud"
+export BURST_LANE_TEST=1
 export BURST_LANE_STATE_DIR="$T/state" BURST_LANE_JOURNAL="$T/journal.log" \
        BURST_LANE_SSH_BIN="$T/ssh" BURST_LANE_RSYNC_BIN="$T/rsync" \
+       BURST_LANE_HCLOUD_BIN="$T/hcloud" \
        BURST_LANE_ENV_FILE="$T/noenv" SPAN_LOG="$T/spans.log"
 
 fail=0

@@ -12,15 +12,26 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 GB="$HERE/../scripts/gate-burst.sh"
+FAKE="$HERE/fixtures/gate-burst-fake"
 [ -x "$GB" ] || { echo "ac11: $GB not executable" >&2; exit 2; }
 
 T="$(mktemp -d "${TMPDIR:-/tmp}/gb-ac11.XXXXXX")"
 trap 'rm -rf "$T"' EXIT
 
+export PATH="$FAKE:$PATH"
+# PRD-build-burst-selftest-isolation: sentinel — every override below (and
+# the PATH-shadowed hcloud/ssh/rsync above) is then REQUIRED; a forgotten
+# one fails closed instead of silently touching the real box/state — this
+# test previously had NO hcloud/ssh/rsync mocking at all, which would have
+# resolved to this machine's real hcloud once the top-of-script isolation
+# guard is checking for it.
+export BURST_LANE_TEST=1
 export GATE_BURST_STATE_DIR="$T/state"; mkdir -p "$GATE_BURST_STATE_DIR"
+export GATE_BURST_LEDGER="$T/ledger.ndjson"
 export GATE_BURST_JOURNAL="$T/journal.md"
 export GATE_BURST_ENV_FILE="$T/env"; echo "SNAPSHOT_ID=427125061" > "$GATE_BURST_ENV_FILE"
 export BURST_LANE_STATE_DIR="$T/burst-lane-state"; mkdir -p "$BURST_LANE_STATE_DIR"
+export BURST_LANE_JOURNAL="$T/burst-lane-journal.log"
 
 fail=0
 expect() {
