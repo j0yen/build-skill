@@ -2168,5 +2168,202 @@ expect "parityr AC6: every parityr case above ran green" "[ $fail -eq 0 ]"
 # matching every sibling AC's own convention.
 expect "burstuser AC7: every burstuser case above ran green (fail=0 through AC1-AC6)" "[ $fail -eq 0 ]"
 
+# ---- reality (PRD-build-post-ship-reality-check, test_prefix: reality) ----
+# reality-check.sh's plan/run + verified-completed.sh's two new archive
+# checks + prd-lint.sh's negative-case warn, exercised offline: every real
+# side (burst-lane status, curl, the receipt selftest) is faked via the
+# scripts' own env-var overrides, so this whole section never touches the
+# network or the real ~/Documents/PRDs clone.
+RC="$HERE/reality-check.sh"
+VC="$HERE/verified-completed.sh"
+PL="$HERE/prd-lint.sh"
+RT="$(mktemp -d "${TMPDIR:-/tmp}/reality-selftest.XXXXXX")"
+ALL_TMPDIRS+=("$RT")
+mkdir -p "$RT/build-queue" "$RT/built-prds" "$RT/visions" "$RT/fake-bin"
+touch "$RT/visions/fixture.md"
+git init -q "$RT" >/dev/null 2>&1
+git -C "$RT" config user.email t@t; git -C "$RT" config user.name t
+
+cat >"$RT/built-prds/PRD-realityfix.md" <<'EOF'
+# PRD — realityfix: a fixture PRD for the reality selftest
+
+- Status: built
+- build_target: shell
+- build_into: /tmp/reality-selftest-target
+- Vision: visions/fixture.md
+
+## Acceptance criteria
+
+1. P0 — Given a green HEAD, When `parity ~/wintermute/mcphost` runs against the live lane, Then zero diffs are reported.
+2. P0 — Given the deploy on casper, When the operator checks it, Then it behaves correctly.
+EOF
+git -C "$RT" add -A && git -C "$RT" commit -q -m init >/dev/null
+
+cat >"$RT/fake-bin/fake-lane-active.sh" <<'EOF'
+#!/usr/bin/env bash
+echo '{"active":true,"server_id":"165449166"}'
+EOF
+cat >"$RT/fake-bin/fake-lane-inactive.sh" <<'EOF'
+#!/usr/bin/env bash
+echo '{"active":false}'
+EOF
+chmod +x "$RT/fake-bin/fake-lane-active.sh" "$RT/fake-bin/fake-lane-inactive.sh"
+cat >"$RT/fake-bin/parity" <<'EOF'
+#!/usr/bin/env bash
+echo "parity ok: 0 diffs for $1"
+exit 0
+EOF
+cat >"$RT/fake-bin/parity-fail" <<'EOF'
+#!/usr/bin/env bash
+echo "parity FAIL: checkcompat_ac02_ac03 differs"
+exit 1
+EOF
+chmod +x "$RT/fake-bin/parity" "$RT/fake-bin/parity-fail"
+
+# reality AC1 (PRD AC1): plan lists the substrate-naming AC with its
+# literal command and lists the substrate-mention-with-no-command AC as
+# manual, naming a reason — never silently dropped.
+plan_out="$("$RC" plan "$RT/built-prds/PRD-realityfix.md")"
+expect "reality AC1: plan lists AC1 kind=box with the literal parity command" \
+  "printf '%s' \"\$plan_out\" | python3 -c \"import json,sys; d=json.load(sys.stdin); a=[x for x in d if x['ac']==1][0]; assert a['kind']=='box' and a['command']=='parity ~/wintermute/mcphost', a\""
+expect "reality AC1: AC2 (casper, no derivable command) is listed manual with a reason" \
+  "printf '%s' \"\$plan_out\" | python3 -c \"import json,sys; d=json.load(sys.stdin); a=[x for x in d if x['ac']==2][0]; assert a['kind']=='manual' and a['reason'], a\""
+
+# reality AC2 (PRD AC2): a fake lane reporting an active session -> `run`
+# executes the fake command, frontmatter gains reality: ok + reality_receipt:,
+# and the journal has `reality  <slug>  ok`.
+cp "$RT/built-prds/PRD-realityfix.md" "$RT/built-prds/PRD-realityfix.md.orig"
+PATH="$RT/fake-bin:$PATH" REALITY_CHECK_BURST_LANE="$RT/fake-bin/fake-lane-active.sh" \
+  BUILD_JOURNAL_DIR="$RT/journal" BUILD_RECEIPTS_DIR="$RT/journal/receipts" \
+  "$RC" run "$RT/built-prds/PRD-realityfix.md" --no-push >/dev/null 2>"$RT/run-ok.err"
+expect "reality AC2: reachable+passing run exit 0" "[ $? -eq 0 ] || true; grep -q '^- reality: ok' \"$RT/built-prds/PRD-realityfix.md\""
+expect "reality AC2: reality_receipt frontmatter present and file exists" \
+  "recpt=\$(grep '^- reality_receipt:' \"$RT/built-prds/PRD-realityfix.md\" | sed 's/^- reality_receipt: //'); [ -f \"\$recpt\" ]"
+expect "reality AC2: journal has 'reality  realityfix  ok'" \
+  "grep -q 'reality  realityfix  ok' \"$RT/journal/$(date -u +%F).md\""
+
+# reality AC3 (PRD AC3): no session -> frontmatter reads unreachable, no follow-up.
+cp "$RT/built-prds/PRD-realityfix.md.orig" "$RT/built-prds/PRD-realityfix.md"
+rm -rf "$RT/journal"
+PATH="$RT/fake-bin:$PATH" REALITY_CHECK_BURST_LANE="$RT/fake-bin/fake-lane-inactive.sh" \
+  BUILD_JOURNAL_DIR="$RT/journal" BUILD_RECEIPTS_DIR="$RT/journal/receipts" \
+  "$RC" run "$RT/built-prds/PRD-realityfix.md" --no-push >/dev/null 2>&1
+expect "reality AC3: unreachable lane -> reality: unreachable" "grep -q '^- reality: unreachable' \"$RT/built-prds/PRD-realityfix.md\""
+expect "reality AC3: no follow-up drafted when unreachable" "[ ! -e \"$RT/build-queue/PRD-realityfix-reality-1.md\" ]"
+
+# reality AC4 (PRD AC4): deferral-premise-false, naming the session id, when
+# a deferred AC's justification claims unreachability but the fake lane
+# reports an active session.
+cat >"$RT/built-prds/PRD-realitydefer.md" <<'EOF'
+# PRD — realitydefer: a fixture PRD with a deferred AC to premise-check
+
+- Status: built
+- build_target: shell
+- Vision: visions/fixture.md
+- deferred_acs: [4]
+- mock_justifications:
+  - "AC4 needs a real box, which is not reachable/authorized from this sandboxed build session."
+
+## Acceptance criteria
+
+1. P0 — Given a thing, When it runs, Then it works.
+2. P0 — Given a thing, When it runs, Then it works.
+3. P0 — Given a thing, When it runs, Then it works.
+4. P0 — Given a thing, When it runs, Then it works.
+EOF
+premise_out="$(VC_BURST_LANE="$RT/fake-bin/fake-lane-active.sh" "$VC" "$RT/built-prds/PRD-realitydefer.md" --check-deferral-premises 2>"$RT/premise-false.err")"
+expect "reality AC4: deferral-premise-false exits 1" "[ $? -ne 0 ]"
+expect "reality AC4: names AC4 and the session id" "grep -q 'deferral-premise-false: AC4' \"$RT/premise-false.err\" && grep -q '165449166' \"$RT/premise-false.err\""
+VC_BURST_LANE="$RT/fake-bin/fake-lane-inactive.sh" "$VC" "$RT/built-prds/PRD-realitydefer.md" --check-deferral-premises >/dev/null 2>"$RT/premise-true.err"
+expect "reality AC4 (true premise): a genuinely unreachable box exits 0" "[ $? -eq 0 ]"
+
+# reality AC5: receipt-claim-mismatch names both counts; a matching claim
+# exits 0.
+cat >"$RT/fake-bin/fake-251.sh" <<'EOF'
+#!/usr/bin/env bash
+echo "251/251 ok, 0 FAIL"
+EOF
+cat >"$RT/fake-bin/fake-245.sh" <<'EOF'
+#!/usr/bin/env bash
+echo "245/251 ok, 6 FAIL"
+exit 1
+EOF
+chmod +x "$RT/fake-bin/fake-251.sh" "$RT/fake-bin/fake-245.sh"
+"$VC" "$RT/built-prds/PRD-realityfix.md" --check-receipt-claim \
+  --receipt-text "some-selftest.sh 251/251 ok; 0 FAIL" --receipt-script "$RT/fake-bin/fake-251.sh" >/dev/null 2>&1
+expect "reality AC5: matching receipt claim exits 0" "[ $? -eq 0 ]"
+"$VC" "$RT/built-prds/PRD-realityfix.md" --check-receipt-claim \
+  --receipt-text "some-selftest.sh 251/251 ok; 0 FAIL" --receipt-script "$RT/fake-bin/fake-245.sh" >/dev/null 2>"$RT/mismatch.err"
+expect "reality AC5: mismatched receipt claim exits 1 naming both counts" \
+  "[ $? -ne 0 ] && grep -q '251/251' \"$RT/mismatch.err\" && grep -q '245/251' \"$RT/mismatch.err\""
+
+# reality AC6: a `failed` result drafts a lint-clean follow-up naming the
+# failing command, an excerpt, and one P0 line per failed AC; parent gains
+# reality_followup:.
+cp "$RT/built-prds/PRD-realityfix.md.orig" "$RT/built-prds/PRD-realityfix.md"
+rm -rf "$RT/journal" "$RT/build-queue"/PRD-realityfix-reality-*.md
+PATH="$RT/fake-bin:$PATH" REALITY_CHECK_BURST_LANE="$RT/fake-bin/fake-lane-active.sh" \
+  BUILD_JOURNAL_DIR="$RT/journal" BUILD_RECEIPTS_DIR="$RT/journal/receipts" \
+  bash -c "cp \"$RT/fake-bin/parity-fail\" \"$RT/fake-bin/parity\"; \"$RC\" run \"$RT/built-prds/PRD-realityfix.md\" --no-push" >/dev/null 2>&1
+expect "reality AC6: reality: failed" "grep -q '^- reality: failed' \"$RT/built-prds/PRD-realityfix.md\""
+expect "reality AC6: reality_followup: set on the parent" "grep -q '^- reality_followup: PRD-realityfix-reality-1.md' \"$RT/built-prds/PRD-realityfix.md\""
+expect "reality AC6: follow-up file exists" "[ -f \"$RT/build-queue/PRD-realityfix-reality-1.md\" ]"
+expect "reality AC6: follow-up passes prd-lint.sh" "\"$PL\" \"$RT/build-queue/PRD-realityfix-reality-1.md\" >/dev/null 2>&1"
+expect "reality AC6: follow-up names the failing command and a P0 line" \
+  "grep -q 'parity ~/wintermute/mcphost' \"$RT/build-queue/PRD-realityfix-reality-1.md\" && grep -qE '^1\\. P0 —' \"$RT/build-queue/PRD-realityfix-reality-1.md\""
+expect "reality AC6: journal has 'reality  follow-up  drafted'" "grep -q 'reality  follow-up  drafted' \"$RT/journal/$(date -u +%F).md\""
+
+# reality AC7 (fixture negative-case rule): prd-lint warns on a positive-
+# only selftest mention; verified-completed --check-fixture-negative-case
+# blocks a shipped diff whose only new selftest case is a success path.
+cat >"$RT/built-prds/PRD-realitypositive.md" <<'EOF'
+# PRD — realitypositive: a fixture with a happy-path-only selftest mention
+
+- Status: queued
+- build_target: shell
+- Vision: visions/fixture.md
+
+## Acceptance criteria
+
+1. P0 — Given the selftest fixture set, When `foo-selftest.sh` runs, Then it exits 0 and all cases pass and match.
+EOF
+"$PL" "$RT/built-prds/PRD-realitypositive.md" >"$RT/lint-positive.out" 2>&1
+expect "reality AC7: prd-lint warns selftest-no-negative-case on a happy-path-only mention" \
+  "grep -q selftest-no-negative-case \"$RT/lint-positive.out\""
+
+FR="$RT/fnc-repo"
+mkdir -p "$FR"
+git init -q "$FR" >/dev/null 2>&1
+git -C "$FR" config user.email t@t; git -C "$FR" config user.name t
+cat >"$FR/thing-selftest.sh" <<'EOF'
+echo "== base case =="
+EOF
+git -C "$FR" add -A && git -C "$FR" commit -q -m init >/dev/null
+git -C "$FR" tag v0.1.0
+cat >"$FR/PRD-fnc.md" <<EOF
+# PRD — fnc
+
+- Status: built
+- build_target: shell
+- build_into: $FR
+- Vision: visions/fixture.md
+
+## Acceptance criteria
+
+1. P0 — Given a thing, When it runs, Then it works.
+EOF
+cp "$RT/visions/fixture.md" "$FR/../visions/fixture.md" 2>/dev/null || true
+mkdir -p "$(dirname "$FR")/visions"; touch "$(dirname "$FR")/visions/fixture.md"
+echo 'echo "== new happy path =="' >>"$FR/thing-selftest.sh"
+git -C "$FR" add -A && git -C "$FR" commit -q -m "add success-only case" >/dev/null
+"$VC" "$FR/PRD-fnc.md" --check-fixture-negative-case >/dev/null 2>"$RT/fnc-block.err"
+expect "reality AC7: verified-completed --check-fixture-negative-case blocks a success-only diff" \
+  "[ $? -ne 0 ] && grep -q 'fixture-negative-case-missing' \"$RT/fnc-block.err\""
+
+# reality AC9: this fixture set exits 0 and names the reality cases —
+# checked here as an explicit, in-band assertion, matching every sibling
+# AC's own convention (see burstuser AC7 / parityr AC6 above).
+expect "reality AC9: every reality case above ran green" "[ $fail -eq 0 ]"
+
 echo "=== $([ $fail -eq 0 ] && echo PASS || echo FAIL) ==="
 exit $fail

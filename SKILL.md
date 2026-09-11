@@ -1002,6 +1002,40 @@ read it before assuming a step is "the last one this tick".
     (another PRD landed on the same crate without a fresh `gate` run), fails
     archive here and stays in `build-queue/` with `Status: in_progress`, not
     silently treated as shipped on the strength of checks #1/#5 alone.
+  - **Check #7 (new; PRD-build-post-ship-reality-check, all shapes) — a
+    deferral or a receipt is a testable claim, not prose to trust.** Two
+    sub-checks, both run via `verified-completed.sh`, both must pass
+    before archive:
+    - `verified-completed.sh <prd> --check-deferral-premises`: every
+      `mock_justifications:` bullet that claims something is unreachable
+      or absent (a box/lane, a URL, a `command -v`-able tool, a path) is
+      re-tested for real (`burst-lane.sh status --json`, `curl -I`,
+      `command -v`, `test -e`). A deferred AC whose justification's claim
+      no longer holds — the exact 2026-09-10/11 defect, `unprivileged-
+      user`'s AC4 deferred as "not reachable from this sandboxed build
+      session" while `burst-lane.sh status` showed an active session —
+      fails archive with `deferral-premise-false: AC<N>` naming the
+      contradicting evidence. Nothing to check (no deferred ACs, or a
+      justification with no probeable claim) passes vacuously.
+    - `verified-completed.sh <prd> --check-receipt-claim`: the PRD's own
+      `Receipts:` line names a selftest count claim (`<n>/<n>`, `<k>
+      FAIL`) — the script re-runs THAT selftest fresh and compares. A
+      receipt that claimed `251/251, 0 FAIL` against a live tree that
+      actually reports `245 ok, 6 FAIL` fails archive with
+      `receipt-claim-mismatch`, both counts named, rather than the stale
+      claim riding into `built-prds/` unchallenged.
+    Both are archive-blocking (`Status: in_progress` stays, gap surfaces
+    next reflect cycle) — same posture as check #6, not a warning.
+  - **Check #6b (new; PRD-build-post-ship-reality-check req 6, block half)
+    — `verified-completed.sh <prd> --check-fixture-negative-case`.** Diffs
+    the build repo's `*selftest*.sh` files since the last tag for newly
+    ADDED `echo "== <description> =="` case headers (this repo's own
+    selftest convention); if the diff adds a case and NONE of the new
+    cases in it use a failure-mode word (fail/reject/block/mismatch/
+    unreachable/...), archive blocks with `fixture-negative-case-missing:
+    <case>`. `prd-lint.sh` carries the pre-ship half of this same
+    requirement: it WARNS (does not block intake) when a PRD's own text
+    describes a selftest requirement in success-only language.
 
   **Verified-completed checklist (python-* path):**
   Same as the new-repo checklist with these substitutions:
@@ -1254,6 +1288,42 @@ least one acceptance criterion that executes against the REAL environment and
 asserts the real side effect (exit=0, bytes moved, artifact present, row written)
 — never only that the code path was traversed. Fixture-only ACs on infra are the
 2026-09-09 burst-lane failure class: 14 "routed" runs, all exit=127, all green.
+
+**Post-ship reality check (2026-09-11, PRD-build-post-ship-reality-check) —
+ship is not the last event the loop owns.** The real-environment AC rule
+above says an AC must be WRITABLE against reality; this step says it must
+also be RUN there, because the gate's own evidence is fixtures written by
+the same agent whose assumptions they encode (four PRDs shipped green
+2026-09-10/11 — gate-on-casper, gate-tools-scope, gate-tools-toolchain,
+unprivileged-user — and each failed at first real use). Within one tick of
+an archive whose PRD has a non-empty `reality-check.sh plan <prd>` (a
+substrate-naming AC the plan could derive a command for), run
+`scripts/reality-check.sh run <archived-prd-path>`:
+- Reachability is probed per AC kind (`burst-lane.sh status --json` for a
+  box, `curl -m 8` for an endpoint, `systemctl --user is-active` for a
+  unit) before anything real runs; an unreachable substrate records
+  `reality: unreachable` and drafts nothing — it is not a failure to find
+  the box asleep, only to ship believing it was awake.
+- A reachable AC's command actually runs; the archived PRD's own
+  frontmatter gains `reality: ok|failed|unreachable` and
+  `reality_receipt: <path under ~/brain/journal/build/receipts/>`, and the
+  journal gains `reality  <slug>  ok|failed|unreachable  (...)`.
+- On `failed`, `reality-check.sh` also drafts
+  `build-queue/PRD-<slug>-reality-<n>.md` (high priority, same
+  `build_into`/`build_target`/`Vision` as the parent) containing the
+  failing command, a 20-line output excerpt, and a first-why observation
+  — lint-checked before it's written, never a PRD that fails its own
+  contract — and sets `reality_followup:` on the parent's archived
+  frontmatter. The Phase-7 branch step for that follow-up PRD's own
+  eventual build is the ordinary one; this step's only job is to make sure
+  the follow-up EXISTS instead of living in an operator's head overnight.
+- This step never blocks the tick it runs in and never reopens the
+  archive (`Status: built` stands); `reality: failed` is a signal for the
+  next reflect cycle and the daily rollup, not a re-ship. See "archive"
+  under Phase 4 for check #6b/#7, the pre-archive half of this same
+  doctrine (a false deferral premise or a stale receipt claim blocks
+  archive outright, before a PRD ever reaches `built-prds/` for this step
+  to run against).
 
 ## Parallelism (per-tick fan-out, added 2026-05-28)
 
