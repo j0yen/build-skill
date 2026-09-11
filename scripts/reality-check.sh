@@ -116,14 +116,41 @@ if cur is not None:
     items.append(cur)
 
 FLEET_HOSTS = ("casper", "redbaron", "carbon", "ryzen7", "wintermute hub", "hetzner")
-SUBSTRATE_RE = re.compile(
-    r"\blive lane\b|\breal box\b|\bon casper\b|\bagainst the redbaron endpoint\b"
-    r"|\bsystemctl\s+--user\s+start\b|\b(" + "|".join(re.escape(h) for h in FLEET_HOSTS) + r")\b",
-    re.I,
-)
+# Deliberately narrow (requirement 1's own list, verbatim) — an early draft
+# widened this to bare "live"/"real" to also catch looser real-world
+# phrasing (e.g. unprivileged-user's own AC4: "Given the live mcphost repo
+# ... When `parity` runs post-ship..."), but a corpus-wide dry run of
+# `plan` against every archived PRD showed why that's unsafe: "real"/"live"
+# are common words, and a nearby backtick-quoted token is very often just
+# a prose identifier or JSON field name ("box: Delta", "box: Refuted",
+# "box: PetFbiPartnerSyndicator"), not a shell command — `run` would eval
+# that literally. Staying narrow means a real-substrate AC written in
+# looser prose is correctly NOT auto-run; it still surfaces to an operator
+# because prd-lint's "Real-environment AC rule" (SKILL.md) requires such a
+# PRD to carry a literal, substrate-naming AC in the first place — the
+# fix for a miss here is tightening that AC's wording, not loosening this
+# regex.
+# STRONG_RE: an unambiguous assertion this AC runs against real
+# infrastructure — auto-run eligible (paired with a literal backtick
+# command). WEAK_HOST_RE (a bare fleet hostname with none of the strong
+# phrases) is NOT auto-run eligible on its own: a corpus-wide dry run of
+# `plan` against every archived PRD showed a bare hostname mention
+# anywhere in an AC's (possibly multi-sentence) text pairing with an
+# UNRELATED backtick token elsewhere in the same AC — "SKILL.md", a PRD
+# filename, a JSON field name, "box: Delta" — none of them shell commands.
+# `run` would `eval` that literally. A weak-only match still enters the
+# plan, but always as `manual`, naming the host, so a human can turn it
+# into a real check rather than it silently vanishing OR getting executed
+# as garbage.
+STRONG_RE = re.compile(
+    r"\blive lane\b|\breal box\b|\bon casper\b|\bagainst the redbaron endpoint\b", re.I)
+WEAK_HOST_RE = re.compile(
+    r"\b(" + "|".join(re.escape(h) for h in FLEET_HOSTS) + r")\b", re.I)
 URL_RE = re.compile(r"https?://[^\s`)]+[^\s`),.]")
 BACKTICK_CMD_RE = re.compile(r"`([^`]+)`")
 SYSTEMCTL_CMD_RE = re.compile(r"systemctl\s+--user\s+[^\s`]+(?:\s+[^\s`]+)?")
+FAKE_RE = re.compile(r"\bfake\b", re.I)
+PLACEHOLDER_RE = re.compile(r"<[^<>`\s]+>")
 
 plan = []
 for it in items:
@@ -131,14 +158,44 @@ for it in items:
     url_m = URL_RE.search(text)
     systemctl_m = SYSTEMCTL_CMD_RE.search(text)
     backtick_cmds = BACKTICK_CMD_RE.findall(text)
-    substrate_m = SUBSTRATE_RE.search(text)
+    strong_m = STRONG_RE.search(text)
+    weak_m = WEAK_HOST_RE.search(text)
 
-    if not (url_m or substrate_m or systemctl_m):
+    if not (url_m or strong_m or weak_m or systemctl_m):
         continue  # not a substrate-naming AC at all — not in the plan
 
+    # Guard against a fixture AC that's DESCRIBING a fake/mock substrate
+    # ("Given a fake box whose test run differs...") rather than asserting
+    # a real one. A strong, unambiguous real-substrate phrase (or a URL)
+    # still counts even if "fake" appears elsewhere in the same AC's text;
+    # a bare hostname alone next to "fake" is exactly the fixture-
+    # description shape this guard exists for.
+    if FAKE_RE.search(text) and not (url_m or strong_m):
+        continue
+
     if systemctl_m:
-        plan.append({"ac": n, "kind": "unit", "command": systemctl_m.group(0),
-                      "text": text, "reason": None})
+        # Auto-run only read-only/idempotent verbs. A post-ship reality
+        # check's job is to confirm something IS running, not to disrupt a
+        # live unit — `restart`/`stop`/`disable`/etc. downgrade to manual
+        # so a human decides whether to actually run them.
+        verb = systemctl_m.group(0).split()[2] if len(systemctl_m.group(0).split()) > 2 else ""
+        SAFE_VERBS = {"status", "is-active", "is-failed", "is-enabled",
+                      "show", "list-timers", "list-units", "cat", "start"}
+        if verb in SAFE_VERBS:
+            plan.append({"ac": n, "kind": "unit", "command": systemctl_m.group(0),
+                          "text": text, "reason": None})
+        else:
+            plan.append({"ac": n, "kind": "manual", "command": None, "text": text,
+                          "reason": f"systemctl verb {verb!r} is state-changing "
+                                    "(not in the auto-run allowlist) — needs manual review"})
+        continue
+    if url_m and PLACEHOLDER_RE.search(url_m.group(0)):
+        # A URL containing an angle-bracket placeholder (e.g.
+        # `https://<fqdn>/healthz`) is a template, not a literal address —
+        # curl would try to resolve the hostname "<fqdn>" verbatim. Manual.
+        plan.append({"ac": n, "kind": "manual", "command": None, "text": text,
+                      "reason": f"URL {url_m.group(0)!r} contains a <placeholder> "
+                                "token, not a literal address"})
         continue
     if url_m and any(url_m.group(0) in c for c in backtick_cmds):
         # URL appears inside a backtick command — prefer the literal command.
@@ -150,18 +207,36 @@ for it in items:
         plan.append({"ac": n, "kind": "endpoint", "command": url_m.group(0),
                       "text": text, "reason": None})
         continue
-    if backtick_cmds:
-        # A substrate keyword plus a literal backtick command — run the
-        # command against the box (the common shape: "run `<cmd>` against
-        # the live lane").
-        plan.append({"ac": n, "kind": "box", "command": backtick_cmds[0],
-                      "text": text, "reason": None})
+    if strong_m:
+        # A backtick command containing an angle-bracket placeholder (e.g.
+        # `burst-lane.sh parity <repo>`) is documentation shorthand, not a
+        # literal invocation — running it verbatim would shell-redirect
+        # stdin from a file literally named "repo". Manual, naming why.
+        literal_cmds = [c for c in backtick_cmds if not PLACEHOLDER_RE.search(c)]
+        if backtick_cmds and not literal_cmds:
+            plan.append({"ac": n, "kind": "manual", "command": None, "text": text,
+                          "reason": f"backtick command {backtick_cmds[0]!r} contains "
+                                    "a <placeholder> token, not a literal invocation"})
+            continue
+        if literal_cmds:
+            # A strong substrate phrase plus a literal backtick command —
+            # run the command against the box (the common shape: "run
+            # `<cmd>` against the live lane").
+            plan.append({"ac": n, "kind": "box", "command": literal_cmds[0],
+                          "text": text, "reason": None})
+            continue
+        # Strong phrase, no derivable command — manual, never dropped.
+        plan.append({"ac": n, "kind": "manual", "command": None, "text": text,
+                      "reason": "AC names a real substrate but no runnable command "
+                                "(no backtick command, URL, or systemctl invocation) "
+                                "could be derived from its text"})
         continue
-    # Substrate named, no derivable command — manual, never dropped.
+    # Only a bare fleet hostname matched (no strong phrase, no URL, no
+    # systemctl) — always manual, never auto-run (see WEAK_HOST_RE above).
     plan.append({"ac": n, "kind": "manual", "command": None, "text": text,
-                  "reason": "AC names a real substrate but no runnable command "
-                            "(no backtick command, URL, or systemctl invocation) "
-                            "could be derived from its text"})
+                  "reason": f"AC mentions fleet host {weak_m.group(1)!r} but not "
+                            "a strong real-substrate phrase — a command near it "
+                            "cannot be safely auto-derived, needs manual review"})
 
 print(json.dumps(plan, indent=2))
 PY
