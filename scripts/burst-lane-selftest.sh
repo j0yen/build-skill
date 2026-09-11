@@ -2928,6 +2928,147 @@ expect "burstvol AC10: the stale marker was cleared" "[ ! -e \"$BURST_LANE_STATE
 # (an explicit, in-band assertion, matching every sibling AC's own
 # convention — see burstuser AC7/parityr AC6 above).
 expect "burstvol AC11: every burstvol case above ran green" "[ $fail -eq 0 ]"
+# ============================================================================
+# PRD-build-burst-path-deps: a remote run syncs everything the crate needs to
+# build. Four cases: a fixture crate with a sibling path dependency actually
+# resolves on the (fake) box (AC1); a genuinely-missing path dependency
+# journals a build-failed line with phase=build instead of masquerading as
+# a test failure (AC2); `verify` asserts CARGO_HOME is a writable-by-build
+# registry outside /root, both the happy path and the fail-closed path
+# (AC3); the gate-tools probe's PATH carries no root fallback, so a tool
+# only root can see is not silently treated as present (AC4). AC5 (a real
+# Hetzner box + a green wintermute-brain HEAD) needs real infra this
+# offline harness cannot provide — left for the live lane, not simulated
+# here. AC6 (this suite exits 0 and names its own pathdeps cases) is the
+# closing assertion at the bottom of this block, same convention as every
+# sibling PRD's own closing AC.
+# ============================================================================
+
+# ---- pathdeps AC1: given a fixture crate depending on ../sibling by path,
+# when `run` executes against the fake box, both directories are rsynced
+# and `cargo metadata` genuinely resolves the dependency — not just
+# `--no-deps`, which (proven against a real cargo while building this PRD)
+# never validates a path dependency actually exists at all; only the full
+# resolve graph does, and that is what production's own `cargo build`/
+# `cargo test` invocations exercise too.
+fresh_env
+"$BL" up >/dev/null 2>&1
+PD_ROOT="$T/pathdeps-root"
+mkdir -p "$PD_ROOT/main-crate/src" "$PD_ROOT/sibling/src"
+cat > "$PD_ROOT/main-crate/Cargo.toml" <<EOF
+[package]
+name = "pathdeps-main"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+sibling = { path = "../sibling" }
+EOF
+echo 'fn main() {}' > "$PD_ROOT/main-crate/src/main.rs"
+cat > "$PD_ROOT/sibling/Cargo.toml" <<EOF
+[package]
+name = "sibling"
+version = "0.1.0"
+edition = "2021"
+EOF
+echo '' > "$PD_ROOT/sibling/src/lib.rs"
+WT_PD1="$PD_ROOT/main-crate"
+export FAKE_RSYNC_CALL_LOG="$T/rsync.calls.pd1"; : > "$FAKE_RSYNC_CALL_LOG"
+pd1_out="$("$BL" run "$WT_PD1" -- cargo metadata --format-version 1 2>&1)"; pd1_rc=$?
+expect "pathdeps AC1: run against a crate with a sibling path dep exits 0" "[ $pd1_rc -eq 0 ]"
+expect "pathdeps AC1: the worktree itself was rsynced" "grep -qF \"$WT_PD1/\" \"$FAKE_RSYNC_CALL_LOG\""
+expect "pathdeps AC1: the sibling path dependency was also rsynced" "grep -qF \"$PD_ROOT/sibling/\" \"$FAKE_RSYNC_CALL_LOG\""
+expect "pathdeps AC1: cargo metadata really resolved the dependency (no 'failed to load source' error)" \
+  "! grep -qi 'failed to load source\|failed to read' <<<\"$pd1_out\""
+expect "pathdeps AC1: journal names exactly one synced dependency" \
+  "grep -qF \"pathdeps  (worktree=$WT_PD1 deps=1\" \"$BURST_LANE_JOURNAL\""
+
+# ---- pathdeps AC2: a path dependency that genuinely does not exist (never
+# synced — nothing for `run` to sync) makes the remote `cargo metadata`
+# fail exactly as it does today; the journal must name it a BUILD failure,
+# not a test failure, and no exit=101/phase=test row should exist for it.
+fresh_env
+"$BL" up >/dev/null 2>&1
+PD2_ROOT="$T/pathdeps-broken"
+mkdir -p "$PD2_ROOT/main-crate/src"
+cat > "$PD2_ROOT/main-crate/Cargo.toml" <<EOF
+[package]
+name = "pathdeps-broken-main"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+missing-sibling = { path = "../missing-sibling" }
+EOF
+echo 'fn main() {}' > "$PD2_ROOT/main-crate/src/main.rs"
+WT_PD2="$PD2_ROOT/main-crate"
+pd2_out="$("$BL" run "$WT_PD2" -- cargo metadata --format-version 1 2>&1)"; pd2_rc=$?
+expect "pathdeps AC2: run against a crate with a missing path dep exits nonzero" "[ $pd2_rc -ne 0 ]"
+expect "pathdeps AC2: journal has a build-failed line naming the cause" \
+  "grep -qF \"run  build-failed  (worktree=$WT_PD2\" \"$BURST_LANE_JOURNAL\""
+expect "pathdeps AC2: no exit=101 phase=test row was written for this failure" \
+  "! grep -E \"run  routed .*worktree=$WT_PD2.*phase=test\" \"$BURST_LANE_JOURNAL\""
+pd2_attr_rc=1
+python3 -c "
+import json
+path = '$BURST_LANE_ATTR_LEDGER'
+try:
+    rows = [json.loads(l) for l in open(path) if l.strip()]
+except FileNotFoundError:
+    rows = []
+ok = any(r.get('worktree') == '$WT_PD2' and r.get('kind') == 'run' and r.get('phase') == 'build' for r in rows)
+raise SystemExit(0 if ok else 1)
+" && pd2_attr_rc=0
+expect "pathdeps AC2: attribution ledger row for this run carries phase=build" "[ $pd2_attr_rc -eq 0 ]"
+
+# ---- pathdeps AC3: `verify` asserts CARGO_HOME resolves to a writable-by-
+# build registry outside /root — both the happy path (fresh_env's default
+# build user, real mkdir/touch/rm probe over the fake ssh) and the
+# fail-closed path (a simulated non-writable registry).
+fresh_env
+"$BL" up >/dev/null 2>&1
+pd3_verify_out="$("$BL" verify 2>&1)"; pd3_verify_rc=$?
+expect "pathdeps AC3: verify exits 0 when the build user's registry is writable" "[ $pd3_verify_rc -eq 0 ]"
+expect "pathdeps AC3: verify reports cargo-home ok, naming the build-home path" \
+  "grep -q 'cargo-home ok' <<<\"$pd3_verify_out\" && grep -qF \"$BURST_LANE_REMOTE_HOME/.cargo\" <<<\"$pd3_verify_out\""
+export FAKE_SSH_REGISTRY_WRITE_FAIL=1
+pd3_neg_out="$("$BL" verify 2>&1)"; pd3_neg_rc=$?
+expect "pathdeps AC3: verify fails closed when the registry is not writable" "[ $pd3_neg_rc -ne 0 ]"
+expect "pathdeps AC3: the failure names the CARGO_HOME/registry path" \
+  "grep -q 'CARGO_HOME registry not writable' <<<\"$pd3_neg_out\""
+unset FAKE_SSH_REGISTRY_WRITE_FAIL
+
+# ---- pathdeps AC4: the gate-tools probe's PATH carries no root fallback
+# for the build user — a tool only root could see must read MISSING, not
+# silently pass, and this is checked against the REAL command sent over
+# ssh (not the fake's canned tool-inventory reply, which never actually
+# reads PATH) so a regression in the constructed PATH string itself is
+# what this test catches.
+fresh_env
+export FAKE_SSH_CALL_LOG="$T/ssh.calls.pd4"; : > "$FAKE_SSH_CALL_LOG"
+"$BL" up >/dev/null 2>&1
+pd4_full_line="$(grep '# gate-tools-probe' "$FAKE_SSH_CALL_LOG" | head -n1)"
+# Isolate just the "user@host<TAB>" prefix and the actual `export PATH=...`
+# assignment — the rest of the flattened multi-line probe command is this
+# file's own explanatory comment text (deliberately containing an escaped,
+# never-expanded literal like \$GATE_TOOLS_REMOTE_BIN_DIR so it reads
+# inertly on the remote side), and embedding THAT raw text into a second
+# eval'd string below would let it be mistaken for a real, unset variable
+# reference on re-parse. Narrowing to just these two pieces sidesteps that
+# entirely rather than fighting it with more quoting.
+pd4_user_prefix="$(cut -f1 <<<"$pd4_full_line")"
+pd4_path_line="$(grep -oE 'export PATH=[^;]*' <<<"$pd4_full_line" | head -n1)"
+expect "pathdeps AC4: the gate-tools probe ran as build@" "[[ \$pd4_user_prefix == build@* ]]"
+expect "pathdeps AC4: the probe's own PATH export carries no /root reference" \
+  "[ -n \"\$pd4_path_line\" ] && [[ \$pd4_path_line != *root* ]]"
+pd4_gt_pattern='export PATH=$GATE_TOOLS_REMOTE_BIN_DIR:\$PATH$gt_probe_extra'
+expect "pathdeps AC4 (structural): gate_tools_probe's PATH export is now conditional on REMOTE_USER, not unconditionally including root's paths" \
+  "grep -qF \"\$pd4_gt_pattern\" \"\$BL\""
+
+# ---- pathdeps AC6 (P1): this fixture set exits 0 and names the pathdeps
+# cases — same in-band closing assertion every sibling PRD's own block ends
+# with (see burstuser AC7 / parityr AC6 just above).
+expect "pathdeps AC6: every pathdeps case above ran green" "[ $fail -eq 0 ]"
 
 echo "=== $([ $fail -eq 0 ] && echo PASS || echo FAIL) ==="
 exit $fail

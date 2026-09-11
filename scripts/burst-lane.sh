@@ -85,6 +85,36 @@
 # the only user who can read the old tree), marking a worktree cold instead
 # of blocking migration if that copy fails.
 #
+# PRD-build-burst-path-deps: `run` used to rsync exactly one worktree —
+# fine for a self-contained crate like mcphost, silently wrong for anything
+# with a sibling path dependency outside the worktree (wintermute-brain's
+# four: agorabus, wm-local-llm, wm-verify, wm-router), which failed to
+# resolve on the box every time since the lane existed. `run` now (1)
+# discovers the crate's transitive path dependencies locally
+# (scripts/burst-lane-pathdeps.py discover, a regex Cargo.toml reader — no
+# full TOML parser, consistent with this skill's other pragmatic parsing),
+# (2) rsyncs each one to its own stable remote location
+# (dep_remote_path_for(), a deps/ subtree keyed like remote_path_for()
+# itself), and (3) rewrites the synced worktree's (and each dep's own)
+# `path =` entries that point at a synced dependency to that remote
+# location (burst-lane-pathdeps.py rewrite) before the remote command ever
+# runs — `cargo metadata`/build/test on the box then resolves it with no
+# operator step. A remote exit before any test binary ran (compile/
+# resolution error) now journals `run  build-failed  (cause=...)` with
+# `phase=build` on its attribution row, instead of the same undistinguished
+# `exit=101` a genuine test failure gets (`phase=test`) — the fix for four
+# days of "tests red" that were never tests, just an unresolved dependency.
+# CARGO_HOME for the build user is now its own ($REMOTE_HOME/.cargo,
+# RUN_CARGO_HOME below) rather than root's shared, read-only
+# ROOT_CARGO_HOME — cargo's registry/git cache needs WRITES for any not-
+# yet-cached crate, which root's chmod'd-read+execute copy never granted
+# (the write race an operator chmod'd by hand, 2026-09-11); RUSTUP_HOME
+# stays root's shared toolchain, read-only, unchanged. The gate-tools
+# probe's PATH no longer falls back to root's bin dirs for the build user
+# (it did, purely to mask a hand-installed-under-/root tool — the exact
+# 07:48Z incident where `claude` read "present" while actually MISSING for
+# build) — see gate_tools_probe()'s `gt_probe_extra`.
+#
 # Subcommands:
 #   burst-lane.sh up
 #       Idempotent (AC1): a live tracked session -> "already-up: <id> <ip>",
@@ -424,6 +454,27 @@ GATE_TOOLS_REMOTE_BIN_DIR="${BURST_LANE_GATE_TOOLS_REMOTE_BIN_DIR:-$GATE_TOOLS_R
 GATE_CRED_REMOTE_PATH="${BURST_LANE_GATE_CRED_REMOTE_PATH:-$REMOTE_HOME/.claude/.credentials.json}"
 REMOTE_SCCACHE_DIR="${BURST_LANE_REMOTE_SCCACHE_DIR:-$REMOTE_SCCACHE_DIR_DEFAULT}"
 
+# PRD-build-burst-path-deps requirement 5: the build user's OWN cargo home
+# (registry + git caches) — never root's shared ROOT_CARGO_HOME. RUSTUP_HOME
+# stays ROOT_RUSTUP_HOME everywhere below (the shared toolchain is read-only
+# and that is fine — only the registry/git CACHE a `cargo` invocation writes
+# into needs write access, and root's copy is chmod'd read+execute only, see
+# create_remote_user()). The write race this closes: two `run`s as build
+# both fetching a not-yet-cached crate into a directory neither of them
+# could write raced and failed until an operator chmod'd root's registry by
+# hand (2026-09-11, this PRD's five-whys level 5). Root rollback
+# (REMOTE_USER=root) keeps CARGO_HOME=ROOT_CARGO_HOME exactly as before this
+# PRD — root already owns that tree outright, nothing to fix there. Note
+# this only changes the CARGO_HOME *data* directory; the `cargo`/`rustup`
+# *binaries* are still found via $ROOT_CARGO_HOME/bin on PATH wherever that
+# was already exported (cmd_run, cmd_verify) — CARGO_HOME need not contain
+# the binary that reads it.
+if [ "$REMOTE_USER" = "root" ]; then
+  RUN_CARGO_HOME="$ROOT_CARGO_HOME"
+else
+  RUN_CARGO_HOME="${BURST_LANE_BUILD_CARGO_HOME:-$REMOTE_HOME/.cargo}"
+fi
+
 # ---- state (flat JSON, jq if present else grep fallback — matches
 # gate-burst.sh's convention so both scripts are readable the same way) ---
 JQ="$(command -v jq || true)"
@@ -593,6 +644,12 @@ box_bootstrap() {  # $1 = ip — make a snapshot box ready (idempotent, ~1s when
   # binary in a user's own $HOME/.local/bin.
   "$SSH_BIN" -o StrictHostKeyChecking=no -o ConnectTimeout=8 -i "$SSH_KEY" "$REMOTE_USER@$1" "
     mkdir -p $REMOTE_ROOT
+    # PRD-build-burst-path-deps requirement 5: the build user's own cargo
+    # home (registry+git caches), created up front so the first `cargo`
+    # invocation that needs to fetch a not-yet-cached crate never races an
+    # on-demand mkdir under a directory it doesn't own — a no-op when
+    # RUN_CARGO_HOME already equals ROOT_CARGO_HOME (root rollback).
+    mkdir -p $RUN_CARGO_HOME/registry $RUN_CARGO_HOME/git
     command -v uv >/dev/null 2>&1 || [ -x $REMOTE_HOME/.local/bin/uv ] || (curl -LsSf https://astral.sh/uv/install.sh | sh) >/dev/null 2>&1
     true" 2>/dev/null || true
 }
@@ -805,6 +862,17 @@ gate_tools_probe() {  # $1=ip -> stdout: one "tool=version|MISSING" line per too
   # PRD-build-burst-unprivileged-user requirement 2: probing needs no root —
   # reading a tool's own --version never writes anything — so this runs as
   # $REMOTE_USER like everything but the requirement-3 allow-list.
+  #
+  # PRD-build-burst-path-deps requirement 4: for the BUILD user, this PATH
+  # carries no root fallback at all — a tool a human hand-installed under
+  # /root (the exact 2026-09-11 07:48Z incident: gate_ready=true while
+  # `claude` was MISSING for build, because this probe's PATH could still
+  # see /root/.local/bin) must read MISSING here, not silently pass. The
+  # ROOT rollback (REMOTE_USER=root) keeps its fallback: root-installed
+  # curl tools (uv, claude) land in plain /root/.local/bin, not
+  # $ROOT_CARGO_HOME/bin, so root's own probe still needs both listed.
+  local gt_probe_extra=""
+  [ "$REMOTE_USER" = "root" ] && gt_probe_extra=":$ROOT_CARGO_HOME/bin:/root/.local/bin"
   "$SSH_BIN" -o StrictHostKeyChecking=no -o ConnectTimeout=8 -i "$SSH_KEY" "$REMOTE_USER@$1" "
 # gate-tools-probe
 # PRD-build-burst-gate-tools-scope requirement 1: a non-login ssh shell's
@@ -813,10 +881,8 @@ gate_tools_probe() {  # $1=ip -> stdout: one "tool=version|MISSING" line per too
 # 165449166 failure mode. PRD-build-burst-unprivileged-user: build's own
 # \$GATE_TOOLS_REMOTE_BIN_DIR comes first — that is where cargo-deny/
 # cargo-nextest/uv/claude/autobuilder actually land for build (requirement
-# 2) — root's shared /root/.cargo/bin:/root/.local/bin stays as a fallback
-# (a no-op second listing for the REMOTE_USER=root rollback, since
-# GATE_TOOLS_REMOTE_BIN_DIR already equals /root/.cargo/bin there).
-export PATH=$GATE_TOOLS_REMOTE_BIN_DIR:\$PATH:$ROOT_CARGO_HOME/bin:/root/.local/bin
+# 2).
+export PATH=$GATE_TOOLS_REMOTE_BIN_DIR:\$PATH$gt_probe_extra
 for t in $GATE_TOOLS_LIST; do
   if command -v \"\$t\" >/dev/null 2>&1; then
     v=\"\$(\"\$t\" --version 2>/dev/null | head -n1)\"
@@ -870,15 +936,22 @@ gate_tools_install_cmd() {  # $1=tool (never "autobuilder" — that's a push, se
       # characters "$PATH" instead of this host's real search path —
       # harmless for `cargo` itself (found via the /root/.cargo/bin prefix
       # regardless) but it silently broke `rustup`/grep/sort/tail lookups.
-      # RUSTUP_HOME/CARGO_HOME (requirement 2) point `cargo`/`rustup` — both
-      # only ever readable, never written, here — at root's shared toolchain
-      # regardless of who's running this; `--root` (see above) is what
-      # keeps the actual `install` write off of it.
+      # RUSTUP_HOME (requirement 2) points `rustup` at root's shared
+      # toolchain, read-only, regardless of who's running this; PATH still
+      # carries $ROOT_CARGO_HOME/bin so the `cargo`/`rustup` BINARIES
+      # resolve (they live there, installed once by root). CARGO_HOME
+      # (PRD-build-burst-path-deps requirement 5) is now $RUN_CARGO_HOME —
+      # build's OWN registry/git cache, never root's read-only one — because
+      # `cargo install` (like any dependency fetch) WRITES into whatever
+      # CARGO_HOME resolves to, and root's copy only grants read+execute;
+      # `--root` (see above) is a separate matter — it only redirects the
+      # installed BINARY's final destination, not the registry cache cargo
+      # uses to get there.
       printf '%s\nexport PATH=$PATH:%s/bin RUSTUP_HOME=%s CARGO_HOME=%s; %s; if [ -n "$tc" ]; then cargo +"$tc" install --locked --root %s cargo-deny@%s; else cargo install --locked --root %s cargo-deny@%s; fi\n' \
-        "# gate-tools-install $tool" "$ROOT_CARGO_HOME" "$ROOT_RUSTUP_HOME" "$ROOT_CARGO_HOME" "$_gate_tools_cargo_toolchain_pick" "$install_root" "$GATE_TOOLS_CARGO_DENY_VERSION" "$install_root" "$GATE_TOOLS_CARGO_DENY_VERSION" ;;
+        "# gate-tools-install $tool" "$ROOT_CARGO_HOME" "$ROOT_RUSTUP_HOME" "$RUN_CARGO_HOME" "$_gate_tools_cargo_toolchain_pick" "$install_root" "$GATE_TOOLS_CARGO_DENY_VERSION" "$install_root" "$GATE_TOOLS_CARGO_DENY_VERSION" ;;
     cargo-nextest)
       printf '%s\nexport PATH=$PATH:%s/bin RUSTUP_HOME=%s CARGO_HOME=%s; %s; if [ -n "$tc" ]; then cargo +"$tc" install --locked --root %s cargo-nextest@%s; else cargo install --locked --root %s cargo-nextest@%s; fi\n' \
-        "# gate-tools-install $tool" "$ROOT_CARGO_HOME" "$ROOT_RUSTUP_HOME" "$ROOT_CARGO_HOME" "$_gate_tools_cargo_toolchain_pick" "$install_root" "$GATE_TOOLS_CARGO_NEXTEST_VERSION" "$install_root" "$GATE_TOOLS_CARGO_NEXTEST_VERSION" ;;
+        "# gate-tools-install $tool" "$ROOT_CARGO_HOME" "$ROOT_RUSTUP_HOME" "$RUN_CARGO_HOME" "$_gate_tools_cargo_toolchain_pick" "$install_root" "$GATE_TOOLS_CARGO_NEXTEST_VERSION" "$install_root" "$GATE_TOOLS_CARGO_NEXTEST_VERSION" ;;
     uv)
       printf '%s\ncurl -LsSf https://astral.sh/uv/install.sh | sh\n' "# gate-tools-install $tool" ;;
     claude)
@@ -1224,12 +1297,16 @@ cmd_verify() {
   rm -rf "$fx"
 
   # PRD-build-burst-unprivileged-user requirement 2/4: cargo/uv/python3 all
-  # probed as $REMOTE_USER — RUSTUP_HOME/CARGO_HOME point at root's shared,
-  # read-only toolchain (requirement 2) regardless of who's asking, so this
-  # is a no-op for the REMOTE_USER=root rollback.
+  # probed as $REMOTE_USER — RUSTUP_HOME points at root's shared, read-only
+  # toolchain (requirement 2) regardless of who's asking, so that half is a
+  # no-op for the REMOTE_USER=root rollback. CARGO_HOME (PRD-build-burst-
+  # path-deps requirement 5) is now $RUN_CARGO_HOME — build's own writable
+  # registry cache, not root's — see the registry-writability check below
+  # for the check this PRD actually adds; this probe only proves `cargo`
+  # itself runs under that CARGO_HOME, not that it can write.
   local rout
   rout="$("$SSH_BIN" -o StrictHostKeyChecking=no -i "$SSH_KEY" "$REMOTE_USER@$ip" \
-    "export PATH=$GATE_TOOLS_REMOTE_BIN_DIR:\$PATH:$ROOT_CARGO_HOME/bin:/root/.local/bin RUSTUP_HOME=$ROOT_RUSTUP_HOME CARGO_HOME=$ROOT_CARGO_HOME; cargo --version && uv --version && python3 -c \"print(1)\"" 2>/dev/null)"
+    "export PATH=$GATE_TOOLS_REMOTE_BIN_DIR:\$PATH:$ROOT_CARGO_HOME/bin:/root/.local/bin RUSTUP_HOME=$ROOT_RUSTUP_HOME CARGO_HOME=$RUN_CARGO_HOME; cargo --version && uv --version && python3 -c \"print(1)\"" 2>/dev/null)"
   printf '%s' "$rout" | grep -q "^cargo " || vfail "remote cargo (user=$REMOTE_USER)"
   printf '%s' "$rout" | grep -q "^uv "    || vfail "remote uv (user=$REMOTE_USER)"
   printf '%s' "$rout" | grep -q "^1$"     || vfail "remote python3 (user=$REMOTE_USER)"
@@ -1246,6 +1323,23 @@ cmd_verify() {
   "$SSH_BIN" -o StrictHostKeyChecking=no -i "$SSH_KEY" "$REMOTE_USER@$ip" \
     "mkdir -p '$REMOTE_SCCACHE_DIR' && [ -d '$REMOTE_SCCACHE_DIR' ]" >/dev/null 2>&1 \
     || vfail "sccache dir ($REMOTE_SCCACHE_DIR)"
+
+  # PRD-build-burst-path-deps requirement 5 / AC3: CARGO_HOME must resolve
+  # to a location the build user actually owns, with a writable registry
+  # cache — the exact write race this PRD closes (root's shared registry,
+  # chmod'd read+execute only, raced the first parallel dependency fetch
+  # until an operator chmod'd it by hand, 2026-09-11). Fails closed, naming
+  # the path, rather than a bare "verify FAIL" an operator has to go dig for.
+  if [ "$REMOTE_USER" != "root" ] && [[ "$RUN_CARGO_HOME" == /root* ]]; then
+    vfail "CARGO_HOME resolves under /root ($RUN_CARGO_HOME) — build user needs its own registry cache"
+  elif "$SSH_BIN" -o StrictHostKeyChecking=no -o ConnectTimeout=8 -i "$SSH_KEY" "$REMOTE_USER@$ip" \
+    "$(printf '%s\nmkdir -p '"'"'%s/registry'"'"' && touch '"'"'%s/registry/.burst-lane-write-test'"'"' && rm -f '"'"'%s/registry/.burst-lane-write-test'"'"'\n' \
+       "# cargo-home-registry-probe" "$RUN_CARGO_HOME" "$RUN_CARGO_HOME" "$RUN_CARGO_HOME")" >/dev/null 2>&1
+  then
+    echo "cargo-home ok ($RUN_CARGO_HOME writable by $REMOTE_USER)"
+  else
+    vfail "CARGO_HOME registry not writable by $REMOTE_USER at $RUN_CARGO_HOME/registry"
+  fi
 
   # Requirement 1's own verify check: fails closed, naming the first missing
   # tool, rather than a bare "gate-tools FAIL" — an operator staring at the
@@ -1815,12 +1909,23 @@ now_fractional() { date +%s.%N; }
 #   kind="pull" ($7="pull"): a lazy pull that DID execute. $11=trigger
 #     (local-read|explicit|teardown). wall_seconds is always 0 (no remote
 #     exec happened); sync_s/bytes are the pull's own cost.
-attribution_record() {  # $1=slug $2=session_id $3=wall_s $4=sync_s $5=bytes $6=worktree [$7=kind $8=pulls_skipped $9=bytes_saved $10=estimate $11=trigger $12=warm]
+#
+# PRD-build-burst-path-deps requirement 3: an optional $13=phase ("build" or
+# "test") rides into a kind="run" row so the cost ledger records which class
+# of failure (if any) a run hit, alongside the journal's own build-failed/
+# routed distinction below — omitted from the JSON row entirely when empty
+# (a successful run, or any pre-existing caller that never passes it),
+# never written as a literal empty string. Kept as its own trailing
+# positional (after persistent-volume's $12=warm, not in place of it) —
+# the two land the same tick and describe unrelated things (warm: did the
+# target dir already exist; phase: did this run fail before or after tests
+# started), so both ride the same row rather than one displacing the other.
+attribution_record() {  # $1=slug $2=session_id $3=wall_s $4=sync_s $5=bytes $6=worktree [$7=kind $8=pulls_skipped $9=bytes_saved $10=estimate $11=trigger $12=warm $13=phase]
   mkdir -p "$STATE_DIR" 2>/dev/null || true
-  local kind="${7:-run}" pulls_skipped="${8:-0}" bytes_saved="${9:-0}" estimate="${10:-false}" trigger="${11:-}" warm="${12:-}"
+  local kind="${7:-run}" pulls_skipped="${8:-0}" bytes_saved="${9:-0}" estimate="${10:-false}" trigger="${11:-}" warm="${12:-}" phase="${13:-}"
   python3 -c '
 import json, sys
-slug, sid, wall_s, sync_s, nbytes, worktree, date, path, kind, pulls_skipped, bytes_saved, estimate, trigger, warm = sys.argv[1:15]
+slug, sid, wall_s, sync_s, nbytes, worktree, date, path, kind, pulls_skipped, bytes_saved, estimate, trigger, warm, phase = sys.argv[1:16]
 row = {
     "date": date, "session_id": sid, "slug": slug,
     "wall_seconds": round(float(wall_s), 3), "sync_s": round(float(sync_s), 3),
@@ -1844,9 +1949,11 @@ else:
     # dir already exist before this action" question of its own).
     if warm != "":
         row["warm"] = (warm == "true")
+    if phase:
+        row["phase"] = phase
 with open(path, "a") as fh:
     fh.write(json.dumps(row) + "\n")
-' "$1" "$2" "$3" "$4" "$5" "$6" "$(now_iso)" "$ATTR_LEDGER" "$kind" "$pulls_skipped" "$bytes_saved" "$estimate" "$trigger" "$warm"
+' "$1" "$2" "$3" "$4" "$5" "$6" "$(now_iso)" "$ATTR_LEDGER" "$kind" "$pulls_skipped" "$bytes_saved" "$estimate" "$trigger" "$warm" "$phase"
 }
 
 # ---- run --------------------------------------------------------------------
@@ -1859,6 +1966,18 @@ RUN_LOCK="$STATE_DIR/run.lock"
 remote_path_for() {  # $1=worktree -> stdout remote dir
   local wkey; wkey="$(printf '%s' "$1" | sha1sum | cut -c1-8)"
   printf '%s/%s-%s\n' "$REMOTE_ROOT" "$(basename "$1")" "$wkey"
+}
+
+# PRD-build-burst-path-deps requirement 2: a path dependency's own stable
+# remote location — same hash-keyed convention as remote_path_for() (so a
+# dep synced by two different worktrees this run shares one copy, and reap
+# can find it the same way it finds a worktree's own remote dir), but under
+# a distinct deps/ subtree so a dep is never confused for a worktree of its
+# own by anything scanning $REMOTE_ROOT's immediate children (reap, the
+# rust-work-remains scan in `down`).
+dep_remote_path_for() {  # $1=dep local abs dir -> stdout remote dir
+  local wkey; wkey="$(printf '%s' "$1" | sha1sum | cut -c1-8)"
+  printf '%s/deps/%s-%s\n' "$REMOTE_ROOT" "$(basename "$1")" "$wkey"
 }
 worktree_lock_key() { printf '%s' "$1" | sha1sum | cut -c1-16; }
 wt_lock_file() { printf '%s/locks/wt-%s.lock\n' "$STATE_DIR" "$(worktree_lock_key "$1")"; }
@@ -2189,7 +2308,60 @@ cmd_run() {
   # and the captured log itself lives under state (survives past $$ exiting,
   # unlike the old /tmp/burst-lane-rsync-up.$$.log a reboot or tmpwatch
   # would also silently reap).
+  # PRD-build-burst-path-deps requirement 1/2: sync every transitive path
+  # dependency of the worktree's own crate BEFORE the worktree itself, so
+  # the worktree's rewritten manifest (below) can point at an
+  # already-present remote location. This is the fix for the whole
+  # problem statement: wintermute-brain (and any crate with siblings
+  # outside the worktree, e.g. agorabus/wm-local-llm/wm-verify/wm-router)
+  # used to sync only $worktree/ — cargo on the box then failed to resolve
+  # a `path = "../sibling"` dependency that was never there, and the
+  # operator had to mirror the crates onto the box by hand (this PRD's
+  # five-whys levels 1-3).
+  local pathdeps=() map_file=""
+  if [ -f "$worktree/Cargo.toml" ] && [ -f "$HERE/burst-lane-pathdeps.py" ]; then
+    while IFS= read -r pd_d; do [ -n "$pd_d" ] && pathdeps+=("$pd_d"); done \
+      < <(python3 "$HERE/burst-lane-pathdeps.py" discover "$worktree/Cargo.toml" 2>/dev/null)
+  fi
   mkdir -p "$STATE_DIR/logs" 2>/dev/null || true
+  if [ "${#pathdeps[@]}" -gt 0 ]; then
+    map_file="$(mktemp)"; : > "$map_file"
+    printf '%s\t%s\n' "$worktree" "$remote_path" >> "$map_file"
+    local pd_dep pd_remote
+    for pd_dep in "${pathdeps[@]}"; do
+      printf '%s\t%s\n' "$pd_dep" "$(dep_remote_path_for "$pd_dep")" >> "$map_file"
+    done
+    local pd_log="$STATE_DIR/logs/pathdep-rsync.$$.log" pd_rc=0 pd_err
+    for pd_dep in "${pathdeps[@]}"; do
+      pd_remote="$(dep_remote_path_for "$pd_dep")"
+      pd_rc=0
+      "$RSYNC_BIN" -az --delete --exclude target --exclude .git --exclude .venv \
+            --rsync-path="mkdir -p '$pd_remote' && rsync" \
+            -e "$SSH_BIN -o StrictHostKeyChecking=no -i $SSH_KEY" \
+            "$pd_dep/" "$REMOTE_USER@$ip:$pd_remote/" >"$pd_log" 2>&1 || pd_rc=$?
+      if [ "$pd_rc" -ne 0 ]; then
+        pd_err="$(grep -v '^[[:space:]]*$' "$pd_log" 2>/dev/null | tail -n1)"
+        journal_line "$(now_iso)  burst-lane  run  fallback  (cause=pathdep-rsync-failed rc=$pd_rc err=\"$pd_err\" worktree=$worktree dep=$pd_dep)"
+        echo "fallback: rsync of path dependency $pd_dep to $ip failed rc=$pd_rc (see $pd_log)"
+        rm -f "$map_file"
+        exit 3
+      fi
+      # Transitive rewrite: this dep's OWN Cargo.toml may itself declare a
+      # path dependency on another dep already in the map — rewrite its
+      # synced copy the same way the worktree's own manifest is rewritten
+      # below, so a chain of path deps (not just one hop) resolves too.
+      if [ -f "$pd_dep/Cargo.toml" ]; then
+        local pd_tmp; pd_tmp="$(mktemp)"
+        if python3 "$HERE/burst-lane-pathdeps.py" rewrite "$pd_dep/Cargo.toml" "$map_file" > "$pd_tmp" 2>/dev/null; then
+          "$RSYNC_BIN" -az -e "$SSH_BIN -o StrictHostKeyChecking=no -i $SSH_KEY" \
+            "$pd_tmp" "$REMOTE_USER@$ip:$pd_remote/Cargo.toml" >>"$pd_log" 2>&1 || true
+        fi
+        rm -f "$pd_tmp"
+      fi
+    done
+    journal_line "$(now_iso)  burst-lane  run  pathdeps  (worktree=$worktree deps=${#pathdeps[@]} paths=$(IFS=,; echo "${pathdeps[*]}"))"
+  fi
+
   local up_log="$STATE_DIR/logs/rsync-up.$$.log" rsync_up_rc=0
   "$RSYNC_BIN" -az --delete --exclude target --exclude .git --exclude .venv \
         --rsync-path="mkdir -p '$remote_path' && rsync" \
@@ -2199,13 +2371,32 @@ cmd_run() {
     local up_err; up_err="$(grep -v '^[[:space:]]*$' "$up_log" 2>/dev/null | tail -n1)"
     journal_line "$(now_iso)  burst-lane  run  fallback  (cause=rsync-up-failed rc=$rsync_up_rc err=\"$up_err\" worktree=$worktree)"
     echo "fallback: rsync to $ip failed rc=$rsync_up_rc (see $up_log)"
+    rm -f "$map_file"
     exit 3
   fi
   t_up_end="$(now_fractional)"
 
+  # PRD-build-burst-path-deps requirement 2: rewrite the just-synced
+  # worktree's own `path =` entries that point at a dependency this run
+  # just synced, to that dependency's remote location. `cargo metadata`/
+  # build/test on the box then resolves it with no operator step (AC1, AC5).
+  if [ -n "$map_file" ]; then
+    local wt_tmp; wt_tmp="$(mktemp)"
+    if python3 "$HERE/burst-lane-pathdeps.py" rewrite "$worktree/Cargo.toml" "$map_file" > "$wt_tmp" 2>/dev/null; then
+      "$RSYNC_BIN" -az -e "$SSH_BIN -o StrictHostKeyChecking=no -i $SSH_KEY" \
+        "$wt_tmp" "$REMOTE_USER@$ip:$remote_path/Cargo.toml" >>"$up_log" 2>&1 || true
+    fi
+    rm -f "$wt_tmp" "$map_file"
+  fi
+
   # A caller (the PATH shims) may hand us the LOCAL absolute binary path —
   # meaningless on the box. Route by bare name; the remote PATH below finds it.
   local first="$1"; shift
+  # PRD-build-burst-path-deps requirement 3: the SUBCOMMAND (build/test/
+  # metadata/...), captured before this shift consumes it too — `first` is
+  # the program name (cargo/uv), never the subcommand, and phase
+  # classification below needs the subcommand specifically.
+  local subcmd="${1:-}"
   case "$first" in */cargo) first=cargo ;; */uv) first=uv ;; esac
   # CARGO_TARGET_DIR pins the remote build into $remote_path/target no matter
   # what .cargo/config.toml the worktree synced up (an off-root target-dir
@@ -2221,14 +2412,23 @@ cmd_run() {
   # does not exist on this remote): assert once, restart-once on failure
   # via a plain `sccache --stop-server && --start-server` (self-contained,
   # no sudo, no unit), assert again, else refuse before $first ever runs.
-  # PRD-build-burst-unprivileged-user requirement 2: RUSTUP_HOME/CARGO_HOME
-  # hardcoded at root's shared, read-only toolchain regardless of who's
-  # running this (a no-op for the REMOTE_USER=root rollback, since that's
-  # already root's own default there); SCCACHE_DIR is $REMOTE_USER's OWN
-  # cache, never root's — sccache's cache dir needs write, not just read.
-  local remote_cmd="cd $remote_path && export PATH=$GATE_TOOLS_REMOTE_BIN_DIR:\$PATH:$ROOT_CARGO_HOME/bin:/root/.local/bin RUSTUP_HOME=$ROOT_RUSTUP_HOME CARGO_HOME=$ROOT_CARGO_HOME CARGO_TARGET_DIR=$remote_path/target RUSTC_WRAPPER=sccache SCCACHE_DIR=$REMOTE_SCCACHE_DIR SCCACHE_CACHE_SIZE=${BURST_SCCACHE_GB}G; timeout 5 sccache --show-stats >/dev/null 2>&1 || { sccache --stop-server >/dev/null 2>&1; sccache --start-server >/dev/null 2>&1; sleep 1; }; timeout 5 sccache --show-stats >/dev/null 2>&1 || { echo 'burst-lane: sccache_unreachable on remote box' >&2; exit 97; }; $first $*"
+  # PRD-build-burst-unprivileged-user requirement 2: RUSTUP_HOME hardcoded
+  # at root's shared, read-only toolchain regardless of who's running this
+  # (a no-op for the REMOTE_USER=root rollback, since that's already root's
+  # own default there); PATH still carries $ROOT_CARGO_HOME/bin so the
+  # `cargo`/`rustup` binaries resolve. CARGO_HOME (PRD-build-burst-path-deps
+  # requirement 5) is $RUN_CARGO_HOME — build's own writable registry/git
+  # cache, never root's read-only one; this is the write-race fix (a
+  # dependency fetch WRITES into CARGO_HOME's registry, which root's copy
+  # never granted). SCCACHE_DIR is $REMOTE_USER's OWN cache, never root's —
+  # sccache's cache dir needs write, not just read. SCCACHE_CACHE_SIZE
+  # (PRD-build-burst-persistent-volume) caps the cache against
+  # $BURST_SCCACHE_GB regardless of which CARGO_HOME is in play.
+  local remote_cmd="cd $remote_path && export PATH=$GATE_TOOLS_REMOTE_BIN_DIR:\$PATH:$ROOT_CARGO_HOME/bin:/root/.local/bin RUSTUP_HOME=$ROOT_RUSTUP_HOME CARGO_HOME=$RUN_CARGO_HOME CARGO_TARGET_DIR=$remote_path/target RUSTC_WRAPPER=sccache SCCACHE_DIR=$REMOTE_SCCACHE_DIR SCCACHE_CACHE_SIZE=${BURST_SCCACHE_GB}G; timeout 5 sccache --show-stats >/dev/null 2>&1 || { sccache --stop-server >/dev/null 2>&1; sccache --start-server >/dev/null 2>&1; sleep 1; }; timeout 5 sccache --show-stats >/dev/null 2>&1 || { echo 'burst-lane: sccache_unreachable on remote box' >&2; exit 97; }; $first $*"
   local rc=0
-  "$SSH_BIN" -o StrictHostKeyChecking=no -i "$SSH_KEY" "$REMOTE_USER@$ip" "$remote_cmd" || rc=$?
+  local remote_out_log="$STATE_DIR/logs/run-remote.$$.log"
+  "$SSH_BIN" -o StrictHostKeyChecking=no -i "$SSH_KEY" "$REMOTE_USER@$ip" "$remote_cmd" 2>&1 | tee "$remote_out_log"
+  rc="${PIPESTATUS[0]}"
   t_remote_end="$(now_fractional)"
 
   # Remote 127/126 = the command or its interpreter is missing ON THE BOX —
@@ -2249,6 +2449,37 @@ cmd_run() {
     echo "fallback: remote sccache did not answer after one restart attempt (rc=97)"
     exit 3
   fi
+
+  # PRD-build-burst-path-deps requirement 3: classify a nonzero exit as a
+  # BUILD failure (compile/resolution error — nothing ever ran) or a TEST
+  # failure (nextest/cargo-test's own red suite) instead of always
+  # journaling `exit=101` the same way regardless of which happened. This
+  # is the fix for the actual defect: four days of wintermute-brain runs
+  # failing before a single test binary ran read as "tests red" in the
+  # journal, so the branch agent kept iterating on tests that were never
+  # the problem (this PRD's five-whys levels 3-4). A non-cargo/nextest
+  # subcommand (e.g. the `bash build.sh` shape several other suites route
+  # through this same primitive) keeps the old undistinguished behavior —
+  # phase stays empty, exactly as if this PRD had never shipped.
+  local phase=""
+  if [ "$rc" -ne 0 ]; then
+    case "$subcmd" in
+      build|clippy|deny|metadata|check) phase="build" ;;
+      test|nextest)
+        if grep -qE 'Running (unittests|tests)|test result:|Summary \[|Starting [0-9]+ tests' "$remote_out_log" 2>/dev/null; then
+          phase="test"
+        else
+          phase="build"
+        fi
+        ;;
+    esac
+  fi
+  if [ "$phase" = "build" ]; then
+    local build_cause; build_cause="$(grep -iE 'error(\[|:)|error:' "$remote_out_log" 2>/dev/null | head -n1)"
+    [ -z "$build_cause" ] && build_cause="$(grep -v '^[[:space:]]*$' "$remote_out_log" 2>/dev/null | tail -n1)"
+    journal_line "$(now_iso)  burst-lane  run  build-failed  (worktree=$worktree cause=\"$build_cause\")"
+  fi
+  rm -f "$remote_out_log" 2>/dev/null || true
 
   # PRD-build-burst-pull-on-demand requirement 1: `run` no longer pulls
   # target/ (or .pybuilder/) back itself — it marks the worktree remote-dirty
@@ -2302,11 +2533,20 @@ cmd_run() {
   # gate's own cargo cost as "unattributed" or the bare repo name.
   slug="${BURST_LANE_PRD_SLUG:-$(attribution_slug_for "$worktree")}"
   bytes_saved="$(last_pull_size "$worktree")"
-  attribution_record "$slug" "$id" "$wall_s" "$sync_s" 0 "$worktree" run 1 "$bytes_saved" true "" "$warm"
+  attribution_record "$slug" "$id" "$wall_s" "$sync_s" 0 "$worktree" run 1 "$bytes_saved" true "" "$warm" "$phase"
 
   flock -u 201
 
-  journal_line "$(now_iso)  burst-lane  run  routed  (server_id=$id worktree=$worktree runs_served=$runs exit=$rc dirty=1 kind=$kind bytes_saved=$bytes_saved slug=$slug wall_s=$wall_s concurrent=$slot_held warm=$warm)"
+  # PRD-build-burst-path-deps requirement 3: a build-classified failure
+  # already got its own `run  build-failed` line above (with the compile/
+  # resolution error's first line as cause) — the ordinary `run  routed`
+  # line is skipped for it so no `exit=101 ... phase=test`-shaped row ever
+  # exists for what was actually a build failure. Every other outcome
+  # (success, or a genuine test-phase failure) keeps this line, now also
+  # naming its phase alongside PRD-build-burst-persistent-volume's warm=.
+  if [ "$phase" != "build" ]; then
+    journal_line "$(now_iso)  burst-lane  run  routed  (server_id=$id worktree=$worktree runs_served=$runs exit=$rc dirty=1 kind=$kind bytes_saved=$bytes_saved slug=$slug wall_s=$wall_s concurrent=$slot_held warm=$warm phase=${phase:-n/a})"
+  fi
   exit "$rc"
 }
 
