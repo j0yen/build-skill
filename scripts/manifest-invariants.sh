@@ -401,8 +401,13 @@ done < <(python3 -c 'import json,sys
 for h in json.loads(sys.argv[1]):
     print(json.dumps(h))' "$final_heals")
 
-# ---- claims-stale alarm (needs a subprocess per building/in_progress entry
-# with a PRD path — done here in bash since it shells out to lane-claim.sh)
+# ---- claims-stale alarm + reclaim (needs a subprocess per building/
+# in_progress entry with a PRD path — done here in bash since it shells out
+# to lane-claim.sh). PRD-build-gate-debt-auto-prd requirement 4: a stale
+# claim is released (via `lane-claim.sh release`) in the same pass that
+# alarms it, journaled as `claim  reclaimed`, so the PRD is re-selectable
+# next tick instead of sitting on a dead claim until a human notices the
+# alarm.
 if [ -x "$LANE_CLAIM" ]; then
   while IFS= read -r row; do
     [ -n "$row" ] || continue
@@ -423,6 +428,23 @@ alarms.append({"slug": sys.argv[2], "class": "stale-claim",
                "message": sys.argv[2] + ": claim is stale (" + sys.argv[3] + ")"})
 print(json.dumps(alarms))' "$alarms_json" "$slug" "$claim_json")"
         alarms_count=$((alarms_count + 1))
+        # Requirement 4 / AC5 (PRD-build-gate-debt-auto-prd): a stale claim
+        # is reclaimed in the SAME tick that alarms it, never merely
+        # alarmed. Previously this block only ever appended the alarm above
+        # (2026-09-11 mcphost-schedules incident: stale-claim alarm fired at
+        # 05:43Z, nothing reclaimed it, the PRD sat gate-pending another
+        # hour+ until a human intervened) — the alarm line above is kept
+        # unchanged (it's the audit trail); this adds the actual release.
+        # claim_json is NOT valid JSON (see the NOTE above — "stale":yes|no
+        # is a bare word), so age_seconds is pulled the same way: pattern
+        # match, not json.loads.
+        age="$(grep -o '"age_seconds":-\?[0-9]*' <<<"$claim_json" | head -n1 | cut -d: -f2)"
+        if release_out="$("$LANE_CLAIM" release "$path" 2>&1)"; then
+          printf '%s  %s  claim  reclaimed  (prd=%s age=%ss lane=%s)\n' \
+            "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$slug" "$slug" "$age" "$(hostname)" >> "$JOURNAL"
+        else
+          log "lane-claim.sh release failed for $slug (stale claim alarmed but not reclaimed): $release_out"
+        fi
       fi
     fi
   done < <(python3 -c 'import json,sys

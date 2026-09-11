@@ -779,6 +779,27 @@ read it before assuming a step is "the last one this tick".
     a passing `Receipts:` line.** The journal already has one line naming
     the blocking receipts (written by `extend-gate.sh` itself); no
     separate journal write is needed here.
+  - **Attribution + gate-debt ownership (2026-09-11, PRD-build-gate-debt-
+    auto-prd).** Every blocking receipt `extend-gate.sh` names is now
+    tagged `in-scope` (this PRD's own merge diff touched it) or
+    `inherited` (landed by an earlier PRD's merge) via
+    `scripts/gate-attribution.sh` — the tags land in the journal gate line
+    (`inherited=<n> in-scope=<m>`) and in `target/autobuilder/
+    last-verdict.json`'s `blocks[]`/`attribution` fields, so a block line
+    is never just a bare receipt name with no owner. On a **block** whose
+    inherited set is non-empty, run `scripts/gate-debt.sh check
+    <build_into> <landed sha>` right after appending the `blockers` line
+    above: the same inherited set blocking the same HEAD on two
+    consecutive `gate` actions (or for 60 minutes) drafts
+    `build-queue/PRD-<repo>-gate-debt-<shortsha>.md` with the findings as
+    countable ACs, high priority, and parks THIS PRD behind it
+    (`Depends-on:` + `Status: queued`) so the existing Phase 2 Depends-on
+    gate holds it instead of it sitting `gate-pending` indefinitely (the
+    2026-09-11 mcphost-schedules incident: 7 hours gate-pending on
+    inherited blocks with no owner). A fresh/changed inherited set is
+    tracked but not yet drafted — `gate-debt.sh check` is a no-op stop the
+    first time a new block shape appears, exactly like any other tick
+    boundary.
   - `extend-gate.sh` takes the crate's own integration lock, so a `gate`
     action never races a same-crate `integrate` or another `gate` run.
     Resumable: if a tick ends mid-gate, the next tick's `gate` action reruns
@@ -1212,6 +1233,16 @@ sections. See "Parallelism" below for the two-tick rule this line feeds.
   regression" and an unretried "unreachable" block ship in one evening.
   Never fails the tick (always exits 0); a flagged verdict is Phase 6's
   reflect-phase input, not a reason to block this tick's own exit.
+- Run `scripts/gate-debt.sh release-check` once (PRD-build-gate-debt-
+  auto-prd requirement 3, AC4). Scans build-queue/ for a `Depends-on:`
+  naming a `PRD-*-gate-debt-*.md` that has now reached `built-prds/` and
+  clears that line, journaling `gate-debt  released` — the existing
+  Phase 2 Depends-on gate already re-admits the freed PRD to selection the
+  moment the file is archived; this call is the visibility/audit line, not
+  new selection logic. A PRD with no such Depends-on, or whose debt PRD
+  hasn't archived yet, is untouched. Never fails the tick (always exits
+  0). `scripts/gate-debt.sh open [--format json]` lists any still-open
+  `PRD-*-gate-debt-*.md` on demand for a status check.
 - Then release `tick.lock`.
 
 This design (per-slug write-ahead intent + a blocking-with-ceiling lock +
@@ -1874,6 +1905,21 @@ python-specific contract.
    Pass `--no-rebase` to reproduce the old abort-immediately behaviour
    (useful for debugging or non-Cargo repos where `cargo check` is
    meaningless).
+
+   **Resurrection guard, for a future union-style recovery path
+   (PRD-build-gate-debt-auto-prd requirement 5).** loom-rebase-retry above
+   ABORTS on a real conflict rather than blending both sides, so it is not
+   itself a "union-resolve" merge — this note is here so a future
+   stale-base recovery strategy that DOES take the union of both sides
+   (the mechanism this PRD's incident narrative names as the suspected
+   resurrection vector) wires in the guard rather than re-deriving it:
+   `scripts/resurrection-guard.sh check <repo> <before_sha> <after_sha>`
+   re-diffs that merge's own range for a `*.rs` addition containing
+   `unsafe` with no `SAFETY` comment nearby in the post-merge file,
+   journals `merge  resurrection-check  (findings=<n>)`, and tags any hit
+   `scope=inherited origin=union-resolve` in gate-attribution.sh's block
+   shape. No such union-resolve path exists in this skill as of this PRD;
+   this is the guard waiting for one, not a claim that one is wired today.
    **`Cargo.lock` is regenerated, not merged.** integrate sets up a
    `Cargo.lock merge=ours` driver (`.gitattributes`, created idempotently)
    so the lockfile never *conflicts* on merge, then runs

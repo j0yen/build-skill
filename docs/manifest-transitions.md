@@ -57,13 +57,17 @@ branch acts on it.
   branches (`manifest.json`, via `manifest-set.sh`).
 - **Inverse:** `lane-claim.sh release`, or another lane's `claim` once the
   claim is stale (age ≥ 3h, or the coordinator is confirmed gone — see
-  `lane-claim.sh`'s `coordinator_gone`). **This is the one inverse this PRD
-  does NOT auto-heal**: which lane resumes a dead claim is a *selection*
-  decision (`lane-predicate.sh` / `lane-claim.sh target-busy`'s own-claim
-  exemption), explicitly out of `manifest-invariants.sh`'s scope per the
-  PRD's Non-goals ("no changes... to selection logic"). Instead
-  `manifest-invariants.sh` **alarms** (`manifest-invariant-stale-claim`) so a
-  human or the next tick's selection sees it — see "Alarms" below.
+  `lane-claim.sh`'s `coordinator_gone`). **Update (PRD-build-gate-debt-
+  auto-prd requirement 4, 2026-09-11):** `manifest-invariants.sh` now calls
+  `lane-claim.sh release` itself in the same pass it alarms a stale claim
+  (journaled `claim  reclaimed`), superseding this PRD's original
+  alarm-only stance — the 2026-09-11 mcphost-schedules incident (a
+  stale-claim alarm fired and nothing reclaimed it for another hour+) is
+  exactly the gap that stance left open. *Which lane's next selection
+  picks the now-free PRD back up* is still untouched, out of scope here —
+  only the release itself moved from "a human or next-tick selection does
+  it" to "the same invariants pass that alarmed it does it". See "Alarms"
+  below.
 
 ### `in_progress`
 
@@ -257,7 +261,7 @@ manifest.
 
 | class (`manifest-invariant-<class>`) | condition |
 |---|---|
-| `stale-claim` | the PRD file carries a claim (`lane-claim.sh status <path> --json` → `claimed: true`) that script's own `stale` verdict marks stale (age ≥ 3h, OR the coordinator is confirmed gone via PID+boot-id — see `lane-claim.sh`'s `coordinator_gone`) |
+| `stale-claim` | the PRD file carries a claim (`lane-claim.sh status <path> --json` → `claimed: true`) that script's own `stale` verdict marks stale (age ≥ 3h, OR the coordinator is confirmed gone via PID+boot-id — see `lane-claim.sh`'s `coordinator_gone`). **Reclaimed, not just alarmed** (PRD-build-gate-debt-auto-prd requirement 4): the same pass calls `lane-claim.sh release` on it and journals `claim  reclaimed  (prd=... age=...)` right after this alarm line — the one exception to "Alarms never mutate the manifest" below (it mutates the PRD file's claim, not `manifest.json` itself). |
 | `shipped-not-archived` | `status` is `shipped` or `built` AND the PRD file is still found under `build-queue/` AND `last_action` is older than `SHIPPED_NOT_ARCHIVED_MINUTES` (default 20; the PRD's own Open Questions table leaves the exact N to a week of measurement) |
 | `unknown-status` | `status` is not one of the eleven statuses in this document |
 | `stale-activity` | `status` is `building` or `in_progress` AND neither `last_action` nor any `iter_log` entry falls within the last 24h |
