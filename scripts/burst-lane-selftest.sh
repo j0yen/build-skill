@@ -1654,5 +1654,94 @@ expect "gatetc AC3b: exactly one apt-update record when no apt tool is missing" 
 expect "gatetc AC3b: apt-update record says ran=false" \
   "grep -q 'gate-tools  apt-update  (ran=false)' \"$BURST_LANE_JOURNAL\""
 
+# ---- gatetc AC4: a suite the box ran but the cached local baseline never
+# had (stale test-output.txt) is "baseline-incomplete", not a diff — parity
+# refreshes the local baseline once, journals baseline-refreshed, and the
+# refreshed comparison reports the suite as compared (ok), never a diff
+# against a null local value. Same fake-cargo-tells-box-from-local-by-$PWD
+# trick as gatebox AC2 above; the only difference here is the PRE-SEEDED
+# stale $WT_AC4/target/autobuilder/test-output.txt this local baseline
+# starts from, which lacks the "extra" suite the box (and the refresh) has.
+fresh_env
+"$BL" up >/dev/null
+WT_AC4="$T/gatetc-ac4-repo"; mkdir -p "$WT_AC4"
+( cd "$WT_AC4" && git init -q && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init )
+FAKEBIN_AC4="$T/fakebin-gatetc-ac4"; mkdir -p "$FAKEBIN_AC4"
+cat > "$FAKEBIN_AC4/cargo" <<EOF
+#!/usr/bin/env bash
+if [ "\${1:-}" = "test" ]; then
+  case "\$PWD" in
+    "$BURST_LANE_REMOTE_ROOT"/*)
+      # box run: parity=ok, extra=ok — "extra" is a suite the stale local
+      # baseline below was seeded WITHOUT.
+      cat <<'LOG'
+     Running unittests src/lib.rs (target/debug/deps/parity-1111111111111111)
+
+running 1 test
+test a ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/extra.rs (target/debug/deps/extra-7777777777777777)
+
+running 1 test
+test d ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+LOG
+      ;;
+    *)
+      # refreshed local run: now also reports "extra", matching the box's
+      # ok — this is what parity's own refresh call to cargo produces.
+      cat <<'LOG'
+     Running unittests src/lib.rs (target/debug/deps/parity-4444444444444444)
+
+running 1 test
+test a ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/extra.rs (target/debug/deps/extra-8888888888888888)
+
+running 1 test
+test d ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+LOG
+      ;;
+  esac
+  exit 0
+fi
+echo "fake-cargo(gatetc-ac4): unhandled args: \$*" >&2
+exit 1
+EOF
+chmod +x "$FAKEBIN_AC4/cargo"
+mkdir -p "$WT_AC4/target/autobuilder"
+cat > "$WT_AC4/target/autobuilder/test-output.txt" <<'LOG'
+     Running unittests src/lib.rs (target/debug/deps/parity-4444444444444444)
+
+running 1 test
+test a ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+LOG
+
+gtc4_out="$(PATH="$FAKEBIN_AC4:$PATH" "$BL" parity "$WT_AC4" 2>&1)"; gtc4_rc=$?
+expect "gatetc AC4: parity exits 0" "[ $gtc4_rc -eq 0 ]"
+expect "gatetc AC4: journal has 'parity  baseline-refreshed' naming the extra suite" \
+  "grep -q 'burst-lane  parity  baseline-refreshed.*names=extra::' \"$BURST_LANE_JOURNAL\""
+expect "gatetc AC4: the refreshed local baseline file now has the extra suite" \
+  "grep -q 'extra.rs' \"$WT_AC4/target/autobuilder/test-output.txt\""
+expect "gatetc AC4: parity reports diff=0 (the suite compared ok, not as a diff on a null)" \
+  "grep -q 'diff=0' <<<\"$gtc4_out\""
+gtc4_json_rc=0
+python3 -c "
+import json
+d = json.load(open('$WT_AC4/target/autobuilder/receipts/box-parity.json'))
+assert 'extra::src/extra.rs' not in d['diff'], d['diff']
+assert d['suites']['extra::src/extra.rs'] == {'box': 'ok', 'local': 'ok'}, d['suites']['extra::src/extra.rs']
+" || gtc4_json_rc=1
+expect "gatetc AC4: box-parity.json compares the extra suite ok/ok, not baseline-incomplete" "[ $gtc4_json_rc -eq 0 ]"
+
 echo "=== $([ $fail -eq 0 ] && echo PASS || echo FAIL) ==="
 exit $fail

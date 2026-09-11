@@ -1724,6 +1724,28 @@ cmd_parity() {
   fi
   local local_suites; local_suites="$(printf '%s\n' "$local_log" | cargo_test_suites_json)"
 
+  # PRD-build-burst-gate-tools-toolchain requirement 4: a suite the box
+  # actually ran but the cached local baseline simply never had (a stale
+  # test-output.txt predating that suite, or one that was never run here
+  # before) is "baseline-incomplete", not a diff — refresh the local
+  # baseline ONCE and recompare, rather than reporting a false diff
+  # against a null. Evidence: 2026-09-11 01:36Z, the first parity on
+  # 3b1fdbc reported diff=1 for a suite the stale local output simply
+  # lacked; the operator had to refresh the local suite by hand to clear
+  # it. This makes that refresh automatic.
+  local missing_locally; missing_locally="$(python3 -c '
+import json, sys
+box = json.loads(sys.argv[1])
+local = json.loads(sys.argv[2])
+print(",".join(sorted(n for n in box if n not in local)))
+' "$box_suites" "$local_suites")"
+  if [ -n "$missing_locally" ]; then
+    local_log="$(cd "$repo" && cargo test --workspace --no-fail-fast 2>&1)"
+    printf '%s\n' "$local_log" > "$local_log_file"
+    local_suites="$(printf '%s\n' "$local_log" | cargo_test_suites_json)"
+    journal_line "$(now_iso)  burst-lane  parity  baseline-refreshed  (repo=$repo names=$missing_locally)"
+  fi
+
   mkdir -p "$repo/target/autobuilder/receipts" 2>/dev/null || true
   local parity_file="$repo/target/autobuilder/receipts/box-parity.json"
   local diff_json status_word
@@ -1736,6 +1758,12 @@ suites = {}
 diff = []
 for n in names:
     b, l = box.get(n), local.get(n)
+    # A suite the box has but the (possibly just-refreshed) local baseline
+    # still genuinely lacks stays "baseline-incomplete" — never counted as
+    # a diff on a null value (requirement 4).
+    if b is not None and l is None:
+        suites[n] = {"box": b, "local": l, "status": "baseline-incomplete"}
+        continue
     suites[n] = {"box": b, "local": l}
     if b != l:
         diff.append(n)
