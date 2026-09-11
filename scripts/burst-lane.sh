@@ -224,6 +224,21 @@ PULLSZ_DIR="$STATE_DIR/pull-sizes"
 ATTR_REPOS_DIR="${BURST_LANE_REPOS_DIR:-$HOME/wintermute}"
 ROLLUP_CURSOR="$STATE_DIR/.rollup-cursor"
 TICK_JOURNAL_DIR="${BURST_LANE_TICK_JOURNAL_DIR:-$HOME/brain/journal/build}"
+# PRD-build-burst-parity-cadence requirement 2: parity's own load-deferral
+# wait bound — distinct from cargo-budget.sh's CARGO_BUDGET_WAIT_MAX, which
+# only gates the LOCAL cargo invocation. This gates the WHOLE parity attempt
+# (box AND local) before either side does any work at all. Shares
+# CARGO_BUDGET_MAX_LOAD/CARGO_BUDGET_LOADAVG/CARGO_BUDGET_HOSTNAME's names
+# with cargo-budget.sh's own gate (see cargo-budget.sh's header) so one
+# fixture/env override drives both layers identically in tests.
+PARITY_LOAD_WAIT_S="${PARITY_LOAD_WAIT_S:-900}"
+PARITY_LOAD_POLL_S="${PARITY_LOAD_POLL_S:-10}"
+# PRD-build-burst-parity-cadence requirement 3: repos `up` schedules one
+# session parity proof for (once per session, not once per HEAD), space-
+# separated basenames resolved under $ATTR_REPOS_DIR — the same known-repo
+# root cost-attribution already uses.
+BURST_PARITY_REPOS="${BURST_PARITY_REPOS:-mcphost}"
+CARGO_BUDGET_SH="${BURST_LANE_CARGO_BUDGET_SH:-$SKILL_DIR/scripts/cargo-budget.sh}"
 # PRD-build-gate-on-casper requirement 1: gate toolchain provisioning. The
 # 8 versioned CLI tools `up` provisions if absent; the two script mirrors
 # (build-skill's own scripts/, rustbuild's scripts/+prompts/) are synced
@@ -1103,6 +1118,7 @@ cmd_up() {
       "gate_ready=$GATE_READY" "gate_tools_missing=$GATE_TOOLS_MISSING"
     journal_line "$(now_iso)  burst-lane  up  adopted  (server_id=$aid ip=$aip sandbox_ok=$sbx gate_ready=$GATE_READY)"
     ( cmd_verify >/dev/null 2>&1 ) || journal_line "$(now_iso)  burst-lane  up  verify-failed-after-adopt  (lane unverified — run falls back local)"
+    schedule_session_parity "$aid"
     echo "already-up: $aid $aip (adopted)"
     exit 0
   fi
@@ -1180,6 +1196,7 @@ print(d.get("id",""), d.get("public_net",{}).get("ipv4",{}).get("ip",""))
   if [ "$sbx" = false ]; then
     journal_line "$(now_iso)  burst-lane  up  sandbox-unavailable  (server_id=$id — rust selection falls back to local cap for python-kind sandboxed tests this tick)"
   fi
+  schedule_session_parity "$id"
   echo "up: $id $ip"
   exit 0
 }
@@ -1538,9 +1555,34 @@ for r in json.loads(sys.argv[1]):
   local redbaron_free_gb; redbaron_free_gb="$(local_disk_free_gb "$STATE_DIR")"
   case "$redbaron_free_gb" in ''|*[!0-9]*) redbaron_free_gb="null" ;; esac
 
+  # PRD-build-burst-parity-cadence requirement 5: this session's parity
+  # state per configured repo (BURST_PARITY_REPOS), straight from each
+  # repo's own box-parity.json — best-effort, a repo with no receipt yet is
+  # simply absent from the array rather than a fabricated placeholder.
+  local parity_json
+  parity_json="$(python3 -c '
+import json, sys
+root, repos = sys.argv[1], sys.argv[2].split()
+out = []
+for name in repos:
+    f = "%s/%s/target/autobuilder/receipts/box-parity.json" % (root, name)
+    try:
+        d = json.load(open(f))
+    except Exception:
+        continue
+    out.append({
+        "repo": name,
+        "session_id": d.get("session_id"),
+        "head_sha": d.get("head_sha"),
+        "diff": d.get("diff", []),
+        "host_sensitive": d.get("host_sensitive", []),
+    })
+print(json.dumps(out))
+' "$ATTR_REPOS_DIR" "$BURST_PARITY_REPOS")"
+
   if [ "$json" -eq 1 ]; then
-    printf '{"active":true,"server_id":"%s","ip":"%s","minutes_alive":%s,"ttl_hours":"%s","sandbox_ok":"%s","concurrent":"%s","free_disk_gb":%s,"disk_state":"%s","dirty":%s,"gates":%s,"gate_ready":"%s","gate_tools_missing":"%s","volume":%s,"redbaron_free_gb":%s}\n' \
-      "$id" "$ip" "$alive" "$ttl" "$sbx" "$conc" "$free_disk_gb" "$disk_state" "$dirty_json" "$gates_json" "$(state_read gate_ready)" "$(state_read gate_tools_missing)" "$vol_json" "$redbaron_free_gb"
+    printf '{"active":true,"server_id":"%s","ip":"%s","minutes_alive":%s,"ttl_hours":"%s","sandbox_ok":"%s","concurrent":"%s","free_disk_gb":%s,"disk_state":"%s","dirty":%s,"gates":%s,"gate_ready":"%s","gate_tools_missing":"%s","volume":%s,"redbaron_free_gb":%s,"parity":%s}\n' \
+      "$id" "$ip" "$alive" "$ttl" "$sbx" "$conc" "$free_disk_gb" "$disk_state" "$dirty_json" "$gates_json" "$(state_read gate_ready)" "$(state_read gate_tools_missing)" "$vol_json" "$redbaron_free_gb" "$parity_json"
   else
     local gate_count; gate_count="$(python3 -c 'import json,sys; print(len(json.loads(sys.argv[1])))' "$gates_json")"
     # PRD-build-burst-gate-tools-scope requirement 3: an operator (or
@@ -1555,6 +1597,15 @@ for r in json.loads(sys.argv[1]):
     echo "active: $id ip=$ip alive=${alive}m ttl=${ttl}h sandbox_ok=$sbx concurrent=$conc disk_state=$disk_state free_disk_gb=$free_disk_gb gates:${gate_count} gate_ready=$(state_read gate_ready) missing=$(state_read gate_tools_missing)${vol_line}"
     [ -n "$dirty_lines" ] && printf '%s\n' "$dirty_lines"
     [ -n "$gate_lines" ] && printf '%s\n' "$gate_lines"
+    local parity_lines; parity_lines="$(python3 -c '
+import json, sys
+for r in json.loads(sys.argv[1]):
+    head = (r.get("head_sha") or "")[:12]
+    print("parity: %s session=%s head=%s diff=%d host_sensitive=%d" % (
+        r.get("repo", ""), r.get("session_id") or "?", head or "?",
+        len(r.get("diff") or []), len(r.get("host_sensitive") or [])))
+' "$parity_json")"
+    [ -n "$parity_lines" ] && printf '%s\n' "$parity_lines"
   fi
   exit 0
 }
@@ -2475,10 +2526,171 @@ print("\n".join(sorted(k for k, v in d.items() if v == sys.argv[2])))
 ' "$1" "$2"
 }
 
+# ---- session-scoped parity validity (PRD-build-burst-parity-cadence) -------
+# requirement 1: a parity receipt is valid for a BOX SESSION + TOOLCHAIN
+# FINGERPRINT, not for a single HEAD — the old contract ("head_sha must equal
+# the HEAD being gated") forced a fresh full local `cargo test --workspace`
+# run on every new commit even though nothing about the box or the toolchain
+# had changed. toolchain_fingerprint() hashes the three things that actually
+# invalidate a prior proof: the box's own gate-tool versions (GATE_TOOLS_
+# STATE_FILE, refreshed by `up`/`provision`), the locally installed rustup
+# toolchains (RedBaron's own compiler set), and the box image id (SNAPSHOT_ID)
+# — any of those changing means the comparison itself could differ even at an
+# unchanged HEAD.
+toolchain_fingerprint() {
+  local rl gv snap
+  rl="$(rustup toolchain list 2>/dev/null | sort | tr '\n' ';')"
+  gv="$(python3 -c '
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    d = {}
+print(json.dumps(d.get("gate_tool_versions", {}), sort_keys=True))
+' "$GATE_TOOLS_STATE_FILE" 2>/dev/null)"
+  snap="${SNAPSHOT_ID:-$DEFAULT_SNAPSHOT_ID}"
+  printf '%s|%s|%s' "$rl" "$gv" "$snap" | sha1sum | awk '{print $1}' | cut -c1-16
+}
+
+# `valid_until` is a descriptive field on the receipt (requirement 1: "valid
+# for the session end") — the actual validity CHECK (see check_parity_receipt
+# below) is session_id + toolchain_fp equality, never a clock comparison, so
+# a stale wall clock or a long-lived session is never treated as invalid on
+# its own. Empty when a session's boot/ttl bookkeeping isn't available (e.g.
+# no active session yet), never fabricated.
+session_valid_until() {
+  local boot_epoch ttl_hours
+  boot_epoch="$(state_read boot_epoch)"
+  ttl_hours="$(state_read ttl_hours)"
+  case "$boot_epoch" in ''|*[!0-9]*) echo ""; return 0 ;; esac
+  case "$ttl_hours" in ''|*[!0-9.]*) echo ""; return 0 ;; esac
+  local until_epoch; until_epoch="$(awk -v b="$boot_epoch" -v t="$ttl_hours" 'BEGIN{printf "%d", b + (t*3600)}')"
+  date -u -d "@$until_epoch" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo ""
+}
+
+# requirement 4: a per-repo `.burst-lane.toml`'s `parity_exclude = [...]`
+# array names suites whose outcome is documented as host-dependent. Parsed
+# with a small regex rather than a TOML library dependency — the file's own
+# convention (see mcphost's `.burst-lane.toml`) is a single flat string
+# array, nothing this needs a real parser for. Absent file or absent key
+# both read as "nothing excluded".
+read_parity_exclude() {  # $1=repo -> stdout: space-separated suite names
+  local f="$1/.burst-lane.toml"
+  [ -f "$f" ] || { echo ""; return 0; }
+  python3 -c '
+import re, sys
+text = open(sys.argv[1]).read()
+m = re.search(r"^\s*parity_exclude\s*=\s*\[(.*?)\]", text, re.MULTILINE | re.DOTALL)
+if not m:
+    print("")
+    raise SystemExit(0)
+items = re.findall(r"\"([^\"]*)\"|\x27([^\x27]*)\x27", m.group(1))
+print(" ".join(a or b for a, b in items))
+' "$f"
+}
+
+# requirement 4's other half: create the placeholder file (empty exclude
+# list) when a repo has none yet, so the valve is visible before any repo
+# actually needs it — mirrors mcphost's own placeholder, created by hand for
+# that repo ahead of this PRD landing.
+ensure_parity_exclude_file() {  # $1=repo
+  local f="$1/.burst-lane.toml"
+  [ -f "$f" ] && return 0
+  cat > "$f" <<'EOF'
+# Per-repo burst-lane parity valve. Names suites (nextest binary-ids or
+# cargo_test_suites_json keys) whose box/local outcome is documented as
+# host-dependent (timing budgets, host-only units) — excluded suites are
+# still run and recorded on both sides (see box-parity.json's
+# "host_sensitive"), just never counted as a parity diff. Owned by
+# PRD-build-burst-parity-cadence, which reads and writes this list; stays
+# empty until a genuinely host-sensitive suite needs it — do not add an
+# entry here as a substitute for fixing a test's own contract.
+parity_exclude = []
+EOF
+}
+
+# requirement 2: RedBaron's load never rises because of parity. Checked
+# BEFORE either side (box or local) does any work — a loaded box gets no
+# rsync, no ssh, nothing — so a caller waiting up to PARITY_LOAD_WAIT_S can
+# see that nothing ran. Off-RedBaron hosts are never gated (mirrors cargo-
+# budget.sh's own is_redbaron() convention; test hooks share its env names).
+parity_load_ok() {
+  local hostname_val="${CARGO_BUDGET_HOSTNAME:-$(hostname 2>/dev/null || echo unknown)}"
+  case "$(printf '%s' "$hostname_val" | tr '[:upper:]' '[:lower:]')" in
+    redbaron) : ;;
+    *) return 0 ;;
+  esac
+  local loadavg_file="${CARGO_BUDGET_LOADAVG:-/proc/loadavg}"
+  local max_load="${CARGO_BUDGET_MAX_LOAD:-64}"
+  local la; la="$(awk '{print $1; found=1} END{if(!found) print 0}' "$loadavg_file" 2>/dev/null || echo 0)"
+  awk -v a="$la" -v b="$max_load" 'BEGIN{exit !(a+0 <= b+0)}'
+}
+
+# requirement 1: a receipt is valid iff it names the CURRENTLY active session
+# and the CURRENT toolchain fingerprint and has no (non-excluded) diff —
+# `head_sha` is deliberately never compared here. Returns one of "" (valid),
+# "parity-diff", "session", "toolchain" on stdout; caller handles the
+# missing-file case itself (that stays "parity-unknown", a distinct cause —
+# see cmd_gate).
+check_parity_receipt() {  # $1=repo -> stdout cause ("" = valid)
+  local repo="$1" parity_file="$1/target/autobuilder/receipts/box-parity.json"
+  [ -f "$parity_file" ] || { echo "parity-unknown"; return 0; }
+  local cur_session cur_fp
+  cur_session="$(state_read server_id)"
+  cur_fp="$(toolchain_fingerprint)"
+  python3 -c '
+import json, sys
+path, session, fp = sys.argv[1:4]
+d = json.load(open(path))
+if d.get("diff"):
+    print("parity-diff"); raise SystemExit(0)
+if not session or d.get("session_id") != session:
+    print("session"); raise SystemExit(0)
+if not fp or d.get("toolchain_fp") != fp:
+    print("toolchain"); raise SystemExit(0)
+print("")
+' "$parity_file" "$cur_session" "$cur_fp"
+}
+
+# requirement 3: once a session exists (adopted or freshly booted), schedule
+# this session's ONE parity proof per configured repo, backgrounded so `up`
+# itself returns promptly — gate's own routing then reads that receipt
+# (check_parity_receipt, session+toolchain matched) instead of triggering a
+# fresh full local test run per HEAD. Each repo's scheduling is journaled
+# independently so a missing/unresolvable repo never blocks the others.
+schedule_session_parity() {  # $1=session_id
+  local sid="$1" name repo
+  for name in $BURST_PARITY_REPOS; do
+    repo="$ATTR_REPOS_DIR/$name"
+    if [ ! -d "$repo/.git" ]; then
+      journal_line "$(now_iso)  burst-lane  parity  schedule-skip  (repo=$name session=$sid cause=not-a-repo)"
+      continue
+    fi
+    journal_line "$(now_iso)  burst-lane  parity  scheduled  (repo=$name session=$sid)"
+    ( cmd_parity "$repo" >/dev/null 2>&1 & disown ) 2>/dev/null || true
+  done
+}
+
 # ---- parity (PRD-build-gate-on-casper requirement 2) ------------------------
 cmd_parity() {
   local repo="${1:-}"
   [ -n "$repo" ] && [ -d "$repo" ] || { echo "usage: burst-lane.sh parity <repo>" >&2; exit 2; }
+
+  # PRD-build-burst-parity-cadence requirement 2: load gate FIRST, before
+  # either side (box or local) does any work — including bringing a box up.
+  # Polls up to PARITY_LOAD_WAIT_S; still too high at the ceiling means
+  # defer, not fail — the caller (gate's reproof, or `up`'s background
+  # schedule) gets another chance later.
+  local pload_wait_start; pload_wait_start="$(now_epoch)"
+  while ! parity_load_ok; do
+    local pload_now pload_elapsed; pload_now="$(now_epoch)"; pload_elapsed=$(( pload_now - pload_wait_start ))
+    if [ "$pload_elapsed" -ge "$PARITY_LOAD_WAIT_S" ]; then
+      journal_line "$(now_iso)  burst-lane  parity  deferred  (cause=load repo=$repo waited=${pload_elapsed}s)"
+      echo "fallback: load"
+      exit 3
+    fi
+    sleep "$PARITY_LOAD_POLL_S"
+  done
 
   if ! state_active; then
     local up_out; up_out="$(cmd_up 2>&1)"; local up_rc=$?
@@ -2549,10 +2761,15 @@ cmd_parity() {
   fi
   flock -u 206
 
+  # PRD-build-burst-parity-cadence requirement 2: the local test run itself
+  # (not the `list`/single-suite-rerun calls below, which are cheap
+  # metadata/single-binary calls) goes through cargo-budget.sh — nice -n 15,
+  # CARGO_BUDGET_TEST_THREADS (default 4), and a ledger row so parity's cost
+  # is visible in the same place every other local cargo invocation's is.
   local local_log_file="$repo/target/autobuilder/test-output.txt" local_log local_suites local_capture="cargo-test"
   if nextest_present_local; then
     local_capture="nextest"
-    local_log="$(cd "$repo" && cargo nextest run --workspace --no-fail-fast 2>&1)"
+    local_log="$(cd "$repo" && CARGO_BUDGET_TEST_THREADS="${CARGO_BUDGET_TEST_THREADS:-4}" "$CARGO_BUDGET_SH" run -- nice -n 15 cargo nextest run --workspace --no-fail-fast 2>&1)"
     local local_list_json; local_list_json="$(cd "$repo" && cargo nextest list --workspace --message-format json 2>/dev/null)"
     local local_names; local_names="$(printf '%s' "$local_list_json" | cargo_nextest_list_names)"
     local local_results; local_results="$(printf '%s\n' "$local_log" | cargo_nextest_suites_json)"
@@ -2563,7 +2780,7 @@ cmd_parity() {
       local_log="$(cat "$local_log_file")"
     else
       mkdir -p "$(dirname "$local_log_file")" 2>/dev/null || true
-      local_log="$(cd "$repo" && env "$CARGO_TEST_RUNNER_TARGET_ENV=stdbuf -o0" cargo test --workspace --no-fail-fast -- --test-threads=1 2>&1)"
+      local_log="$(cd "$repo" && env "$CARGO_TEST_RUNNER_TARGET_ENV=stdbuf -o0" CARGO_BUDGET_TEST_THREADS="${CARGO_BUDGET_TEST_THREADS:-4}" "$CARGO_BUDGET_SH" run -- nice -n 15 cargo test --workspace --no-fail-fast -- --test-threads=1 2>&1)"
       printf '%s\n' "$local_log" > "$local_log_file"
     fi
     local_suites="$(printf '%s\n' "$local_log" | cargo_test_suites_json)"
@@ -2586,7 +2803,7 @@ local = json.loads(sys.argv[2])
 print(",".join(sorted(n for n in box if n not in local)))
 ' "$box_suites" "$local_suites")"
     if [ -n "$missing_locally" ]; then
-      local_log="$(cd "$repo" && env "$CARGO_TEST_RUNNER_TARGET_ENV=stdbuf -o0" cargo test --workspace --no-fail-fast -- --test-threads=1 2>&1)"
+      local_log="$(cd "$repo" && env "$CARGO_TEST_RUNNER_TARGET_ENV=stdbuf -o0" CARGO_BUDGET_TEST_THREADS="${CARGO_BUDGET_TEST_THREADS:-4}" "$CARGO_BUDGET_SH" run -- nice -n 15 cargo test --workspace --no-fail-fast -- --test-threads=1 2>&1)"
       printf '%s\n' "$local_log" > "$local_log_file"
       local_suites="$(printf '%s\n' "$local_log" | cargo_test_suites_json)"
       journal_line "$(now_iso)  burst-lane  parity  baseline-refreshed  (repo=$repo names=$missing_locally)"
@@ -2640,14 +2857,23 @@ print(",".join(sorted(n for n in box if n not in local)))
   local local_log_receipt="$repo/target/autobuilder/receipts/parity-local.log"
   printf '%s\n' "$box_log" > "$box_log_receipt"
   printf '%s\n' "$local_log" > "$local_log_receipt"
+
+  # PRD-build-burst-parity-cadence requirement 4: suites this repo's own
+  # `.burst-lane.toml` documents as host-dependent are still run and
+  # recorded on both sides, but never counted as a parity diff.
+  ensure_parity_exclude_file "$repo"
+  local parity_exclude; parity_exclude="$(read_parity_exclude "$repo")"
+
   local diff_json status_word
   diff_json="$(python3 -c '
 import json, sys
 box = json.loads(sys.argv[1])
 local = json.loads(sys.argv[2])
+excluded = set(sys.argv[3].split())
 names = sorted(set(box) | set(local))
 suites = {}
 diff = []
+host_sensitive = []
 for n in names:
     b, l = box.get(n), local.get(n)
     # A suite the box has but the (possibly just-refreshed) local baseline
@@ -2656,25 +2882,48 @@ for n in names:
     if b is not None and l is None:
         suites[n] = {"box": b, "local": l, "status": "baseline-incomplete"}
         continue
+    if n in excluded and b != l:
+        suites[n] = {"box": b, "local": l, "status": "host-sensitive"}
+        host_sensitive.append(n)
+        continue
     suites[n] = {"box": b, "local": l}
     if b != l:
         diff.append(n)
-print(json.dumps({"suites": suites, "diff": diff}))
-' "$box_suites" "$local_suites")"
+print(json.dumps({"suites": suites, "diff": diff, "host_sensitive": host_sensitive}))
+' "$box_suites" "$local_suites" "$parity_exclude")"
+
+  # PRD-build-burst-parity-cadence requirement 1: the receipt is valid for a
+  # box SESSION + TOOLCHAIN FINGERPRINT, not a single HEAD — session_id and
+  # toolchain_fp are what cmd_gate's check_parity_receipt() actually compares
+  # (head_sha stays on the receipt for diagnostics only, never compared).
+  local session_id toolchain_fp valid_until
+  session_id="$(state_read server_id)"
+  toolchain_fp="$(toolchain_fingerprint)"
+  valid_until="$(session_valid_until)"
+
   python3 -c '
 import json, sys
 d = json.loads(sys.argv[1])
 out = {
     "head_sha": sys.argv[2], "box_host": sys.argv[3], "suites": d["suites"], "diff": d["diff"],
+    "host_sensitive": d["host_sensitive"],
     "box_log": sys.argv[5], "local_log": sys.argv[6],
     "box_capture": sys.argv[7], "local_capture": sys.argv[8],
+    "session_id": sys.argv[9], "toolchain_fp": sys.argv[10], "valid_until": sys.argv[11],
 }
 json.dump(out, open(sys.argv[4], "w"), indent=2)
-' "$diff_json" "$head_sha" "$ip" "$parity_file" "$box_log_receipt" "$local_log_receipt" "$box_capture" "$local_capture"
+' "$diff_json" "$head_sha" "$ip" "$parity_file" "$box_log_receipt" "$local_log_receipt" "$box_capture" "$local_capture" \
+  "$session_id" "$toolchain_fp" "$valid_until"
 
   local diff_count; diff_count="$(python3 -c 'import json,sys; print(len(json.loads(sys.argv[1])["diff"]))' "$diff_json")"
+  local host_sensitive_count host_sensitive_names
+  host_sensitive_count="$(python3 -c 'import json,sys; print(len(json.loads(sys.argv[1])["host_sensitive"]))' "$diff_json")"
   if [ "$diff_count" -eq 0 ]; then status_word="ok"; else status_word="diff"; fi
-  journal_line "$(now_iso)  burst-lane  parity  $status_word  (repo=$repo head=$head_sha box=$ip diff=$diff_count)"
+  journal_line "$(now_iso)  burst-lane  parity  $status_word  (repo=$repo head=$head_sha box=$ip diff=$diff_count session=$session_id)"
+  if [ "$host_sensitive_count" -gt 0 ]; then
+    host_sensitive_names="$(python3 -c 'import json,sys; print(",".join(json.loads(sys.argv[1])["host_sensitive"]))' "$diff_json")"
+    journal_line "$(now_iso)  burst-lane  parity  host-sensitive  (repo=$repo names=$host_sensitive_names)"
+  fi
   echo "parity: $status_word (diff=$diff_count) — $parity_file"
   exit 0
 }
@@ -2839,16 +3088,28 @@ cmd_gate() {
     exit 3
   fi
 
+  # PRD-build-burst-parity-cadence requirement 1: a receipt is valid for the
+  # box SESSION + TOOLCHAIN FINGERPRINT, not for this exact HEAD — head_sha
+  # is deliberately never compared here any more (see check_parity_receipt).
+  # A session/toolchain MISMATCH (as opposed to a real parity-diff, or no
+  # receipt at all) gets exactly one re-proof before falling back, since a
+  # fresh box or a toolchain bump genuinely invalidates whatever was proven
+  # before and a fresh proof is cheap relative to blocking every gate on a
+  # box that's actually fine.
   local parity_file="$repo/target/autobuilder/receipts/box-parity.json"
   local cause=""
   if [ ! -f "$parity_file" ]; then
     cause="parity-unknown"
   else
-    python3 -c '
-import json, sys
-d = json.load(open(sys.argv[1]))
-sys.exit(0 if d.get("head_sha") == sys.argv[2] and d.get("diff") == [] else 1)
-' "$parity_file" "$head_now" || cause="parity-diff"
+    cause="$(check_parity_receipt "$repo")"
+  fi
+  if [ "$cause" = "session" ] || [ "$cause" = "toolchain" ]; then
+    journal_line "$(now_iso)  burst-lane  parity  reproof  (cause=$cause repo=$repo)"
+    # Subshell: cmd_parity ends every path with an `exit`, correct for a
+    # top-level dispatch but fatal to the calling process if invoked as a
+    # plain function call — `( ... )` scopes that exit to the subshell only.
+    ( cmd_parity "$repo" ) >/dev/null 2>&1 || true
+    cause="$(check_parity_receipt "$repo")"
   fi
   if [ -n "$cause" ]; then
     journal_line "$(now_iso)  burst-lane  gate  fallback  (cause=$cause repo=$repo head=$head_now)"
@@ -3706,6 +3967,34 @@ print(remote, local_)
   read -r gates_remote gates_local <<<"$gate_stats"
   line="$line gates_remote=${gates_remote:-0} gates_local=${gates_local:-0}"
 
+  # PRD-build-burst-parity-cadence requirement 5: today's parity activity —
+  # completed proofs (ok or diff) and load-deferrals — straight from this
+  # script's own $JOURNAL, same source/shape as gates_remote/gates_local
+  # just above.
+  local parity_stats parity_runs parity_load_deferred
+  parity_stats="$(python3 -c '
+import sys
+today, path = sys.argv[1], sys.argv[2]
+runs = 0
+deferred = 0
+try:
+    with open(path) as fh:
+        for ln in fh:
+            if not ln.startswith(today):
+                continue
+            if "burst-lane  parity  " not in ln:
+                continue
+            if "  parity  ok  " in ln or "  parity  diff  " in ln:
+                runs += 1
+            elif "  parity  deferred  " in ln:
+                deferred += 1
+except OSError:
+    pass
+print(runs, deferred)
+' "$today" "$JOURNAL")"
+  read -r parity_runs parity_load_deferred <<<"$parity_stats"
+  line="$line parity_runs=${parity_runs:-0} parity_load_deferred=${parity_load_deferred:-0}"
+
   # isolation_refusals was already computed above (before the cost-ledger
   # gate), so a refusal count is visible in this line the same as any other
   # metric here (PRD-build-burst-selftest-isolation requirement 4).
@@ -4217,6 +4506,17 @@ main() {
     _debug-remote-config)
       printf 'remote_user=%s\nremote_home=%s\nremote_root=%s\ngate_tools_bin=%s\ngate_cred_path=%s\nsccache_dir=%s\n' \
         "$REMOTE_USER" "$REMOTE_HOME" "$REMOTE_ROOT" "$GATE_TOOLS_REMOTE_BIN_DIR" "$GATE_CRED_REMOTE_PATH" "$REMOTE_SCCACHE_DIR"
+      exit 0
+      ;;
+    # Undocumented/hidden — PRD-build-burst-parity-cadence: a pure read-only
+    # print of toolchain_fingerprint()'s current value, same rationale as
+    # _debug-remote-config above — lets the offline selftest hand-craft a
+    # receipt that is genuinely VALID under the new session+toolchain
+    # contract (rather than every non-parity gate fixture accidentally
+    # tripping the new one-reproof path just because its hand-crafted
+    # receipt predates session_id/toolchain_fp).
+    _debug-toolchain-fp)
+      toolchain_fingerprint
       exit 0
       ;;
     *) usage ;;

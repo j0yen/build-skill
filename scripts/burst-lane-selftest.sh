@@ -107,6 +107,19 @@ expect() {
   if eval "$cond"; then echo "ok  $label"; else echo "FAIL $label" >&2; fail=1; fi
 }
 
+# PRD-build-burst-parity-cadence: every hand-crafted box-parity.json fixture
+# in this suite must carry the ACTIVE session's session_id + toolchain_fp
+# (matching what a real `parity` run would write) so cmd_gate's session/
+# toolchain validity check reads it as valid — a receipt missing these
+# fields correctly reads as the pre-migration shape (see the PRD's own
+# Migration/compatibility section) and triggers a re-proof, which would
+# change the assertions of every gate fixture here that predates the field
+# and isn't itself testing that re-proof path (see the dedicated
+# `paritycad AC2` case for that). Call only after `up` — needs an active
+# session.
+pc_active_session_id() { grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2; }
+pc_active_toolchain_fp() { "$BL" _debug-toolchain-fp; }
+
 # PRD-build-burst-pull-on-demand: rc0 iff `status --json`'s "dirty" array
 # lists $1 by exact worktree path (used instead of a raw grep since a JSON
 # array's field order/whitespace is an implementation detail this selftest
@@ -1199,8 +1212,9 @@ WT_GATE="$T/gate-repo"; mkdir -p "$WT_GATE"
 ( cd "$WT_GATE" && git init -q && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init )
 head_gate="$(git -C "$WT_GATE" rev-parse HEAD)"
 mkdir -p "$WT_GATE/target/autobuilder/receipts"
+sid_gate3="$(pc_active_session_id)"; tfp_gate3="$(pc_active_toolchain_fp)"
 cat > "$WT_GATE/target/autobuilder/receipts/box-parity.json" <<EOF
-{"head_sha": "$head_gate", "box_host": "127.0.0.1", "suites": {}, "diff": []}
+{"head_sha": "$head_gate", "box_host": "127.0.0.1", "suites": {}, "diff": [], "session_id": "$sid_gate3", "toolchain_fp": "$tfp_gate3"}
 EOF
 
 FAKEBIN_GATE="$T/fakebin-gate"; mkdir -p "$FAKEBIN_GATE"
@@ -1279,7 +1293,8 @@ fresh_env
 WT_AC8="$T/ac8-repo"; mkdir -p "$WT_AC8/target/autobuilder/receipts"
 ( cd "$WT_AC8" && git init -q && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init )
 head_ac8="$(git -C "$WT_AC8" rev-parse HEAD)"
-echo "{\"head_sha\": \"$head_ac8\", \"box_host\": \"x\", \"suites\": {}, \"diff\": []}" > "$WT_AC8/target/autobuilder/receipts/box-parity.json"
+sid_ac8="$(pc_active_session_id)"; tfp_ac8="$(pc_active_toolchain_fp)"
+echo "{\"head_sha\": \"$head_ac8\", \"box_host\": \"x\", \"suites\": {}, \"diff\": [], \"session_id\": \"$sid_ac8\", \"toolchain_fp\": \"$tfp_ac8\"}" > "$WT_AC8/target/autobuilder/receipts/box-parity.json"
 FAKEBIN_AC8="$T/fakebin-ac8"; mkdir -p "$FAKEBIN_AC8"
 AC8_CALLLOG="$T/ac8-extend-gate-calls.log"
 cat > "$FAKEBIN_AC8/extend-gate.sh" <<EOF
@@ -1403,15 +1418,16 @@ exit 0
 EOF
 chmod +x "$FAKEBIN_CONC/extend-gate.sh"
 
+sid_conc="$(pc_active_session_id)"; tfp_conc="$(pc_active_toolchain_fp)"
 WT_C1="$T/conc1-repo"; mkdir -p "$WT_C1/target/autobuilder/receipts"
 ( cd "$WT_C1" && git init -q && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init )
 head_c1="$(git -C "$WT_C1" rev-parse HEAD)"
-echo "{\"head_sha\": \"$head_c1\", \"box_host\": \"x\", \"suites\": {}, \"diff\": []}" > "$WT_C1/target/autobuilder/receipts/box-parity.json"
+echo "{\"head_sha\": \"$head_c1\", \"box_host\": \"x\", \"suites\": {}, \"diff\": [], \"session_id\": \"$sid_conc\", \"toolchain_fp\": \"$tfp_conc\"}" > "$WT_C1/target/autobuilder/receipts/box-parity.json"
 
 WT_C2="$T/conc2-repo"; mkdir -p "$WT_C2/target/autobuilder/receipts"
 ( cd "$WT_C2" && git init -q && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init )
 head_c2="$(git -C "$WT_C2" rev-parse HEAD)"
-echo "{\"head_sha\": \"$head_c2\", \"box_host\": \"x\", \"suites\": {}, \"diff\": []}" > "$WT_C2/target/autobuilder/receipts/box-parity.json"
+echo "{\"head_sha\": \"$head_c2\", \"box_host\": \"x\", \"suites\": {}, \"diff\": [], \"session_id\": \"$sid_conc\", \"toolchain_fp\": \"$tfp_conc\"}" > "$WT_C2/target/autobuilder/receipts/box-parity.json"
 
 export BURST_MAX_CONCURRENT_RUNS=7   # AC6's own "sub-cap 7" — comfortably >= 2
 PATH="$FAKEBIN_CONC:$PATH" "$BL" gate "$WT_C1" --head "$head_c1" >"$T/gate-c1.out" 2>&1 &
@@ -1508,16 +1524,17 @@ exit 0
 EOF
 chmod +x "$FAKEBIN_R9/extend-gate.sh"
 
+sid_r9="$(pc_active_session_id)"; tfp_r9="$(pc_active_toolchain_fp)"
 WT_R1="$T/r9-repo-one"; mkdir -p "$WT_R1/target/autobuilder/receipts"
 ( cd "$WT_R1" && git init -q && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init )
 head_r1="$(git -C "$WT_R1" rev-parse HEAD)"
-echo "{\"head_sha\": \"$head_r1\", \"box_host\": \"x\", \"suites\": {}, \"diff\": []}" > "$WT_R1/target/autobuilder/receipts/box-parity.json"
+echo "{\"head_sha\": \"$head_r1\", \"box_host\": \"x\", \"suites\": {}, \"diff\": [], \"session_id\": \"$sid_r9\", \"toolchain_fp\": \"$tfp_r9\"}" > "$WT_R1/target/autobuilder/receipts/box-parity.json"
 PATH="$FAKEBIN_R9:$PATH" "$BL" gate "$WT_R1" --head "$head_r1" >/dev/null 2>&1
 
 WT_R2="$T/r9-repo-two"; mkdir -p "$WT_R2/target/autobuilder/receipts"
 ( cd "$WT_R2" && git init -q && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init )
 head_r2="$(git -C "$WT_R2" rev-parse HEAD)"
-echo "{\"head_sha\": \"$head_r2\", \"box_host\": \"x\", \"suites\": {}, \"diff\": []}" > "$WT_R2/target/autobuilder/receipts/box-parity.json"
+echo "{\"head_sha\": \"$head_r2\", \"box_host\": \"x\", \"suites\": {}, \"diff\": [], \"session_id\": \"$sid_r9\", \"toolchain_fp\": \"$tfp_r9\"}" > "$WT_R2/target/autobuilder/receipts/box-parity.json"
 PATH="$FAKEBIN_R9:$PATH" "$BL" gate "$WT_R2" --head "$head_r2" >/dev/null 2>&1
 
 r9_attr_rc=0
@@ -1593,7 +1610,8 @@ fresh_env
 WT_AC5="$T/ac5-repo"; mkdir -p "$WT_AC5/target/autobuilder/receipts"
 ( cd "$WT_AC5" && git init -q && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init )
 head_ac5="$(git -C "$WT_AC5" rev-parse HEAD)"
-echo "{\"head_sha\": \"$head_ac5\", \"box_host\": \"x\", \"suites\": {}, \"diff\": []}" > "$WT_AC5/target/autobuilder/receipts/box-parity.json"
+sid_ac5="$(pc_active_session_id)"; tfp_ac5="$(pc_active_toolchain_fp)"
+echo "{\"head_sha\": \"$head_ac5\", \"box_host\": \"x\", \"suites\": {}, \"diff\": [], \"session_id\": \"$sid_ac5\", \"toolchain_fp\": \"$tfp_ac5\"}" > "$WT_AC5/target/autobuilder/receipts/box-parity.json"
 
 ac5_out="$(FAKE_RSYNC_FAIL=1 FAKE_RSYNC_FAIL_RC=11 FAKE_RSYNC_FAIL_MSG='rsync: fake gate rsync failure' "$BL" gate "$WT_AC5" --head "$head_ac5" 2>&1)"; ac5_rc=$?
 expect "gatebox AC5: gate exits 3 when the rsync-up itself fails before the remote gate starts" "[ $ac5_rc -eq 3 ]"
@@ -1652,7 +1670,8 @@ export FAKE_SSH_GATE_TOOLS_INSTALL_FAIL=1
 WT_GT3="$T/gt3-repo"; mkdir -p "$WT_GT3/target/autobuilder/receipts"
 ( cd "$WT_GT3" && git init -q && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init )
 head_gt3="$(git -C "$WT_GT3" rev-parse HEAD)"
-echo "{\"head_sha\": \"$head_gt3\", \"box_host\": \"x\", \"suites\": {}, \"diff\": []}" > "$WT_GT3/target/autobuilder/receipts/box-parity.json"
+sid_gt3="$(pc_active_session_id)"; tfp_gt3="$(pc_active_toolchain_fp)"
+echo "{\"head_sha\": \"$head_gt3\", \"box_host\": \"x\", \"suites\": {}, \"diff\": [], \"session_id\": \"$sid_gt3\", \"toolchain_fp\": \"$tfp_gt3\"}" > "$WT_GT3/target/autobuilder/receipts/box-parity.json"
 gt3_out="$("$BL" gate "$WT_GT3" --head "$head_gt3" 2>&1)"; gt3_rc=$?
 expect "gatetools AC3: gate exits 3 when gate_ready=false" "[ $gt3_rc -eq 3 ]"
 expect "gatetools AC3: gate prints fallback: gate-tools-missing naming the tool" \
@@ -2369,6 +2388,325 @@ expect "isolate AC5: clean once the fixture-named dir is gone" "[ $iso_ac5b_rc -
 # cases — matching every sibling AC's own "does the suite name its own
 # coverage" convention (parityr AC6, burstuser AC7 above).
 expect "isolate AC6: every isolate case above ran green" "[ $fail -eq 0 ]"
+
+# ==============================================================================
+# paritycad AC1-AC6 (PRD-build-burst-parity-cadence): a parity receipt is
+# valid for a box SESSION + TOOLCHAIN FINGERPRINT (not a single HEAD), the
+# local half is load-gated and cargo-budget-wrapped, and a per-repo
+# `.burst-lane.toml` can mark a suite host-sensitive without blocking
+# routing.
+# ==============================================================================
+
+# cargo-budget.sh is a separate script with no isolation-guard.sh of its own
+# (unlike burst-lane.sh's own state/journal) — every case below that reaches
+# cmd_parity's LOCAL half must explicitly scope cargo-budget's state/
+# journal/meminfo/loadavg/hostname under $T (same convention as cargo-
+# budget-selftest.sh's own common_env()), or a real invocation here would
+# write into this host's REAL cargo-budget ledger/journal and could contend
+# a REAL production slot lock.
+paritycad_cargo_budget_env() {
+  local dir="$1"
+  export CARGO_BUDGET_STATE_DIR="$dir/cb-state"
+  export CARGO_BUDGET_JOURNAL="$dir/cb-journal.md"
+  export CARGO_BUDGET_HOSTNAME="paritycad-not-redbaron"
+  printf '0.10 0.05 0.01 1/200 12345\n' > "$dir/cb-loadavg"
+  export CARGO_BUDGET_LOADAVG="$dir/cb-loadavg"
+  cat > "$dir/cb-meminfo" <<'EOF'
+MemTotal:       31000000 kB
+MemFree:        20000000 kB
+MemAvailable:   25000000 kB
+EOF
+  export CARGO_BUDGET_MEMINFO="$dir/cb-meminfo"
+}
+
+# ---- paritycad AC1: a receipt valid for the ACTIVE session + toolchain
+# fingerprint routes `gate` at a NEW head without re-running parity —
+# head_sha is never compared any more (requirement 1).
+fresh_env
+paritycad_cargo_budget_env "$T"
+export FAKE_SSH_NEXTEST_PRESENT=1
+export BURST_LANE_FORCE_NEXTEST_LOCAL=1
+"$BL" up >/dev/null
+sid_pc1="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+WT_PC1="$T/paritycad-repo1"; mkdir -p "$WT_PC1"
+( cd "$WT_PC1" && git init -q && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init )
+FAKEBIN_PC1="$T/fakebin-paritycad1"; mkdir -p "$FAKEBIN_PC1"
+export PARITYCAD1_CARGO_CALLS="$T/paritycad1-cargo-calls"
+cat > "$FAKEBIN_PC1/cargo" <<'CARGOEOF'
+#!/usr/bin/env bash
+if [ "${1:-}" = "nextest" ]; then
+  shift
+  sub="${1:-}"; shift || true
+  case "$PWD" in
+    "$BURST_LANE_REMOTE_ROOT"/*) side=box ;;
+    *) side=local; echo run >> "$PARITYCAD1_CARGO_CALLS" ;;
+  esac
+  if [ "$sub" = "list" ]; then
+    echo '{"rust-suites": {"parity::a": {}, "parity::b": {}}}'
+    exit 0
+  fi
+  if [ "$sub" = "run" ]; then
+    echo "        PASS [   0.001s] (1/2) parity::a test_a"
+    echo "        PASS [   0.001s] (2/2) parity::b test_b"
+    exit 0
+  fi
+fi
+echo "fake-cargo(paritycad1): unhandled args: $*" >&2
+exit 1
+CARGOEOF
+chmod +x "$FAKEBIN_PC1/cargo"
+
+pc1_parity_out="$(PATH="$FAKEBIN_PC1:$PATH" "$BL" parity "$WT_PC1" 2>&1)"; pc1_parity_rc=$?
+expect "paritycad AC1: initial parity exits 0 with a clean diff" "[ $pc1_parity_rc -eq 0 ] && grep -q 'diff=0' <<<\"\$pc1_parity_out\""
+pc1_receipt="$WT_PC1/target/autobuilder/receipts/box-parity.json"
+pc1_fields_rc=0
+python3 -c "
+import json
+d = json.load(open('$pc1_receipt'))
+assert d.get('session_id') == '$sid_pc1', d.get('session_id')
+assert d.get('toolchain_fp'), d
+assert d.get('diff') == [], d
+" || pc1_fields_rc=1
+expect "paritycad AC1: receipt carries session_id + toolchain_fp" "[ $pc1_fields_rc -eq 0 ]"
+
+head_a_pc1="$(git -C "$WT_PC1" rev-parse HEAD)"
+( cd "$WT_PC1" && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m "moves head" )
+head_b_pc1="$(git -C "$WT_PC1" rev-parse HEAD)"
+
+FAKE_EG_CALLLOG_PC1="$T/paritycad1-extend-gate-calls.log"
+cat > "$FAKEBIN_PC1/extend-gate.sh" <<EOF
+#!/usr/bin/env bash
+echo "\$*" >> "$FAKE_EG_CALLLOG_PC1"
+mkdir -p target/autobuilder/receipts
+echo '{"pass": 25, "block": 0}' > target/autobuilder/last-verdict.json
+exit 0
+EOF
+chmod +x "$FAKEBIN_PC1/extend-gate.sh"
+reproof_before_pc1="$(grep -c 'burst-lane  parity  reproof' "$BURST_LANE_JOURNAL" 2>/dev/null || echo 0)"
+gate1_out="$(PATH="$FAKEBIN_PC1:$PATH" "$BL" gate "$WT_PC1" --head "$head_b_pc1" 2>&1)"; gate1_rc=$?
+reproof_after_pc1="$(grep -c 'burst-lane  parity  reproof' "$BURST_LANE_JOURNAL" 2>/dev/null || echo 0)"
+expect "paritycad AC1: gate at a NEW head routes (invokes extend-gate.sh, not a parity fallback)" \
+  "[ $gate1_rc -eq 0 ] && [ \"\$(wc -l < \"$FAKE_EG_CALLLOG_PC1\")\" -eq 1 ] && [ \"$head_a_pc1\" != \"$head_b_pc1\" ]"
+expect "paritycad AC1: gate never falls back on the receipt's stale head_sha" "! grep -q '^fallback:' <<<\"$gate1_out\""
+expect "paritycad AC1: no re-proof happened (session+toolchain both still match)" "[ \"$reproof_before_pc1\" = \"$reproof_after_pc1\" ]"
+
+# ---- paritycad AC2: a receipt whose session_id no longer matches the
+# ACTIVE session triggers exactly one re-proof (journaled with its cause),
+# and gate's routing follows that re-proof's own result.
+fresh_env
+paritycad_cargo_budget_env "$T"
+export FAKE_SSH_NEXTEST_PRESENT=1
+export BURST_LANE_FORCE_NEXTEST_LOCAL=1
+"$BL" up >/dev/null
+sid_pc2="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+WT_PC2="$T/paritycad-repo2"; mkdir -p "$WT_PC2"
+( cd "$WT_PC2" && git init -q && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init )
+FAKEBIN_PC2="$T/fakebin-paritycad2"; mkdir -p "$FAKEBIN_PC2"
+export PARITYCAD2_CARGO_CALLS="$T/paritycad2-cargo-calls"
+cat > "$FAKEBIN_PC2/cargo" <<'CARGOEOF'
+#!/usr/bin/env bash
+if [ "${1:-}" = "nextest" ]; then
+  shift
+  sub="${1:-}"; shift || true
+  case "$PWD" in
+    "$BURST_LANE_REMOTE_ROOT"/*) side=box ;;
+    *) side=local ;;
+  esac
+  if [ "$sub" = "list" ]; then
+    echo '{"rust-suites": {"parity::a": {}, "parity::b": {}}}'
+    exit 0
+  fi
+  if [ "$sub" = "run" ]; then
+    # Count only actual TEST RUNS (not the cheap `list` metadata call) on
+    # the local side — this is what "the re-proof re-ran the local test"
+    # means to paritycad AC2.
+    [ "$side" = "local" ] && echo run >> "$PARITYCAD2_CARGO_CALLS"
+    echo "        PASS [   0.001s] (1/2) parity::a test_a"
+    echo "        PASS [   0.001s] (2/2) parity::b test_b"
+    exit 0
+  fi
+fi
+echo "fake-cargo(paritycad2): unhandled args: $*" >&2
+exit 1
+CARGOEOF
+chmod +x "$FAKEBIN_PC2/cargo"
+cat > "$FAKEBIN_PC2/extend-gate.sh" <<'EOF'
+#!/usr/bin/env bash
+mkdir -p target/autobuilder/receipts
+echo '{"pass": 25, "block": 0}' > target/autobuilder/last-verdict.json
+exit 0
+EOF
+chmod +x "$FAKEBIN_PC2/extend-gate.sh"
+
+pc2_parity_out="$(PATH="$FAKEBIN_PC2:$PATH" "$BL" parity "$WT_PC2" 2>&1)"; pc2_parity_rc=$?
+expect "paritycad AC2: initial parity exits 0 with a clean diff" "[ $pc2_parity_rc -eq 0 ]"
+pc2_receipt="$WT_PC2/target/autobuilder/receipts/box-parity.json"
+head_pc2="$(git -C "$WT_PC2" rev-parse HEAD)"
+
+# Simulate "a new session": forge the receipt's session_id to a foreign
+# value — the ACTIVE session is unchanged, only the receipt now claims a
+# different one, isolating this case to the session-mismatch path alone.
+python3 -c "
+import json
+p = '$pc2_receipt'
+d = json.load(open(p))
+d['session_id'] = 'some-other-session-999'
+json.dump(d, open(p, 'w'))
+"
+
+cargo_calls_before_pc2="$(wc -l < "$PARITYCAD2_CARGO_CALLS" 2>/dev/null || echo 0)"
+gate2_out="$(PATH="$FAKEBIN_PC2:$PATH" "$BL" gate "$WT_PC2" --head "$head_pc2" 2>&1)"; gate2_rc=$?
+cargo_calls_after_pc2="$(wc -l < "$PARITYCAD2_CARGO_CALLS" 2>/dev/null || echo 0)"
+
+expect "paritycad AC2: exactly one re-proof journaled with cause=session" \
+  "[ \"\$(grep -c 'burst-lane  parity  reproof  (cause=session' \"$BURST_LANE_JOURNAL\")\" = 1 ]"
+expect "paritycad AC2: the re-proof actually re-ran the local test exactly once" \
+  "[ $((cargo_calls_after_pc2 - cargo_calls_before_pc2)) -eq 1 ]"
+expect "paritycad AC2: routing follows the re-proof's result (gate proceeds, exit 0)" "[ $gate2_rc -eq 0 ]"
+pc2_session_fixed_rc=0
+python3 -c "
+import json
+d = json.load(open('$pc2_receipt'))
+assert d.get('session_id') == '$sid_pc2', d.get('session_id')
+" || pc2_session_fixed_rc=1
+expect "paritycad AC2: the re-proof rewrote the receipt with the real active session_id" "[ $pc2_session_fixed_rc -eq 0 ]"
+
+# ---- paritycad AC3: RedBaron's load never rises because of parity — a load
+# above CARGO_BUDGET_MAX_LOAD defers the WHOLE attempt (no box, no local, no
+# `up`) and journals the cause (requirement 2).
+fresh_env
+export CARGO_BUDGET_HOSTNAME="redbaron"
+printf '999.0 999.0 999.0 1/500 99999\n' > "$T/pc3-loadavg"
+export CARGO_BUDGET_LOADAVG="$T/pc3-loadavg"
+export PARITY_LOAD_WAIT_S=0
+WT_PC3="$T/paritycad-repo3"; mkdir -p "$WT_PC3"
+( cd "$WT_PC3" && git init -q && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init )
+pc3_out="$("$BL" parity "$WT_PC3" 2>&1)"; pc3_rc=$?
+expect "paritycad AC3: parity exits 3 when RedBaron's load exceeds the cap" "[ $pc3_rc -eq 3 ]"
+expect "paritycad AC3: parity prints fallback: load" "grep -q '^fallback: load$' <<<\"$pc3_out\""
+expect "paritycad AC3: journal records the deferral with cause=load" \
+  "grep -q 'burst-lane  parity  deferred  (cause=load' \"$BURST_LANE_JOURNAL\""
+expect "paritycad AC3: no session was ever brought up (neither side ran)" "[ ! -f \"$BURST_LANE_STATE_DIR/session.json\" ]"
+expect "paritycad AC3: no local test baseline was written" "[ ! -e \"$WT_PC3/target/autobuilder/test-output.txt\" ]"
+expect "paritycad AC3: no parity receipt was written" "[ ! -e \"$WT_PC3/target/autobuilder/receipts/box-parity.json\" ]"
+unset CARGO_BUDGET_HOSTNAME CARGO_BUDGET_LOADAVG PARITY_LOAD_WAIT_S
+
+# ---- paritycad AC4: a suite named in .burst-lane.toml's parity_exclude is
+# still run and recorded on both sides, but never counted as a parity diff
+# — reported under host_sensitive instead — and gate still routes
+# (requirement 4).
+fresh_env
+paritycad_cargo_budget_env "$T"
+export FAKE_SSH_NEXTEST_PRESENT=1
+export BURST_LANE_FORCE_NEXTEST_LOCAL=1
+"$BL" up >/dev/null
+WT_PC4="$T/paritycad-repo4"; mkdir -p "$WT_PC4"
+( cd "$WT_PC4" && git init -q && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init )
+cat > "$WT_PC4/.burst-lane.toml" <<'EOF'
+parity_exclude = ["parity::flaky_host"]
+EOF
+FAKEBIN_PC4="$T/fakebin-paritycad4"; mkdir -p "$FAKEBIN_PC4"
+cat > "$FAKEBIN_PC4/cargo" <<'CARGOEOF'
+#!/usr/bin/env bash
+if [ "${1:-}" = "nextest" ]; then
+  shift
+  sub="${1:-}"; shift || true
+  case "$PWD" in
+    "$BURST_LANE_REMOTE_ROOT"/*) side=box ;;
+    *) side=local ;;
+  esac
+  if [ "$sub" = "list" ]; then
+    echo '{"rust-suites": {"parity::steady": {}, "parity::flaky_host": {}}}'
+    exit 0
+  fi
+  if [ "$sub" = "run" ]; then
+    if [ "$side" = "box" ]; then
+      echo "        FAIL [   0.010s] (1/2) parity::flaky_host test_x"
+      echo "        PASS [   0.001s] (2/2) parity::steady test_s"
+    else
+      echo "        PASS [   0.010s] (1/2) parity::flaky_host test_x"
+      echo "        PASS [   0.001s] (2/2) parity::steady test_s"
+    fi
+    exit 0
+  fi
+fi
+echo "fake-cargo(paritycad4): unhandled args: $*" >&2
+exit 1
+CARGOEOF
+chmod +x "$FAKEBIN_PC4/cargo"
+pc4_out="$(PATH="$FAKEBIN_PC4:$PATH" "$BL" parity "$WT_PC4" 2>&1)"; pc4_rc=$?
+expect "paritycad AC4: parity exits 0" "[ $pc4_rc -eq 0 ]"
+expect "paritycad AC4: diff stays empty (the only disagreement is excluded)" "grep -q 'diff=0' <<<\"$pc4_out\""
+pc4_receipt="$WT_PC4/target/autobuilder/receipts/box-parity.json"
+pc4_json_rc=0
+python3 -c "
+import json
+d = json.load(open('$pc4_receipt'))
+assert d['diff'] == [], d['diff']
+assert d['host_sensitive'] == ['parity::flaky_host'], d['host_sensitive']
+assert d['suites']['parity::flaky_host'] == {'box': 'FAILED', 'local': 'ok', 'status': 'host-sensitive'}, d['suites']['parity::flaky_host']
+" || pc4_json_rc=1
+expect "paritycad AC4: box-parity.json lists the excluded suite under host_sensitive with both results" "[ $pc4_json_rc -eq 0 ]"
+
+head_pc4="$(git -C "$WT_PC4" rev-parse HEAD)"
+cat > "$FAKEBIN_PC4/extend-gate.sh" <<'EOF'
+#!/usr/bin/env bash
+mkdir -p target/autobuilder/receipts
+echo '{"pass": 25, "block": 0}' > target/autobuilder/last-verdict.json
+exit 0
+EOF
+chmod +x "$FAKEBIN_PC4/extend-gate.sh"
+gate4_out="$(PATH="$FAKEBIN_PC4:$PATH" "$BL" gate "$WT_PC4" --head "$head_pc4" 2>&1)"; gate4_rc=$?
+expect "paritycad AC4: gate routes despite the host-sensitive suite (not blocked by it)" "[ $gate4_rc -eq 0 ]"
+
+# ---- paritycad AC5: parity's local half runs through cargo-budget.sh (nice
+# -n 15, CARGO_BUDGET_TEST_THREADS default 4) — the ledger gets a row for it
+# and the wrapped process actually saw RUST_TEST_THREADS=4 (requirement 2).
+fresh_env
+paritycad_cargo_budget_env "$T"
+export FAKE_SSH_NEXTEST_PRESENT=1
+export BURST_LANE_FORCE_NEXTEST_LOCAL=1
+"$BL" up >/dev/null
+WT_PC5="$T/paritycad-repo5"; mkdir -p "$WT_PC5"
+( cd "$WT_PC5" && git init -q && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init )
+FAKEBIN_PC5="$T/fakebin-paritycad5"; mkdir -p "$FAKEBIN_PC5"
+export PARITYCAD5_THREADS_SEEN="$T/paritycad5-threads-seen"
+cat > "$FAKEBIN_PC5/cargo" <<'CARGOEOF'
+#!/usr/bin/env bash
+if [ "${1:-}" = "nextest" ]; then
+  shift
+  sub="${1:-}"; shift || true
+  case "$PWD" in
+    "$BURST_LANE_REMOTE_ROOT"/*) side=box ;;
+    *) side=local ;;
+  esac
+  if [ "$sub" = "list" ]; then
+    echo '{"rust-suites": {"parity::a": {}}}'
+    exit 0
+  fi
+  if [ "$sub" = "run" ]; then
+    if [ "$side" = "local" ]; then
+      echo "RUST_TEST_THREADS=${RUST_TEST_THREADS:-unset}" >> "$PARITYCAD5_THREADS_SEEN"
+    fi
+    echo "        PASS [   0.001s] (1/1) parity::a test_a"
+    exit 0
+  fi
+fi
+echo "fake-cargo(paritycad5): unhandled args: $*" >&2
+exit 1
+CARGOEOF
+chmod +x "$FAKEBIN_PC5/cargo"
+pc5_out="$(PATH="$FAKEBIN_PC5:$PATH" "$BL" parity "$WT_PC5" 2>&1)"; pc5_rc=$?
+expect "paritycad AC5: parity exits 0" "[ $pc5_rc -eq 0 ]"
+expect "paritycad AC5: cargo-budget ledger has at least one row for the local run" \
+  "[ -s \"$CARGO_BUDGET_STATE_DIR/ledger.jsonl\" ]"
+expect "paritycad AC5: the wrapped local run saw RUST_TEST_THREADS=4 (CARGO_BUDGET_TEST_THREADS default)" \
+  "grep -q '^RUST_TEST_THREADS=4$' \"$PARITYCAD5_THREADS_SEEN\""
+
+# ---- paritycad AC6 (P1): this fixture set exits 0 and names the
+# paritycad cases — matching every sibling AC's own "does the suite name
+# its own coverage" convention (parityr AC6, isolate AC6 above).
+expect "paritycad AC6: every paritycad case above ran green" "[ $fail -eq 0 ]"
 
 # ---- isolate AC2 / requirement 3: the real top-level audit wrap (snapshot
 # taken at the very top of this file) closes here — every fixture case in
