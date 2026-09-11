@@ -1420,6 +1420,31 @@ selected this tick (cap=<limit>)` regardless of busy/cargo-free status.
 This is the actual enforcement point — Phase 2's selection prose below is
 advisory sizing, not a substitute for calling the guard.
 
+**`BUILD_DISTINCT_TARGETS` (env var, added 2026-09-11,
+PRD-build-distinct-targets-per-tick).** Candidates sharing a `build_into`
+are not co-scheduled in one tick. Journal-confirmed: with
+`BUILD_MAX_BRANCHES=2` a tick paired two PRDs sharing a `build_into`
+(mcphost-schedules + mcphost-tests-host-independence, both
+`~/wintermute/mcphost`) — the second went `gate deferred-lock-contended`
+on the integrate lock while the first starved on cargo-budget slots
+(`wait slot timeout after 1200s`); the session returned, cgroup cleanup
+reaped the half-done gate, the claim went stale, and neither shipped. The
+same gate completed clean (1258s, `lock_wait=0`) run alone against that
+target. Default **1 (ON)** — unset or any value other than `0` behaves as
+1; set to `0` to disable and fall back to the worktree-isolation/sub-cap
+behavior in "Selection rules" below. Enforced the same way as
+`BUILD_MAX_BRANCHES`, by `scripts/select-guard.sh <slug> [lane] [prd-dir]
+<branch-count> <admitted-targets>` (see "Required dispatch-boundary
+guard" under Phase 4/Dispatch): pass the comma-separated `build_into`
+values already admitted this tick as the 5th argument, appending this
+candidate's own `build_into` once it is admitted. A candidate whose
+`build_into` is already in that list is blocked with `same-target:
+<build_into> already selected this tick (BUILD_DISTINCT_TARGETS=1)`
+regardless of busy/cargo-free/cap status. A PRD with no `build_into` is
+never blocked by this rule. It only matters once more than one PRD can be
+admitted a tick — with `BUILD_MAX_BRANCHES=1` (or any single-branch tick)
+it never fires, since the cap already stops at one candidate first.
+
 Each tick advances **up to `BUILD_MAX_BRANCHES` PRDs in parallel**
 (default 30). The per-tick fan-out grew (1 → 5 → 10 → 30) independently
 of the per-PRD step contract: **as
@@ -1461,7 +1486,21 @@ time.
 After the existing priority sort, pick up to `BUILD_MAX_BRANCHES` PRDs
 (default 30) that mutually satisfy:
 
-1. **Shared `build_into` → isolate with worktrees, don't serialize.**
+1. **Shared `build_into` → not co-scheduled in one tick by default
+   (`BUILD_DISTINCT_TARGETS`, see "Parallelism" above).** `select-guard.sh`
+   admits at most one PRD per `build_into` per tick unless
+   `BUILD_DISTINCT_TARGETS=0`. This takes precedence over the
+   worktree-isolation scheme described below: worktrees isolate the git
+   index and `target/` dir, but not the integrate lock or the host-wide
+   cargo-budget slots, and journal-confirmed churn (PRD-build-distinct-
+   targets-per-tick, 2026-09-11) showed two worktree-isolated same-target
+   branches still colliding on both — one deferred-lock-contended, the
+   other cargo-budget-starved, neither shipping. The worktree/sub-cap
+   scheme below is what `BUILD_DISTINCT_TARGETS=0` falls back to.
+
+   **Shared `build_into` → isolate with worktrees, don't serialize
+   (pre-2026-09-11 default; still the fallback under
+   `BUILD_DISTINCT_TARGETS=0`).**
    Two branches mutating the same crate in place would race cargo locks
    and the git index. Instead, when ≥2 selected rust-extend PRDs share a
    `build_into`, each runs in its own git worktree (separate index, tree,
@@ -1813,7 +1852,7 @@ PRD, fan-out or single ad-hoc pick, automated timer or manual invocation —
 run:
 
 ```
-scripts/select-guard.sh <slug> [lane] [prd-dir] <branch-count>
+scripts/select-guard.sh <slug> [lane] [prd-dir] <branch-count> [admitted-targets]
 ```
 
 `<branch-count>` is how many PRDs this tick has already admitted before
@@ -1821,6 +1860,16 @@ this candidate (0 for the first) — pass it so `select-guard.sh` can
 enforce `BUILD_MAX_BRANCHES` (default 30, see "Parallelism" above); a
 candidate whose branch-count already meets the cap is blocked with
 `cap: ...` regardless of busy/cargo-free status.
+
+`[admitted-targets]` is a comma-separated list of `build_into` values
+already admitted this tick — same caller-maintained running-state
+convention as `<branch-count>` (append this candidate's own `build_into`
+once it is admitted; empty/omitted means none admitted yet). It lets
+`select-guard.sh` enforce `BUILD_DISTINCT_TARGETS` (default 1, see
+"Parallelism" above): a candidate whose `build_into` matches one already
+in the list is blocked with `same-target: <build_into> already selected
+this tick (BUILD_DISTINCT_TARGETS=1)`, regardless of busy/cargo-free
+status or the branch-count cap.
 
 Exit 0 (`ok: <slug>: ...`) means dispatch may proceed. Exit 1
 (`blocked: <slug>: ...`) means dispatch MUST NOT happen this tick — drop

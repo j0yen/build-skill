@@ -150,4 +150,92 @@ out=$(BUILD_MAX_BRANCHES=bogus "$SG" victim carbon "$ROOT/clone" 0)
 echo "$out" | grep -q '^ok: victim:' || { echo "FAIL: BUILD_MAX_BRANCHES=bogus should fall back to 30, got: $out"; exit 1; }
 echo ok
 
+# --- BUILD_DISTINCT_TARGETS (PRD-build-distinct-targets-per-tick, 2026-09-11) -----
+# Never co-schedule PRDs sharing a build_into in one tick (journal-confirmed
+# mcphost-schedules + mcphost-tests-host-independence collision — same
+# build_into, integrate-lock contention + cargo-budget starvation, nothing
+# shipped). Three PRDs staged: alpha+beta share repo A's build_into, gamma
+# is repo B (independent). admitted-targets is passed positionally (5th
+# arg), same caller-maintained-running-state convention as branch-count
+# (4th arg).
+command -v git >/dev/null 2>&1 || { echo "FAIL: git not on PATH"; exit 1; }
+
+cat > "$ROOT/clone/build-queue/PRD-alpha.md" <<'EOF'
+# PRD: alpha — repo A, first of two sharing a build_into
+
+- Status: queued
+- build_target: shell
+- build_into: /tmp/select-guard-distinct-repo-a
+EOF
+cat > "$ROOT/clone/build-queue/PRD-beta.md" <<'EOF'
+# PRD: beta — repo A, second of two sharing a build_into
+
+- Status: queued
+- build_target: shell
+- build_into: /tmp/select-guard-distinct-repo-a
+EOF
+cat > "$ROOT/clone/build-queue/PRD-gamma.md" <<'EOF'
+# PRD: gamma — repo B, independent build_into
+
+- Status: queued
+- build_target: shell
+- build_into: /tmp/select-guard-distinct-repo-b
+EOF
+git -C "$ROOT/clone" add -A
+git -C "$ROOT/clone" -c user.name=t -c user.email=t@t commit -q -m "stage alpha+beta+gamma for distinct-targets"
+git -C "$ROOT/clone" push -q origin "$BRANCH"
+
+echo "== BUILD_DISTINCT_TARGETS=1 (default), cap 2: alpha+gamma admitted, beta blocked same-target =="
+branch_count=0
+admitted_targets=""
+for slug in alpha beta gamma; do
+  set +e
+  out=$(BUILD_DISTINCT_TARGETS=1 BUILD_MAX_BRANCHES=2 "$SG" "$slug" carbon "$ROOT/clone" "$branch_count" "$admitted_targets" 2>&1); rc=$?
+  set -e
+  case "$slug" in
+    alpha)
+      [ "$rc" -eq 0 ] || { echo "FAIL: expected alpha admitted, got rc=$rc: $out"; exit 1; }
+      echo "$out" | grep -q '^ok: alpha:' || { echo "FAIL: $out"; exit 1; }
+      branch_count=$((branch_count+1))
+      admitted_targets="/tmp/select-guard-distinct-repo-a"
+      ;;
+    beta)
+      [ "$rc" -eq 1 ] || { echo "FAIL: expected beta blocked, got rc=$rc: $out"; exit 1; }
+      [ "$out" = "blocked: beta: same-target: /tmp/select-guard-distinct-repo-a already selected this tick (BUILD_DISTINCT_TARGETS=1)" ] \
+        || { echo "FAIL: same-target message mismatch: $out"; exit 1; }
+      ;;
+    gamma)
+      [ "$rc" -eq 0 ] || { echo "FAIL: expected gamma admitted, got rc=$rc: $out"; exit 1; }
+      echo "$out" | grep -q '^ok: gamma:' || { echo "FAIL: $out"; exit 1; }
+      branch_count=$((branch_count+1))
+      admitted_targets="$admitted_targets,/tmp/select-guard-distinct-repo-b"
+      ;;
+  esac
+done
+[ "$branch_count" -eq 2 ] || { echo "FAIL: expected exactly 2 admitted (alpha+gamma), got $branch_count"; exit 1; }
+echo ok
+
+echo "== BUILD_DISTINCT_TARGETS=0: both repo-A PRDs admitted (cap permitting) =="
+branch_count=0
+admitted_targets=""
+for slug in alpha beta; do
+  out=$(BUILD_DISTINCT_TARGETS=0 BUILD_MAX_BRANCHES=3 "$SG" "$slug" carbon "$ROOT/clone" "$branch_count" "$admitted_targets")
+  echo "$out" | grep -q "^ok: $slug:" || { echo "FAIL: $out"; exit 1; }
+  branch_count=$((branch_count+1))
+  admitted_targets="$admitted_targets,/tmp/select-guard-distinct-repo-a"
+done
+[ "$branch_count" -eq 2 ] || { echo "FAIL: expected both repo-A PRDs admitted with BUILD_DISTINCT_TARGETS=0, got $branch_count"; exit 1; }
+echo ok
+
+echo "== BUILD_MAX_BRANCHES=1: the distinct-target rule never fires (cap blocks beta first) =="
+out=$(BUILD_MAX_BRANCHES=1 "$SG" alpha carbon "$ROOT/clone" 0 "")
+echo "$out" | grep -q '^ok: alpha:' || { echo "FAIL: expected alpha admitted, got: $out"; exit 1; }
+set +e
+out=$(BUILD_MAX_BRANCHES=1 "$SG" beta carbon "$ROOT/clone" 1 "/tmp/select-guard-distinct-repo-a" 2>&1); rc=$?
+set -e
+[ "$rc" -eq 1 ] || { echo "FAIL: expected beta blocked, got rc=$rc: $out"; exit 1; }
+echo "$out" | grep -q '^blocked: beta: cap:' || { echo "FAIL: expected cap block (not same-target) with cap=1, got: $out"; exit 1; }
+echo "$out" | grep -q 'same-target' && { echo "FAIL: same-target rule fired despite cap=1 already blocking: $out"; exit 1; }
+echo ok
+
 echo "ALL PASS"
