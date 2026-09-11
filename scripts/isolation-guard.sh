@@ -55,7 +55,14 @@ isolation_refuse() {
   local ts
   ts="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo unknown)"
   mkdir -p "$(dirname "$ISOLATION_LIVE_JOURNAL_FILE")" 2>/dev/null || true
-  printf '%s  isolation  refused  (caller=%s path=%s)\n' "$ts" "$caller" "$path" \
+  # refusal-rate-limit (2026-09-11): 14 lines/30 s during a selftest polluted the very journal this guard
+  # protects. Count every refusal in state; write at most one journal line per caller per hour.
+  _rl_dir="${ISOLATION_STATE_DIR:-$HOME/.claude/skills/build/state}/isolation-refusals"; mkdir -p "$_rl_dir" 2>/dev/null
+  _rl_key="$_rl_dir/$(printf '%s' "$caller" | tr -c 'A-Za-z0-9' '_')"; echo "$ts $path" >> "$_rl_key.count"
+  _rl_hour="$(date -u +%Y%m%dT%H)"
+  if [ "$(cat "$_rl_key.hour" 2>/dev/null)" = "$_rl_hour" ]; then return 0 2>/dev/null || exit 0; fi
+  echo "$_rl_hour" > "$_rl_key.hour"
+  printf '%s  isolation  refused  (caller=%s path=%s — first this hour; count in state/isolation-refusals)\n' "$ts" "$caller" "$path" \
     >> "$ISOLATION_LIVE_JOURNAL_FILE" 2>/dev/null || true
   echo "test-isolation: live path $path under BURST_LANE_TEST" >&2
   exit 9

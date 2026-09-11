@@ -779,7 +779,6 @@ json.dump(obj, open('$out', 'w'))
   ( cd "$repo" && autobuilder reviewer-agent finalize --project "$project_rel" --input "$out" ) 9>&- \
     || { note_block "reviewer-agent — finalize rejected the subagent's output"; return 1; }
 }
-run_reviewer || true
 
 # 7. ci-checks — needs `gh` authenticated against the pushed HEAD.
 if ! command -v gh >/dev/null 2>&1; then
@@ -806,6 +805,15 @@ fi
   || note_block "extended-receipts — one or more extended producers did not pass|skip (see output above)"
 
 # 9. the risk gate itself — authoritative pass/block, reads all 25 receipts.
+# Quota guard (Joe 2026-09-11): the reviewer is a Sonnet `claude -p` call. It runs LAST, and only
+# when every other producer passed — a red gate never pays for a review it cannot use. The next gate
+# on a fixed HEAD runs it. On 2026-09-11 five reviewer runs shipped nothing.
+if [ "${#blocking_notes[@]}" -eq 0 ]; then
+  run_reviewer || true
+else
+  echo "extend-gate: reviewer skipped — ${#blocking_notes[@]} block(s) already recorded (no Sonnet spend on a red gate)"
+  echo "$(date -u +%FT%TZ)  gate  ${repo##*/}  reviewer-skipped  (blocks=${#blocking_notes[@]} head=${head_now:0:7})" >> "$HOME/brain/journal/build/$(date -u +%F).md"
+fi
 gate_out="$(exec 9>&-; cd "$repo" && autobuilder gate --project "$project_rel" 2>&1)"
 gate_rc=$?
 printf '%s\n' "$gate_out"

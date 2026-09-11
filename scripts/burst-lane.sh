@@ -3541,6 +3541,13 @@ cmd_ensure_fresh() {
 # journaled — never aborts the rest of the sweep.
 sweep_dirty_worktrees() {  # $1=caller (down|watchdog)
   mkdir -p "$DIRTY_DIR" "$STATE_DIR/locks" 2>/dev/null || true
+  # Money guard (Joe 2026-09-11): pulls at teardown are optional and bounded. With the loop stopped
+  # nothing will read them, and on 09-11 a sweep that pulled worktrees back for 10+ min kept a
+  # billed box alive past a forced delete. Skip entirely when the loop is inactive; cap each pull.
+  if [ "$(systemctl --user is-active claude-build.path 2>/dev/null)" != "active" ]; then
+    journal_line "$(now_iso)  burst-lane  ${1:-down}  sweep-skipped  (cause=loop-stopped — delete proceeds without pulls)"
+    return 0
+  fi
   local f wt
   for f in "$DIRTY_DIR"/*.json; do
     [ -e "$f" ] || continue
