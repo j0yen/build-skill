@@ -131,6 +131,52 @@ case "$cmd" in
     eval "$cmd"
     exit $?
     ;;
+  *'# volume-mount'*)
+    # PRD-build-burst-persistent-volume requirement 1: simulates the
+    # label-check + conditional mkfs + mount + chown round trip without a
+    # real block device (this fixture's "remote" is the local filesystem,
+    # which has no /dev/disk/by-id/... to format). FAKE_SSH_VOLUME_LABEL_
+    # PRESENT=1 simulates an already-formatted volume (no FORMATTED line,
+    # no mkfs); default (0/unset) simulates a bare volume (echoes
+    # FORMATTED, matching AC1's "formats only when no label found").
+    # FAKE_SSH_VOLUME_MOUNT_FAIL=1 simulates a mount failure.
+    [ "${FAKE_SSH_VOLUME_MOUNT_FAIL:-0}" = "1" ] && exit 1
+    if [ "${FAKE_SSH_VOLUME_LABEL_PRESENT:-0}" != "1" ]; then
+      echo FORMATTED
+    fi
+    mkdir -p "${BURST_LANE_REMOTE_ROOT:-}" 2>/dev/null || true
+    echo MOUNTED
+    exit 0
+    ;;
+  *'# volume-umount'*)
+    # requirement 2 (teardown order): unmount before detach. Always
+    # succeeds offline (nothing real is mounted); the local $REMOTE_ROOT
+    # tmpdir is left in place since sweep_dirty_worktrees already ran.
+    exit 0
+    ;;
+  *'# volume-fsck'*)
+    # requirement 2: run once on the next `up` after a detach-failed marked
+    # the volume dirty. FAKE_SSH_VOLUME_FSCK_CALLLOG (if set) records that
+    # this ran, so a selftest can assert it without a real fsck binary.
+    [ -n "${FAKE_SSH_VOLUME_FSCK_CALLLOG:-}" ] && echo "fsck" >> "$FAKE_SSH_VOLUME_FSCK_CALLLOG"
+    exit 0
+    ;;
+  *'# volume-df'*)
+    # requirement 4/status: canned usage line instead of a real df against
+    # a real mounted filesystem. FAKE_SSH_VOLUME_USED_GB/SIZE_GB/PCT let a
+    # test pin the exact numbers status --json / cost must surface.
+    echo "${FAKE_SSH_VOLUME_USED_GB:-205}G ${FAKE_SSH_VOLUME_SIZE_GB:-500}G ${FAKE_SSH_VOLUME_USED_PCT:-41}%"
+    exit 0
+    ;;
+  *'# cargo-home-registry-probe'*)
+    # PRD-build-burst-path-deps AC3: cmd_verify's CARGO_HOME registry
+    # writability check. FAKE_SSH_REGISTRY_WRITE_FAIL=1 simulates the
+    # exact real-world defect this PRD fixes (a registry directory the
+    # build user cannot write into) without touching any other probe.
+    [ "${FAKE_SSH_REGISTRY_WRITE_FAIL:-0}" = "1" ] && exit 1
+    eval "$cmd"
+    exit $?
+    ;;
   *'command -v cargo-nextest'*)
     # PRD-build-burst-parity-robust requirement 1: box-side nextest
     # presence check. Answered explicitly (never `eval`'d against this

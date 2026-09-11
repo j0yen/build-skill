@@ -24,7 +24,7 @@
 set -uo pipefail
 
 repo="${1:-}"; shift || true
-[ -n "$repo" ] && [ -d "$repo/.git" ] || { echo "usage: ship-postconditions.sh <repo> [--project-root <rel>]" >&2; exit 2; }
+[ -n "$repo" ] && [ -e "$repo/.git" ] || { echo "usage: ship-postconditions.sh <repo> [--project-root <rel>]" >&2; exit 2; }
 proj="."
 [ "${1:-}" = "--project-root" ] && proj="${2:-.}"
 

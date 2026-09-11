@@ -31,15 +31,94 @@ FAKE="$HERE/../tests/fixtures/burst-lane-fake"
 SHIM="$HERE/burst-lane-bin/cargo"
 [ -x "$BL" ] || { echo "selftest: $BL not executable" >&2; exit 2; }
 
+# PRD-build-burst-selftest-isolation requirement 1: this whole process runs
+# under the sentinel from the very first line, not just inside fresh_env's
+# per-case setup — belt-and-suspenders against a future test block that
+# calls burst-lane.sh (or a helper that shells to it) before ever calling
+# fresh_env. Refuses to start rather than silently running unguarded if,
+# for any reason, the export below didn't take.
+export BURST_LANE_TEST=1
+[ "${BURST_LANE_TEST:-}" = "1" ] || {
+  echo "burst-lane-selftest: BURST_LANE_TEST not set in own environment — refusing to start" >&2
+  exit 2
+}
+
 fail=0
 ALL_TMPDIRS=()
 cleanup() { for d in "${ALL_TMPDIRS[@]:-}"; do rm -rf "$d"; done; }
 trap cleanup EXIT
 
+# ---- Live audit (PRD-build-burst-selftest-isolation requirement 3) --------
+# audit_snapshot: sha256sum of every file under a state dir + the last 200
+# lines of a journal, as one comparable text blob. Generic over its paths
+# (not hardcoded to the real live ones) so isolate_ac3/isolate_ac5 below can
+# exercise the mechanism against disposable fixtures instead of ever
+# planting a real change into the actual live tree to prove it works.
+# audit_diff: rc 0 if two snapshots are byte-identical, else prints
+# `isolation-breach: <name(s)>` naming what changed and returns 1.
+audit_snapshot() {  # $1 = state dir, $2 = journal file -> stdout
+  local state_dir="$1" journal_file="$2"
+  if [ -d "$state_dir" ]; then
+    find "$state_dir" -type f -print0 2>/dev/null | sort -z | xargs -0 sha256sum 2>/dev/null
+  fi
+  echo "---journal-tail---"
+  tail -n 200 "$journal_file" 2>/dev/null
+}
+audit_diff() {  # $1 = before-snapshot-file, $2 = after-snapshot-file
+  diff -q "$1" "$2" >/dev/null 2>&1 && return 0
+  local changed
+  changed="$(diff "$1" "$2" 2>/dev/null | grep -E '^[<>]' | awk '{print $NF}' | sort -u | tr '\n' ' ')"
+  echo "isolation-breach: ${changed:-live tree differs}"
+  return 1
+}
+
+# AC2/requirement 3's real top-level wrap: snapshot the ACTUAL live
+# burst-lane state dir + journal now, before this suite's own (fully
+# sandboxed, per fresh_env) work runs, and diff again at the very end —
+# this suite touching its own $T fixtures all day must never move a single
+# byte under the real live paths. Scoped to burst-lane's own state
+# subdirectory and journal file specifically (not the whole shared
+# build-skill state/ or brain/journal/ tree), since other concurrent
+# /build lanes and PRDs legitimately touch unrelated parts of those during
+# a real tick — this audit is about THIS mechanism's own blast radius, not
+# a claim that nothing else on the host is running.
+ISO_LIVE_STATE_DIR="$HOME/.claude/skills/build/state/burst-lane"
+ISO_LIVE_JOURNAL="$HOME/brain/journal/build/burst-lane.log"
+iso_audit_before="$(mktemp "${TMPDIR:-/tmp}/bl-audit-before.XXXXXX")"
+iso_audit_after="$(mktemp "${TMPDIR:-/tmp}/bl-audit-after.XXXXXX")"
+ALL_TMPDIRS+=("$iso_audit_before" "$iso_audit_after")
+# A REAL, independently-running burst-lane session (this host's own live
+# lane serving other PRDs/gates right now — session.json present BEFORE
+# this suite starts) legitimately mutates its own state/journal the whole
+# time this suite runs (a pull, a run, a teardown from an unrelated tick).
+# The audit below cannot distinguish that from a leak by diffing alone; it
+# is scoped to "did the fixtures in THIS FILE ever touch the live tree",
+# not "did anything on the host". Record whether one was already up so the
+# final check below reports skipped-not-failed in that case, rather than
+# perpetually false-failing this suite on every host that has a live lane
+# in normal production use (Technical considerations: this audit's zero-
+# diff guarantee only holds absent independent concurrent live activity).
+iso_audit_live_session_pre="false"
+[ -f "$ISO_LIVE_STATE_DIR/session.json" ] && iso_audit_live_session_pre="true"
+audit_snapshot "$ISO_LIVE_STATE_DIR" "$ISO_LIVE_JOURNAL" > "$iso_audit_before"
+
 expect() {
   local label="$1" cond="$2"
   if eval "$cond"; then echo "ok  $label"; else echo "FAIL $label" >&2; fail=1; fi
 }
+
+# PRD-build-burst-parity-cadence: every hand-crafted box-parity.json fixture
+# in this suite must carry the ACTIVE session's session_id + toolchain_fp
+# (matching what a real `parity` run would write) so cmd_gate's session/
+# toolchain validity check reads it as valid — a receipt missing these
+# fields correctly reads as the pre-migration shape (see the PRD's own
+# Migration/compatibility section) and triggers a re-proof, which would
+# change the assertions of every gate fixture here that predates the field
+# and isn't itself testing that re-proof path (see the dedicated
+# `paritycad AC2` case for that). Call only after `up` — needs an active
+# session.
+pc_active_session_id() { grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2; }
+pc_active_toolchain_fp() { "$BL" _debug-toolchain-fp; }
 
 # PRD-build-burst-pull-on-demand: rc0 iff `status --json`'s "dirty" array
 # lists $1 by exact worktree path (used instead of a raw grep since a JSON
@@ -60,8 +139,20 @@ fresh_env() {
   T="$(mktemp -d "${TMPDIR:-/tmp}/bl-selftest.XXXXXX")"
   ALL_TMPDIRS+=("$T")
   export PATH="$FAKE:$PATH"
+  # PRD-build-burst-selftest-isolation requirement 1: every fixture here
+  # runs under the sentinel, so a future path this function forgets to
+  # override fails closed (exit 9) instead of silently falling through to
+  # the live default — isolation becomes a property of burst-lane.sh
+  # itself, not of this function staying exhaustive forever.
+  export BURST_LANE_TEST=1
   export BURST_LANE_STATE_DIR="$T/state"; mkdir -p "$BURST_LANE_STATE_DIR"
   export BURST_LANE_JOURNAL="$T/journal.log"
+  # isolation-guard.sh's OWN refusal record (a deliberate exception to
+  # "everything under the sentinel is sandboxed" — see its header) defaults
+  # to the real live journal; point it at this fixture's journal too so
+  # this suite's own isolate_ac* cases (and every other case here) never
+  # read or write the real ~/brain/journal/build/burst-lane.log.
+  export BURST_ISOLATION_LIVE_JOURNAL="$BURST_LANE_JOURNAL"
   export BURST_LANE_ENV_FILE="$T/env"; echo "SNAPSHOT_ID=427125061" > "$BURST_LANE_ENV_FILE"
   export BURST_LANE_REMOTE_ROOT="$T/remote"
   # PRD-build-burst-unprivileged-user: $REMOTE_USER now defaults to `build`,
@@ -126,11 +217,22 @@ fresh_env() {
   # fake ssh fixture's own explicit `command -v cargo-nextest` case, which
   # already defaults to "missing" unless a test sets FAKE_SSH_NEXTEST_PRESENT=1.
   export BURST_LANE_FORCE_NEXTEST_LOCAL=0
+  # PRD-build-burst-persistent-volume: every pre-existing test in this file
+  # predates the volume feature and asserts exact hcloud/ssh call sequences
+  # around `up` — defaulting to the documented rollback (BURST_VOLUME_NAME
+  # empty) keeps every one of them byte-for-byte unaffected (no `hcloud
+  # volume` call, no extra root@/build@ round trip). The dedicated "burstvol"
+  # block below opts back in per-case.
+  export BURST_VOLUME_NAME=""
+  export FAKE_HCLOUD_VOLUME_STATE="$T/hcloud-volume.state"
   unset FAKE_HCLOUD_AUTH_FAIL FAKE_HCLOUD_CREATE_FAIL FAKE_HCLOUD_DELETE_FAIL FAKE_SSH_REMOTE_FAIL FAKE_SSH_SANDBOX_FAIL FAKE_RSYNC_FAIL BURST_LANE_NOW \
         FAKE_SSH_GATE_TOOLS_MISSING FAKE_SSH_GATE_TOOLS_INSTALL_FAIL FAKE_SSH_AUTOBUILDER_VERSION BURST_GATE_REVIEWER BURST_CLAUDE_CRED_SRC \
         FAKE_SSH_GATE_TOOLS_INSTALL_FAIL_TOOL FAKE_SSH_GATE_TOOLS_INSTALL_FAIL_RC FAKE_SSH_GATE_TOOLS_INSTALL_FAIL_STDERR \
         FAKE_SSH_GATE_TOOLS_TOOLCHAIN_SIM FAKE_GATE_TOOLS_TOOLCHAIN_BIN FAKE_RUSTUP_TOOLCHAINS FAKE_CARGO_REQUIRE_TOOLCHAIN \
-        FAKE_SSH_GATE_TOOLS_APT_UPDATE_FAIL FAKE_SSH_NEXTEST_PRESENT
+        FAKE_SSH_GATE_TOOLS_APT_UPDATE_FAIL FAKE_SSH_NEXTEST_PRESENT \
+        FAKE_HCLOUD_VOLUME_CREATE_FAIL FAKE_HCLOUD_VOLUME_ATTACH_FAIL FAKE_HCLOUD_VOLUME_DETACH_FAIL \
+        FAKE_SSH_VOLUME_LABEL_PRESENT FAKE_SSH_VOLUME_MOUNT_FAIL FAKE_SSH_VOLUME_USED_GB FAKE_SSH_VOLUME_SIZE_GB FAKE_SSH_VOLUME_USED_PCT \
+        FAKE_SSH_VOLUME_FSCK_CALLLOG
 }
 
 # ---- AC1: single-box refusal + adoption ------------------------------------
@@ -1110,8 +1212,9 @@ WT_GATE="$T/gate-repo"; mkdir -p "$WT_GATE"
 ( cd "$WT_GATE" && git init -q && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init )
 head_gate="$(git -C "$WT_GATE" rev-parse HEAD)"
 mkdir -p "$WT_GATE/target/autobuilder/receipts"
+sid_gate3="$(pc_active_session_id)"; tfp_gate3="$(pc_active_toolchain_fp)"
 cat > "$WT_GATE/target/autobuilder/receipts/box-parity.json" <<EOF
-{"head_sha": "$head_gate", "box_host": "127.0.0.1", "suites": {}, "diff": []}
+{"head_sha": "$head_gate", "box_host": "127.0.0.1", "suites": {}, "diff": [], "session_id": "$sid_gate3", "toolchain_fp": "$tfp_gate3"}
 EOF
 
 FAKEBIN_GATE="$T/fakebin-gate"; mkdir -p "$FAKEBIN_GATE"
@@ -1190,7 +1293,8 @@ fresh_env
 WT_AC8="$T/ac8-repo"; mkdir -p "$WT_AC8/target/autobuilder/receipts"
 ( cd "$WT_AC8" && git init -q && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init )
 head_ac8="$(git -C "$WT_AC8" rev-parse HEAD)"
-echo "{\"head_sha\": \"$head_ac8\", \"box_host\": \"x\", \"suites\": {}, \"diff\": []}" > "$WT_AC8/target/autobuilder/receipts/box-parity.json"
+sid_ac8="$(pc_active_session_id)"; tfp_ac8="$(pc_active_toolchain_fp)"
+echo "{\"head_sha\": \"$head_ac8\", \"box_host\": \"x\", \"suites\": {}, \"diff\": [], \"session_id\": \"$sid_ac8\", \"toolchain_fp\": \"$tfp_ac8\"}" > "$WT_AC8/target/autobuilder/receipts/box-parity.json"
 FAKEBIN_AC8="$T/fakebin-ac8"; mkdir -p "$FAKEBIN_AC8"
 AC8_CALLLOG="$T/ac8-extend-gate-calls.log"
 cat > "$FAKEBIN_AC8/extend-gate.sh" <<EOF
@@ -1314,15 +1418,16 @@ exit 0
 EOF
 chmod +x "$FAKEBIN_CONC/extend-gate.sh"
 
+sid_conc="$(pc_active_session_id)"; tfp_conc="$(pc_active_toolchain_fp)"
 WT_C1="$T/conc1-repo"; mkdir -p "$WT_C1/target/autobuilder/receipts"
 ( cd "$WT_C1" && git init -q && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init )
 head_c1="$(git -C "$WT_C1" rev-parse HEAD)"
-echo "{\"head_sha\": \"$head_c1\", \"box_host\": \"x\", \"suites\": {}, \"diff\": []}" > "$WT_C1/target/autobuilder/receipts/box-parity.json"
+echo "{\"head_sha\": \"$head_c1\", \"box_host\": \"x\", \"suites\": {}, \"diff\": [], \"session_id\": \"$sid_conc\", \"toolchain_fp\": \"$tfp_conc\"}" > "$WT_C1/target/autobuilder/receipts/box-parity.json"
 
 WT_C2="$T/conc2-repo"; mkdir -p "$WT_C2/target/autobuilder/receipts"
 ( cd "$WT_C2" && git init -q && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init )
 head_c2="$(git -C "$WT_C2" rev-parse HEAD)"
-echo "{\"head_sha\": \"$head_c2\", \"box_host\": \"x\", \"suites\": {}, \"diff\": []}" > "$WT_C2/target/autobuilder/receipts/box-parity.json"
+echo "{\"head_sha\": \"$head_c2\", \"box_host\": \"x\", \"suites\": {}, \"diff\": [], \"session_id\": \"$sid_conc\", \"toolchain_fp\": \"$tfp_conc\"}" > "$WT_C2/target/autobuilder/receipts/box-parity.json"
 
 export BURST_MAX_CONCURRENT_RUNS=7   # AC6's own "sub-cap 7" — comfortably >= 2
 PATH="$FAKEBIN_CONC:$PATH" "$BL" gate "$WT_C1" --head "$head_c1" >"$T/gate-c1.out" 2>&1 &
@@ -1419,16 +1524,17 @@ exit 0
 EOF
 chmod +x "$FAKEBIN_R9/extend-gate.sh"
 
+sid_r9="$(pc_active_session_id)"; tfp_r9="$(pc_active_toolchain_fp)"
 WT_R1="$T/r9-repo-one"; mkdir -p "$WT_R1/target/autobuilder/receipts"
 ( cd "$WT_R1" && git init -q && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init )
 head_r1="$(git -C "$WT_R1" rev-parse HEAD)"
-echo "{\"head_sha\": \"$head_r1\", \"box_host\": \"x\", \"suites\": {}, \"diff\": []}" > "$WT_R1/target/autobuilder/receipts/box-parity.json"
+echo "{\"head_sha\": \"$head_r1\", \"box_host\": \"x\", \"suites\": {}, \"diff\": [], \"session_id\": \"$sid_r9\", \"toolchain_fp\": \"$tfp_r9\"}" > "$WT_R1/target/autobuilder/receipts/box-parity.json"
 PATH="$FAKEBIN_R9:$PATH" "$BL" gate "$WT_R1" --head "$head_r1" >/dev/null 2>&1
 
 WT_R2="$T/r9-repo-two"; mkdir -p "$WT_R2/target/autobuilder/receipts"
 ( cd "$WT_R2" && git init -q && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init )
 head_r2="$(git -C "$WT_R2" rev-parse HEAD)"
-echo "{\"head_sha\": \"$head_r2\", \"box_host\": \"x\", \"suites\": {}, \"diff\": []}" > "$WT_R2/target/autobuilder/receipts/box-parity.json"
+echo "{\"head_sha\": \"$head_r2\", \"box_host\": \"x\", \"suites\": {}, \"diff\": [], \"session_id\": \"$sid_r9\", \"toolchain_fp\": \"$tfp_r9\"}" > "$WT_R2/target/autobuilder/receipts/box-parity.json"
 PATH="$FAKEBIN_R9:$PATH" "$BL" gate "$WT_R2" --head "$head_r2" >/dev/null 2>&1
 
 r9_attr_rc=0
@@ -1504,7 +1610,8 @@ fresh_env
 WT_AC5="$T/ac5-repo"; mkdir -p "$WT_AC5/target/autobuilder/receipts"
 ( cd "$WT_AC5" && git init -q && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init )
 head_ac5="$(git -C "$WT_AC5" rev-parse HEAD)"
-echo "{\"head_sha\": \"$head_ac5\", \"box_host\": \"x\", \"suites\": {}, \"diff\": []}" > "$WT_AC5/target/autobuilder/receipts/box-parity.json"
+sid_ac5="$(pc_active_session_id)"; tfp_ac5="$(pc_active_toolchain_fp)"
+echo "{\"head_sha\": \"$head_ac5\", \"box_host\": \"x\", \"suites\": {}, \"diff\": [], \"session_id\": \"$sid_ac5\", \"toolchain_fp\": \"$tfp_ac5\"}" > "$WT_AC5/target/autobuilder/receipts/box-parity.json"
 
 ac5_out="$(FAKE_RSYNC_FAIL=1 FAKE_RSYNC_FAIL_RC=11 FAKE_RSYNC_FAIL_MSG='rsync: fake gate rsync failure' "$BL" gate "$WT_AC5" --head "$head_ac5" 2>&1)"; ac5_rc=$?
 expect "gatebox AC5: gate exits 3 when the rsync-up itself fails before the remote gate starts" "[ $ac5_rc -eq 3 ]"
@@ -1563,7 +1670,8 @@ export FAKE_SSH_GATE_TOOLS_INSTALL_FAIL=1
 WT_GT3="$T/gt3-repo"; mkdir -p "$WT_GT3/target/autobuilder/receipts"
 ( cd "$WT_GT3" && git init -q && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init )
 head_gt3="$(git -C "$WT_GT3" rev-parse HEAD)"
-echo "{\"head_sha\": \"$head_gt3\", \"box_host\": \"x\", \"suites\": {}, \"diff\": []}" > "$WT_GT3/target/autobuilder/receipts/box-parity.json"
+sid_gt3="$(pc_active_session_id)"; tfp_gt3="$(pc_active_toolchain_fp)"
+echo "{\"head_sha\": \"$head_gt3\", \"box_host\": \"x\", \"suites\": {}, \"diff\": [], \"session_id\": \"$sid_gt3\", \"toolchain_fp\": \"$tfp_gt3\"}" > "$WT_GT3/target/autobuilder/receipts/box-parity.json"
 gt3_out="$("$BL" gate "$WT_GT3" --head "$head_gt3" 2>&1)"; gt3_rc=$?
 expect "gatetools AC3: gate exits 3 when gate_ready=false" "[ $gt3_rc -eq 3 ]"
 expect "gatetools AC3: gate prints fallback: gate-tools-missing naming the tool" \
@@ -2364,6 +2472,799 @@ expect "reality AC7: verified-completed --check-fixture-negative-case blocks a s
 # checked here as an explicit, in-band assertion, matching every sibling
 # AC's own convention (see burstuser AC7 / parityr AC6 above).
 expect "reality AC9: every reality case above ran green" "[ $fail -eq 0 ]"
+# ================================================================
+# isolate AC1-6 (PRD-build-burst-selftest-isolation) — every fixture in
+# this section is fully self-contained (its own tmpdir "fake home" or
+# fixture paths, never the real live tree) EXCEPT the top-of-file/
+# bottom-of-file live audit wrap, which deliberately targets the real
+# $HOME/.claude/skills/build/state/burst-lane + $HOME/brain/journal/build/
+# burst-lane.log — the whole point being that THIS suite's own extensive
+# fixture-based work above never moved a single byte there.
+# ================================================================
+
+# ---- isolate AC1: sentinel + a forgotten override -> exit 9, zero side
+# effect (PRD requirement 2, AC1). Built against a scratch "fake home" with
+# burst-lane.sh + isolation-guard.sh copied into the SAME relative layout
+# real production uses ($FAKEHOME/.claude/skills/build/scripts/) so
+# STATE_DIR's own $SKILL_DIR-derived default and isolation-guard.sh's
+# hardcoded $HOME-derived live root coincide exactly the way they do once
+# this repo is installed at ~/.claude/skills/build (the real symlink
+# target) — independent of whether THIS invocation happens to be running
+# from a development worktree or the real install.
+iso_fakehome="$(mktemp -d "${TMPDIR:-/tmp}/bl-iso-fakehome.XXXXXX")"
+ALL_TMPDIRS+=("$iso_fakehome")
+mkdir -p "$iso_fakehome/.claude/skills/build/scripts" "$iso_fakehome/brain/journal/build"
+cp "$HERE/burst-lane.sh" "$HERE/isolation-guard.sh" "$iso_fakehome/.claude/skills/build/scripts/"
+iso_fake_bl="$iso_fakehome/.claude/skills/build/scripts/burst-lane.sh"
+iso_fake_session="$iso_fakehome/.claude/skills/build/state/burst-lane/session.json"
+mkdir -p "$(dirname "$iso_fake_session")"
+printf '{}' > "$iso_fake_session"
+iso_ac1_before="$(stat -c %Y "$iso_fake_session" 2>/dev/null || stat -f %m "$iso_fake_session" 2>/dev/null)"
+iso_ac1_out="$(env -i HOME="$iso_fakehome" PATH="/usr/bin:/bin" BURST_LANE_TEST=1 "$iso_fake_bl" status 2>&1)"; iso_ac1_rc=$?
+iso_ac1_after="$(stat -c %Y "$iso_fake_session" 2>/dev/null || stat -f %m "$iso_fake_session" 2>/dev/null)"
+expect "isolate AC1: burst-lane.sh status exits 9 under the sentinel with no overrides" "[ $iso_ac1_rc -eq 9 ]"
+expect "isolate AC1: refusal names the live state path" "grep -qE 'test-isolation: live path .*state/burst-lane' <<<\"\$iso_ac1_out\""
+expect "isolate AC1: the live session file's mtime is unchanged" "[ \"\$iso_ac1_before\" = \"\$iso_ac1_after\" ]"
+
+# ---- isolate AC3: the audit mechanism itself catches a planted change to
+# a "live" journal, mid-run — exercised against a disposable fixture pair
+# (never the real live tree) so proving the DETECTOR works never itself
+# requires touching production.
+iso_ac3_state="$(mktemp -d "${TMPDIR:-/tmp}/bl-iso-ac3-state.XXXXXX")"
+iso_ac3_journal="$(mktemp "${TMPDIR:-/tmp}/bl-iso-ac3-journal.XXXXXX")"
+ALL_TMPDIRS+=("$iso_ac3_state")
+printf 'line one\nline two\n' > "$iso_ac3_journal"
+iso_ac3_before="$(mktemp "${TMPDIR:-/tmp}/bl-iso-ac3-before.XXXXXX")"
+iso_ac3_after="$(mktemp "${TMPDIR:-/tmp}/bl-iso-ac3-after.XXXXXX")"
+ALL_TMPDIRS+=("$iso_ac3_before" "$iso_ac3_after")
+audit_snapshot "$iso_ac3_state" "$iso_ac3_journal" > "$iso_ac3_before"
+printf 'X' >> "$iso_ac3_journal"   # the "one byte, mid-run" plant
+audit_snapshot "$iso_ac3_state" "$iso_ac3_journal" > "$iso_ac3_after"
+iso_ac3_out="$(audit_diff "$iso_ac3_before" "$iso_ac3_after" 2>&1)"; iso_ac3_rc=$?
+expect "isolate AC3: the audit detects a one-byte planted change (nonzero exit)" "[ $iso_ac3_rc -ne 0 ]"
+expect "isolate AC3: it reports isolation-breach naming the journal" "grep -q 'isolation-breach:' <<<\"\$iso_ac3_out\""
+rm -f "$iso_ac3_journal"
+
+# ---- isolate AC4: the live-side counter — a caller that exports
+# BURST_LANE_TEST=1 "by mistake" (every other override left at its live
+# default) is refused, the refusal is journaled, and the daily rollup's
+# isolation_refusals field counts it (requirement 4). Same fakehome
+# technique as isolate AC1 so this never touches the REAL live journal.
+iso_ac4_fakehome="$(mktemp -d "${TMPDIR:-/tmp}/bl-iso-ac4-fakehome.XXXXXX")"
+ALL_TMPDIRS+=("$iso_ac4_fakehome")
+mkdir -p "$iso_ac4_fakehome/.claude/skills/build/scripts" "$iso_ac4_fakehome/brain/journal/build"
+cp "$HERE/burst-lane.sh" "$HERE/isolation-guard.sh" "$iso_ac4_fakehome/.claude/skills/build/scripts/"
+iso_ac4_bl="$iso_ac4_fakehome/.claude/skills/build/scripts/burst-lane.sh"
+iso_ac4_journal="$iso_ac4_fakehome/brain/journal/build/burst-lane.log"
+iso_ac4_state="$iso_ac4_fakehome/.claude/skills/build/state/burst-lane"
+
+env -i HOME="$iso_ac4_fakehome" PATH="/usr/bin:/bin" BURST_LANE_TEST=1 \
+  "$iso_ac4_bl" run /tmp -- bash -c true >/dev/null 2>&1
+iso_ac4_rc=$?
+expect "isolate AC4: a mistaken sentinel on run refuses (exit 9)" "[ $iso_ac4_rc -eq 9 ]"
+expect "isolate AC4: the refusal is journaled (isolation  refused)" "grep -q 'isolation  refused' \"$iso_ac4_journal\""
+
+# Give the daily rollup something to fire on (a same-day cost row — its
+# real-world trigger is a leak attempt during otherwise-normal burst-lane
+# use, not an idle day), then invoke `down` (sentinel OFF for this call —
+# it's the ordinary live path, exactly like the real rollup caller) so
+# maybe_daily_rollup runs and folds in the refusal count from the journal
+# line just written above.
+today="$(date -u +%Y-%m-%d)"
+# The refused call above has NO side effect by design (that's AC1's own
+# point), so $iso_ac4_state was never created — make it now.
+mkdir -p "$iso_ac4_state"
+printf '{"date":"%sT00:00:00Z","kind":"slug","slug":"isolate-ac4","eur":0.01}\n' "$today" > "$iso_ac4_state/cost.jsonl"
+env -i HOME="$iso_ac4_fakehome" PATH="/usr/bin:/bin" \
+  BURST_LANE_STATE_DIR="$iso_ac4_state" BURST_LANE_TICK_JOURNAL_DIR="$iso_ac4_fakehome/tick-journal" \
+  "$iso_ac4_bl" down >/dev/null 2>&1
+iso_ac4_rollup_file="$iso_ac4_fakehome/tick-journal/$today.md"
+expect "isolate AC4: the daily rollup line carries isolation_refusals>=1" \
+  "grep -qE 'isolation_refusals=[1-9]' \"$iso_ac4_rollup_file\" 2>/dev/null"
+
+# ---- isolate AC5: a fixture-named directory on the box fails the check
+# while a session is active. Exercises box_isolation_check() end-to-end
+# against the fake ssh/hcloud fixtures already used above (fresh_env),
+# with one extra fixture-named dir seeded into the fake remote root.
+fresh_env
+mkdir -p "$BURST_LANE_REPOS_DIR/mcphost"
+"$BL" up >/dev/null
+# The fake ssh fixture resolves its "remote root" onto this machine's own
+# filesystem (per its own header — see fresh_env's BURST_LANE_REMOTE_ROOT);
+# seed the fixture-named directory it should now flag.
+mkdir -p "$BURST_LANE_REMOTE_ROOT/gb-ac3.deadbe"
+iso_ac5_out="$("$BL" box-isolation-check 2>&1)"; iso_ac5_rc=$?
+expect "isolate AC5: box-isolation-check fails with a fixture-named box dir present" "[ $iso_ac5_rc -ne 0 ]"
+expect "isolate AC5: it names the offending directory" "grep -q 'isolation-breach: box dir gb-ac3.deadbe' <<<\"\$iso_ac5_out\""
+rm -rf "$BURST_LANE_REMOTE_ROOT/gb-ac3.deadbe"
+iso_ac5b_out="$("$BL" box-isolation-check 2>&1)"; iso_ac5b_rc=$?
+expect "isolate AC5: clean once the fixture-named dir is gone" "[ $iso_ac5b_rc -eq 0 ]"
+
+# ---- isolate AC6 (P1): this fixture set exits 0 and names the isolate
+# cases — matching every sibling AC's own "does the suite name its own
+# coverage" convention (parityr AC6, burstuser AC7 above).
+expect "isolate AC6: every isolate case above ran green" "[ $fail -eq 0 ]"
+
+# ==============================================================================
+# paritycad AC1-AC6 (PRD-build-burst-parity-cadence): a parity receipt is
+# valid for a box SESSION + TOOLCHAIN FINGERPRINT (not a single HEAD), the
+# local half is load-gated and cargo-budget-wrapped, and a per-repo
+# `.burst-lane.toml` can mark a suite host-sensitive without blocking
+# routing.
+# ==============================================================================
+
+# cargo-budget.sh is a separate script with no isolation-guard.sh of its own
+# (unlike burst-lane.sh's own state/journal) — every case below that reaches
+# cmd_parity's LOCAL half must explicitly scope cargo-budget's state/
+# journal/meminfo/loadavg/hostname under $T (same convention as cargo-
+# budget-selftest.sh's own common_env()), or a real invocation here would
+# write into this host's REAL cargo-budget ledger/journal and could contend
+# a REAL production slot lock.
+paritycad_cargo_budget_env() {
+  local dir="$1"
+  export CARGO_BUDGET_STATE_DIR="$dir/cb-state"
+  export CARGO_BUDGET_JOURNAL="$dir/cb-journal.md"
+  export CARGO_BUDGET_HOSTNAME="paritycad-not-redbaron"
+  printf '0.10 0.05 0.01 1/200 12345\n' > "$dir/cb-loadavg"
+  export CARGO_BUDGET_LOADAVG="$dir/cb-loadavg"
+  cat > "$dir/cb-meminfo" <<'EOF'
+MemTotal:       31000000 kB
+MemFree:        20000000 kB
+MemAvailable:   25000000 kB
+EOF
+  export CARGO_BUDGET_MEMINFO="$dir/cb-meminfo"
+}
+
+# ---- paritycad AC1: a receipt valid for the ACTIVE session + toolchain
+# fingerprint routes `gate` at a NEW head without re-running parity —
+# head_sha is never compared any more (requirement 1).
+fresh_env
+paritycad_cargo_budget_env "$T"
+export FAKE_SSH_NEXTEST_PRESENT=1
+export BURST_LANE_FORCE_NEXTEST_LOCAL=1
+"$BL" up >/dev/null
+sid_pc1="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+WT_PC1="$T/paritycad-repo1"; mkdir -p "$WT_PC1"
+( cd "$WT_PC1" && git init -q && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init )
+FAKEBIN_PC1="$T/fakebin-paritycad1"; mkdir -p "$FAKEBIN_PC1"
+export PARITYCAD1_CARGO_CALLS="$T/paritycad1-cargo-calls"
+cat > "$FAKEBIN_PC1/cargo" <<'CARGOEOF'
+#!/usr/bin/env bash
+if [ "${1:-}" = "nextest" ]; then
+  shift
+  sub="${1:-}"; shift || true
+  case "$PWD" in
+    "$BURST_LANE_REMOTE_ROOT"/*) side=box ;;
+    *) side=local; echo run >> "$PARITYCAD1_CARGO_CALLS" ;;
+  esac
+  if [ "$sub" = "list" ]; then
+    echo '{"rust-suites": {"parity::a": {}, "parity::b": {}}}'
+    exit 0
+  fi
+  if [ "$sub" = "run" ]; then
+    echo "        PASS [   0.001s] (1/2) parity::a test_a"
+    echo "        PASS [   0.001s] (2/2) parity::b test_b"
+    exit 0
+  fi
+fi
+echo "fake-cargo(paritycad1): unhandled args: $*" >&2
+exit 1
+CARGOEOF
+chmod +x "$FAKEBIN_PC1/cargo"
+
+pc1_parity_out="$(PATH="$FAKEBIN_PC1:$PATH" "$BL" parity "$WT_PC1" 2>&1)"; pc1_parity_rc=$?
+expect "paritycad AC1: initial parity exits 0 with a clean diff" "[ $pc1_parity_rc -eq 0 ] && grep -q 'diff=0' <<<\"\$pc1_parity_out\""
+pc1_receipt="$WT_PC1/target/autobuilder/receipts/box-parity.json"
+pc1_fields_rc=0
+python3 -c "
+import json
+d = json.load(open('$pc1_receipt'))
+assert d.get('session_id') == '$sid_pc1', d.get('session_id')
+assert d.get('toolchain_fp'), d
+assert d.get('diff') == [], d
+" || pc1_fields_rc=1
+expect "paritycad AC1: receipt carries session_id + toolchain_fp" "[ $pc1_fields_rc -eq 0 ]"
+
+head_a_pc1="$(git -C "$WT_PC1" rev-parse HEAD)"
+( cd "$WT_PC1" && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m "moves head" )
+head_b_pc1="$(git -C "$WT_PC1" rev-parse HEAD)"
+
+FAKE_EG_CALLLOG_PC1="$T/paritycad1-extend-gate-calls.log"
+cat > "$FAKEBIN_PC1/extend-gate.sh" <<EOF
+#!/usr/bin/env bash
+echo "\$*" >> "$FAKE_EG_CALLLOG_PC1"
+mkdir -p target/autobuilder/receipts
+echo '{"pass": 25, "block": 0}' > target/autobuilder/last-verdict.json
+exit 0
+EOF
+chmod +x "$FAKEBIN_PC1/extend-gate.sh"
+reproof_before_pc1="$(grep -c 'burst-lane  parity  reproof' "$BURST_LANE_JOURNAL" 2>/dev/null || echo 0)"
+gate1_out="$(PATH="$FAKEBIN_PC1:$PATH" "$BL" gate "$WT_PC1" --head "$head_b_pc1" 2>&1)"; gate1_rc=$?
+reproof_after_pc1="$(grep -c 'burst-lane  parity  reproof' "$BURST_LANE_JOURNAL" 2>/dev/null || echo 0)"
+expect "paritycad AC1: gate at a NEW head routes (invokes extend-gate.sh, not a parity fallback)" \
+  "[ $gate1_rc -eq 0 ] && [ \"\$(wc -l < \"$FAKE_EG_CALLLOG_PC1\")\" -eq 1 ] && [ \"$head_a_pc1\" != \"$head_b_pc1\" ]"
+expect "paritycad AC1: gate never falls back on the receipt's stale head_sha" "! grep -q '^fallback:' <<<\"$gate1_out\""
+expect "paritycad AC1: no re-proof happened (session+toolchain both still match)" "[ \"$reproof_before_pc1\" = \"$reproof_after_pc1\" ]"
+
+# ---- paritycad AC2: a receipt whose session_id no longer matches the
+# ACTIVE session triggers exactly one re-proof (journaled with its cause),
+# and gate's routing follows that re-proof's own result.
+fresh_env
+paritycad_cargo_budget_env "$T"
+export FAKE_SSH_NEXTEST_PRESENT=1
+export BURST_LANE_FORCE_NEXTEST_LOCAL=1
+"$BL" up >/dev/null
+sid_pc2="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+WT_PC2="$T/paritycad-repo2"; mkdir -p "$WT_PC2"
+( cd "$WT_PC2" && git init -q && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init )
+FAKEBIN_PC2="$T/fakebin-paritycad2"; mkdir -p "$FAKEBIN_PC2"
+export PARITYCAD2_CARGO_CALLS="$T/paritycad2-cargo-calls"
+cat > "$FAKEBIN_PC2/cargo" <<'CARGOEOF'
+#!/usr/bin/env bash
+if [ "${1:-}" = "nextest" ]; then
+  shift
+  sub="${1:-}"; shift || true
+  case "$PWD" in
+    "$BURST_LANE_REMOTE_ROOT"/*) side=box ;;
+    *) side=local ;;
+  esac
+  if [ "$sub" = "list" ]; then
+    echo '{"rust-suites": {"parity::a": {}, "parity::b": {}}}'
+    exit 0
+  fi
+  if [ "$sub" = "run" ]; then
+    # Count only actual TEST RUNS (not the cheap `list` metadata call) on
+    # the local side — this is what "the re-proof re-ran the local test"
+    # means to paritycad AC2.
+    [ "$side" = "local" ] && echo run >> "$PARITYCAD2_CARGO_CALLS"
+    echo "        PASS [   0.001s] (1/2) parity::a test_a"
+    echo "        PASS [   0.001s] (2/2) parity::b test_b"
+    exit 0
+  fi
+fi
+echo "fake-cargo(paritycad2): unhandled args: $*" >&2
+exit 1
+CARGOEOF
+chmod +x "$FAKEBIN_PC2/cargo"
+cat > "$FAKEBIN_PC2/extend-gate.sh" <<'EOF'
+#!/usr/bin/env bash
+mkdir -p target/autobuilder/receipts
+echo '{"pass": 25, "block": 0}' > target/autobuilder/last-verdict.json
+exit 0
+EOF
+chmod +x "$FAKEBIN_PC2/extend-gate.sh"
+
+pc2_parity_out="$(PATH="$FAKEBIN_PC2:$PATH" "$BL" parity "$WT_PC2" 2>&1)"; pc2_parity_rc=$?
+expect "paritycad AC2: initial parity exits 0 with a clean diff" "[ $pc2_parity_rc -eq 0 ]"
+pc2_receipt="$WT_PC2/target/autobuilder/receipts/box-parity.json"
+head_pc2="$(git -C "$WT_PC2" rev-parse HEAD)"
+
+# Simulate "a new session": forge the receipt's session_id to a foreign
+# value — the ACTIVE session is unchanged, only the receipt now claims a
+# different one, isolating this case to the session-mismatch path alone.
+python3 -c "
+import json
+p = '$pc2_receipt'
+d = json.load(open(p))
+d['session_id'] = 'some-other-session-999'
+json.dump(d, open(p, 'w'))
+"
+
+cargo_calls_before_pc2="$(wc -l < "$PARITYCAD2_CARGO_CALLS" 2>/dev/null || echo 0)"
+gate2_out="$(PATH="$FAKEBIN_PC2:$PATH" "$BL" gate "$WT_PC2" --head "$head_pc2" 2>&1)"; gate2_rc=$?
+cargo_calls_after_pc2="$(wc -l < "$PARITYCAD2_CARGO_CALLS" 2>/dev/null || echo 0)"
+
+expect "paritycad AC2: exactly one re-proof journaled with cause=session" \
+  "[ \"\$(grep -c 'burst-lane  parity  reproof  (cause=session' \"$BURST_LANE_JOURNAL\")\" = 1 ]"
+expect "paritycad AC2: the re-proof actually re-ran the local test exactly once" \
+  "[ $((cargo_calls_after_pc2 - cargo_calls_before_pc2)) -eq 1 ]"
+expect "paritycad AC2: routing follows the re-proof's result (gate proceeds, exit 0)" "[ $gate2_rc -eq 0 ]"
+pc2_session_fixed_rc=0
+python3 -c "
+import json
+d = json.load(open('$pc2_receipt'))
+assert d.get('session_id') == '$sid_pc2', d.get('session_id')
+" || pc2_session_fixed_rc=1
+expect "paritycad AC2: the re-proof rewrote the receipt with the real active session_id" "[ $pc2_session_fixed_rc -eq 0 ]"
+
+# ---- paritycad AC3: RedBaron's load never rises because of parity — a load
+# above CARGO_BUDGET_MAX_LOAD defers the WHOLE attempt (no box, no local, no
+# `up`) and journals the cause (requirement 2).
+fresh_env
+export CARGO_BUDGET_HOSTNAME="redbaron"
+printf '999.0 999.0 999.0 1/500 99999\n' > "$T/pc3-loadavg"
+export CARGO_BUDGET_LOADAVG="$T/pc3-loadavg"
+export PARITY_LOAD_WAIT_S=0
+WT_PC3="$T/paritycad-repo3"; mkdir -p "$WT_PC3"
+( cd "$WT_PC3" && git init -q && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init )
+pc3_out="$("$BL" parity "$WT_PC3" 2>&1)"; pc3_rc=$?
+expect "paritycad AC3: parity exits 3 when RedBaron's load exceeds the cap" "[ $pc3_rc -eq 3 ]"
+expect "paritycad AC3: parity prints fallback: load" "grep -q '^fallback: load$' <<<\"$pc3_out\""
+expect "paritycad AC3: journal records the deferral with cause=load" \
+  "grep -q 'burst-lane  parity  deferred  (cause=load' \"$BURST_LANE_JOURNAL\""
+expect "paritycad AC3: no session was ever brought up (neither side ran)" "[ ! -f \"$BURST_LANE_STATE_DIR/session.json\" ]"
+expect "paritycad AC3: no local test baseline was written" "[ ! -e \"$WT_PC3/target/autobuilder/test-output.txt\" ]"
+expect "paritycad AC3: no parity receipt was written" "[ ! -e \"$WT_PC3/target/autobuilder/receipts/box-parity.json\" ]"
+unset CARGO_BUDGET_HOSTNAME CARGO_BUDGET_LOADAVG PARITY_LOAD_WAIT_S
+
+# ---- paritycad AC4: a suite named in .burst-lane.toml's parity_exclude is
+# still run and recorded on both sides, but never counted as a parity diff
+# — reported under host_sensitive instead — and gate still routes
+# (requirement 4).
+fresh_env
+paritycad_cargo_budget_env "$T"
+export FAKE_SSH_NEXTEST_PRESENT=1
+export BURST_LANE_FORCE_NEXTEST_LOCAL=1
+"$BL" up >/dev/null
+WT_PC4="$T/paritycad-repo4"; mkdir -p "$WT_PC4"
+( cd "$WT_PC4" && git init -q && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init )
+cat > "$WT_PC4/.burst-lane.toml" <<'EOF'
+parity_exclude = ["parity::flaky_host"]
+EOF
+FAKEBIN_PC4="$T/fakebin-paritycad4"; mkdir -p "$FAKEBIN_PC4"
+cat > "$FAKEBIN_PC4/cargo" <<'CARGOEOF'
+#!/usr/bin/env bash
+if [ "${1:-}" = "nextest" ]; then
+  shift
+  sub="${1:-}"; shift || true
+  case "$PWD" in
+    "$BURST_LANE_REMOTE_ROOT"/*) side=box ;;
+    *) side=local ;;
+  esac
+  if [ "$sub" = "list" ]; then
+    echo '{"rust-suites": {"parity::steady": {}, "parity::flaky_host": {}}}'
+    exit 0
+  fi
+  if [ "$sub" = "run" ]; then
+    if [ "$side" = "box" ]; then
+      echo "        FAIL [   0.010s] (1/2) parity::flaky_host test_x"
+      echo "        PASS [   0.001s] (2/2) parity::steady test_s"
+    else
+      echo "        PASS [   0.010s] (1/2) parity::flaky_host test_x"
+      echo "        PASS [   0.001s] (2/2) parity::steady test_s"
+    fi
+    exit 0
+  fi
+fi
+echo "fake-cargo(paritycad4): unhandled args: $*" >&2
+exit 1
+CARGOEOF
+chmod +x "$FAKEBIN_PC4/cargo"
+pc4_out="$(PATH="$FAKEBIN_PC4:$PATH" "$BL" parity "$WT_PC4" 2>&1)"; pc4_rc=$?
+expect "paritycad AC4: parity exits 0" "[ $pc4_rc -eq 0 ]"
+expect "paritycad AC4: diff stays empty (the only disagreement is excluded)" "grep -q 'diff=0' <<<\"$pc4_out\""
+pc4_receipt="$WT_PC4/target/autobuilder/receipts/box-parity.json"
+pc4_json_rc=0
+python3 -c "
+import json
+d = json.load(open('$pc4_receipt'))
+assert d['diff'] == [], d['diff']
+assert d['host_sensitive'] == ['parity::flaky_host'], d['host_sensitive']
+assert d['suites']['parity::flaky_host'] == {'box': 'FAILED', 'local': 'ok', 'status': 'host-sensitive'}, d['suites']['parity::flaky_host']
+" || pc4_json_rc=1
+expect "paritycad AC4: box-parity.json lists the excluded suite under host_sensitive with both results" "[ $pc4_json_rc -eq 0 ]"
+
+head_pc4="$(git -C "$WT_PC4" rev-parse HEAD)"
+cat > "$FAKEBIN_PC4/extend-gate.sh" <<'EOF'
+#!/usr/bin/env bash
+mkdir -p target/autobuilder/receipts
+echo '{"pass": 25, "block": 0}' > target/autobuilder/last-verdict.json
+exit 0
+EOF
+chmod +x "$FAKEBIN_PC4/extend-gate.sh"
+gate4_out="$(PATH="$FAKEBIN_PC4:$PATH" "$BL" gate "$WT_PC4" --head "$head_pc4" 2>&1)"; gate4_rc=$?
+expect "paritycad AC4: gate routes despite the host-sensitive suite (not blocked by it)" "[ $gate4_rc -eq 0 ]"
+
+# ---- paritycad AC5: parity's local half runs through cargo-budget.sh (nice
+# -n 15, CARGO_BUDGET_TEST_THREADS default 4) — the ledger gets a row for it
+# and the wrapped process actually saw RUST_TEST_THREADS=4 (requirement 2).
+fresh_env
+paritycad_cargo_budget_env "$T"
+export FAKE_SSH_NEXTEST_PRESENT=1
+export BURST_LANE_FORCE_NEXTEST_LOCAL=1
+"$BL" up >/dev/null
+WT_PC5="$T/paritycad-repo5"; mkdir -p "$WT_PC5"
+( cd "$WT_PC5" && git init -q && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init )
+FAKEBIN_PC5="$T/fakebin-paritycad5"; mkdir -p "$FAKEBIN_PC5"
+export PARITYCAD5_THREADS_SEEN="$T/paritycad5-threads-seen"
+cat > "$FAKEBIN_PC5/cargo" <<'CARGOEOF'
+#!/usr/bin/env bash
+if [ "${1:-}" = "nextest" ]; then
+  shift
+  sub="${1:-}"; shift || true
+  case "$PWD" in
+    "$BURST_LANE_REMOTE_ROOT"/*) side=box ;;
+    *) side=local ;;
+  esac
+  if [ "$sub" = "list" ]; then
+    echo '{"rust-suites": {"parity::a": {}}}'
+    exit 0
+  fi
+  if [ "$sub" = "run" ]; then
+    if [ "$side" = "local" ]; then
+      echo "RUST_TEST_THREADS=${RUST_TEST_THREADS:-unset}" >> "$PARITYCAD5_THREADS_SEEN"
+    fi
+    echo "        PASS [   0.001s] (1/1) parity::a test_a"
+    exit 0
+  fi
+fi
+echo "fake-cargo(paritycad5): unhandled args: $*" >&2
+exit 1
+CARGOEOF
+chmod +x "$FAKEBIN_PC5/cargo"
+pc5_out="$(PATH="$FAKEBIN_PC5:$PATH" "$BL" parity "$WT_PC5" 2>&1)"; pc5_rc=$?
+expect "paritycad AC5: parity exits 0" "[ $pc5_rc -eq 0 ]"
+expect "paritycad AC5: cargo-budget ledger has at least one row for the local run" \
+  "[ -s \"$CARGO_BUDGET_STATE_DIR/ledger.jsonl\" ]"
+expect "paritycad AC5: the wrapped local run saw RUST_TEST_THREADS=4 (CARGO_BUDGET_TEST_THREADS default)" \
+  "grep -q '^RUST_TEST_THREADS=4$' \"$PARITYCAD5_THREADS_SEEN\""
+
+# ---- paritycad AC6 (P1): this fixture set exits 0 and names the
+# paritycad cases — matching every sibling AC's own "does the suite name
+# its own coverage" convention (parityr AC6, isolate AC6 above).
+expect "paritycad AC6: every paritycad case above ran green" "[ $fail -eq 0 ]"
+
+# ---- isolate AC2 / requirement 3: the real top-level audit wrap (snapshot
+# taken at the very top of this file) closes here — every fixture case in
+# this ~2000-line suite ran against its own $T tmpdir, never the real
+# live burst-lane state or journal. Skipped (not failed) when a real
+# session was already up before this suite started — see the note at the
+# snapshot site above.
+audit_snapshot "$ISO_LIVE_STATE_DIR" "$ISO_LIVE_JOURNAL" > "$iso_audit_after"
+iso_audit_out="$(audit_diff "$iso_audit_before" "$iso_audit_after" 2>&1)"; iso_audit_rc=$?
+if [ "$iso_audit_live_session_pre" = "true" ]; then
+  echo "ok  isolate AC2: skipped — a real burst-lane session was already active before this suite started (cannot distinguish its own legitimate activity from a leak by diffing alone)"
+  [ $iso_audit_rc -eq 0 ] || echo "$iso_audit_out (informational only, not counted — pre-existing live session)" >&2
+else
+  expect "isolate AC2: the live burst-lane state/journal are unchanged after this whole suite ran" "[ $iso_audit_rc -eq 0 ]"
+  [ $iso_audit_rc -eq 0 ] || echo "$iso_audit_out" >&2
+fi
+# =============================================================================
+# ---- burstvol: PRD-build-burst-persistent-volume ---------------------------
+# The build root ($REMOTE_ROOT) moves onto a Hetzner Cloud volume that `up`
+# attaches/mounts and teardown detaches, so warm targets survive across boxes.
+# Every pre-existing case above ran with BURST_VOLUME_NAME="" (fresh_env's
+# default — the documented rollback), so none of them ever made an `hcloud
+# volume` call; these cases opt back in explicitly.
+# =============================================================================
+
+# ---- burstvol AC1: no volume exists -> create, attach, format, mount -------
+fresh_env
+export BURST_VOLUME_NAME="wm-burst-build"
+export FAKE_SSH_CALL_LOG="$T/ssh.calls"; : > "$FAKE_SSH_CALL_LOG"
+bv1_out="$("$BL" up)"; bv1_rc=$?
+expect "burstvol AC1: up exits 0" "[ $bv1_rc -eq 0 ]"
+bv1_create_calls="$(grep -c 'volume create' "$FAKE_HCLOUD_CALLLOG")"
+expect "burstvol AC1: exactly one volume create call" "[ \"$bv1_create_calls\" -eq 1 ]"
+bv1_attach_calls="$(grep -c 'volume attach' "$FAKE_HCLOUD_CALLLOG")"
+expect "burstvol AC1: exactly one volume attach call" "[ \"$bv1_attach_calls\" -eq 1 ]"
+expect "burstvol AC1: the mount+format round trip ran as root" \
+  "grep -P '^root@\\S+\\t.*# volume-mount' \"$FAKE_SSH_CALL_LOG\" >/dev/null"
+bv1_created_line="$(grep -n 'burst-lane  up  volume  created' "$BURST_LANE_JOURNAL" | head -1 | cut -d: -f1)"
+bv1_attached_line="$(grep -n 'burst-lane  up  volume  attached' "$BURST_LANE_JOURNAL" | head -1 | cut -d: -f1)"
+expect "burstvol AC1: journal has both a volume created and a volume attached line" \
+  "[ -n \"$bv1_created_line\" ] && [ -n \"$bv1_attached_line\" ]"
+expect "burstvol AC1: volume created precedes volume attached" \
+  "[ -n \"$bv1_created_line\" ] && [ -n \"$bv1_attached_line\" ] && [ \"$bv1_created_line\" -lt \"$bv1_attached_line\" ]"
+
+# ---- burstvol AC2: volume already exists with a filesystem label -> no ----
+# format, no create call, journal has "attached" only.
+fresh_env
+export BURST_VOLUME_NAME="wm-burst-build"
+hcloud volume create --name wm-burst-build --size 500 >/dev/null 2>&1
+export FAKE_SSH_VOLUME_LABEL_PRESENT=1
+bv2_out="$("$BL" up)"; bv2_rc=$?
+expect "burstvol AC2: up exits 0 against a pre-existing, already-formatted volume" "[ $bv2_rc -eq 0 ]"
+bv2_create_calls="$(grep -c 'volume create' "$FAKE_HCLOUD_CALLLOG")"
+expect "burstvol AC2: no volume create call during this up (only the pre-seed's own)" "[ \"$bv2_create_calls\" -eq 1 ]"
+expect "burstvol AC2: journal has volume attached, never volume created" \
+  "grep -q 'burst-lane  up  volume  attached' \"$BURST_LANE_JOURNAL\" && ! grep -q 'burst-lane  up  volume  created' \"$BURST_LANE_JOURNAL\""
+unset FAKE_SSH_VOLUME_LABEL_PRESENT
+
+# ---- burstvol AC3: teardown order — sweep/sync/umount/detach/verify before -
+# server delete; journal has "volume detached" before "down decision=deleted".
+fresh_env
+export BURST_VOLUME_NAME="wm-burst-build"
+"$BL" up >/dev/null
+bv3_boot_epoch="$(grep -oE '"boot_epoch":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+export BURST_LANE_NOW=$((bv3_boot_epoch + 3600 - 60))
+bv3_down_out="$("$BL" down)"
+unset BURST_LANE_NOW
+expect "burstvol AC3: teardown still deletes cleanly with a volume attached" "[ \"$bv3_down_out\" = 'decision=deleted' ]"
+bv3_detach_line="$(grep -n 'volume detach' "$FAKE_HCLOUD_CALLLOG" | head -1 | cut -d: -f1)"
+bv3_delete_line="$(grep -n '^server delete' "$FAKE_HCLOUD_CALLLOG" | tail -1 | cut -d: -f1)"
+expect "burstvol AC3: hcloud volume detach happens before server delete" \
+  "[ -n \"$bv3_detach_line\" ] && [ -n \"$bv3_delete_line\" ] && [ \"$bv3_detach_line\" -lt \"$bv3_delete_line\" ]"
+bv3_detached_j="$(grep -n 'burst-lane  down  volume  detached' "$BURST_LANE_JOURNAL" | head -1 | cut -d: -f1)"
+bv3_deleted_j="$(grep -n 'burst-lane  down  decision=deleted' "$BURST_LANE_JOURNAL" | head -1 | cut -d: -f1)"
+expect "burstvol AC3: journal has volume detached before down decision=deleted" \
+  "[ -n \"$bv3_detached_j\" ] && [ -n \"$bv3_deleted_j\" ] && [ \"$bv3_detached_j\" -lt \"$bv3_deleted_j\" ]"
+
+# ---- burstvol AC4: detach fails -> server still deletes, journal detach- --
+# failed, volume_dirty=true, next up fscks before mounting.
+fresh_env
+export BURST_VOLUME_NAME="wm-burst-build"
+"$BL" up >/dev/null
+export FAKE_HCLOUD_VOLUME_DETACH_FAIL=1
+bv4_boot_epoch="$(grep -oE '"boot_epoch":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+export BURST_LANE_NOW=$((bv4_boot_epoch + 3600 - 60))
+bv4_down_out="$("$BL" down)"
+unset BURST_LANE_NOW FAKE_HCLOUD_VOLUME_DETACH_FAIL
+expect "burstvol AC4: server still deletes even though detach failed" "[ \"$bv4_down_out\" = 'decision=deleted' ]"
+expect "burstvol AC4: journal records volume detach-failed" "grep -q 'burst-lane  down  volume  detach-failed' \"$BURST_LANE_JOURNAL\""
+expect "burstvol AC4: volume state file marks volume_dirty=true" \
+  "python3 -c \"import json,sys; d=json.load(open('$BURST_LANE_STATE_DIR/volume.json')); sys.exit(0 if d.get('volume_dirty')=='true' else 1)\""
+export FAKE_SSH_VOLUME_FSCK_CALLLOG="$T/fsck.calls"; : > "$FAKE_SSH_VOLUME_FSCK_CALLLOG"
+bv4b_up_out="$("$BL" up)"; bv4b_up_rc=$?
+expect "burstvol AC4: the next up exits 0" "[ $bv4b_up_rc -eq 0 ]"
+expect "burstvol AC4: the next up ran fsck before mounting (prior detach-failed)" "[ -s \"$FAKE_SSH_VOLUME_FSCK_CALLLOG\" ]"
+unset FAKE_SSH_VOLUME_FSCK_CALLLOG
+
+# ---- burstvol AC5: hcloud reports the volume attached to another server ---
+# -> no attach attempted, "volume busy" journaled, session boots without it.
+fresh_env
+export BURST_VOLUME_NAME="wm-burst-build"
+hcloud volume create --name wm-burst-build --size 500 >/dev/null 2>&1
+awk -F'|' -v OFS='|' '{$4="999999"; print}' "$FAKE_HCLOUD_VOLUME_STATE" > "$FAKE_HCLOUD_VOLUME_STATE.tmp" && mv "$FAKE_HCLOUD_VOLUME_STATE.tmp" "$FAKE_HCLOUD_VOLUME_STATE"
+bv5_up_out="$("$BL" up)"; bv5_up_rc=$?
+expect "burstvol AC5: up still exits 0 (boots without the volume)" "[ $bv5_up_rc -eq 0 ]"
+expect "burstvol AC5: no volume attach call was attempted" "! grep -q 'volume attach' \"$FAKE_HCLOUD_CALLLOG\""
+expect "burstvol AC5: journal names the server the volume is attached to" \
+  "grep -q 'burst-lane  up  volume  busy  (attached_to=999999' \"$BURST_LANE_JOURNAL\""
+expect "burstvol AC5: volume state recorded volume_mounted=false" \
+  "python3 -c \"import json,sys; d=json.load(open('$BURST_LANE_STATE_DIR/volume.json')); sys.exit(0 if d.get('volume_mounted')=='false' else 1)\""
+
+# ---- burstvol AC6: disk fields (status --json) reflect the volume, not ----
+# the root disk — a fake df reporting 41% used comes back as volume.used_pct.
+fresh_env
+export BURST_VOLUME_NAME="wm-burst-build"
+export FAKE_SSH_VOLUME_USED_PCT=41
+"$BL" up >/dev/null
+bv6_status_json="$("$BL" status --json)"
+expect "burstvol AC6: status --json carries volume.used_pct from a live df read" \
+  "grep -q '\"used_pct\":41' <<<\$bv6_status_json"
+bv6_status_text="$("$BL" status)"
+expect "burstvol AC6: status (text mode) shows volume=attached 41%" \
+  "grep -q 'volume=attached 41%' <<<\$bv6_status_text"
+unset FAKE_SSH_VOLUME_USED_PCT
+
+# ---- burstvol AC7: warm attribution — a run against an empty remote target
+# journals warm=false; a second run against the now-existing target journals
+# warm=true, and the attribution ledger's row for it carries warm:true too.
+fresh_env
+WT_BV7="$T/warm-wt"; mkdir -p "$WT_BV7"
+echo 'mkdir -p target && echo built > target/out.txt' > "$WT_BV7/build.sh"
+bv7_run1_out="$("$BL" run "$WT_BV7" -- bash build.sh 2>&1)"; bv7_run1_rc=$?
+expect "burstvol AC7: first run (empty remote target) exits 0" "[ $bv7_run1_rc -eq 0 ]"
+expect "burstvol AC7: first run journaled warm=false" \
+  "grep -q 'burst-lane  run  routed.*warm=false' \"$BURST_LANE_JOURNAL\""
+bv7_run2_out="$("$BL" run "$WT_BV7" -- bash build.sh 2>&1)"; bv7_run2_rc=$?
+expect "burstvol AC7: second run (target now exists) exits 0" "[ $bv7_run2_rc -eq 0 ]"
+expect "burstvol AC7: second run journaled warm=true" \
+  "grep -q 'burst-lane  run  routed.*warm=true' \"$BURST_LANE_JOURNAL\""
+expect "burstvol AC7: attribution.jsonl's second run row carries warm:true" \
+  "python3 -c \"
+import json
+rows = [json.loads(l) for l in open('$BURST_LANE_ATTR_LEDGER') if l.strip()]
+runs = [r for r in rows if r.get('kind') == 'run' and r.get('worktree') == '$WT_BV7']
+import sys
+sys.exit(0 if len(runs) >= 2 and runs[-1].get('warm') is True else 1)
+\""
+
+# ---- burstvol AC8 (P1): the daily rollup carries volume_gb and a ----------
+# cold_builds_avoided count, same two-`down`-calls pattern gatebox AC9 uses
+# (the first down's own proration lands too late for maybe_daily_rollup to
+# see it; the second, no-op down sees it and emits the real rollup line).
+fresh_env
+export BURST_VOLUME_NAME="wm-burst-build"
+export BURST_VOLUME_GB=500
+"$BL" up >/dev/null
+WT_BV8="$T/rollup-wt"; mkdir -p "$WT_BV8"
+echo 'mkdir -p target; exit 0' > "$WT_BV8/build.sh"
+"$BL" run "$WT_BV8" -- bash build.sh >/dev/null 2>&1
+bv8_boot_epoch="$(grep -oE '"boot_epoch":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+export BURST_LANE_NOW=$((bv8_boot_epoch + 3600 - 60))
+"$BL" down >/dev/null
+"$BL" down >/dev/null
+unset BURST_LANE_NOW
+bv8_today="$(date -u +%Y-%m-%d)"
+bv8_rollup_line="$(grep '^burst-cost:' "$BURST_LANE_TICK_JOURNAL_DIR/$bv8_today.md" 2>/dev/null | tail -1)"
+expect "burstvol AC8: daily rollup line carries volume_gb=500" "grep -q 'volume_gb=500' <<<\"$bv8_rollup_line\""
+expect "burstvol AC8: daily rollup line carries a cold_builds_avoided count" \
+  "grep -qE 'cold_builds_avoided=[0-9]+' <<<\"$bv8_rollup_line\""
+
+# ---- burstvol AC9: the pull-back DESTINATION guard — a low-free-space -----
+# RedBaron root defers the pull (marker stays dirty for a later retry)
+# instead of starting an rsync it can't safely finish, using the larger of
+# BURST_LOCAL_DISK_FLOOR_GB and this worktree's own last-observed pull size
+# as the threshold (the PRD's own scenario: 20 GB free, an 87 GB last pull).
+fresh_env
+"$BL" up >/dev/null
+WT_BV9="$T/localdisk-wt"; mkdir -p "$WT_BV9"
+echo 'mkdir -p target && echo built > target/out.txt' > "$WT_BV9/build.sh"
+"$BL" run "$WT_BV9" -- bash build.sh >/dev/null 2>&1
+bv9_wkey="$(printf '%s' "$WT_BV9" | sha1sum | cut -c1-8)"
+mkdir -p "$BURST_LANE_STATE_DIR/pull-sizes"
+# 87 GB, exactly matching the PRD's own AC9 scenario and the real
+# 2026-09-11 incident evidence (an 87 GB single gate pull).
+printf '%s\n' "$((87 * 1073741824))" > "$BURST_LANE_STATE_DIR/pull-sizes/$bv9_wkey"
+export BURST_LANE_LOCAL_FREE_GB=20
+bv9_pull_out="$("$BL" pull "$WT_BV9" 2>&1)"; bv9_pull_rc=$?
+unset BURST_LANE_LOCAL_FREE_GB
+expect "burstvol AC9: pull exits 0 (deferred, not an error)" "[ $bv9_pull_rc -eq 0 ]"
+expect "burstvol AC9: journal records pull deferred cause=local-disk free_gb=20 need_gb=87" \
+  "grep -q 'burst-lane  pull  deferred  (worktree=$WT_BV9 .*cause=local-disk free_gb=20 need_gb=87' \"$BURST_LANE_JOURNAL\""
+expect "burstvol AC9: the marker stays dirty (never cleared)" "dirty_has \"$WT_BV9\""
+
+# ---- burstvol AC10: a dirty marker under a moved root (byte-identical to --
+# the 2026-09-11 user-migration evidence: a marker still naming /root/build
+# after $REMOTE_ROOT moved) is treated as cold on read, cleared, and NEVER
+# retried as rsync-failed — checked before any ssh round trip.
+fresh_env
+"$BL" up >/dev/null
+WT_BV10="$T/rootmove-wt"; mkdir -p "$WT_BV10"
+bv10_wkey="$(printf '%s' "$WT_BV10" | sha1sum | cut -c1-8)"
+mkdir -p "$BURST_LANE_STATE_DIR/dirty"
+python3 -c "
+import json
+json.dump(
+    {'worktree': '$WT_BV10', 'session_id': 'stale-session', 'kind': 'target',
+     'remote_path': '/root/build/rootmove-wt-$bv10_wkey', 'marked_ts': '2026-01-01T00:00:00Z'},
+    open('$BURST_LANE_STATE_DIR/dirty/$bv10_wkey.json', 'w'))
+"
+bv10_pull_out="$("$BL" pull "$WT_BV10" 2>&1)"; bv10_pull_rc=$?
+expect "burstvol AC10: pull against a marker under a moved root exits 0 (cold, not an error)" "[ $bv10_pull_rc -eq 0 ]"
+expect "burstvol AC10: journal records pull cold cause=remote-path-missing" \
+  "grep -q 'burst-lane  pull  cold  (worktree=$WT_BV10 .*cause=remote-path-missing' \"$BURST_LANE_JOURNAL\""
+expect "burstvol AC10: never journaled as rsync-failed for this worktree" \
+  "! grep -q \"burst-lane  pull  fallback  (cause=rsync-failed worktree=$WT_BV10\" \"$BURST_LANE_JOURNAL\""
+expect "burstvol AC10: the stale marker was cleared" "[ ! -e \"$BURST_LANE_STATE_DIR/dirty/$bv10_wkey.json\" ]"
+
+# ---- burstvol AC11: this fixture set exits 0 and names the burstvol cases -
+# (an explicit, in-band assertion, matching every sibling AC's own
+# convention — see burstuser AC7/parityr AC6 above).
+expect "burstvol AC11: every burstvol case above ran green" "[ $fail -eq 0 ]"
+# ============================================================================
+# PRD-build-burst-path-deps: a remote run syncs everything the crate needs to
+# build. Four cases: a fixture crate with a sibling path dependency actually
+# resolves on the (fake) box (AC1); a genuinely-missing path dependency
+# journals a build-failed line with phase=build instead of masquerading as
+# a test failure (AC2); `verify` asserts CARGO_HOME is a writable-by-build
+# registry outside /root, both the happy path and the fail-closed path
+# (AC3); the gate-tools probe's PATH carries no root fallback, so a tool
+# only root can see is not silently treated as present (AC4). AC5 (a real
+# Hetzner box + a green wintermute-brain HEAD) needs real infra this
+# offline harness cannot provide — left for the live lane, not simulated
+# here. AC6 (this suite exits 0 and names its own pathdeps cases) is the
+# closing assertion at the bottom of this block, same convention as every
+# sibling PRD's own closing AC.
+# ============================================================================
+
+# ---- pathdeps AC1: given a fixture crate depending on ../sibling by path,
+# when `run` executes against the fake box, both directories are rsynced
+# and `cargo metadata` genuinely resolves the dependency — not just
+# `--no-deps`, which (proven against a real cargo while building this PRD)
+# never validates a path dependency actually exists at all; only the full
+# resolve graph does, and that is what production's own `cargo build`/
+# `cargo test` invocations exercise too.
+fresh_env
+"$BL" up >/dev/null 2>&1
+PD_ROOT="$T/pathdeps-root"
+mkdir -p "$PD_ROOT/main-crate/src" "$PD_ROOT/sibling/src"
+cat > "$PD_ROOT/main-crate/Cargo.toml" <<EOF
+[package]
+name = "pathdeps-main"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+sibling = { path = "../sibling" }
+EOF
+echo 'fn main() {}' > "$PD_ROOT/main-crate/src/main.rs"
+cat > "$PD_ROOT/sibling/Cargo.toml" <<EOF
+[package]
+name = "sibling"
+version = "0.1.0"
+edition = "2021"
+EOF
+echo '' > "$PD_ROOT/sibling/src/lib.rs"
+WT_PD1="$PD_ROOT/main-crate"
+export FAKE_RSYNC_CALL_LOG="$T/rsync.calls.pd1"; : > "$FAKE_RSYNC_CALL_LOG"
+pd1_out="$("$BL" run "$WT_PD1" -- cargo metadata --format-version 1 2>&1)"; pd1_rc=$?
+expect "pathdeps AC1: run against a crate with a sibling path dep exits 0" "[ $pd1_rc -eq 0 ]"
+expect "pathdeps AC1: the worktree itself was rsynced" "grep -qF \"$WT_PD1/\" \"$FAKE_RSYNC_CALL_LOG\""
+expect "pathdeps AC1: the sibling path dependency was also rsynced" "grep -qF \"$PD_ROOT/sibling/\" \"$FAKE_RSYNC_CALL_LOG\""
+expect "pathdeps AC1: cargo metadata really resolved the dependency (no 'failed to load source' error)" \
+  "! grep -qi 'failed to load source\|failed to read' <<<\"$pd1_out\""
+expect "pathdeps AC1: journal names exactly one synced dependency" \
+  "grep -qF \"pathdeps  (worktree=$WT_PD1 deps=1\" \"$BURST_LANE_JOURNAL\""
+
+# ---- pathdeps AC2: a path dependency that genuinely does not exist (never
+# synced — nothing for `run` to sync) makes the remote `cargo metadata`
+# fail exactly as it does today; the journal must name it a BUILD failure,
+# not a test failure, and no exit=101/phase=test row should exist for it.
+fresh_env
+"$BL" up >/dev/null 2>&1
+PD2_ROOT="$T/pathdeps-broken"
+mkdir -p "$PD2_ROOT/main-crate/src"
+cat > "$PD2_ROOT/main-crate/Cargo.toml" <<EOF
+[package]
+name = "pathdeps-broken-main"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+missing-sibling = { path = "../missing-sibling" }
+EOF
+echo 'fn main() {}' > "$PD2_ROOT/main-crate/src/main.rs"
+WT_PD2="$PD2_ROOT/main-crate"
+pd2_out="$("$BL" run "$WT_PD2" -- cargo metadata --format-version 1 2>&1)"; pd2_rc=$?
+expect "pathdeps AC2: run against a crate with a missing path dep exits nonzero" "[ $pd2_rc -ne 0 ]"
+expect "pathdeps AC2: journal has a build-failed line naming the cause" \
+  "grep -qF \"run  build-failed  (worktree=$WT_PD2\" \"$BURST_LANE_JOURNAL\""
+expect "pathdeps AC2: no exit=101 phase=test row was written for this failure" \
+  "! grep -E \"run  routed .*worktree=$WT_PD2.*phase=test\" \"$BURST_LANE_JOURNAL\""
+pd2_attr_rc=1
+python3 -c "
+import json
+path = '$BURST_LANE_ATTR_LEDGER'
+try:
+    rows = [json.loads(l) for l in open(path) if l.strip()]
+except FileNotFoundError:
+    rows = []
+ok = any(r.get('worktree') == '$WT_PD2' and r.get('kind') == 'run' and r.get('phase') == 'build' for r in rows)
+raise SystemExit(0 if ok else 1)
+" && pd2_attr_rc=0
+expect "pathdeps AC2: attribution ledger row for this run carries phase=build" "[ $pd2_attr_rc -eq 0 ]"
+
+# ---- pathdeps AC3: `verify` asserts CARGO_HOME resolves to a writable-by-
+# build registry outside /root — both the happy path (fresh_env's default
+# build user, real mkdir/touch/rm probe over the fake ssh) and the
+# fail-closed path (a simulated non-writable registry).
+fresh_env
+"$BL" up >/dev/null 2>&1
+pd3_verify_out="$("$BL" verify 2>&1)"; pd3_verify_rc=$?
+expect "pathdeps AC3: verify exits 0 when the build user's registry is writable" "[ $pd3_verify_rc -eq 0 ]"
+expect "pathdeps AC3: verify reports cargo-home ok, naming the build-home path" \
+  "grep -q 'cargo-home ok' <<<\"$pd3_verify_out\" && grep -qF \"$BURST_LANE_REMOTE_HOME/.cargo\" <<<\"$pd3_verify_out\""
+export FAKE_SSH_REGISTRY_WRITE_FAIL=1
+pd3_neg_out="$("$BL" verify 2>&1)"; pd3_neg_rc=$?
+expect "pathdeps AC3: verify fails closed when the registry is not writable" "[ $pd3_neg_rc -ne 0 ]"
+expect "pathdeps AC3: the failure names the CARGO_HOME/registry path" \
+  "grep -q 'CARGO_HOME registry not writable' <<<\"$pd3_neg_out\""
+unset FAKE_SSH_REGISTRY_WRITE_FAIL
+
+# ---- pathdeps AC4: the gate-tools probe's PATH carries no root fallback
+# for the build user — a tool only root could see must read MISSING, not
+# silently pass, and this is checked against the REAL command sent over
+# ssh (not the fake's canned tool-inventory reply, which never actually
+# reads PATH) so a regression in the constructed PATH string itself is
+# what this test catches.
+fresh_env
+export FAKE_SSH_CALL_LOG="$T/ssh.calls.pd4"; : > "$FAKE_SSH_CALL_LOG"
+"$BL" up >/dev/null 2>&1
+pd4_full_line="$(grep '# gate-tools-probe' "$FAKE_SSH_CALL_LOG" | head -n1)"
+# Isolate just the "user@host<TAB>" prefix and the actual `export PATH=...`
+# assignment — the rest of the flattened multi-line probe command is this
+# file's own explanatory comment text (deliberately containing an escaped,
+# never-expanded literal like \$GATE_TOOLS_REMOTE_BIN_DIR so it reads
+# inertly on the remote side), and embedding THAT raw text into a second
+# eval'd string below would let it be mistaken for a real, unset variable
+# reference on re-parse. Narrowing to just these two pieces sidesteps that
+# entirely rather than fighting it with more quoting.
+pd4_user_prefix="$(cut -f1 <<<"$pd4_full_line")"
+pd4_path_line="$(grep -oE 'export PATH=[^;]*' <<<"$pd4_full_line" | head -n1)"
+expect "pathdeps AC4: the gate-tools probe ran as build@" "[[ \$pd4_user_prefix == build@* ]]"
+expect "pathdeps AC4: the probe's own PATH export carries no /root reference" \
+  "[ -n \"\$pd4_path_line\" ] && [[ \$pd4_path_line != *root* ]]"
+pd4_gt_pattern='export PATH=$GATE_TOOLS_REMOTE_BIN_DIR:\$PATH$gt_probe_extra'
+expect "pathdeps AC4 (structural): gate_tools_probe's PATH export is now conditional on REMOTE_USER, not unconditionally including root's paths" \
+  "grep -qF \"\$pd4_gt_pattern\" \"\$BL\""
+
+# ---- pathdeps AC6 (P1): this fixture set exits 0 and names the pathdeps
+# cases — same in-band closing assertion every sibling PRD's own block ends
+# with (see burstuser AC7 / parityr AC6 just above).
+expect "pathdeps AC6: every pathdeps case above ran green" "[ $fail -eq 0 ]"
 
 echo "=== $([ $fail -eq 0 ] && echo PASS || echo FAIL) ==="
 exit $fail

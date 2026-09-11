@@ -90,6 +90,14 @@ SAME_LANE_SUBCAP="${SAME_LANE_SUBCAP:-5}"
 # targets while a session is up. Overridable so selftests can point this
 # at a fake script without a real Hetzner session.
 BURST_LANE_SH="${BURST_LANE_SH:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/burst-lane.sh}"
+# PRD-build-burst-selftest-isolation: this script never resolves a
+# state/journal/box path of its own for the burst-lane call above — it
+# only shells out to burst-lane.sh (which owns and guards those paths
+# under BURST_LANE_TEST=1, see isolation-guard.sh) and effective_subcap()
+# below already fails open on ANY non-zero exit from that call, including
+# the guard's own exit 9. A test that sets BURST_LANE_TEST=1 for a
+# lane-claim.sh scenario is therefore already isolation-safe by
+# delegation: no separate override plumbing needed here.
 
 die() { echo "lane-claim: $*" >&2; exit "${2:-4}"; }
 

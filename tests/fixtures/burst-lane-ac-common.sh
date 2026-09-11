@@ -18,7 +18,11 @@ run_suite_and_expect_labels() {  # $@ = exact "ok  <label>" lines required
   here="$(cd "$(dirname "${BASH_SOURCE[1]}")" && pwd)"
   suite="$here/../scripts/burst-lane-selftest.sh"
   [ -x "$suite" ] || { echo "FAIL: $suite not executable" >&2; return 2; }
-  out="$(bash "$suite" 2>&1)"; rc=$?
+  # PRD-build-burst-selftest-isolation requirement 1: belt-and-suspenders —
+  # burst-lane-selftest.sh already self-exports this at its own top, but
+  # every tests/*.sh is required to export it too, so this wrapper does not
+  # rely solely on the suite it calls remembering to.
+  out="$(BURST_LANE_TEST=1 bash "$suite" 2>&1)"; rc=$?
   if [ "$rc" -ne 0 ]; then
     echo "FAIL: burst-lane-selftest.sh exited $rc" >&2
     echo "$out" | tail -20 >&2

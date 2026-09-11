@@ -93,6 +93,12 @@
 #   overrides the remote working directory (default `/root/gate-burst`)
 #   so a fake ssh/rsync pair can target a writable scratch path instead
 #   of `/root`.
+#
+# Test isolation (PRD-build-burst-selftest-isolation): BURST_LANE_TEST=1
+# marks a test run — every override above is then REQUIRED; STATE_DIR,
+# LEDGER, JOURNAL, or hcloud/ssh/rsync still resolving to a live path/binary
+# fails closed (exit 9) instead of touching production. See
+# isolation-guard.sh (shared with burst-lane.sh — same sentinel var).
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -107,6 +113,24 @@ JOURNAL="${GATE_BURST_JOURNAL:-$HOME/brain/journal/build/$(date -u +%F).md}"
 HCLOUD="${GATE_BURST_HCLOUD_BIN:-hcloud}"
 SSH_BIN="${GATE_BURST_SSH_BIN:-ssh}"
 RSYNC_BIN="${GATE_BURST_RSYNC_BIN:-rsync}"
+
+# PRD-build-burst-selftest-isolation: default-deny under BURST_LANE_TEST=1 —
+# same sentinel + shared guard burst-lane.sh uses (this script and
+# burst-lane.sh are the same "lane" from the PRD's point of view). Checked
+# AFTER override resolution but BEFORE the first mkdir/write below.
+if [ -r "$HERE/isolation-guard.sh" ]; then
+  # shellcheck source=isolation-guard.sh
+  source "$HERE/isolation-guard.sh"
+else
+  isolation_guard_path() { :; }
+  isolation_guard_bin() { :; }
+fi
+isolation_guard_path "$STATE_DIR" "gate-burst.sh"
+isolation_guard_path "$LEDGER" "gate-burst.sh"
+isolation_guard_path "$JOURNAL" "gate-burst.sh"
+isolation_guard_bin "$(command -v "$HCLOUD" 2>/dev/null)" "gate-burst.sh(hcloud)"
+isolation_guard_bin "$(command -v "$SSH_BIN" 2>/dev/null)" "gate-burst.sh(ssh)"
+isolation_guard_bin "$(command -v "$RSYNC_BIN" 2>/dev/null)" "gate-burst.sh(rsync)"
 
 # PRD-build-burst-lane-ccx53 requirement 5: should-route defers to the
 # session-lifecycle script's own state rather than re-deriving it. This is
