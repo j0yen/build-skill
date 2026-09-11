@@ -565,16 +565,19 @@ fi
 # (<repo>/.git/autobuilder-integrate.lock via flock), so a gate run and an
 # integrate on the same crate — or two gate runs — never overlap.
 #
-# PRD-extend-gate-lock-cloexec (2026-09-05 incident class): every producer
-# subshell below closes fd 9 (`9>&-`) before exec'ing its child. Without
-# this, a child that outlives the script — cargo autostarting the
-# long-lived sccache daemon, or mcphost's bwrap warm-pool sandboxes leaking
-# past `cargo test` — inherits fd 9 and keeps the lock held after this
-# script exits, timing out the NEXT gate run (exit 4, $EXTEND_GATE_PRODUCER_LOCK_WAIT
-# wait) even though the process that opened the lock is long gone. Do not
-# remove the `9>&-` from a producer invocation without re-reading this
-# comment.
-lockfile="$repo/.git/autobuilder-integrate.lock"
+# $repo can be a `git worktree` checkout (PRD-autobuilder-gate-unstick,
+# 2026-09-11): there, `$repo/.git` is a *file* pointing at the main
+# checkout's `.git/worktrees/<name>`, not a directory, so a lock placed
+# under it would neither create correctly nor be visible to a concurrent
+# integrate/gate running against the main checkout. `git rev-parse
+# --git-common-dir` resolves to the one real `.git` directory shared by
+# the main checkout and every one of its worktrees, so anchoring the lock
+# there keeps the "never overlap" guarantee regardless of which checkout
+# a given gate run points at. Falls back to the old `$repo/.git` path if
+# git can't answer (e.g. $repo isn't a git repo at all) so a missing git
+# binary never turns into a gate outage.
+git_common_dir=$(git -C "$repo" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || echo "$repo/.git")
+lockfile="$git_common_dir/autobuilder-integrate.lock"
 exec 9>"$lockfile"
 # PRD-build-extend-gate-concurrent-isolation requirement 8 (P2, journal
 # visibility): every run records how long it waited for producer access —
