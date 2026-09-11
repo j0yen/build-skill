@@ -269,6 +269,26 @@ DEFAULT_TTL_HOURS="6"
 HARD_TTL_HOURS="12"
 COST_PER_HOUR_EUR="0.47"
 
+# ---- persistent volume (PRD-build-burst-persistent-volume) -----------------
+# BURST_VOLUME_NAME empty is the documented rollback: root-disk behavior,
+# byte-for-byte, no hcloud volume call ever made. Kept as plain vars (not
+# load_env-sourced) so an operator can flip the rollback with a bare env
+# export, same as every other BURST_* knob here.
+BURST_VOLUME_NAME="${BURST_VOLUME_NAME-wm-burst-build}"
+BURST_VOLUME_GB="${BURST_VOLUME_GB:-500}"
+BURST_SCCACHE_GB="${BURST_SCCACHE_GB:-40}"
+BURST_VOLUME_EUR_PER_GB_MONTH="${BURST_VOLUME_EUR_PER_GB_MONTH:-0.0476}"
+# Requirement 9: the pull-BACK destination guard — RedBaron's own local disk,
+# not the box's. Default 60 (same floor family as BURST_DISK_FLOOR_GB's own
+# 40, sized a bit higher since a single gate pull has been observed as large
+# as 87 GB — see the 2026-09-11 08:55Z 0-bytes-free incident in the PRD).
+BURST_LOCAL_DISK_FLOOR_GB="${BURST_LOCAL_DISK_FLOOR_GB:-60}"
+# Persistent across sessions (NOT cleared by state_clear/`down`'s delete —
+# the volume, and the fact that its last detach failed, outlive the box that
+# was attached to it). volume_state_write's own key=value convention mirrors
+# state_write's.
+VOLUME_STATE_FILE="$STATE_DIR/volume.json"
+
 die() { echo "burst-lane: $*" >&2; exit "${2:-1}"; }
 usage() { echo "usage: burst-lane.sh {up|status|run|sync-back|pull|ensure-fresh|down|watchdog|cost|sub-cap|verify|provision|reap|route-check|parity|gate} ..." >&2; exit 2; }
 
@@ -334,15 +354,20 @@ CARGO_TEST_RUNNER_TARGET_ENV="${BURST_LANE_CARGO_TEST_RUNNER_TARGET_ENV:-CARGO_T
 if [ "$REMOTE_USER" = "root" ]; then
   REMOTE_HOME="/root"
   GATE_TOOLS_REMOTE_BIN_DIR_DEFAULT="$ROOT_CARGO_HOME/bin"
-  REMOTE_SCCACHE_DIR_DEFAULT="/root/.sccache"
 else
   # Absolute (no "~") — the fake rsync fixture only string-strips a
   # "user@host:" prefix, it never runs a remote shell to expand a tilde.
   REMOTE_HOME="${BURST_LANE_REMOTE_HOME:-/home/$REMOTE_USER}"
   GATE_TOOLS_REMOTE_BIN_DIR_DEFAULT="$REMOTE_HOME/.local/bin"
-  REMOTE_SCCACHE_DIR_DEFAULT="$REMOTE_HOME/.cache/sccache"
 fi
 REMOTE_ROOT="${BURST_LANE_REMOTE_ROOT:-$REMOTE_HOME/build}"
+# PRD-build-burst-persistent-volume requirement 3: sccache moves onto the
+# same tree the volume mounts at $REMOTE_ROOT (byte-identical path whether or
+# not a volume is actually attached this session — see "up"'s volume_ensure,
+# which mounts AT $REMOTE_ROOT rather than renaming it). Previously
+# $REMOTE_HOME/.cache/sccache (build) or /root/.sccache (root); still
+# overridable via BURST_LANE_REMOTE_SCCACHE_DIR for either rollback.
+REMOTE_SCCACHE_DIR_DEFAULT="$REMOTE_ROOT/.sccache"
 # PRD-build-burst-parity-robust requirement 4: the FIXED historical root a
 # pre-unprivileged-user (or rolled-back) session always used, independent of
 # whatever $REMOTE_ROOT resolves to today — this is where `reap` looks for
@@ -393,6 +418,56 @@ state_write() {  # $1..$N = key=value pairs
 
 state_clear() { rm -f "$STATE_FILE" "$SERVED_FILE"; }
 state_active() { [ -f "$STATE_FILE" ]; }
+
+# ---- persistent-volume state (PRD-build-burst-persistent-volume) ----------
+# Deliberately a SEPARATE file from $STATE_FILE: the volume (and a failed-
+# detach's dirty flag) outlive the session/server that state_clear wipes at
+# every successful teardown. volume_mounted reflects only the most recent
+# `up`'s outcome (harmless if stale — every reader of it also checks
+# state_active first); volume_dirty is the one field that must survive
+# across a full session boundary (requirement 2).
+volume_state_read() {  # $1 = key -> stdout value or empty
+  [ -f "$VOLUME_STATE_FILE" ] || return 0
+  if [ -n "$JQ" ]; then
+    "$JQ" -r --arg k "$1" '.[$k] // empty' "$VOLUME_STATE_FILE" 2>/dev/null
+  else
+    grep -oE "\"$1\":\"?[^,\"}]*\"?" "$VOLUME_STATE_FILE" 2>/dev/null | head -n1 | sed -E 's/^[^:]*:"?([^",}]*)"?$/\1/'
+  fi
+}
+
+volume_state_write() {  # $1..$N = key=value pairs, merged onto whatever's
+                         # already in the file (a partial call — e.g. just
+                         # "volume_dirty=true" — never clobbers volume_id).
+  local tmp="$VOLUME_STATE_FILE.tmp.$$"
+  local -A merged
+  local k
+  for k in volume_id volume_mounted volume_dirty volume_size_gb volume_used_pct; do
+    merged["$k"]="$(volume_state_read "$k")"
+  done
+  local kv v
+  for kv in "$@"; do
+    k="${kv%%=*}"; v="${kv#*=}"
+    merged["$k"]="$v"
+  done
+  {
+    echo "{"
+    local first=1
+    for k in "${!merged[@]}"; do
+      v="${merged[$k]}"
+      [ -n "$v" ] || continue
+      [ "$first" -eq 1 ] || echo ","
+      first=0
+      case "$v" in
+        true|false|''|*[!0-9.]*) printf '  "%s":"%s"' "$k" "$v" ;;
+        *.*.*)                   printf '  "%s":"%s"' "$k" "$v" ;;
+        *)                       printf '  "%s":%s' "$k" "$v" ;;
+      esac
+    done
+    echo
+    echo "}"
+  } > "$tmp"
+  mv -f "$tmp" "$VOLUME_STATE_FILE"
+}
 
 # ---- hcloud helpers -------------------------------------------------------
 server_alive() {  # $1 = server id -> 0 if hcloud still sees it
@@ -487,6 +562,185 @@ sandbox_probe() {  # $1 = ip -> echoes true|false
   else
     echo false
   fi
+}
+
+# ---- persistent volume (PRD-build-burst-persistent-volume) ----------------
+# `up` calls volume_ensure() right after box_bootstrap (both the adoption and
+# fresh-create branches — see cmd_up) so $REMOTE_ROOT is a mounted, durable
+# tree before provision_gate_tools/place_gate_credential ever write into it.
+# Fails OPEN on every hcloud/ssh error along the way (create-failed, attach-
+# failed, mount-failed): the box boots and runs on the ephemeral root disk
+# exactly as it did before this PRD, with volume_mounted=false recorded so
+# `status`/`cost` never claim a durability this session doesn't have.
+find_volume() {  # -> stdout "id size_gb server_id device" (server_id empty
+                  # if unattached); rc1 if BURST_VOLUME_NAME is unset/empty
+                  # (the documented rollback) or hcloud reports no such volume
+  [ -n "$BURST_VOLUME_NAME" ] || return 1
+  local out; out="$("$HCLOUD" volume describe "$BURST_VOLUME_NAME" -o json 2>/dev/null)" || return 1
+  [ -n "$out" ] || return 1
+  # PRD-build-burst-persistent-volume: pipe-delimited, NOT space-delimited —
+  # server_id is routinely empty (an unattached volume), and `read`'s
+  # default IFS word-splitting collapses consecutive whitespace, silently
+  # dropping an empty middle field and shifting linux_device into server_id's
+  # slot (caught in offline testing: a fresh, never-attached volume read
+  # back as "busy, attached to /dev/disk/by-id/...").
+  python3 -c '
+import json, sys
+d = json.loads(sys.stdin.read())
+d = d.get("volume", d)
+sid = d.get("server")
+print("%s|%s|%s|%s" % (d.get("id",""), d.get("size",""), sid if sid is not None else "", d.get("linux_device","")))
+' <<<"$out" 2>/dev/null
+}
+
+volume_ensure() {  # $1=ip $2=server_id
+  local ip="$1" sid="$2"
+  if [ -z "$BURST_VOLUME_NAME" ]; then
+    volume_state_write "volume_mounted=false"
+    return 0
+  fi
+
+  local vid vsize vserver vdevice
+  local found; found="$(find_volume)"
+  if [ -n "$found" ]; then
+    IFS='|' read -r vid vsize vserver vdevice <<<"$found"
+  else
+    local create_out
+    if ! create_out="$("$HCLOUD" volume create --name "$BURST_VOLUME_NAME" --size "$BURST_VOLUME_GB" --location "$LOCATION" -o json 2>&1)"; then
+      journal_line "$(now_iso)  burst-lane  up  volume-create-failed  (name=$BURST_VOLUME_NAME err=\"$(tr '\n' ' ' <<<"$create_out")\" — booting on root disk)"
+      volume_state_write "volume_mounted=false"
+      return 0
+    fi
+    IFS='|' read -r vid vsize vserver vdevice <<<"$(python3 -c '
+import json, sys
+d = json.loads(sys.stdin.read())
+d = d.get("volume", d)
+sid = d.get("server")
+print("%s|%s|%s|%s" % (d.get("id",""), d.get("size",""), sid if sid is not None else "", d.get("linux_device","")))
+' <<<"$create_out" 2>/dev/null)"
+    if [ -z "$vid" ]; then
+      journal_line "$(now_iso)  burst-lane  up  volume-create-failed  (name=$BURST_VOLUME_NAME cause=could-not-parse-id — booting on root disk)"
+      volume_state_write "volume_mounted=false"
+      return 0
+    fi
+    journal_line "$(now_iso)  burst-lane  up  volume  created  (id=$vid name=$BURST_VOLUME_NAME size=${vsize}G)"
+  fi
+
+  # Requirement 6: single-attach safety. Hetzner volumes attach to one
+  # server at a time; a volume some OTHER live server holds is never
+  # attached here — this box boots without it (root disk) rather than
+  # racing/stealing it.
+  if [ -n "$vserver" ] && [ "$vserver" != "$sid" ]; then
+    journal_line "$(now_iso)  burst-lane  up  volume  busy  (attached_to=$vserver id=$vid)"
+    volume_state_write "volume_id=$vid" "volume_mounted=false"
+    return 0
+  fi
+
+  if [ -z "$vserver" ]; then
+    if ! "$HCLOUD" volume attach --server "$sid" "$vid" >/dev/null 2>&1; then
+      journal_line "$(now_iso)  burst-lane  up  volume-attach-failed  (id=$vid server_id=$sid — booting on root disk)"
+      volume_state_write "volume_id=$vid" "volume_mounted=false"
+      return 0
+    fi
+  fi
+
+  # Requirement 2 (teardown-order counterpart): a volume left dirty by a
+  # prior detach failure gets an fsck before this mount, exactly once.
+  if [ "$(volume_state_read volume_dirty)" = "true" ]; then
+    "$SSH_BIN" -o StrictHostKeyChecking=no -o ConnectTimeout=8 -i "$SSH_KEY" "root@$ip" \
+      "fsck -y '$vdevice' >/dev/null 2>&1; true # volume-fsck" >/dev/null 2>&1 || true
+    journal_line "$(now_iso)  burst-lane  up  volume  fsck  (id=$vid device=$vdevice cause=prior-detach-failed)"
+  fi
+
+  # Requirement 1: format only when the volume has no filesystem (a label
+  # check on the box itself, not an hcloud-API property) — one combined root
+  # ssh round trip, mirroring box_bootstrap's own style. Mounts AT
+  # $REMOTE_ROOT (never renames it) so every existing remote_path_for()/
+  # dirty-marker path is unaffected by whether a volume happens to be there.
+  local mount_out mount_rc=0
+  mount_out="$("$SSH_BIN" -o StrictHostKeyChecking=no -o ConnectTimeout=8 -i "$SSH_KEY" "root@$ip" "
+# volume-mount
+label=\$(blkid -s LABEL -o value '$vdevice' 2>/dev/null)
+if [ -z \"\$label\" ]; then mkfs.ext4 -L $BURST_VOLUME_NAME '$vdevice' >/dev/null 2>&1 && echo FORMATTED; fi
+mkdir -p '$REMOTE_ROOT'
+mount '$vdevice' '$REMOTE_ROOT' 2>/dev/null || true
+chown -R $REMOTE_USER:$REMOTE_USER '$REMOTE_ROOT'
+echo MOUNTED
+" 2>/dev/null)" || mount_rc=$?
+  if [ "$mount_rc" -ne 0 ] || ! grep -q MOUNTED <<<"$mount_out"; then
+    journal_line "$(now_iso)  burst-lane  up  volume-mount-failed  (id=$vid device=$vdevice — booting on root disk)"
+    volume_state_write "volume_id=$vid" "volume_mounted=false"
+    return 0
+  fi
+
+  local dfout used_gb size_gb pct
+  dfout="$("$SSH_BIN" -o StrictHostKeyChecking=no -o ConnectTimeout=8 -i "$SSH_KEY" "$REMOTE_USER@$ip" \
+    "df -BG --output=used,size,pcent '$REMOTE_ROOT' 2>/dev/null | tail -n1 # volume-df" 2>/dev/null)"
+  used_gb="$(awk '{print $1}' <<<"$dfout" | tr -dc '0-9')"
+  size_gb="$(awk '{print $2}' <<<"$dfout" | tr -dc '0-9')"
+  pct="$(awk '{print $3}' <<<"$dfout" | tr -dc '0-9')"
+  size_gb="${size_gb:-$vsize}"
+
+  volume_state_write "volume_id=$vid" "volume_mounted=true" "volume_dirty=false" \
+    "volume_size_gb=${size_gb:-$BURST_VOLUME_GB}" "volume_used_pct=${pct:-0}"
+  journal_line "$(now_iso)  burst-lane  up  volume  attached  (id=$vid size=${size_gb:-$BURST_VOLUME_GB}G used=${pct:-0}%)"
+}
+
+# ---- persistent volume teardown (requirement 2) ----------------------------
+# Called from BOTH cmd_down's delete path and cmd_watchdog's teardown path,
+# right before destroy_verify(id) — sync, unmount, detach, verify detached.
+# Hetzner detaches a volume automatically on `server delete` regardless, so a
+# detach failure here NEVER blocks the server delete that follows it (fail
+# open on the teardown, same doctrine as volume_ensure on the way up) — it
+# only marks volume_dirty=true so the NEXT up's mount runs fsck first.
+volume_teardown() {  # $1=ip $2=caller(down|watchdog)
+  local ip="$1" caller="$2"
+  [ "$(volume_state_read volume_mounted)" = "true" ] || return 0
+  local vid; vid="$(volume_state_read volume_id)"
+  [ -n "$vid" ] || return 0
+
+  "$SSH_BIN" -o StrictHostKeyChecking=no -o ConnectTimeout=8 -i "$SSH_KEY" "$REMOTE_USER@$ip" \
+    "sync # volume-sync" >/dev/null 2>&1 || true
+  "$SSH_BIN" -o StrictHostKeyChecking=no -o ConnectTimeout=8 -i "$SSH_KEY" "root@$ip" \
+    "umount '$REMOTE_ROOT' 2>/dev/null; true # volume-umount" >/dev/null 2>&1 || true
+
+  if ! "$HCLOUD" volume detach "$vid" >/dev/null 2>&1; then
+    journal_line "$(now_iso)  burst-lane  $caller  volume  detach-failed  (id=$vid)"
+    volume_state_write "volume_dirty=true" "volume_mounted=false"
+    return 0
+  fi
+  # Verify detached (requirement 2's "verify the volume reports detached") —
+  # a describe that still shows a server attached is the same detach-failed
+  # outcome as the hcloud call itself erroring, never silently trusted.
+  local check; check="$(find_volume 2>/dev/null)"
+  local _cid _csize cserver _cdev
+  IFS='|' read -r _cid _csize cserver _cdev <<<"${check:-}"
+  if [ -n "$cserver" ]; then
+    journal_line "$(now_iso)  burst-lane  $caller  volume  detach-failed  (id=$vid cause=still-attached server=$cserver)"
+    volume_state_write "volume_dirty=true" "volume_mounted=false"
+    return 0
+  fi
+  volume_state_write "volume_mounted=false" "volume_dirty=false"
+  journal_line "$(now_iso)  burst-lane  $caller  volume  detached  (id=$vid)"
+}
+
+# `status --json`/`status` want a LIVE reading (not whatever volume_ensure
+# last stored at `up` time) — AC6 exercises this by pointing the fake ssh's
+# `# volume-df` case at a specific used-pct and expecting THIS call to see
+# it. Falls back to the last-stored size/pct (never ssh-unreachable => no
+# answer at all) if the live probe fails.
+volume_status_probe() {  # $1=ip -> stdout "id size_gb used_pct"; empty if no volume tracked
+  [ "$(volume_state_read volume_mounted)" = "true" ] || return 0
+  local vid; vid="$(volume_state_read volume_id)"
+  [ -n "$vid" ] || return 0
+  local dfout size_gb pct
+  dfout="$("$SSH_BIN" -o StrictHostKeyChecking=no -o ConnectTimeout=8 -i "$SSH_KEY" "$REMOTE_USER@$1" \
+    "df -BG --output=used,size,pcent '$REMOTE_ROOT' 2>/dev/null | tail -n1 # volume-df" 2>/dev/null)"
+  size_gb="$(awk '{print $2}' <<<"$dfout" | tr -dc '0-9')"
+  pct="$(awk '{print $3}' <<<"$dfout" | tr -dc '0-9')"
+  size_gb="${size_gb:-$(volume_state_read volume_size_gb)}"
+  pct="${pct:-$(volume_state_read volume_used_pct)}"
+  printf '%s %s %s\n' "$vid" "${size_gb:-0}" "${pct:-0}"
 }
 
 # ---- gate toolchain provisioning (PRD-build-gate-on-casper requirement 1) --
@@ -810,6 +1064,7 @@ cmd_up() {
   if [ -n "$adopt" ]; then
     local aid aip; aid="${adopt%% *}"; aip="${adopt##* }"
     box_bootstrap "$aip"
+    volume_ensure "$aip" "$aid"
     local sbx; sbx="$(sandbox_probe "$aip")"
     provision_gate_tools "$aip"
     place_gate_credential "$aip"
@@ -883,6 +1138,7 @@ print(d.get("id",""), d.get("public_net",{}).get("ipv4",{}).get("ip",""))
   fi
 
   box_bootstrap "$ip"
+  volume_ensure "$ip" "$id"
   local sbx; sbx="$(sandbox_probe "$ip")"
   provision_gate_tools "$ip"
   place_gate_credential "$ip"
@@ -938,6 +1194,14 @@ cmd_verify() {
   # names the user so an operator isn't left guessing which identity's
   # bwrap access is broken.
   [ "$(sandbox_probe "$ip")" = "true" ]   || vfail "bwrap sandbox (user=$REMOTE_USER)"
+
+  # PRD-build-burst-persistent-volume requirement 3: confirm $REMOTE_USER can
+  # actually see (and, via mkdir -p, write into) the sccache dir — real
+  # regardless of whether a volume is attached this session (a rollback
+  # session still has $REMOTE_ROOT on the root disk, same path).
+  "$SSH_BIN" -o StrictHostKeyChecking=no -i "$SSH_KEY" "$REMOTE_USER@$ip" \
+    "mkdir -p '$REMOTE_SCCACHE_DIR' && [ -d '$REMOTE_SCCACHE_DIR' ]" >/dev/null 2>&1 \
+    || vfail "sccache dir ($REMOTE_SCCACHE_DIR)"
 
   # Requirement 1's own verify check: fails closed, naming the first missing
   # tool, rather than a bare "gate-tools FAIL" — an operator staring at the
@@ -1227,16 +1491,41 @@ for r in json.loads(sys.argv[1]):
     print("gate: %s head=%s age=%ss slot=%s" % (r.get("repo", ""), head or "?", r.get("age_seconds", 0), r.get("slot") or "?"))
 ' "$gates_json")"
 
+  # PRD-build-burst-persistent-volume requirement 4/AC6: volume.{id,size_gb,
+  # used_pct} — a live read (volume_status_probe), not last-boot's cached
+  # figure, so an operator's `status` and the disk-guard's own numbers never
+  # disagree about which filesystem is being described.
+  local vol_json="null" vol_line=""
+  local vol_probe; vol_probe="$(volume_status_probe "$ip" 2>/dev/null)"
+  if [ -n "$vol_probe" ]; then
+    local vp_id vp_size vp_pct
+    read -r vp_id vp_size vp_pct <<<"$vol_probe"
+    vol_json="{\"id\":\"$vp_id\",\"size_gb\":${vp_size:-0},\"used_pct\":${vp_pct:-0}}"
+    vol_line=" volume=attached ${vp_pct:-0}%"
+  fi
+
+  # PRD-build-burst-persistent-volume requirement 9: RedBaron's own free
+  # disk (the pull-back DESTINATION `do_marker_pull`'s local-disk guard
+  # checks against) — surfaced here so an operator sees it beside the box's
+  # own free_disk_gb rather than having to ssh into neither host to find it.
+  local redbaron_free_gb; redbaron_free_gb="$(local_disk_free_gb "$STATE_DIR")"
+  case "$redbaron_free_gb" in ''|*[!0-9]*) redbaron_free_gb="null" ;; esac
+
   if [ "$json" -eq 1 ]; then
-    printf '{"active":true,"server_id":"%s","ip":"%s","minutes_alive":%s,"ttl_hours":"%s","sandbox_ok":"%s","concurrent":"%s","free_disk_gb":%s,"disk_state":"%s","dirty":%s,"gates":%s,"gate_ready":"%s","gate_tools_missing":"%s"}\n' \
-      "$id" "$ip" "$alive" "$ttl" "$sbx" "$conc" "$free_disk_gb" "$disk_state" "$dirty_json" "$gates_json" "$(state_read gate_ready)" "$(state_read gate_tools_missing)"
+    printf '{"active":true,"server_id":"%s","ip":"%s","minutes_alive":%s,"ttl_hours":"%s","sandbox_ok":"%s","concurrent":"%s","free_disk_gb":%s,"disk_state":"%s","dirty":%s,"gates":%s,"gate_ready":"%s","gate_tools_missing":"%s","volume":%s,"redbaron_free_gb":%s}\n' \
+      "$id" "$ip" "$alive" "$ttl" "$sbx" "$conc" "$free_disk_gb" "$disk_state" "$dirty_json" "$gates_json" "$(state_read gate_ready)" "$(state_read gate_tools_missing)" "$vol_json" "$redbaron_free_gb"
   else
     local gate_count; gate_count="$(python3 -c 'import json,sys; print(len(json.loads(sys.argv[1])))' "$gates_json")"
     # PRD-build-burst-gate-tools-scope requirement 3: an operator (or
     # lane-claim.sh) reading text-mode status must see gate readiness at a
     # glance, independent of whether the lane itself is verified for
     # ordinary runs.
-    echo "active: $id ip=$ip alive=${alive}m ttl=${ttl}h sandbox_ok=$sbx concurrent=$conc disk_state=$disk_state free_disk_gb=$free_disk_gb gates:${gate_count} gate_ready=$(state_read gate_ready) missing=$(state_read gate_tools_missing)"
+    # NOTE: redbaron_free_gb is intentionally JSON-only (not appended here)
+    # — an existing gatetools AC4 case anchors on "missing=$(state_read
+    # gate_tools_missing)" being the last token on this line whenever no
+    # volume line follows; text-mode operators already get free_disk_gb
+    # (the box) and volume=attached (the volume) on this same line.
+    echo "active: $id ip=$ip alive=${alive}m ttl=${ttl}h sandbox_ok=$sbx concurrent=$conc disk_state=$disk_state free_disk_gb=$free_disk_gb gates:${gate_count} gate_ready=$(state_read gate_ready) missing=$(state_read gate_tools_missing)${vol_line}"
     [ -n "$dirty_lines" ] && printf '%s\n' "$dirty_lines"
     [ -n "$gate_lines" ] && printf '%s\n' "$gate_lines"
   fi
@@ -1448,12 +1737,12 @@ now_fractional() { date +%s.%N; }
 #   kind="pull" ($7="pull"): a lazy pull that DID execute. $11=trigger
 #     (local-read|explicit|teardown). wall_seconds is always 0 (no remote
 #     exec happened); sync_s/bytes are the pull's own cost.
-attribution_record() {  # $1=slug $2=session_id $3=wall_s $4=sync_s $5=bytes $6=worktree [$7=kind $8=pulls_skipped $9=bytes_saved $10=estimate $11=trigger]
+attribution_record() {  # $1=slug $2=session_id $3=wall_s $4=sync_s $5=bytes $6=worktree [$7=kind $8=pulls_skipped $9=bytes_saved $10=estimate $11=trigger $12=warm]
   mkdir -p "$STATE_DIR" 2>/dev/null || true
-  local kind="${7:-run}" pulls_skipped="${8:-0}" bytes_saved="${9:-0}" estimate="${10:-false}" trigger="${11:-}"
+  local kind="${7:-run}" pulls_skipped="${8:-0}" bytes_saved="${9:-0}" estimate="${10:-false}" trigger="${11:-}" warm="${12:-}"
   python3 -c '
 import json, sys
-slug, sid, wall_s, sync_s, nbytes, worktree, date, path, kind, pulls_skipped, bytes_saved, estimate, trigger = sys.argv[1:14]
+slug, sid, wall_s, sync_s, nbytes, worktree, date, path, kind, pulls_skipped, bytes_saved, estimate, trigger, warm = sys.argv[1:15]
 row = {
     "date": date, "session_id": sid, "slug": slug,
     "wall_seconds": round(float(wall_s), 3), "sync_s": round(float(sync_s), 3),
@@ -1472,9 +1761,14 @@ else:
     row["pulls_skipped"] = int(pulls_skipped or 0)
     row["bytes_saved"] = int(bytes_saved or 0)
     row["estimate"] = (estimate == "true")
+    # PRD-build-burst-persistent-volume requirement 5: warm=true|false, only
+    # meaningful for a plain run row (a pull/gate row has no "did the target
+    # dir already exist before this action" question of its own).
+    if warm != "":
+        row["warm"] = (warm == "true")
 with open(path, "a") as fh:
     fh.write(json.dumps(row) + "\n")
-' "$1" "$2" "$3" "$4" "$5" "$6" "$(now_iso)" "$ATTR_LEDGER" "$kind" "$pulls_skipped" "$bytes_saved" "$estimate" "$trigger"
+' "$1" "$2" "$3" "$4" "$5" "$6" "$(now_iso)" "$ATTR_LEDGER" "$kind" "$pulls_skipped" "$bytes_saved" "$estimate" "$trigger" "$warm"
 }
 
 # ---- run --------------------------------------------------------------------
@@ -1544,6 +1838,20 @@ last_pull_size() {  # $1=worktree -> stdout bytes (0 if never pulled)
   cat "$PULLSZ_DIR/$wkey" 2>/dev/null || echo 0
 }
 
+# PRD-build-burst-persistent-volume requirement 9: RedBaron's own free disk
+# (the pull DESTINATION, never the box's — a wholly separate filesystem from
+# every other free-space read in this script). BURST_LANE_LOCAL_FREE_GB is
+# the offline-test seam (mirrors every other BURST_LANE_NOW-style override
+# here) — a real `df` never runs under it, same doctrine as the box-side
+# probes' own FAKE_SSH_* knobs.
+local_disk_free_gb() {  # $1=path -> stdout free GB, or empty on an unreadable probe
+  if [ -n "${BURST_LANE_LOCAL_FREE_GB:-}" ]; then
+    echo "$BURST_LANE_LOCAL_FREE_GB"
+    return 0
+  fi
+  df -BG --output=avail "$1" 2>/dev/null | tail -n1 | tr -dc '0-9'
+}
+
 # rc0 if the box currently reachable at $1 still has $2 on disk — used both
 # to decide whether a lazy pull can proceed and (when it can't) whether that
 # marker should go COLD (box/dir provably gone — requirement 4) rather than
@@ -1573,12 +1881,61 @@ do_marker_pull() {  # $1=worktree $2=trigger(local-read|explicit|teardown) -> rc
   remote_path="$(dirty_field "$worktree" remote_path)"
   kind="$(dirty_field "$worktree" kind)"
 
+  # PRD-build-burst-persistent-volume requirement 9: the pull-back
+  # DESTINATION guard, checked before every other reason to give up or
+  # proceed below — a low-disk RedBaron root must DEFER (marker stays
+  # dirty, retried whenever this worktree is next read/pulled/swept) rather
+  # than being reclassified "cold" (which permanently drops the artifact)
+  # or attempted and left to fail mid-transfer, one gate pull after another,
+  # the way four straight 87/49/87/19 GB pulls actually took RedBaron's
+  # root to 0 bytes free on 2026-09-11. need_gb is the larger of the
+  # configured floor and this worktree's own last-observed pull size (the
+  # best evidence of what THIS pull is about to cost) — fails OPEN (proceeds)
+  # on an unreadable probe, never blocking a pull the real disk has room for.
+  local pull_free_gb; pull_free_gb="$(local_disk_free_gb "$worktree")"
+  case "$pull_free_gb" in
+    ''|*[!0-9]*) : ;;
+    *)
+      local pull_last_bytes pull_last_gb pull_need_gb
+      pull_last_bytes="$(last_pull_size "$worktree")"
+      pull_last_gb="$(awk -v b="${pull_last_bytes:-0}" 'BEGIN{printf "%.0f", b/1073741824}')"
+      pull_need_gb="$BURST_LOCAL_DISK_FLOOR_GB"
+      [ "${pull_last_gb:-0}" -gt "$pull_need_gb" ] 2>/dev/null && pull_need_gb="$pull_last_gb"
+      if [ "$pull_free_gb" -lt "$pull_need_gb" ]; then
+        journal_line "$(now_iso)  burst-lane  pull  deferred  (worktree=$worktree trigger=$trigger cause=local-disk free_gb=$pull_free_gb need_gb=$pull_need_gb)"
+        return 0
+      fi
+      ;;
+  esac
+
   if ! state_active; then
     clear_dirty "$worktree"
     journal_line "$(now_iso)  burst-lane  pull  cold  (worktree=$worktree session_id=$sid trigger=$trigger cause=no-active-session — local target stale, next local build recompiles)"
     return 0
   fi
   local ip; ip="$(state_read ip)"
+
+  # PRD-build-burst-persistent-volume requirement 8: a marker's remote_path
+  # is only ever valid under the CURRENT $REMOTE_ROOT — a root move (a
+  # volume mount, the 2026-09-11 user migration, a future rollback) leaves
+  # old markers naming a path under a root that no longer applies, and an
+  # ssh round trip against it is not reliable evidence either way (a stale
+  # /root/build/... path can exist-but-be-unreadable under the new
+  # unprivileged user, producing a false "exists" or a permission-flavored
+  # ssh failure that `run`'s rsync then retries as rsync-failed instead of
+  # recognizing as cold — the 2026-09-11 wintermute-brain-wmd-local-gpu-rung
+  # evidence, three rsync-failed retries against a marker still naming
+  # /root/build). Checked BEFORE any ssh round trip: deterministic, no
+  # network needed, and it is what the AC actually asks for — "never
+  # retried as rsync-failed".
+  case "$remote_path" in
+    "$REMOTE_ROOT"/*) : ;;
+    *)
+      clear_dirty "$worktree"
+      journal_line "$(now_iso)  burst-lane  pull  cold  (worktree=$worktree session_id=$sid remote_path=$remote_path trigger=$trigger cause=remote-path-missing — local target stale, next local build recompiles)"
+      return 0
+      ;;
+  esac
 
   if ! remote_dir_exists "$ip" "$remote_path"; then
     clear_dirty "$worktree"
@@ -1701,6 +2058,22 @@ cmd_run() {
 
   local remote_path; remote_path="$(remote_path_for "$worktree")"
 
+  # PRD-build-burst-persistent-volume requirement 5: warm attribution — did
+  # this worktree's target dir (or .pybuilder/, for a uv-routed run) already
+  # exist on the box BEFORE this run's own rsync-up creates it if missing?
+  # Checked here, before rsync-up (which `--rsync-path="mkdir -p ..."`
+  # unconditionally creates the parent of), and keyed off the same first-arg
+  # command name `first`/`kind` are derived from further down — a live
+  # volume makes this true on a fresh box's very first run against a
+  # worktree it built yesterday (the whole point of the persistent volume);
+  # an empty/never-attached tree makes it false, same as today.
+  local warm_kind warm=false
+  case "$1" in
+    */uv|uv) warm_kind="$remote_path/.pybuilder" ;;
+    *)       warm_kind="$remote_path/target" ;;
+  esac
+  remote_dir_exists "$ip" "$warm_kind" && warm=true
+
   # PRD-build-burst-remote-disk-guard requirement 3: refuse to route to a
   # box that cannot receive this worktree, checked BEFORE the (now
   # known-likely-to-fail) rsync-up rather than discovered from its failure.
@@ -1775,7 +2148,7 @@ cmd_run() {
   # running this (a no-op for the REMOTE_USER=root rollback, since that's
   # already root's own default there); SCCACHE_DIR is $REMOTE_USER's OWN
   # cache, never root's — sccache's cache dir needs write, not just read.
-  local remote_cmd="cd $remote_path && export PATH=$GATE_TOOLS_REMOTE_BIN_DIR:\$PATH:$ROOT_CARGO_HOME/bin:/root/.local/bin RUSTUP_HOME=$ROOT_RUSTUP_HOME CARGO_HOME=$ROOT_CARGO_HOME CARGO_TARGET_DIR=$remote_path/target RUSTC_WRAPPER=sccache SCCACHE_DIR=$REMOTE_SCCACHE_DIR; timeout 5 sccache --show-stats >/dev/null 2>&1 || { sccache --stop-server >/dev/null 2>&1; sccache --start-server >/dev/null 2>&1; sleep 1; }; timeout 5 sccache --show-stats >/dev/null 2>&1 || { echo 'burst-lane: sccache_unreachable on remote box' >&2; exit 97; }; $first $*"
+  local remote_cmd="cd $remote_path && export PATH=$GATE_TOOLS_REMOTE_BIN_DIR:\$PATH:$ROOT_CARGO_HOME/bin:/root/.local/bin RUSTUP_HOME=$ROOT_RUSTUP_HOME CARGO_HOME=$ROOT_CARGO_HOME CARGO_TARGET_DIR=$remote_path/target RUSTC_WRAPPER=sccache SCCACHE_DIR=$REMOTE_SCCACHE_DIR SCCACHE_CACHE_SIZE=${BURST_SCCACHE_GB}G; timeout 5 sccache --show-stats >/dev/null 2>&1 || { sccache --stop-server >/dev/null 2>&1; sccache --start-server >/dev/null 2>&1; sleep 1; }; timeout 5 sccache --show-stats >/dev/null 2>&1 || { echo 'burst-lane: sccache_unreachable on remote box' >&2; exit 97; }; $first $*"
   local rc=0
   "$SSH_BIN" -o StrictHostKeyChecking=no -i "$SSH_KEY" "$REMOTE_USER@$ip" "$remote_cmd" || rc=$?
   t_remote_end="$(now_fractional)"
@@ -1851,11 +2224,11 @@ cmd_run() {
   # gate's own cargo cost as "unattributed" or the bare repo name.
   slug="${BURST_LANE_PRD_SLUG:-$(attribution_slug_for "$worktree")}"
   bytes_saved="$(last_pull_size "$worktree")"
-  attribution_record "$slug" "$id" "$wall_s" "$sync_s" 0 "$worktree" run 1 "$bytes_saved" true
+  attribution_record "$slug" "$id" "$wall_s" "$sync_s" 0 "$worktree" run 1 "$bytes_saved" true "" "$warm"
 
   flock -u 201
 
-  journal_line "$(now_iso)  burst-lane  run  routed  (server_id=$id worktree=$worktree runs_served=$runs exit=$rc dirty=1 kind=$kind bytes_saved=$bytes_saved slug=$slug wall_s=$wall_s concurrent=$slot_held)"
+  journal_line "$(now_iso)  burst-lane  run  routed  (server_id=$id worktree=$worktree runs_served=$runs exit=$rc dirty=1 kind=$kind bytes_saved=$bytes_saved slug=$slug wall_s=$wall_s concurrent=$slot_held warm=$warm)"
   exit "$rc"
 }
 
@@ -2531,7 +2904,7 @@ sys.exit(0 if d.get("head_sha") == sys.argv[2] and d.get("diff") == [] else 1)
   # cargo/rustup calls at root's shared, read-only toolchain the same way
   # every other remote cargo invocation does.
   local remote_journal="$remote_path/target/autobuilder/gate-journal.md"
-  local remote_cmd="cd $remote_path && export PATH=\$PATH:$GATE_TOOLS_REMOTE_BIN_DIR:$ROOT_CARGO_HOME/bin:/root/.local/bin:$REMOTE_ROOT/.gate-tools/build-scripts RUSTUP_HOME=$ROOT_RUSTUP_HOME CARGO_HOME=$ROOT_CARGO_HOME RUSTC_WRAPPER=sccache SCCACHE_DIR=$REMOTE_SCCACHE_DIR BURST_LANE=0 RUSTBUILD_SCRIPTS=$REMOTE_ROOT/.gate-tools/rustbuild-scripts REVIEWER_PROMPT=$REMOTE_ROOT/.gate-tools/rustbuild-prompts/reviewer-agent.md EXTEND_GATE_JOURNAL=$remote_journal; extend-gate.sh . $(printf '%q ' "${extra_args[@]}")"
+  local remote_cmd="cd $remote_path && export PATH=\$PATH:$GATE_TOOLS_REMOTE_BIN_DIR:$ROOT_CARGO_HOME/bin:/root/.local/bin:$REMOTE_ROOT/.gate-tools/build-scripts RUSTUP_HOME=$ROOT_RUSTUP_HOME CARGO_HOME=$ROOT_CARGO_HOME RUSTC_WRAPPER=sccache SCCACHE_DIR=$REMOTE_SCCACHE_DIR SCCACHE_CACHE_SIZE=${BURST_SCCACHE_GB}G BURST_LANE=0 RUSTBUILD_SCRIPTS=$REMOTE_ROOT/.gate-tools/rustbuild-scripts REVIEWER_PROMPT=$REMOTE_ROOT/.gate-tools/rustbuild-prompts/reviewer-agent.md EXTEND_GATE_JOURNAL=$remote_journal; extend-gate.sh . $(printf '%q ' "${extra_args[@]}")"
   "$SSH_BIN" -o StrictHostKeyChecking=no -i "$SSH_KEY" "$REMOTE_USER@$ip" "bash -lc $(printf '%q' "$remote_cmd")" || rc=$?
   t1="$(now_fractional)"
   rm -f "$inflight_marker"
@@ -3247,6 +3620,50 @@ print(remote, local_)
   read -r gates_remote gates_local <<<"$gate_stats"
   line="$line gates_remote=${gates_remote:-0} gates_local=${gates_local:-0}"
 
+  # PRD-build-burst-persistent-volume requirement 7/AC8: volume_gb (the
+  # provisioned size — a flat config number, not a probe), the last-known
+  # used_pct (whatever `up`'s mount step or `status` last recorded — this
+  # rollup runs from `down`, which may fire after the box that would answer
+  # a live probe is already gone), and cold_builds_avoided (today's distinct
+  # worktrees whose FIRST `run  routed` line already had warm=true — the
+  # success-metrics table's own definition: "warm= field on the first run
+  # per session").
+  local cold_avoided
+  cold_avoided="$(python3 -c '
+import sys
+today, path = sys.argv[1], sys.argv[2]
+first_warm = {}
+try:
+    with open(path) as fh:
+        for ln in fh:
+            if not ln.startswith(today):
+                continue
+            if "burst-lane  run  routed" not in ln:
+                continue
+            wt = None
+            warm = None
+            for tok in ln.split():
+                if tok.startswith("worktree="):
+                    wt = tok[len("worktree="):]
+                elif tok.startswith("warm="):
+                    warm = tok[len("warm="):].rstrip(")")
+            if wt is None:
+                continue
+            if wt not in first_warm:
+                first_warm[wt] = (warm == "true")
+except OSError:
+    pass
+print(sum(1 for v in first_warm.values() if v))
+' "$today" "$JOURNAL")"
+  local rollup_used_pct; rollup_used_pct="$(volume_state_read volume_used_pct)"
+  line="$line volume_gb=${BURST_VOLUME_GB:-0} volume_used_pct=${rollup_used_pct:-0} cold_builds_avoided=${cold_avoided:-0}"
+
+  # PRD-build-burst-persistent-volume requirement 9: RedBaron's own free
+  # disk, same once-a-day visibility as the volume/box numbers above.
+  local rollup_local_free; rollup_local_free="$(local_disk_free_gb "$STATE_DIR")"
+  case "$rollup_local_free" in ''|*[!0-9]*) rollup_local_free="null" ;; esac
+  line="$line redbaron_free_gb=${rollup_local_free}"
+
   mkdir -p "$TICK_JOURNAL_DIR" 2>/dev/null || true
   printf '%s\n' "$line" >> "$TICK_JOURNAL_DIR/$today.md"
   printf '%s\n' "$today" > "$ROLLUP_CURSOR"
@@ -3319,6 +3736,11 @@ cmd_down() {
     # (if one was ever placed — a no-op, un-journaled, otherwise) before the
     # box that would carry it away is destroyed.
     shred_gate_credential "$(state_read ip)" down
+    # PRD-build-burst-persistent-volume requirement 2: sync/unmount/detach
+    # BEFORE the server delete that follows — never blocks it (Hetzner
+    # detaches on delete regardless; a failure here only marks volume_dirty
+    # for the next up's fsck).
+    volume_teardown "$(state_read ip)" down
     if destroy_verify "$id"; then
       local hrs; hrs="$(awk -v m="$alive" 'BEGIN{printf "%.4f", m/60.0}')"
       local eur; eur="$(awk -v h="$hrs" -v r="$COST_PER_HOUR_EUR" 'BEGIN{printf "%.4f", h*r}')"
@@ -3406,6 +3828,9 @@ cmd_watchdog() {
   # PRD-build-gate-on-casper requirement 4: same credential shred as
   # `down`'s delete path — the watchdog is a teardown path too.
   shred_gate_credential "$(state_read ip)" watchdog
+  # PRD-build-burst-persistent-volume requirement 2: same teardown-order
+  # detach as `down`'s delete path — the watchdog is a teardown path too.
+  volume_teardown "$(state_read ip)" watchdog
   if destroy_verify "$id"; then
     local hrs eur
     hrs="$(awk -v m="$alive" 'BEGIN{printf "%.4f", m/60.0}')"
@@ -3585,6 +4010,15 @@ for line in open(path):
 prds_str = ",".join(prds) if prds else "none"
 print(f"hours={hours:.2f} eur={eur:.2f} prds={prds_str}")
 ' "$today" "$COST_LEDGER"
+  # PRD-build-burst-persistent-volume requirement 7: the volume's monthly
+  # line beside the box-hours line above — billed whether attached or not
+  # (Technical considerations), so this is a pure BURST_VOLUME_GB *
+  # BURST_VOLUME_EUR_PER_GB_MONTH computation, independent of whether a
+  # session is even up right now.
+  if [ -n "$BURST_VOLUME_NAME" ]; then
+    awk -v gb="$BURST_VOLUME_GB" -v rate="$BURST_VOLUME_EUR_PER_GB_MONTH" \
+      'BEGIN{printf "volume_gb=%d volume_monthly_eur=%.2f\n", gb, gb*rate}'
+  fi
 }
 
 # ---- cost --by-prd (PRD-build-cost-attribution requirement 3) ---------------
