@@ -661,50 +661,69 @@ read it before assuming a step is "the last one this tick".
   Counts as one tick action.
 
   **Mixed-tick burst routing (2026-09-06, PRD-build-gate-cloudburst;
-  updated 2026-09-09, PRD-build-burst-lane-ccx53 requirement 5).**
-  Heavy cargo (this gate's 25-receipt regeneration) sharing a box with a
-  timing-sensitive Python suite can flip the suite's verdict under load
-  (observed 2026-09-06: a 444s mcphost gate beside a synthorg suite that
-  went red at an unchanged green commit). Before invoking `extend-gate.sh`,
-  the tick consults the routing predicate with this tick's own dispatch
-  counts:
+  updated 2026-09-09, PRD-build-burst-lane-ccx53 requirement 5; gated
+  2026-09-11 on `burst_configured()` — see `scripts/lib/burst-configured.sh`).**
+  Cargo/gates run LOCALLY on RedBaron. Everything below this paragraph is a
+  dormant, optional lane, used ONLY when an operator has explicitly opted
+  back in (`BUILD_BURST_ENABLED=1`, or `~/.config/wm-burst/.env` declares a
+  non-dormant `BUILDER_IP`/`BUILDER_ID` — `burst_configured()` is the single
+  shared check). When burst is not configured (the current default), the
+  tick MUST NOT call `gate-burst.sh should-route`, MUST NOT export
+  `BURST_LANE=1` or prepend `burst-lane-bin` to `$PATH`, and MUST NOT narrate
+  or plan for cargo running "on the box" — `extend-gate.sh` runs, and its
+  producers execute, entirely locally, exactly as if this section did not
+  exist. The mechanics below describe the configured case only, kept for
+  when an operator re-enables it:
   ```
   scripts/gate-burst.sh should-route --rust <n_rust_gate_prds> --python <n_python_prds>
   ```
-  `should-route` now checks `scripts/burst-lane.sh status --json`
-  (PRD-build-burst-lane-ccx53) FIRST: if that session is up, it routes to
-  burst unconditionally — a live burst-lane box takes every rust gate
-  regardless of tick mix, not only mixed ticks, per requirement 5 — and
-  only falls back to the original both-counts-must-be-positive mixed-tick
-  predicate when no burst-lane session exists. **CORRECTED 2026-09-09 (five-whys: the 19:34Z remote rc=127):** never
-  route the extend-gate INVOCATION itself through `gate-burst.sh run` —
-  the box has no build-skill scripts, no autobuilder, and no reviewer, so
-  a remoted `extend-gate.sh` can only 127. The working pattern (proven
-  19:07Z, exit=0, 2.76 GB target pulled back) is: run `extend-gate.sh`
-  LOCALLY with the burst PATH shims armed, so its cargo-heavy producers
-  execute on the box while orchestration stays here:
+  Heavy cargo (this gate's 25-receipt regeneration) sharing a box with a
+  timing-sensitive Python suite can flip the suite's verdict under load
+  (observed 2026-09-06: a 444s mcphost gate beside a synthorg suite that
+  went red at an unchanged green commit). `should-route` checks
+  `scripts/burst-lane.sh status --json` (PRD-build-burst-lane-ccx53) FIRST:
+  if that session is up, it routes to burst unconditionally — a live
+  burst-lane box takes every rust gate regardless of tick mix, not only
+  mixed ticks, per requirement 5 — and only falls back to the original
+  both-counts-must-be-positive mixed-tick predicate when no burst-lane
+  session exists. **CORRECTED 2026-09-09 (five-whys: the 19:34Z remote
+  rc=127):** never route the extend-gate INVOCATION itself through
+  `gate-burst.sh run` — the box has no build-skill scripts, no autobuilder,
+  and no reviewer, so a remoted `extend-gate.sh` can only 127. The working
+  pattern (proven 19:07Z, exit=0, 2.76 GB target pulled back) is: run
+  `extend-gate.sh` LOCALLY with the burst PATH shims armed, so its
+  cargo-heavy producers execute on the box while orchestration stays here:
   ```
   export PATH="$HOME/.claude/skills/build/scripts/burst-lane-bin:$PATH" BURST_LANE=1
   scripts/extend-gate.sh <build_into> --head <landed sha>
   ```
   `should-route` reporting `local` (or any shim fallback) means the same
-  command simply runs its cargo locally — today's behavior, unchanged. `gate-burst.sh run`'s own fallback covers every
-  burst failure mode (precondition absent, boot failure, rsync/ssh
-  failure) by printing `fallback: <cause>` and exiting 3 — the tick must
-  treat that exit code as "fall back to local", never as a gate block.
+  command simply runs its cargo locally — today's behavior, unchanged, and
+  the ONLY behavior when burst is not configured. `gate-burst.sh run`'s own
+  fallback covers every burst failure mode (precondition absent, boot
+  failure, rsync/ssh failure) by printing `fallback: <cause>` and exiting 3
+  — the tick must treat that exit code as "fall back to local", never as a
+  gate block.
 
-  **Full-gate remote routing (2026-09-10, PRD-build-gate-on-casper).**
-  `gate-burst.sh`/`should-route` above only ever routed the cargo
-  producers — orchestration, the reviewer, and the verdict stayed here,
-  because the box had no build-skill scripts, no autobuilder, and no
-  reviewer. PRD-build-gate-on-casper's `burst-lane.sh` now provisions all
-  of that at `up` (requirement 1), so when `BURST_GATE_REMOTE=1` the tick
-  calls this INSTEAD of the local `extend-gate.sh` invocation above:
+  **Full-gate remote routing (2026-09-10, PRD-build-gate-on-casper; gated
+  2026-09-11 on `burst_configured()`).** Dormant by default, same as Mixed-
+  tick burst routing above: `BURST_GATE_REMOTE=1` alone does not move
+  anything remote — `burst-lane.sh gate`'s own provisioning step (`up`) now
+  refuses unless `burst_configured()` is true, so when burst is not
+  configured this whole feature is inert regardless of `BURST_GATE_REMOTE`.
+  Kept here for the configured case: `gate-burst.sh`/`should-route` above
+  only ever routed the cargo producers — orchestration, the reviewer, and
+  the verdict stayed here, because the box had no build-skill scripts, no
+  autobuilder, and no reviewer. PRD-build-gate-on-casper's `burst-lane.sh`
+  now provisions all of that at `up` (requirement 1), so when
+  `BURST_GATE_REMOTE=1` AND burst is configured, the tick calls this
+  INSTEAD of the local `extend-gate.sh` invocation above:
   ```
   scripts/burst-lane.sh gate <build_into> --head <landed sha>
   ```
   This is unconditional to call — `burst-lane.sh gate` itself checks
   `BURST_GATE_REMOTE` first and, when it isn't `1` (the ships-dark
+  default), or when `burst_configured()` is false (the RedBaron-local
   default), immediately prints `fallback: remote-disabled` and exits 3
   without touching parity, ssh, or rsync, so the tick can call it every
   time and branch only on the exit code, exactly as it already does for
@@ -713,28 +732,29 @@ read it before assuming a step is "the last one this tick".
   land at the same `target/autobuilder/receipts` path with `host: <box>`
   added to `last-verdict.json` — so the ship rule, verdict cache, and
   `Receipts:` line below are all unchanged. Any failure before the remote
-  gate starts (routing disabled, parity unknown/diff, provisioning, ssh,
-  rsync) prints `fallback: <cause>` and exits 3: treat exactly like
-  `gate-burst.sh run`'s own fallback — run the LOCAL command:
+  gate starts (routing disabled, burst not configured, parity unknown/diff,
+  provisioning, ssh, rsync) prints `fallback: <cause>` and exits 3: treat
+  exactly like `gate-burst.sh run`'s own fallback — run the LOCAL command:
   ```
   scripts/extend-gate.sh <build_into> --head <landed sha>
   ```
   A failure AFTER the remote gate starts is a normal gate verdict (0 or
   1), carried in the synced-back receipts, not a fallback. Default is
-  `BURST_GATE_REMOTE=0` — until this is turned on, the tick keeps running
-  the mixed-tick burst routing / local `extend-gate.sh` path documented
-  above, unchanged.
+  `BURST_GATE_REMOTE=0` and burst dormant — until an operator turns both
+  on, the tick keeps running the mixed-tick burst routing / local
+  `extend-gate.sh` path documented above, unchanged, and the session must
+  not narrate remote gate routing as something that is happening.
   **Precondition, verified 2026-09-06:** no `/cloudbuild` skill exists on
   this machine (checked directly — not under a renamed pre-fleet-sync
   backup either) and `hcloud` itself is not on `$PATH`, so
   `scripts/gate-burst.sh precondition` currently fails closed for real;
   bursting stays off until a Hetzner-capable box runs `hcloud` setup +
   `~/.config/wm-burst/.env`'s `SNAPSHOT_ID` — see the script's own header
-  for exactly what it checks. At tick end (Phase 7 parent step, after all
-  branches return), call `scripts/gate-burst.sh down` (add
-  `--more-work-queued` when the next tick's candidate pool already shows
-  pending rust-extend gates) so a box never survives into a second billed
-  hour idle.
+  for exactly what it checks. When burst IS configured, at tick end (Phase
+  7 parent step, after all branches return), call `scripts/gate-burst.sh
+  down` (add `--more-work-queued` when the next tick's candidate pool
+  already shows pending rust-extend gates) so a box never survives into a
+  second billed hour idle.
 
   **Ship rule (updated 2026-09-06, PRD-build-gate-delta-baseline): `pass`
   OR `delta-pass` ships — not just absolute `block=0`.** `extend-gate.sh`
@@ -1577,18 +1597,27 @@ PATH=\"$HOME/.claude/skills/build/scripts/cargo-budget-bin:$PATH\" so cargo
 test/clippy/build --release/deny/nextest route through the shared
 concurrency budget (cargo-budget.sh); cargo check/metadata are unaffected."
 
-**Burst-lane PATH, rust branches only, when a session is up
-(PRD-build-burst-lane-ccx53, requirement 4).** `scripts/burst-lane-bin/cargo`
-must resolve AHEAD of `cargo-budget-bin` on PATH — it re-execs the real
-cargo itself and, with `BURST_LANE=1` and `burst-lane.sh status` reporting a
-session, routes `build`/`test`/`clippy`/`deny`/`nextest` to the CCX53 over
-`burst-lane.sh run` instead of running them on RedBaron at all; with no
-session it falls straight through to whatever cargo is next on PATH
-(`cargo-budget-bin`'s shim, unaffected). `worktree-extend.sh add` prints this
-reminder to stderr for any worktree with a `Cargo.toml`. Every rust branch
-agent prompt must include this directive verbatim, in addition to (not
-instead of) the cargo-budget directive above: "Before any cargo command,
-also export PATH=\"$HOME/.claude/skills/build/scripts/burst-lane-bin:$PATH\"
+**Burst-lane PATH, rust branches only, when burst is configured AND a
+session is up (PRD-build-burst-lane-ccx53, requirement 4; gated 2026-09-11
+on `burst_configured()`).** Cargo runs LOCALLY on RedBaron by default (see
+"Where cargo runs" above). This directive applies ONLY when an operator has
+opted burst back in (`burst_configured()` true — `BUILD_BURST_ENABLED=1` or
+a populated `~/.config/wm-burst/.env`); when it is not, do NOT add the
+burst-lane PATH export to any branch prompt, do NOT check `burst-lane.sh
+status`, and do NOT mention burst routing to the branch agent at all — the
+cargo-budget directive above is the whole story. Mechanics for the
+configured case: `scripts/burst-lane-bin/cargo` must resolve AHEAD of
+`cargo-budget-bin` on PATH — it re-execs the real cargo itself and, with
+`BURST_LANE=1` and `burst-lane.sh status` reporting a session, routes
+`build`/`test`/`clippy`/`deny`/`nextest` to the CCX53 over `burst-lane.sh
+run` instead of running them on RedBaron at all; with no session it falls
+straight through to whatever cargo is next on PATH (`cargo-budget-bin`'s
+shim, unaffected). `worktree-extend.sh add` prints this reminder to stderr
+for any worktree with a `Cargo.toml`. When burst IS configured, every rust
+branch agent prompt must include this directive verbatim, in addition to
+(not instead of) the cargo-budget directive above: "Before any cargo
+command, also export
+PATH=\"$HOME/.claude/skills/build/scripts/burst-lane-bin:$PATH\"
 BURST_LANE=1 (prepended AFTER the cargo-budget-bin export above, so it
 resolves first) — this routes cargo build/test/clippy/deny/nextest to the
 Hetzner CCX53 burst lane when a session is up (burst-lane.sh status), and
@@ -1626,21 +1655,27 @@ conservation-checked totals row), and `down` writes a cursor-guarded,
 once-per-day `burst-cost: <eur> across <n> slugs; top <slug> <eur>` line into
 the tick journal (`~/brain/journal/build/<date>.md`).
 
-**Burst-lane PATH, python branches, when a session is up and the suite is
-sandbox-safe (PRD-build-burst-lane-ccx53, requirement 12).**
-`scripts/burst-lane-bin/uv` mirrors the cargo shim: with `BURST_LANE=1`,
-`BURST_PY=1`, and `burst-lane.sh status` reporting a session, it routes
-`uv run` / `uv sync` to the CCX53 over `burst-lane.sh run` (the box's
-`.venv` is resolved there from `uv.lock` — `.venv` itself is excluded from
-the rsync in both directions); with no session, or `BURST_PY` unset, it
-falls straight through to the real `uv` locally. `BURST_PY` is a second,
-deliberate opt-in on top of `BURST_LANE=1` — the box has no `claude` CLI
-login, so any test module or PRD that depends on the CLI backend
-(`SYNTHORG_LLM_BACKEND=cli`, a `needs_claude_cli` marker, or any suite the
-PRD itself calls out as needing an interactive/logged-in agent) MUST stay
-local and MUST NOT set `BURST_PY=1`; when a python PRD's own tests carry
-no such marker/dependency, its branch agent prompt sets `BURST_PY=1`.
-Every sandbox-safe python branch agent prompt must include this directive
+**Burst-lane PATH, python branches, when burst is configured, a session is
+up, and the suite is sandbox-safe (PRD-build-burst-lane-ccx53, requirement
+12; gated 2026-09-11 on `burst_configured()`).** Python runs LOCALLY under
+`uv` by default. Like the rust directive above, everything in this
+paragraph applies ONLY when `burst_configured()` is true; when it is not,
+skip this directive entirely — do not add the burst-lane PATH export to
+any python branch prompt and do not mention burst routing. Mechanics for
+the configured case: `scripts/burst-lane-bin/uv` mirrors the cargo shim:
+with `BURST_LANE=1`, `BURST_PY=1`, and `burst-lane.sh status` reporting a
+session, it routes `uv run` / `uv sync` to the CCX53 over `burst-lane.sh
+run` (the box's `.venv` is resolved there from `uv.lock` — `.venv` itself
+is excluded from the rsync in both directions); with no session, or
+`BURST_PY` unset, it falls straight through to the real `uv` locally.
+`BURST_PY` is a second, deliberate opt-in on top of `BURST_LANE=1` — the
+box has no `claude` CLI login, so any test module or PRD that depends on
+the CLI backend (`SYNTHORG_LLM_BACKEND=cli`, a `needs_claude_cli` marker,
+or any suite the PRD itself calls out as needing an interactive/logged-in
+agent) MUST stay local and MUST NOT set `BURST_PY=1`; when a python PRD's
+own tests carry no such marker/dependency AND burst is configured, its
+branch agent prompt sets `BURST_PY=1`. When burst IS configured, every
+sandbox-safe python branch agent prompt must include this directive
 verbatim, in addition to the standard PATH setup: "Before any `uv run` /
 `uv sync` command, export
 PATH=\"$HOME/.claude/skills/build/scripts/burst-lane-bin:$PATH\"
@@ -1663,23 +1698,27 @@ Each agent prompt must include, self-contained:
   cargo test/clippy/build --release/deny/nextest route through the shared
   concurrency budget (cargo-budget.sh); cargo check/metadata are
   unaffected."
-- For any RUST branch specifically (worktree or not): the burst-lane PATH
-  directive verbatim, in addition to the cargo-budget one above
-  (PRD-build-burst-lane-ccx53 requirement 4, see "Burst-lane PATH" above) —
+- ONLY when `burst_configured()` is true (see "Burst-lane PATH" above —
+  `BUILD_BURST_ENABLED=1` or a populated `~/.config/wm-burst/.env`; the
+  RedBaron-local default is NOT configured, so this bullet and the next are
+  normally omitted entirely): for any RUST branch specifically (worktree or
+  not), the burst-lane PATH directive verbatim, in addition to the
+  cargo-budget one above (PRD-build-burst-lane-ccx53 requirement 4, see
+  "Burst-lane PATH" above) —
   "Before any cargo command, also export
   PATH=\"$HOME/.claude/skills/build/scripts/burst-lane-bin:$PATH\"
   BURST_LANE=1 (prepended AFTER the cargo-budget-bin export above, so it
   resolves first) — this routes cargo build/test/clippy/deny/nextest to the
   Hetzner CCX53 burst lane when a session is up (burst-lane.sh status), and
   falls through to the local concurrency budget otherwise."
-- For any PYTHON branch (`build_target: python-cli|python-lib|python-agent`)
-  whose test suite carries no CLI-login dependency (no
-  `SYNTHORG_LLM_BACKEND=cli`, no `needs_claude_cli` marker, no suite the
-  PRD calls out as needing an interactive/logged-in agent): the burst-lane
-  python PATH directive verbatim (PRD-build-burst-lane-ccx53 requirement
-  12, see "Burst-lane PATH, python branches" above) — "Before any `uv run`
-  / `uv sync` command, export
-  PATH=\"$HOME/.claude/skills/build/scripts/burst-lane-bin:$PATH\"
+- ONLY when `burst_configured()` is true (same condition as above): for any
+  PYTHON branch (`build_target: python-cli|python-lib|python-agent`) whose
+  test suite carries no CLI-login dependency (no `SYNTHORG_LLM_BACKEND=cli`,
+  no `needs_claude_cli` marker, no suite the PRD calls out as needing an
+  interactive/logged-in agent), the burst-lane python PATH directive
+  verbatim (PRD-build-burst-lane-ccx53 requirement 12, see "Burst-lane
+  PATH, python branches" above) — "Before any `uv run` / `uv sync` command,
+  export PATH=\"$HOME/.claude/skills/build/scripts/burst-lane-bin:$PATH\"
   BURST_LANE=1 BURST_PY=1 — this routes uv run/uv sync to the Hetzner
   CCX53 burst lane when a session is up (burst-lane.sh status), and falls
   through to local uv otherwise. Do NOT set BURST_PY=1 if any test in this

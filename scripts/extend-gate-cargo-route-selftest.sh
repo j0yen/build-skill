@@ -64,25 +64,29 @@ set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 
-# 2026-09-11 RedBaron-local policy (same gate as burst-lane-selftest.sh):
-# every AC below but AC3 fakes an active burst session via a real
-# `burst-lane.sh up` call against fully offline fixtures (fake hcloud/ssh,
-# tests/fixtures/burst-lane-fake) to exercise extend-gate.sh's cargo-route
-# attestation. `up`'s own burst_configured() gate (the money-critical fix
-# for the 2026-09-11 burst-idle-guard billing incident) now correctly
-# refuses that fixture's `up` call too, since the fixture env file never
-# declares BUILDER_IP/BUILDER_ID — it was never meant to simulate a real
-# opt-in. Gated here rather than working around the refusal, for the exact
-# reason lib/burst-configured.sh's header gives: a selftest must never
-# resurrect burst-lane coverage via a fake/simulated session while the real
-# lane is dormant policy, even to test something else (cargo routing).
-# shellcheck source=lib/burst-configured.sh
-source "$HERE/lib/burst-configured.sh"
-if ! burst_configured; then
-  echo "SKIP: burst lane dormant (RedBaron-local policy) — see burst-configured.sh"
-  exit 0
-fi
-
+# 2026-09-11 RedBaron-local policy, RUNNING (not skipped): this test's own
+# fake-burst ACs (AC1/AC2/AC4) each call a real `burst-lane.sh up` against
+# fully offline fixtures (fake hcloud/ssh, tests/fixtures/burst-lane-fake)
+# to exercise extend-gate.sh's cargo-route attestation. `up`'s own
+# burst_configured() gate (the money-critical fix for the 2026-09-11
+# burst-idle-guard billing incident) refuses that fixture's `up` call by
+# default, since the fixture env file never declares BUILDER_IP/BUILDER_ID
+# — it was never meant to simulate a real opt-in.
+#
+# Rather than skip this whole file (which silently dropped AC3 — the only
+# assertion of the LOCAL cargo-routing path, and the one AC that runs with
+# burst NOT enabled), each `up` call below sets BUILD_BURST_ENABLED=1
+# INLINE on that one command only (`BUILD_BURST_ENABLED=1 PATH=... up`,
+# bash's per-command environment-prefix form) — scoped to that single
+# subprocess, never `export`ed into this script's own shell, so it can
+# never leak into the real ~/.config/wm-burst/.env, into extend-gate.sh's
+# own invocation below it, or into AC3, which deliberately never sets it
+# and so genuinely exercises the local (burst-not-configured) path. This
+# is a one-off forced-test-run use of the documented escape hatch in
+# lib/burst-configured.sh's own header, not a resurrection of burst-lane
+# coverage: the lane itself stays fully offline (fake hcloud/ssh), and
+# burst_configured() is never called from this file with any wider scope
+# than that single `up` invocation.
 EXTEND_GATE="$HERE/extend-gate.sh"
 FAKE="$HERE/../tests/fixtures/burst-lane-fake"
 [ -x "$EXTEND_GATE" ] || { echo "selftest: $EXTEND_GATE not executable" >&2; exit 2; }
@@ -237,14 +241,50 @@ exit 0
 EOF
 chmod +x "$FAKEBIN/cargo"
 
+# 2026-09-11 determinism fix: extend-gate.sh funnels every producer phase
+# through cargo_budgeted(), which by default execs the REAL cargo-budget.sh
+# against its REAL production state dir (<skill>/state/cargo-budget) and
+# REAL host telemetry (/proc/meminfo, and on RedBaron /proc/loadavg). Run
+# in isolation, right after boot, those gates pass instantly and this
+# selftest never notices; run after the rest of the ~30-selftest suite
+# (several of which build real crates), available memory can dip under
+# cargo-budget.sh's default 6GB floor, so a gate call here starts POLLING
+# a REAL, host-wide "wait mem" loop — a wait this file's own per-gate
+# `timeout` (90s) then kills well before cargo-budget's own 1200s ceiling,
+# reading here as a false "gate completed (not a hang/timeout)" failure.
+# That is the shared-state root cause of the flake this file previously
+# had. Isolating it exactly like cargo-budget-sccache-selftest.sh already
+# does for that script's own cargo-budget.sh calls: a per-run STATE_DIR
+# (so slot locks are never shared with any other selftest or a real
+# build), a per-run JOURNAL (so a real wait, if one ever did occur, would
+# never land in the shared ~/brain/journal/build/ file), and FAKE
+# meminfo/loadavg files reporting plenty of headroom regardless of what
+# the real host is doing at the moment this file happens to run in the
+# suite. CARGO_BUDGET_SCCACHE_ASSERT=0 additionally skips cargo-budget.sh's
+# real-sccache-server reachability probe (auto-armed whenever `sccache` is
+# on $PATH) — another real, unfaked, host-shared dependency this file
+# never needs to prove.
+CARGO_BUDGET_FAKE_MEMINFO="$T/fake-meminfo"
+printf 'MemTotal:       132000000 kB\nMemAvailable:   128000000 kB\n' > "$CARGO_BUDGET_FAKE_MEMINFO"
+CARGO_BUDGET_FAKE_LOADAVG="$T/fake-loadavg"
+printf '0.10 0.08 0.05 1/200 12345\n' > "$CARGO_BUDGET_FAKE_LOADAVG"
+
 # Common env for every invocation below: never a real journal file, never a
 # real reviewer subagent call (mirrors extend-gate-concurrent-selftest.sh's
-# own COMMON_ENV note verbatim), and REMOTE_FAIL short-circuits the fake
-# ssh before its recursion-hazard eval (see header).
+# own COMMON_ENV note verbatim), REMOTE_FAIL short-circuits the fake ssh
+# before its recursion-hazard eval (see header), and the CARGO_BUDGET_*
+# vars above isolate every producer phase's cargo-budget.sh call from real
+# host state (see note above).
 COMMON_EXTEND_GATE_ENV=(
   "REVIEWER_PROMPT=/nonexistent/extend-gate-cargo-route-selftest-reviewer-prompt.md"
   "EXTEND_GATE_JOURNAL=$T/gate-journal.md"
   "FAKE_SSH_REMOTE_FAIL=3"
+  "CARGO_BUDGET_STATE_DIR=$T/cargo-budget-state"
+  "CARGO_BUDGET_JOURNAL=$T/cargo-budget-journal.md"
+  "CARGO_BUDGET_MEMINFO=$CARGO_BUDGET_FAKE_MEMINFO"
+  "CARGO_BUDGET_LOADAVG=$CARGO_BUDGET_FAKE_LOADAVG"
+  "CARGO_BUDGET_HOSTNAME=not-redbaron"
+  "CARGO_BUDGET_SCCACHE_ASSERT=0"
 )
 
 TIMEOUT_S="${EXTEND_GATE_CARGO_ROUTE_SELFTEST_TIMEOUT:-90}"
@@ -264,7 +304,7 @@ build_fixture "$REPO1" "gateroute-ac1" audit
 HEAD1="$(git -C "$REPO1" rev-parse HEAD)"
 
 setup_fake_burst_env ac1
-PATH="$FAKE:$PATH" "$HERE/burst-lane.sh" up >/dev/null 2>&1
+BUILD_BURST_ENABLED=1 PATH="$FAKE:$PATH" "$HERE/burst-lane.sh" up >/dev/null 2>&1
 
 rm -f "$FAKE_CARGO_MARKER"
 ac1_out="$T/ac1.log"
@@ -326,7 +366,7 @@ build_fixture "$REPO4" "gateroute-ac4"
 HEAD4="$(git -C "$REPO4" rev-parse HEAD)"
 
 setup_fake_burst_env ac4
-PATH="$FAKE:$PATH" "$HERE/burst-lane.sh" up >/dev/null 2>&1
+BUILD_BURST_ENABLED=1 PATH="$FAKE:$PATH" "$HERE/burst-lane.sh" up >/dev/null 2>&1
 
 rm -f "$FAKE_CARGO_MARKER"
 ac4_out="$T/ac4.log"
@@ -406,7 +446,7 @@ build_fixture "$REPO2" "gateroute-ac2" audit
 HEAD2="$(git -C "$REPO2" rev-parse HEAD)"
 
 setup_fake_burst_env ac2
-PATH="$FAKE:$PATH" "$HERE/burst-lane.sh" up >/dev/null 2>&1
+BUILD_BURST_ENABLED=1 PATH="$FAKE:$PATH" "$HERE/burst-lane.sh" up >/dev/null 2>&1
 
 mismatch_count_before="$(grep -c 'gate  route-mismatch' "$T/gate-journal.md" 2>/dev/null || echo 0)"
 ac2_out="$T/ac2.log"
