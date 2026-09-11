@@ -74,9 +74,12 @@
 #       --project-root <rel>: for repos whose Cargo.toml lives under a
 #       subdirectory of <repo> (nested crate root, e.g. post-source-unify
 #       split repos) — passed through to extend-handler.sh's bump-version
-#       and current-version calls, same flag/semantics as extend-gate.sh's
-#       and intent-card-refresh.sh's own --project-root. Omit for the
-#       common case (Cargo.toml at repo root); behavior is unchanged.
+#       and current-version calls, to lock_regen (Cargo.lock regen — run
+#       AFTER the bump, so the lockfile's own self-entry reflects the
+#       version Cargo.toml now carries, not the pre-bump merged one), and to
+#       ship-postconditions.sh, same flag/semantics as extend-gate.sh's and
+#       intent-card-refresh.sh's own --project-root. Omit for the common
+#       case (Cargo.toml at repo root); behavior is unchanged.
 #
 #   cleanup <repo> <slug>
 #       Remove the worktree dir AND its cargo target-dir (named by the
@@ -240,17 +243,27 @@ lock_merge_setup() {
 # invocations below close fd 9 (`9>&-`) in their subshell before exec'ing
 # cargo, so an autostarted sccache daemon never inherits the lock fd and
 # outlives this script holding it hostage for the next gate/integrate run.
+# --project-root <rel>: same nested-crate-root convention as bump-version /
+# changelog-prepend (post-source-unify split repos, e.g. autobuilder's
+# canonical crate at <repo>/autobuilder/Cargo.toml) — PRD-autobuilder-
+# receipt-write-verify's integrate hit this as a silent no-op: `$repo/
+# Cargo.toml` doesn't exist for such a repo, so lock_regen treated it as
+# "not a cargo repo" and skipped regeneration entirely, shipping a bump
+# commit whose Cargo.lock still named the PRE-bump version. Omit for the
+# common case (Cargo.toml at repo root); behavior is unchanged.
 lock_regen() {
-  local repo="$1"
-  [ -f "$repo/Cargo.toml" ] || return 0          # not a cargo repo: no-op
-  [ -f "$repo/Cargo.lock" ] || return 0          # no lockfile to regenerate
+  local repo="$1" project_root="${2:-}"
+  local root="$repo"
+  [ -n "$project_root" ] && root="$repo/$project_root"
+  [ -f "$root/Cargo.toml" ] || return 0          # not a cargo repo: no-op
+  [ -f "$root/Cargo.lock" ] || return 0          # no lockfile to regenerate
   command -v cargo >/dev/null 2>&1 || return 0   # no cargo: leave as merged
-  if ( cd "$repo" && cargo generate-lockfile --offline >/dev/null 2>&1 ) 9>&-; then
+  if ( cd "$root" && cargo generate-lockfile --offline >/dev/null 2>&1 ) 9>&-; then
     return 0
   fi
   # --offline could not satisfy the merged Cargo.toml from cache. Try an
   # offline build as a fallback (resolves via the cache without re-fetching).
-  if ( cd "$repo" && cargo build --offline --quiet >/dev/null 2>&1 ) 9>&-; then
+  if ( cd "$root" && cargo build --offline --quiet >/dev/null 2>&1 ) 9>&-; then
     return 0
   fi
   # Genuinely needs network for a new/uncached dependency: do not commit stale.
@@ -538,18 +551,20 @@ cmd_integrate() {
     fi
     echo "worktree-extend: $slug: rebase-retry succeeded" >&2
   fi
-  # Post-merge: regenerate Cargo.lock for the merged Cargo.toml. The trailing
-  # `git add -A` stages it into the single bump commit. If a new uncached dep
-  # needs the network, flag the sidecar rather than committing a stale lock.
-  if ! lock_regen "$repo"; then
-    echo "worktree-extend: $slug: lockfile-regen-needs-net (committing merged source; lock left as merged)" >&2
-    [ -x "$SIDECAR" ] && "$SIDECAR" write "$slug" last_error=lockfile-regen-needs-net >&2 || true
-  fi
   # Serial version bump + changelog so stacked branches increment cleanly.
   "$EXTEND" bump-version "$repo" "$bump" "${project_root_args[@]}" >&2 || die 6 "bump-version failed"
   local newver; newver="$("$EXTEND" current-version "$repo" "${project_root_args[@]}")"
   if [ -n "$tldr" ] && [ -f "$tldr" ]; then
     "$EXTEND" changelog-prepend "$repo" "$newver" "$tldr" "${project_root_args[@]}" >&2 || die 6 "changelog-prepend failed"
+  fi
+  # Regenerate Cargo.lock AFTER the version bump (not before — the lockfile's
+  # own self-entry must reflect the version Cargo.toml now carries, not the
+  # merged-but-pre-bump one) for the merged+bumped Cargo.toml. The trailing
+  # `git add -A` stages it into the single bump commit. If a new uncached dep
+  # needs the network, flag the sidecar rather than committing a stale lock.
+  if ! lock_regen "$repo" "$project_root"; then
+    echo "worktree-extend: $slug: lockfile-regen-needs-net (committing merged source; lock left as merged)" >&2
+    [ -x "$SIDECAR" ] && "$SIDECAR" write "$slug" last_error=lockfile-regen-needs-net >&2 || true
   fi
   git -C "$repo" add -A >&2
   git -C "$repo" "${GIT_ID[@]}" commit -q -m "$(basename "$repo"): v$newver — $slug (parallel integrate)" >&2 \
@@ -563,7 +578,11 @@ cmd_integrate() {
   # Executable "shipped" contract (see scripts/ship-postconditions.sh header for
   # the 5-whys). Non-fatal here — the bump commit already exists and the gate
   # hard-fails on the same contract — but loud and sidecar-recorded.
-  if ! "$(dirname "$0")/ship-postconditions.sh" "$repo" >&2; then
+  # --project-root threaded through here too (previously omitted, so a
+  # nested-crate repo's postcondition check silently no-oped as "non-cargo
+  # project" instead of actually verifying anything — same incident as
+  # lock_regen above).
+  if ! "$(dirname "$0")/ship-postconditions.sh" "$repo" "${project_root_args[@]}" >&2; then
     echo "worktree-extend: $slug: SHIP-POSTCONDITIONS FAILED after integrate — gate will block until healed" >&2
     [ -x "$SIDECAR" ] && "$SIDECAR" write "$slug" last_error=ship-postconditions-failed >&2 || true
   fi
