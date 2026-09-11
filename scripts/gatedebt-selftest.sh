@@ -12,11 +12,32 @@
 # origin=union-resolve (AC6).
 #
 # Usage: gatedebt-selftest.sh
-# Exit: 0 iff every gatedebt_ac*.sh case exits 0; 1 otherwise.
+# Env: GATEDEBT_TESTS_DIR overrides the fixture directory (default
+#      <repo>/tests) — used by AC7's own test to point this aggregator at
+#      an isolated scratch fixture set instead of the real tests/ dir, so
+#      testing "the aggregator names its cases" never has to invoke the
+#      aggregator on a directory that contains AC7's own test file (see
+#      the reentrancy guard below for why that would matter).
+# Exit: 0 iff every gatedebt_ac*.sh case exits 0; 1 otherwise; 3 if called
+#      reentrantly (see guard below).
 set -uo pipefail
 
+# Reentrancy guard (2026-09-11 postmortem): a gatedebt_ac*.sh case that
+# invokes this aggregator on the real tests/ dir recurses forever, because
+# the aggregator's own loop would reach that very case file and re-invoke
+# the aggregator again, ad infinitum — this forked >60 processes on
+# RedBaron before being caught. AC7's test now uses GATEDEBT_TESTS_DIR to
+# avoid ever doing that, but this guard is the deep fix: any future case
+# that accidentally calls this script on the shared tests/ dir fails fast
+# with exit 3 instead of forking without bound.
+if [ -n "${GATEDEBT_SELFTEST_RUNNING:-}" ]; then
+  echo "gatedebt-selftest: refusing reentrant invocation — a gatedebt_ac*.sh case called this aggregator on the same tests dir it is already running from (see PRD-build-gate-debt-auto-prd AC7 postmortem)" >&2
+  exit 3
+fi
+export GATEDEBT_SELFTEST_RUNNING=1
+
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-TESTS_DIR="$HERE/../tests"
+TESTS_DIR="${GATEDEBT_TESTS_DIR:-$HERE/../tests}"
 
 fail=0
 count=0
