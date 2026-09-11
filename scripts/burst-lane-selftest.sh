@@ -204,11 +204,22 @@ fresh_env() {
   # fake ssh fixture's own explicit `command -v cargo-nextest` case, which
   # already defaults to "missing" unless a test sets FAKE_SSH_NEXTEST_PRESENT=1.
   export BURST_LANE_FORCE_NEXTEST_LOCAL=0
+  # PRD-build-burst-persistent-volume: every pre-existing test in this file
+  # predates the volume feature and asserts exact hcloud/ssh call sequences
+  # around `up` — defaulting to the documented rollback (BURST_VOLUME_NAME
+  # empty) keeps every one of them byte-for-byte unaffected (no `hcloud
+  # volume` call, no extra root@/build@ round trip). The dedicated "burstvol"
+  # block below opts back in per-case.
+  export BURST_VOLUME_NAME=""
+  export FAKE_HCLOUD_VOLUME_STATE="$T/hcloud-volume.state"
   unset FAKE_HCLOUD_AUTH_FAIL FAKE_HCLOUD_CREATE_FAIL FAKE_HCLOUD_DELETE_FAIL FAKE_SSH_REMOTE_FAIL FAKE_SSH_SANDBOX_FAIL FAKE_RSYNC_FAIL BURST_LANE_NOW \
         FAKE_SSH_GATE_TOOLS_MISSING FAKE_SSH_GATE_TOOLS_INSTALL_FAIL FAKE_SSH_AUTOBUILDER_VERSION BURST_GATE_REVIEWER BURST_CLAUDE_CRED_SRC \
         FAKE_SSH_GATE_TOOLS_INSTALL_FAIL_TOOL FAKE_SSH_GATE_TOOLS_INSTALL_FAIL_RC FAKE_SSH_GATE_TOOLS_INSTALL_FAIL_STDERR \
         FAKE_SSH_GATE_TOOLS_TOOLCHAIN_SIM FAKE_GATE_TOOLS_TOOLCHAIN_BIN FAKE_RUSTUP_TOOLCHAINS FAKE_CARGO_REQUIRE_TOOLCHAIN \
-        FAKE_SSH_GATE_TOOLS_APT_UPDATE_FAIL FAKE_SSH_NEXTEST_PRESENT
+        FAKE_SSH_GATE_TOOLS_APT_UPDATE_FAIL FAKE_SSH_NEXTEST_PRESENT \
+        FAKE_HCLOUD_VOLUME_CREATE_FAIL FAKE_HCLOUD_VOLUME_ATTACH_FAIL FAKE_HCLOUD_VOLUME_DETACH_FAIL \
+        FAKE_SSH_VOLUME_LABEL_PRESENT FAKE_SSH_VOLUME_MOUNT_FAIL FAKE_SSH_VOLUME_USED_GB FAKE_SSH_VOLUME_SIZE_GB FAKE_SSH_VOLUME_USED_PCT \
+        FAKE_SSH_VOLUME_FSCK_CALLLOG
 }
 
 # ---- AC1: single-box refusal + adoption ------------------------------------
@@ -2374,6 +2385,211 @@ else
   expect "isolate AC2: the live burst-lane state/journal are unchanged after this whole suite ran" "[ $iso_audit_rc -eq 0 ]"
   [ $iso_audit_rc -eq 0 ] || echo "$iso_audit_out" >&2
 fi
+# =============================================================================
+# ---- burstvol: PRD-build-burst-persistent-volume ---------------------------
+# The build root ($REMOTE_ROOT) moves onto a Hetzner Cloud volume that `up`
+# attaches/mounts and teardown detaches, so warm targets survive across boxes.
+# Every pre-existing case above ran with BURST_VOLUME_NAME="" (fresh_env's
+# default — the documented rollback), so none of them ever made an `hcloud
+# volume` call; these cases opt back in explicitly.
+# =============================================================================
+
+# ---- burstvol AC1: no volume exists -> create, attach, format, mount -------
+fresh_env
+export BURST_VOLUME_NAME="wm-burst-build"
+export FAKE_SSH_CALL_LOG="$T/ssh.calls"; : > "$FAKE_SSH_CALL_LOG"
+bv1_out="$("$BL" up)"; bv1_rc=$?
+expect "burstvol AC1: up exits 0" "[ $bv1_rc -eq 0 ]"
+bv1_create_calls="$(grep -c 'volume create' "$FAKE_HCLOUD_CALLLOG")"
+expect "burstvol AC1: exactly one volume create call" "[ \"$bv1_create_calls\" -eq 1 ]"
+bv1_attach_calls="$(grep -c 'volume attach' "$FAKE_HCLOUD_CALLLOG")"
+expect "burstvol AC1: exactly one volume attach call" "[ \"$bv1_attach_calls\" -eq 1 ]"
+expect "burstvol AC1: the mount+format round trip ran as root" \
+  "grep -P '^root@\\S+\\t.*# volume-mount' \"$FAKE_SSH_CALL_LOG\" >/dev/null"
+bv1_created_line="$(grep -n 'burst-lane  up  volume  created' "$BURST_LANE_JOURNAL" | head -1 | cut -d: -f1)"
+bv1_attached_line="$(grep -n 'burst-lane  up  volume  attached' "$BURST_LANE_JOURNAL" | head -1 | cut -d: -f1)"
+expect "burstvol AC1: journal has both a volume created and a volume attached line" \
+  "[ -n \"$bv1_created_line\" ] && [ -n \"$bv1_attached_line\" ]"
+expect "burstvol AC1: volume created precedes volume attached" \
+  "[ -n \"$bv1_created_line\" ] && [ -n \"$bv1_attached_line\" ] && [ \"$bv1_created_line\" -lt \"$bv1_attached_line\" ]"
+
+# ---- burstvol AC2: volume already exists with a filesystem label -> no ----
+# format, no create call, journal has "attached" only.
+fresh_env
+export BURST_VOLUME_NAME="wm-burst-build"
+hcloud volume create --name wm-burst-build --size 500 >/dev/null 2>&1
+export FAKE_SSH_VOLUME_LABEL_PRESENT=1
+bv2_out="$("$BL" up)"; bv2_rc=$?
+expect "burstvol AC2: up exits 0 against a pre-existing, already-formatted volume" "[ $bv2_rc -eq 0 ]"
+bv2_create_calls="$(grep -c 'volume create' "$FAKE_HCLOUD_CALLLOG")"
+expect "burstvol AC2: no volume create call during this up (only the pre-seed's own)" "[ \"$bv2_create_calls\" -eq 1 ]"
+expect "burstvol AC2: journal has volume attached, never volume created" \
+  "grep -q 'burst-lane  up  volume  attached' \"$BURST_LANE_JOURNAL\" && ! grep -q 'burst-lane  up  volume  created' \"$BURST_LANE_JOURNAL\""
+unset FAKE_SSH_VOLUME_LABEL_PRESENT
+
+# ---- burstvol AC3: teardown order — sweep/sync/umount/detach/verify before -
+# server delete; journal has "volume detached" before "down decision=deleted".
+fresh_env
+export BURST_VOLUME_NAME="wm-burst-build"
+"$BL" up >/dev/null
+bv3_boot_epoch="$(grep -oE '"boot_epoch":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+export BURST_LANE_NOW=$((bv3_boot_epoch + 3600 - 60))
+bv3_down_out="$("$BL" down)"
+unset BURST_LANE_NOW
+expect "burstvol AC3: teardown still deletes cleanly with a volume attached" "[ \"$bv3_down_out\" = 'decision=deleted' ]"
+bv3_detach_line="$(grep -n 'volume detach' "$FAKE_HCLOUD_CALLLOG" | head -1 | cut -d: -f1)"
+bv3_delete_line="$(grep -n '^server delete' "$FAKE_HCLOUD_CALLLOG" | tail -1 | cut -d: -f1)"
+expect "burstvol AC3: hcloud volume detach happens before server delete" \
+  "[ -n \"$bv3_detach_line\" ] && [ -n \"$bv3_delete_line\" ] && [ \"$bv3_detach_line\" -lt \"$bv3_delete_line\" ]"
+bv3_detached_j="$(grep -n 'burst-lane  down  volume  detached' "$BURST_LANE_JOURNAL" | head -1 | cut -d: -f1)"
+bv3_deleted_j="$(grep -n 'burst-lane  down  decision=deleted' "$BURST_LANE_JOURNAL" | head -1 | cut -d: -f1)"
+expect "burstvol AC3: journal has volume detached before down decision=deleted" \
+  "[ -n \"$bv3_detached_j\" ] && [ -n \"$bv3_deleted_j\" ] && [ \"$bv3_detached_j\" -lt \"$bv3_deleted_j\" ]"
+
+# ---- burstvol AC4: detach fails -> server still deletes, journal detach- --
+# failed, volume_dirty=true, next up fscks before mounting.
+fresh_env
+export BURST_VOLUME_NAME="wm-burst-build"
+"$BL" up >/dev/null
+export FAKE_HCLOUD_VOLUME_DETACH_FAIL=1
+bv4_boot_epoch="$(grep -oE '"boot_epoch":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+export BURST_LANE_NOW=$((bv4_boot_epoch + 3600 - 60))
+bv4_down_out="$("$BL" down)"
+unset BURST_LANE_NOW FAKE_HCLOUD_VOLUME_DETACH_FAIL
+expect "burstvol AC4: server still deletes even though detach failed" "[ \"$bv4_down_out\" = 'decision=deleted' ]"
+expect "burstvol AC4: journal records volume detach-failed" "grep -q 'burst-lane  down  volume  detach-failed' \"$BURST_LANE_JOURNAL\""
+expect "burstvol AC4: volume state file marks volume_dirty=true" \
+  "python3 -c \"import json,sys; d=json.load(open('$BURST_LANE_STATE_DIR/volume.json')); sys.exit(0 if d.get('volume_dirty')=='true' else 1)\""
+export FAKE_SSH_VOLUME_FSCK_CALLLOG="$T/fsck.calls"; : > "$FAKE_SSH_VOLUME_FSCK_CALLLOG"
+bv4b_up_out="$("$BL" up)"; bv4b_up_rc=$?
+expect "burstvol AC4: the next up exits 0" "[ $bv4b_up_rc -eq 0 ]"
+expect "burstvol AC4: the next up ran fsck before mounting (prior detach-failed)" "[ -s \"$FAKE_SSH_VOLUME_FSCK_CALLLOG\" ]"
+unset FAKE_SSH_VOLUME_FSCK_CALLLOG
+
+# ---- burstvol AC5: hcloud reports the volume attached to another server ---
+# -> no attach attempted, "volume busy" journaled, session boots without it.
+fresh_env
+export BURST_VOLUME_NAME="wm-burst-build"
+hcloud volume create --name wm-burst-build --size 500 >/dev/null 2>&1
+awk -F'|' -v OFS='|' '{$4="999999"; print}' "$FAKE_HCLOUD_VOLUME_STATE" > "$FAKE_HCLOUD_VOLUME_STATE.tmp" && mv "$FAKE_HCLOUD_VOLUME_STATE.tmp" "$FAKE_HCLOUD_VOLUME_STATE"
+bv5_up_out="$("$BL" up)"; bv5_up_rc=$?
+expect "burstvol AC5: up still exits 0 (boots without the volume)" "[ $bv5_up_rc -eq 0 ]"
+expect "burstvol AC5: no volume attach call was attempted" "! grep -q 'volume attach' \"$FAKE_HCLOUD_CALLLOG\""
+expect "burstvol AC5: journal names the server the volume is attached to" \
+  "grep -q 'burst-lane  up  volume  busy  (attached_to=999999' \"$BURST_LANE_JOURNAL\""
+expect "burstvol AC5: volume state recorded volume_mounted=false" \
+  "python3 -c \"import json,sys; d=json.load(open('$BURST_LANE_STATE_DIR/volume.json')); sys.exit(0 if d.get('volume_mounted')=='false' else 1)\""
+
+# ---- burstvol AC6: disk fields (status --json) reflect the volume, not ----
+# the root disk — a fake df reporting 41% used comes back as volume.used_pct.
+fresh_env
+export BURST_VOLUME_NAME="wm-burst-build"
+export FAKE_SSH_VOLUME_USED_PCT=41
+"$BL" up >/dev/null
+bv6_status_json="$("$BL" status --json)"
+expect "burstvol AC6: status --json carries volume.used_pct from a live df read" \
+  "grep -q '\"used_pct\":41' <<<\$bv6_status_json"
+bv6_status_text="$("$BL" status)"
+expect "burstvol AC6: status (text mode) shows volume=attached 41%" \
+  "grep -q 'volume=attached 41%' <<<\$bv6_status_text"
+unset FAKE_SSH_VOLUME_USED_PCT
+
+# ---- burstvol AC7: warm attribution — a run against an empty remote target
+# journals warm=false; a second run against the now-existing target journals
+# warm=true, and the attribution ledger's row for it carries warm:true too.
+fresh_env
+WT_BV7="$T/warm-wt"; mkdir -p "$WT_BV7"
+echo 'mkdir -p target && echo built > target/out.txt' > "$WT_BV7/build.sh"
+bv7_run1_out="$("$BL" run "$WT_BV7" -- bash build.sh 2>&1)"; bv7_run1_rc=$?
+expect "burstvol AC7: first run (empty remote target) exits 0" "[ $bv7_run1_rc -eq 0 ]"
+expect "burstvol AC7: first run journaled warm=false" \
+  "grep -q 'burst-lane  run  routed.*warm=false' \"$BURST_LANE_JOURNAL\""
+bv7_run2_out="$("$BL" run "$WT_BV7" -- bash build.sh 2>&1)"; bv7_run2_rc=$?
+expect "burstvol AC7: second run (target now exists) exits 0" "[ $bv7_run2_rc -eq 0 ]"
+expect "burstvol AC7: second run journaled warm=true" \
+  "grep -q 'burst-lane  run  routed.*warm=true' \"$BURST_LANE_JOURNAL\""
+expect "burstvol AC7: attribution.jsonl's second run row carries warm:true" \
+  "python3 -c \"
+import json
+rows = [json.loads(l) for l in open('$BURST_LANE_ATTR_LEDGER') if l.strip()]
+runs = [r for r in rows if r.get('kind') == 'run' and r.get('worktree') == '$WT_BV7']
+import sys
+sys.exit(0 if len(runs) >= 2 and runs[-1].get('warm') is True else 1)
+\""
+
+# ---- burstvol AC8 (P1): the daily rollup carries volume_gb and a ----------
+# cold_builds_avoided count, same two-`down`-calls pattern gatebox AC9 uses
+# (the first down's own proration lands too late for maybe_daily_rollup to
+# see it; the second, no-op down sees it and emits the real rollup line).
+fresh_env
+export BURST_VOLUME_NAME="wm-burst-build"
+export BURST_VOLUME_GB=500
+"$BL" up >/dev/null
+WT_BV8="$T/rollup-wt"; mkdir -p "$WT_BV8"
+echo 'mkdir -p target; exit 0' > "$WT_BV8/build.sh"
+"$BL" run "$WT_BV8" -- bash build.sh >/dev/null 2>&1
+bv8_boot_epoch="$(grep -oE '"boot_epoch":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+export BURST_LANE_NOW=$((bv8_boot_epoch + 3600 - 60))
+"$BL" down >/dev/null
+"$BL" down >/dev/null
+unset BURST_LANE_NOW
+bv8_today="$(date -u +%Y-%m-%d)"
+bv8_rollup_line="$(grep '^burst-cost:' "$BURST_LANE_TICK_JOURNAL_DIR/$bv8_today.md" 2>/dev/null | tail -1)"
+expect "burstvol AC8: daily rollup line carries volume_gb=500" "grep -q 'volume_gb=500' <<<\"$bv8_rollup_line\""
+expect "burstvol AC8: daily rollup line carries a cold_builds_avoided count" \
+  "grep -qE 'cold_builds_avoided=[0-9]+' <<<\"$bv8_rollup_line\""
+
+# ---- burstvol AC9: the pull-back DESTINATION guard — a low-free-space -----
+# RedBaron root defers the pull (marker stays dirty for a later retry)
+# instead of starting an rsync it can't safely finish, using the larger of
+# BURST_LOCAL_DISK_FLOOR_GB and this worktree's own last-observed pull size
+# as the threshold (the PRD's own scenario: 20 GB free, an 87 GB last pull).
+fresh_env
+"$BL" up >/dev/null
+WT_BV9="$T/localdisk-wt"; mkdir -p "$WT_BV9"
+echo 'mkdir -p target && echo built > target/out.txt' > "$WT_BV9/build.sh"
+"$BL" run "$WT_BV9" -- bash build.sh >/dev/null 2>&1
+bv9_wkey="$(printf '%s' "$WT_BV9" | sha1sum | cut -c1-8)"
+mkdir -p "$BURST_LANE_STATE_DIR/pull-sizes"
+# 87 GB, exactly matching the PRD's own AC9 scenario and the real
+# 2026-09-11 incident evidence (an 87 GB single gate pull).
+printf '%s\n' "$((87 * 1073741824))" > "$BURST_LANE_STATE_DIR/pull-sizes/$bv9_wkey"
+export BURST_LANE_LOCAL_FREE_GB=20
+bv9_pull_out="$("$BL" pull "$WT_BV9" 2>&1)"; bv9_pull_rc=$?
+unset BURST_LANE_LOCAL_FREE_GB
+expect "burstvol AC9: pull exits 0 (deferred, not an error)" "[ $bv9_pull_rc -eq 0 ]"
+expect "burstvol AC9: journal records pull deferred cause=local-disk free_gb=20 need_gb=87" \
+  "grep -q 'burst-lane  pull  deferred  (worktree=$WT_BV9 .*cause=local-disk free_gb=20 need_gb=87' \"$BURST_LANE_JOURNAL\""
+expect "burstvol AC9: the marker stays dirty (never cleared)" "dirty_has \"$WT_BV9\""
+
+# ---- burstvol AC10: a dirty marker under a moved root (byte-identical to --
+# the 2026-09-11 user-migration evidence: a marker still naming /root/build
+# after $REMOTE_ROOT moved) is treated as cold on read, cleared, and NEVER
+# retried as rsync-failed — checked before any ssh round trip.
+fresh_env
+"$BL" up >/dev/null
+WT_BV10="$T/rootmove-wt"; mkdir -p "$WT_BV10"
+bv10_wkey="$(printf '%s' "$WT_BV10" | sha1sum | cut -c1-8)"
+mkdir -p "$BURST_LANE_STATE_DIR/dirty"
+python3 -c "
+import json
+json.dump(
+    {'worktree': '$WT_BV10', 'session_id': 'stale-session', 'kind': 'target',
+     'remote_path': '/root/build/rootmove-wt-$bv10_wkey', 'marked_ts': '2026-01-01T00:00:00Z'},
+    open('$BURST_LANE_STATE_DIR/dirty/$bv10_wkey.json', 'w'))
+"
+bv10_pull_out="$("$BL" pull "$WT_BV10" 2>&1)"; bv10_pull_rc=$?
+expect "burstvol AC10: pull against a marker under a moved root exits 0 (cold, not an error)" "[ $bv10_pull_rc -eq 0 ]"
+expect "burstvol AC10: journal records pull cold cause=remote-path-missing" \
+  "grep -q 'burst-lane  pull  cold  (worktree=$WT_BV10 .*cause=remote-path-missing' \"$BURST_LANE_JOURNAL\""
+expect "burstvol AC10: never journaled as rsync-failed for this worktree" \
+  "! grep -q \"burst-lane  pull  fallback  (cause=rsync-failed worktree=$WT_BV10\" \"$BURST_LANE_JOURNAL\""
+expect "burstvol AC10: the stale marker was cleared" "[ ! -e \"$BURST_LANE_STATE_DIR/dirty/$bv10_wkey.json\" ]"
+
+# ---- burstvol AC11: this fixture set exits 0 and names the burstvol cases -
+# (an explicit, in-band assertion, matching every sibling AC's own
+# convention — see burstuser AC7/parityr AC6 above).
+expect "burstvol AC11: every burstvol case above ran green" "[ $fail -eq 0 ]"
 
 echo "=== $([ $fail -eq 0 ] && echo PASS || echo FAIL) ==="
 exit $fail

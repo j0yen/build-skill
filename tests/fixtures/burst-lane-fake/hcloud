@@ -7,10 +7,18 @@
 # FAKE_HCLOUD_AUTH_FAIL, FAKE_HCLOUD_CREATE_FAIL, FAKE_HCLOUD_DELETE_FAIL.
 # Asserts the never-poweroff/shutdown/stop/reboot invariant (AC14) by
 # hard-failing if any such subcommand is ever invoked.
+#
+# PRD-build-burst-persistent-volume: `volume {create,describe,attach,detach}`
+# added, mirroring the server state file's own flat-line convention. State:
+# "id|name|size_gb|server_id|device" lines under $FAKE_HCLOUD_VOLUME_STATE
+# (default /tmp/bl-fake-hcloud-volume.state); server_id is empty when
+# unattached. Failure-injection: FAKE_HCLOUD_VOLUME_CREATE_FAIL,
+# FAKE_HCLOUD_VOLUME_ATTACH_FAIL, FAKE_HCLOUD_VOLUME_DETACH_FAIL.
 set -uo pipefail
 STATE="${FAKE_HCLOUD_STATE:-/tmp/bl-fake-hcloud.state}"
+VOLSTATE="${FAKE_HCLOUD_VOLUME_STATE:-/tmp/bl-fake-hcloud-volume.state}"
 CALLLOG="${FAKE_HCLOUD_CALLLOG:-}"
-touch "$STATE"
+touch "$STATE" "$VOLSTATE"
 [ -n "$CALLLOG" ] && printf '%s\n' "$*" >> "$CALLLOG"
 
 case "${1:-}" in
@@ -50,12 +58,88 @@ case "${1:-}" in
         key="$3"
         sed -i -E "/^$key\|/d" "$STATE" 2>/dev/null || true
         awk -F'|' -v k="$key" '$2!=k' "$STATE" > "$STATE.tmp" 2>/dev/null && mv "$STATE.tmp" "$STATE"
+        # PRD-build-burst-persistent-volume requirement 2: Hetzner detaches
+        # any attached volume when its server is deleted, REGARDLESS of
+        # whether burst-lane.sh's own prior `volume detach` call succeeded
+        # (the whole point of "still deletes the server (Hetzner detaches on
+        # delete)") — clear server_id on any volume this server id held.
+        awk -F'|' -v OFS='|' -v k="$key" '$4==k{$4=""} {print}' "$VOLSTATE" > "$VOLSTATE.tmp" 2>/dev/null && mv "$VOLSTATE.tmp" "$VOLSTATE"
         [ "${FAKE_HCLOUD_DELETE_FAIL:-0}" = "1" ] && exit 1
         exit 0
         ;;
       poweroff|shutdown|stop|reboot)
         echo "FAKE-HCLOUD-VIOLATION: burst-lane.sh must never call 'server $2' (a stopped server still bills)" >&2
         exit 99
+        ;;
+      *) exit 2 ;;
+    esac
+    ;;
+  volume)
+    case "${2:-}" in
+      create)
+        [ "${FAKE_HCLOUD_VOLUME_CREATE_FAIL:-0}" = "1" ] && { echo "volume create failed" >&2; exit 1; }
+        name="" size=""
+        shift 2
+        while [ $# -gt 0 ]; do
+          case "$1" in
+            --name) name="$2"; shift 2 ;;
+            --size) size="$2"; shift 2 ;;
+            *) shift ;;
+          esac
+        done
+        vid=$((RANDOM % 900000 + 100000))
+        size="${size:-500}"
+        device="/dev/disk/by-id/scsi-0HC_Volume_$vid"
+        echo "$vid|$name|$size||$device" >> "$VOLSTATE"
+        printf '{"volume":{"id":%s,"name":"%s","size":%s,"linux_device":"%s","server":null}}\n' \
+          "$vid" "$name" "$size" "$device"
+        exit 0
+        ;;
+      describe)
+        key="$3"
+        line="$(grep -E "^$key\|" "$VOLSTATE" 2>/dev/null | head -n1)"
+        [ -z "$line" ] && line="$(awk -F'|' -v k="$key" '$2==k' "$VOLSTATE" 2>/dev/null | head -n1)"
+        [ -z "$line" ] && exit 1
+        IFS='|' read -r vid name size sid device <<<"$line"
+        if [ -n "$sid" ]; then
+          printf '{"volume":{"id":%s,"name":"%s","size":%s,"linux_device":"%s","server":%s}}\n' \
+            "$vid" "$name" "$size" "$device" "$sid"
+        else
+          printf '{"volume":{"id":%s,"name":"%s","size":%s,"linux_device":"%s","server":null}}\n' \
+            "$vid" "$name" "$size" "$device"
+        fi
+        exit 0
+        ;;
+      attach)
+        [ "${FAKE_HCLOUD_VOLUME_ATTACH_FAIL:-0}" = "1" ] && { echo "volume attach failed" >&2; exit 1; }
+        sid=""
+        shift 2
+        while [ $# -gt 0 ]; do
+          case "$1" in
+            --server) sid="$2"; shift 2 ;;
+            *) key="$1"; shift ;;
+          esac
+        done
+        line="$(grep -E "^$key\|" "$VOLSTATE" 2>/dev/null | head -n1)"
+        [ -z "$line" ] && line="$(awk -F'|' -v k="$key" '$2==k' "$VOLSTATE" 2>/dev/null | head -n1)"
+        [ -z "$line" ] && exit 1
+        IFS='|' read -r vid name size old_sid device <<<"$line"
+        awk -F'|' -v k="$vid" 'BEGIN{OFS="|"} $1==k{next} {print}' "$VOLSTATE" > "$VOLSTATE.tmp" 2>/dev/null
+        printf '%s|%s|%s|%s|%s\n' "$vid" "$name" "$size" "$sid" "$device" >> "$VOLSTATE.tmp"
+        mv "$VOLSTATE.tmp" "$VOLSTATE"
+        exit 0
+        ;;
+      detach)
+        [ "${FAKE_HCLOUD_VOLUME_DETACH_FAIL:-0}" = "1" ] && { echo "volume detach failed" >&2; exit 1; }
+        key="$3"
+        line="$(grep -E "^$key\|" "$VOLSTATE" 2>/dev/null | head -n1)"
+        [ -z "$line" ] && line="$(awk -F'|' -v k="$key" '$2==k' "$VOLSTATE" 2>/dev/null | head -n1)"
+        [ -z "$line" ] && exit 1
+        IFS='|' read -r vid name size old_sid device <<<"$line"
+        awk -F'|' -v k="$vid" 'BEGIN{OFS="|"} $1==k{next} {print}' "$VOLSTATE" > "$VOLSTATE.tmp" 2>/dev/null
+        printf '%s|%s|%s||%s\n' "$vid" "$name" "$size" "$device" >> "$VOLSTATE.tmp"
+        mv "$VOLSTATE.tmp" "$VOLSTATE"
+        exit 0
         ;;
       *) exit 2 ;;
     esac
