@@ -1,6 +1,6 @@
 ---
 name: build
-description: Continuously implement queued PRDs end-to-end — scan for new PRDs, build them (delegating to /rustbuild for Rust — cargo runs on RedBaron, locally there and remotely from every other node), wire them into the system, publish them as GitHub repos per the PRD's `publish:` key (default `j0yen/private`; the joeyen-atscale route was retired 2026-08-27), update Abouts (per-repo READMEs + wintermute REPOS.md), and draft follow-on PRDs that expand Claude's own capabilities. Rust routes to /rustbuild, Python (`python-*`) to /pybuild. The parsed PRD contract is documented in build-contract.md. Runs on manual invocation or systemd-user timer when enabled; up to 30 PRDs advanced in parallel per tick, one ATOMIC step at a time per PRD, chained while green with no default cap (2026-09-09). Use when the user says /build, when the SessionStart hook reports a queued PRD, or when the user asks Claude to "make progress on the queue" or "build the next thing."
+description: Continuously implement queued PRDs end-to-end — scan for new PRDs, build them (delegating to /rustbuild for Rust — cargo runs on RedBaron, locally there and remotely from every other node), wire them into the system, publish them as GitHub repos per the PRD's `publish:` key (default `j0yen/private`; the joeyen-atscale route was retired 2026-08-27), update Abouts (per-repo READMEs + wintermute REPOS.md), and draft follow-on PRDs that expand Claude's own capabilities. Rust routes to /rustbuild, Python (`python-*`) to /pybuild. The parsed PRD contract is documented in build-contract.md. Runs on manual invocation or systemd-user timer when enabled; up to `BUILD_MAX_BRANCHES` PRDs (default 30, env-overridable per host since 2026-09-11) advanced in parallel per tick, one ATOMIC step at a time per PRD, chained while green with no default cap (2026-09-09). Use when the user says /build, when the SessionStart hook reports a queued PRD, or when the user asks Claude to "make progress on the queue" or "build the next thing."
 model: sonnet
 ---
 
@@ -28,9 +28,10 @@ root, indexed in `~/wintermute/REPOS.md`). Canonical skill sources are listed
 in `README.md` and enforced by `fleet-sync`.
 
 Cadence is **every 5 minutes** (systemd-user timer `claude-build.timer`).
-Per tick, the skill dispatches **up to 30 PRDs in parallel** as parallel
-Agent (subagent) tool calls in a single tool-use message, then collects
-their results. **Per-PRD contract, updated 2026-09-09
+Per tick, the skill dispatches **up to `BUILD_MAX_BRANCHES` PRDs in
+parallel** (env var, default **30** when unset or invalid — see
+"Parallelism" below) as parallel Agent (subagent) tool calls in a single
+tool-use message, then collects their results. **Per-PRD contract, updated 2026-09-09
 (PRD-build-chained-tick-actions; operator authorization, Joe, verbatim:
 "does it have to be one action per PRD for tick? Can we expand thsis?" —
 expand it, and on a chain cap, "no, no chain cap"):** each dispatched PRD
@@ -46,9 +47,12 @@ never really about cadence; it was about atomic, independently-revertable
 progress, which chaining preserves by construction (every chained step is
 still its own manifest commit). Only the PER-TICK fan-out changed on the
 older timeline (2026-05-28: 1 → 5; 2026-05-29: 5 → 10; raised by user
-2026-06-11: 10 → 30 — **30 is the operative cap on fan-out, do not
-self-throttle below it**). Worst-case blast radius per tick is now
-30 PRDs × (however many atomic steps each chains through before a
+2026-06-11: 10 → 30 — **30 is the default cap on fan-out (do not
+self-throttle below it), overridable per-host via `BUILD_MAX_BRANCHES`
+(2026-09-11, PRD-build-max-branches-cap) when a lane needs a lower
+enforced ceiling — see "Parallelism" below**). Worst-case blast radius
+per tick is now `BUILD_MAX_BRANCHES` PRDs (default 30) × (however many
+atomic steps each chains through before a
 mandatory stop), each step still independently revertable; a green PRD's
 whole worst-case blast radius collapses to "however many steps it has,"
 same as it always did — chaining changes WHEN those steps land, not how
@@ -236,12 +240,12 @@ Within both buckets, sort by `build_priority` descending
 PRDs the user has explicitly bumped to `build_priority: high` get
 picked before their normal-priority siblings.
 
-Then pick **up to 30 PRDs** from the pool that mutually satisfy the
-parallel-dispatch rules in the "Parallelism" section (shared `build_into`
-isolated via worktrees up to the ≤5 same-target sub-cap, ≤1 kernel-extend,
-≤1 reflect-eligible). Fewer than 30 is fine; the cap is 30, the floor is
-whatever the queue admits after conflict-pruning. If the pool yields zero,
-exit clean.
+Then pick **up to `BUILD_MAX_BRANCHES` PRDs** (default 30 — see
+"Parallelism") from the pool that mutually satisfy the parallel-dispatch
+rules in the "Parallelism" section (shared `build_into` isolated via
+worktrees up to the ≤5 same-target sub-cap, ≤1 kernel-extend, ≤1
+reflect-eligible). Fewer than the cap is fine; the floor is whatever the
+queue admits after conflict-pruning. If the pool yields zero, exit clean.
 
 **Lane predicate (2026-09-06, PRD-build-second-lane-carbon).** Before
 admitting a candidate, run `scripts/lane-predicate.sh select <prd-path>`
@@ -455,8 +459,9 @@ authorization, Joe, 2026-09-09, verbatim: "does it have to be one action
 per PRD for tick? Can we expand thsis?" — expand it; and on a chain cap,
 "no, no chain cap").** For each PRD selected in Phase 2, do ONE of the
 following — whichever advances that PRD by one well-defined, atomically
-manifest-committed step. The 1..=30 PRDs in this tick's selection run in
-parallel via Agent tool calls (see "Parallelism" below). **What changed:**
+manifest-committed step. The 1..=`BUILD_MAX_BRANCHES` PRDs (default 30)
+in this tick's selection run in parallel via Agent tool calls (see
+"Parallelism" below). **What changed:**
 a branch no longer stops unconditionally after its first action. After
 committing that step's manifest transition (Phase 7's `manifest-set.sh`
 call), it re-checks — for this SAME PRD only — the same preconditions the
@@ -1376,8 +1381,28 @@ substrate-naming AC the plan could derive a command for), run
 
 ## Parallelism (per-tick fan-out, added 2026-05-28)
 
-Each tick advances **up to 30 PRDs in parallel**. The per-tick fan-out
-grew (1 → 5 → 10 → 30) independently of the per-PRD step contract: **as
+**`BUILD_MAX_BRANCHES` (env var, added 2026-09-11,
+PRD-build-max-branches-cap).** Caps how many PRDs a tick may admit in
+total. Unset, empty, or not a positive integer preserves the historic
+default of **30** — no change to default behavior anywhere it is unset.
+Set on a host that needs a lower enforced ceiling (e.g. RedBaron capped
+to 2) via the systemd service environment; it must reach the tick's shell
+environment the same way `CHAIN_MAX_STEPS`/`BUILD_TICKS_PER_DAY` do (no
+special plumbing beyond `Environment=`/`--setenv` forwarding into the
+process that runs `/build`). It is enforced by
+`scripts/select-guard.sh <slug> [lane] [prd-dir] <branch-count>` — the
+same mandatory pre-dispatch call every candidate already goes through
+(see "Required dispatch-boundary guard" under Phase 4/Dispatch): pass the
+count of PRDs already admitted so far this tick as the 4th argument (0
+for the first candidate); once that count reaches the cap, every further
+candidate is blocked with `blocked: <slug>: cap: <n> branches already
+selected this tick (cap=<limit>)` regardless of busy/cargo-free status.
+This is the actual enforcement point — Phase 2's selection prose below is
+advisory sizing, not a substitute for calling the guard.
+
+Each tick advances **up to `BUILD_MAX_BRANCHES` PRDs in parallel**
+(default 30). The per-tick fan-out grew (1 → 5 → 10 → 30) independently
+of the per-PRD step contract: **as
 of 2026-09-09 (PRD-build-chained-tick-actions) that per-PRD contract is
 "one ATOMIC step at a time, chained while green" rather than "exactly one
 action per PRD per tick"** — see "In-tick chaining" under Phase 4/Dispatch
@@ -1387,10 +1412,11 @@ before returning) are orthogonal: a 30-wide tick can still have some
 branches chain to `archived` while others take one step and stop at a
 mandatory boundary. User instruction 2026-05-28: "this laptop can handle
 it"; raised 5 → 10 on 2026-05-29; raised 10 → 30 by user 2026-06-11 —
-**30 is the operative cap on fan-out, do not self-throttle below it.**
+**30 is the default cap on fan-out, do not self-throttle below it absent
+an explicit `BUILD_MAX_BRANCHES` override.**
 
-**Fan out to the full cap by default — do NOT self-throttle below 30 on
-memory grounds.** Carbon has **15 GB RAM (0 swap), typically ~11 GB
+**Fan out to the full cap by default — do NOT self-throttle below the
+cap on memory grounds.** Carbon has **15 GB RAM (0 swap), typically ~11 GB
 free** (RedBaron has 30 GB). On carbon/ryzen7 heavy cargo builds route
 to RedBaron through /rustbuild's cargo shim, so local memory pressure is minimal; on
 RedBaron they run locally, so honor the ≤5 same-target sub-cap strictly. The real OOM guard is **cargo-budget.sh**
@@ -1400,7 +1426,8 @@ because unbudgeted `cargo test` fan-out under the sub-cap stacked 95 test
 binaries + sandboxes). The ≤5 same-target sub-cap bounds selection width on
 one heavy crate; with the budget live, total width 30 is safe. The **< 4 GB
 available** check (at selection time) is the ONLY permitted reason to
-reduce width — and it must be logged with the measured number.
+reduce width below the default absent an explicit `BUILD_MAX_BRANCHES`
+override — and it must be logged with the measured number.
 
 Note on coordination: ticks run detached as `claude-build-work.service`
 (30-min cap), so a 30-wide fan-out has room to finish + commit. Seeing
@@ -1411,8 +1438,8 @@ time.
 
 ### Selection rules (extends Phase 2)
 
-After the existing priority sort, pick up to 30 PRDs that mutually
-satisfy:
+After the existing priority sort, pick up to `BUILD_MAX_BRANCHES` PRDs
+(default 30) that mutually satisfy:
 
 1. **Shared `build_into` → isolate with worktrees, don't serialize.**
    Two branches mutating the same crate in place would race cargo locks
@@ -1471,9 +1498,10 @@ satisfy:
    If two candidates would otherwise both trigger reflect, designate
    one as reflect-eligible and the other skips Phase 6.
 
-Fewer than 30 is fine. Selection is greedy — walk the sorted candidate
-pool, admit each PRD that doesn't violate a rule against already-
-admitted ones, stop at 30 or end-of-pool.
+Fewer than the cap is fine. Selection is greedy — walk the sorted
+candidate pool, admit each PRD that doesn't violate a rule against
+already-admitted ones, stop at `BUILD_MAX_BRANCHES` (default 30) or
+end-of-pool.
 
 ### Dispatch
 
@@ -1746,19 +1774,26 @@ PRD, fan-out or single ad-hoc pick, automated timer or manual invocation —
 run:
 
 ```
-scripts/select-guard.sh <slug>
+scripts/select-guard.sh <slug> [lane] [prd-dir] <branch-count>
 ```
+
+`<branch-count>` is how many PRDs this tick has already admitted before
+this candidate (0 for the first) — pass it so `select-guard.sh` can
+enforce `BUILD_MAX_BRANCHES` (default 30, see "Parallelism" above); a
+candidate whose branch-count already meets the cap is blocked with
+`cap: ...` regardless of busy/cargo-free status.
 
 Exit 0 (`ok: <slug>: ...`) means dispatch may proceed. Exit 1
 (`blocked: <slug>: ...`) means dispatch MUST NOT happen this tick — drop
 that PRD from the batch, log the reported reason, and do not open an Agent
 call for it; the next tick re-checks normally. `select-guard.sh` composes
-`lane-predicate.sh select` (cargo-free filter + target-busy) unchanged — it
-adds this call site, not new busy-detection logic — so the earlier Phase 2
-prose describing the same check is not a substitute for actually calling
-this script here, at the boundary where a skipped check would otherwise let
-a branch land on a `build_into` another lane already holds live (the
-2026-09-08 `autobuilder-gate-debt` collision this PRD is named for).
+`lane-predicate.sh select` (cargo-free filter + target-busy) unchanged, and
+adds the `BUILD_MAX_BRANCHES` count check itself — it adds this call site,
+not new busy-detection logic — so the earlier Phase 2 prose describing the
+same check is not a substitute for actually calling this script here, at
+the boundary where a skipped check would otherwise let a branch land on a
+`build_into` another lane already holds live (the 2026-09-08
+`autobuilder-gate-debt` collision this PRD is named for).
 
 Issue all calls in a single message — that's what makes them
 parallel. Do not chain follow-up Agent calls in the same tick — this means

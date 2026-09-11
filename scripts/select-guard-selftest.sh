@@ -84,4 +84,70 @@ out=$("$SG" victim carbon "$ROOT/clone")
 echo "$out" | grep -q '^ok: victim:' || { echo "FAIL expected ok on stale claim, got: $out"; exit 1; }
 echo ok
 
+# --- BUILD_MAX_BRANCHES (PRD-build-max-branches-cap, 2026-09-11) -----------
+# Per-tick fan-out cap. Extends this file (rather than a standalone
+# max-branches-selftest.sh) because select-guard.sh's dispatch-boundary
+# call is the enforcement point, and this file already owns that script's
+# scratch fixtures. Three PRDs staged (>= 3 eligible, no busy claims) so
+# the cap alone decides admission; branch-count is passed positionally
+# (4th arg), same convention as chain-guard.sh's --step-count.
+
+cat > "$ROOT/clone/build-queue/PRD-second.md" <<'EOF'
+# PRD: second — an independent candidate (own build_into, never busy)
+
+- Status: queued
+- build_target: shell
+- build_into: /tmp/select-guard-second-repo
+EOF
+cat > "$ROOT/clone/build-queue/PRD-third.md" <<'EOF'
+# PRD: third — an independent candidate (own build_into, never busy)
+
+- Status: queued
+- build_target: shell
+- build_into: /tmp/select-guard-third-repo
+EOF
+git -C "$ROOT/clone" add -A
+git -C "$ROOT/clone" -c user.name=t -c user.email=t@t commit -q -m "stage second+third for max-branches"
+git -C "$ROOT/clone" push -q origin "$BRANCH"
+
+echo "== BUILD_MAX_BRANCHES=2, >=3 eligible: selection admits exactly 2, blocks the 3rd on cap =="
+admitted=0
+for i in 0 1 2; do
+  slug=$(printf '%s\n' victim second third | sed -n "$((i+1))p")
+  set +e
+  out=$(BUILD_MAX_BRANCHES=2 "$SG" "$slug" carbon "$ROOT/clone" "$admitted" 2>&1); rc=$?
+  set -e
+  if [ "$i" -lt 2 ]; then
+    [ "$rc" -eq 0 ] || { echo "FAIL: expected admit #$((i+1)) ($slug), got rc=$rc: $out"; exit 1; }
+    echo "$out" | grep -q "^ok: $slug:" || { echo "FAIL: $out"; exit 1; }
+    admitted=$((admitted+1))
+  else
+    [ "$rc" -eq 1 ] || { echo "FAIL: expected the 3rd ($slug) blocked, got rc=$rc: $out"; exit 1; }
+    echo "$out" | grep -q "^blocked: $slug: cap: 2 branches already selected this tick (cap=2)$" \
+      || { echo "FAIL cap message: $out"; exit 1; }
+  fi
+done
+[ "$admitted" -eq 2 ] || { echo "FAIL: expected exactly 2 admitted, got $admitted"; exit 1; }
+echo ok
+
+echo "== BUILD_MAX_BRANCHES unset: same pool admits all 3 (min(eligible,30)) =="
+admitted=0
+for slug in victim second third; do
+  out=$("$SG" "$slug" carbon "$ROOT/clone" "$admitted")
+  echo "$out" | grep -q "^ok: $slug:" || { echo "FAIL: $out"; exit 1; }
+  admitted=$((admitted+1))
+done
+[ "$admitted" -eq 3 ] || { echo "FAIL: expected all 3 admitted with cap unset, got $admitted"; exit 1; }
+echo ok
+
+echo "== BUILD_MAX_BRANCHES=0 (invalid, non-positive): falls back to default 30, does not block =="
+out=$(BUILD_MAX_BRANCHES=0 "$SG" victim carbon "$ROOT/clone" 0)
+echo "$out" | grep -q '^ok: victim:' || { echo "FAIL: BUILD_MAX_BRANCHES=0 should fall back to 30, got: $out"; exit 1; }
+echo ok
+
+echo "== BUILD_MAX_BRANCHES=bogus (invalid, non-integer): falls back to default 30, does not block =="
+out=$(BUILD_MAX_BRANCHES=bogus "$SG" victim carbon "$ROOT/clone" 0)
+echo "$out" | grep -q '^ok: victim:' || { echo "FAIL: BUILD_MAX_BRANCHES=bogus should fall back to 30, got: $out"; exit 1; }
+echo ok
+
 echo "ALL PASS"
