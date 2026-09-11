@@ -168,6 +168,15 @@ case "$cmd" in
     echo "${FAKE_SSH_VOLUME_USED_GB:-205}G ${FAKE_SSH_VOLUME_SIZE_GB:-500}G ${FAKE_SSH_VOLUME_USED_PCT:-41}%"
     exit 0
     ;;
+  *'# cargo-home-registry-probe'*)
+    # PRD-build-burst-path-deps AC3: cmd_verify's CARGO_HOME registry
+    # writability check. FAKE_SSH_REGISTRY_WRITE_FAIL=1 simulates the
+    # exact real-world defect this PRD fixes (a registry directory the
+    # build user cannot write into) without touching any other probe.
+    [ "${FAKE_SSH_REGISTRY_WRITE_FAIL:-0}" = "1" ] && exit 1
+    eval "$cmd"
+    exit $?
+    ;;
   *'command -v cargo-nextest'*)
     # PRD-build-burst-parity-robust requirement 1: box-side nextest
     # presence check. Answered explicitly (never `eval`'d against this
