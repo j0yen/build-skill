@@ -117,11 +117,20 @@ fresh_env() {
   # to exercise the routed path, so default it on per-block and let the
   # dedicated AC8 block below override it back to unset for its own case.
   export BURST_GATE_REMOTE=1
+  # PRD-build-burst-parity-robust requirement 1: force the pre-nextest
+  # cargo-test fallback by default on the LOCAL side — this machine (and any
+  # other running this suite) may genuinely have cargo-nextest on $PATH, and
+  # only the dedicated parityr nextest-path tests below opt into exercising
+  # it (see nextest_present_local()'s override contract in burst-lane.sh).
+  # The box side needs no such override: it's fully mediated through the
+  # fake ssh fixture's own explicit `command -v cargo-nextest` case, which
+  # already defaults to "missing" unless a test sets FAKE_SSH_NEXTEST_PRESENT=1.
+  export BURST_LANE_FORCE_NEXTEST_LOCAL=0
   unset FAKE_HCLOUD_AUTH_FAIL FAKE_HCLOUD_CREATE_FAIL FAKE_HCLOUD_DELETE_FAIL FAKE_SSH_REMOTE_FAIL FAKE_SSH_SANDBOX_FAIL FAKE_RSYNC_FAIL BURST_LANE_NOW \
         FAKE_SSH_GATE_TOOLS_MISSING FAKE_SSH_GATE_TOOLS_INSTALL_FAIL FAKE_SSH_AUTOBUILDER_VERSION BURST_GATE_REVIEWER BURST_CLAUDE_CRED_SRC \
         FAKE_SSH_GATE_TOOLS_INSTALL_FAIL_TOOL FAKE_SSH_GATE_TOOLS_INSTALL_FAIL_RC FAKE_SSH_GATE_TOOLS_INSTALL_FAIL_STDERR \
         FAKE_SSH_GATE_TOOLS_TOOLCHAIN_SIM FAKE_GATE_TOOLS_TOOLCHAIN_BIN FAKE_RUSTUP_TOOLCHAINS FAKE_CARGO_REQUIRE_TOOLCHAIN \
-        FAKE_SSH_GATE_TOOLS_APT_UPDATE_FAIL
+        FAKE_SSH_GATE_TOOLS_APT_UPDATE_FAIL FAKE_SSH_NEXTEST_PRESENT
 }
 
 # ---- AC1: single-box refusal + adoption ------------------------------------
@@ -1928,6 +1937,14 @@ expect "burstuser AC6: the worktree's remote artifact landed in the NEW (build) 
   "[ -f \"$bu6_new_remote/artifact.txt\" ]"
 expect "burstuser AC6: the migration copy ran over root ssh (only user who can read the old tree)" \
   "grep -P '^root@\\S+\\t.*cp -a' \"$FAKE_SSH_CALL_LOG\" >/dev/null"
+# PRD-build-burst-parity-robust requirement 4 / parityr AC4: the old-root
+# copy is a single small file, so its verified-copy check (size+count) must
+# match and the source directory must be gone afterward — no residue left
+# from a migration whose copy genuinely succeeded.
+expect "parityr AC4: old-root copy verified (bytes+count match) and removed after migration" \
+  "[ ! -d \"$OLD_REMOTE_MIG\" ]"
+expect "parityr AC4: journal records migrated-removed naming the old path" \
+  "grep -qF \"provision  migrated-removed  (from=$OLD_REMOTE_MIG)\" \"$BURST_LANE_JOURNAL\""
 : > "$FAKE_SSH_CALL_LOG"
 bu6_run_out="$("$BL" run "$WT_MIG" -- bash -c 'exit 0' 2>&1)"; bu6_run_rc=$?
 expect "burstuser AC6: a following run exits cleanly without a second up" "[ $bu6_run_rc -eq 0 ]"
@@ -1935,6 +1952,214 @@ expect "burstuser AC6: that run routed as build@, no reboot needed" \
   "grep -qP '^build@' \"$FAKE_SSH_CALL_LOG\""
 expect "burstuser AC6: that run made no root@ call" \
   "! grep -qP '^root@' \"$FAKE_SSH_CALL_LOG\""
+
+# ---- parityr AC4 (continued): a copy MISMATCH keeps the old directory and
+# journals migrate-keep(cause=copy-mismatch) rather than losing data. Same
+# root-only-session setup as burstuser AC6 above, but the NEW remote path is
+# pre-seeded with an extra file `cp -a`'s merge semantics won't remove, so
+# the post-copy size/count can never match the old tree's.
+fresh_env
+export FAKE_SSH_CALL_LOG="$T/ssh.calls"; : > "$FAKE_SSH_CALL_LOG"
+"$BL" up >/dev/null 2>&1
+pr4_sid="$(python3 -c "import json; print(json.load(open('$BURST_LANE_STATE_DIR/session.json'))['server_id'])")"
+sed -i 's/"remote_user":"build"/"remote_user":"root"/' "$BURST_LANE_STATE_DIR/session.json"
+WT_PR4="$T/wt-migrate-mismatch"; mkdir -p "$WT_PR4"
+OLD_REMOTE_PR4="$T/old-root-remote-tree-mismatch"; mkdir -p "$OLD_REMOTE_PR4"
+echo "pre-existing build artifact" > "$OLD_REMOTE_PR4/artifact.txt"
+mkdir -p "$BURST_LANE_STATE_DIR/dirty"
+pr4_wkey="$(printf '%s' "$WT_PR4" | sha1sum | cut -c1-8)"
+python3 -c "
+import json
+json.dump({'worktree': '$WT_PR4', 'session_id': '$pr4_sid', 'remote_path': '$OLD_REMOTE_PR4', 'kind': 'target', 'marked_ts': '2026-01-01T00:00:00Z'},
+           open('$BURST_LANE_STATE_DIR/dirty/$pr4_wkey.json', 'w'))
+"
+pr4_new_remote="$BURST_LANE_REMOTE_ROOT/$(basename "$WT_PR4")-$pr4_wkey"
+mkdir -p "$pr4_new_remote"
+echo "pre-existing extra file the copy will not clear" > "$pr4_new_remote/extra.txt"
+pr4_prov_out="$("$BL" provision 2>&1)"
+expect "parityr AC4: a copy mismatch keeps the old directory" "[ -d \"$OLD_REMOTE_PR4\" ]"
+expect "parityr AC4: journal records migrate-keep(cause=copy-mismatch) naming the old path" \
+  "grep -qF \"provision  migrate-keep  (cause=copy-mismatch from=$OLD_REMOTE_PR4\" \"$BURST_LANE_JOURNAL\""
+
+# ---- parityr (requirement 4, second half): `reap` sweeps
+# $OLD_ROOT_REMOTE_ROOT too, removing residue left behind (a copy-mismatch
+# keep, or a leftover from before this fix ever shipped) even though nothing
+# new ever lands there again once the session has migrated off root.
+fresh_env
+export BURST_LANE_OLD_ROOT_REMOTE_ROOT="$T/old-root-scan"
+mkdir -p "$BURST_LANE_OLD_ROOT_REMOTE_ROOT/leftover-abc12345"
+echo "stale residue" > "$BURST_LANE_OLD_ROOT_REMOTE_ROOT/leftover-abc12345/f.txt"
+"$BL" up >/dev/null 2>&1
+mkdir -p "$BURST_LANE_REMOTE_ROOT"
+reap_old_out="$("$BL" reap 2>&1)"
+expect "parityr: reap removes the old-root leftover" "[ ! -d \"$BURST_LANE_OLD_ROOT_REMOTE_ROOT/leftover-abc12345\" ]"
+expect "parityr: reap journals the old-root removal tagged with its root" \
+  "grep -qF \"reap  ok  (dir=leftover-abc12345 root=$BURST_LANE_OLD_ROOT_REMOTE_ROOT\" \"$BURST_LANE_JOURNAL\""
+expect "parityr: reap's own summary counts the old-root dir too" "grep -qE '^reaped_dirs=[1-9]' <<<\"$reap_old_out\""
+
+# ---- parityr AC1/AC2: nextest is the primary capture path on both sides;
+# every result line is attributed by the binary name IT carries (never by
+# position), so a comparison stays correct even when box and local list
+# their suites in completely different orders — the exact misattribution
+# class this PRD closes (see problem statement: a 0.01s suite's line landing
+# out of order got attributed to the wrong neighbor, or dropped). Also
+# covers requirement 2's raw-log receipts.
+fresh_env
+export FAKE_SSH_NEXTEST_PRESENT=1
+export BURST_LANE_FORCE_NEXTEST_LOCAL=1
+"$BL" up >/dev/null
+WT_PR1="$T/parityr-repo"; mkdir -p "$WT_PR1"
+( cd "$WT_PR1" && git init -q && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init )
+FAKEBIN_PR1="$T/fakebin-parityr"; mkdir -p "$FAKEBIN_PR1"
+cat > "$FAKEBIN_PR1/cargo" <<'CARGOEOF'
+#!/usr/bin/env bash
+if [ "${1:-}" = "nextest" ]; then
+  shift
+  sub="${1:-}"; shift || true
+  case "$PWD" in
+    "$BURST_LANE_REMOTE_ROOT"/*) side=box ;;
+    *) side=local ;;
+  esac
+  filt=""
+  for a in "$@"; do
+    case "$a" in
+      binary_id\(*\)) filt="${a#binary_id(}"; filt="${filt%)}" ;;
+    esac
+  done
+  if [ "$sub" = "list" ]; then
+    echo '{"rust-suites": {"parity::other": {}, "parity::fast": {}, "parity::slow": {}}}'
+    exit 0
+  fi
+  if [ "$sub" = "run" ]; then
+    if [ -n "$filt" ]; then
+      echo "fake-cargo(parityr): unexpected single-suite rerun for $filt" >&2
+      exit 1
+    fi
+    if [ "$side" = "box" ]; then
+      # box order: other(FAIL), fast(PASS), slow(PASS) — deliberately NOT
+      # the same order local emits below.
+      cat <<'LOG'
+        FAIL [   0.050s] (1/3) parity::other test_o
+        PASS [   0.001s] (2/3) parity::fast test_f
+        PASS [   0.030s] (3/3) parity::slow test_s
+LOG
+    else
+      # local order: slow, fast, other — other now PASSES (the one real
+      # diff); fast/slow match the box despite the reordering.
+      cat <<'LOG'
+        PASS [   0.030s] (1/3) parity::slow test_s
+        PASS [   0.001s] (2/3) parity::fast test_f
+        PASS [   0.049s] (3/3) parity::other test_o
+LOG
+    fi
+    exit 0
+  fi
+fi
+echo "fake-cargo(parityr): unhandled args: $*" >&2
+exit 1
+CARGOEOF
+chmod +x "$FAKEBIN_PR1/cargo"
+pr1_out="$(PATH="$FAKEBIN_PR1:$PATH" "$BL" parity "$WT_PR1" 2>&1)"; pr1_rc=$?
+pr1_parity_file="$WT_PR1/target/autobuilder/receipts/box-parity.json"
+expect "parityr AC1: parity exits 0" "[ $pr1_rc -eq 0 ]"
+expect "parityr AC1: both sides captured via nextest" \
+  "grep -q '\"box_capture\": \"nextest\"' \"$pr1_parity_file\" && grep -q '\"local_capture\": \"nextest\"' \"$pr1_parity_file\""
+expect "parityr AC1: exactly one true diff (parity::other), despite box/local listing suites in different order" \
+  "grep -q 'diff=1' <<<\"$pr1_out\""
+pr1_json_rc=0
+python3 -c "
+import json
+d = json.load(open('$pr1_parity_file'))
+assert d['diff'] == ['parity::other'], d['diff']
+assert d['suites']['parity::fast'] == {'box': 'ok', 'local': 'ok'}, d['suites']['parity::fast']
+assert d['suites']['parity::slow'] == {'box': 'ok', 'local': 'ok'}, d['suites']['parity::slow']
+assert d['suites']['parity::other'] == {'box': 'FAILED', 'local': 'ok'}, d['suites']['parity::other']
+" || pr1_json_rc=1
+expect "parityr AC1: fast/slow attributed ok/ok, other attributed FAILED/ok — never misattributed by line order" \
+  "[ $pr1_json_rc -eq 0 ]"
+expect "parityr AC2: receipts/parity-box.log exists and is non-empty" "[ -s \"$WT_PR1/target/autobuilder/receipts/parity-box.log\" ]"
+expect "parityr AC2: receipts/parity-local.log exists and is non-empty" "[ -s \"$WT_PR1/target/autobuilder/receipts/parity-local.log\" ]"
+expect "parityr AC2: box-parity.json names both raw-log receipt paths" \
+  "grep -q 'parity-box.log' \"$pr1_parity_file\" && grep -q 'parity-local.log' \"$pr1_parity_file\""
+
+# ---- parityr AC3: a "no-output" suite (nextest's list enumerated it, but
+# zero PASS/FAIL lines for it showed up in the run log — e.g. a silent
+# crash) is re-run ALONE on that side exactly once; if the rerun reports,
+# that result is used instead of a permanent false diff.
+fresh_env
+export FAKE_SSH_NEXTEST_PRESENT=1
+export BURST_LANE_FORCE_NEXTEST_LOCAL=1
+"$BL" up >/dev/null
+WT_PR3="$T/parityr-rerun-repo"; mkdir -p "$WT_PR3"
+( cd "$WT_PR3" && git init -q && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init )
+FAKEBIN_PR3="$T/fakebin-parityr-rerun"; mkdir -p "$FAKEBIN_PR3"
+export PARITYR_RERUN_MARK="$T/pr3-box-rerun-count"
+cat > "$FAKEBIN_PR3/cargo" <<'CARGOEOF'
+#!/usr/bin/env bash
+if [ "${1:-}" = "nextest" ]; then
+  shift
+  sub="${1:-}"; shift || true
+  case "$PWD" in
+    "$BURST_LANE_REMOTE_ROOT"/*) side=box ;;
+    *) side=local ;;
+  esac
+  filt=""
+  for a in "$@"; do
+    case "$a" in
+      binary_id\(*\)) filt="${a#binary_id(}"; filt="${filt%)}" ;;
+    esac
+  done
+  if [ "$sub" = "list" ]; then
+    echo '{"rust-suites": {"parity": {}, "parity::flaky": {}}}'
+    exit 0
+  fi
+  if [ "$sub" = "run" ]; then
+    if [ -n "$filt" ]; then
+      if [ "$side" = "box" ] && [ "$filt" = "parity::flaky" ]; then
+        echo "1" >> "$PARITYR_RERUN_MARK"
+        echo "        PASS [   0.002s] (1/1) parity::flaky test_flaky"
+        exit 0
+      fi
+      echo "        PASS [   0.002s] (1/1) $filt test_x"
+      exit 0
+    fi
+    if [ "$side" = "box" ]; then
+      # parity::flaky prints NOTHING here — simulated silent crash, zero
+      # output lines for a suite nextest's own list still enumerated.
+      echo "        PASS [   0.001s] (1/2) parity tests::test_a"
+    else
+      echo "        PASS [   0.001s] (1/2) parity tests::test_a"
+      echo "        PASS [   0.002s] (2/2) parity::flaky test_flaky"
+    fi
+    exit 0
+  fi
+fi
+echo "fake-cargo(parityr-rerun): unhandled args: $*" >&2
+exit 1
+CARGOEOF
+chmod +x "$FAKEBIN_PR3/cargo"
+pr3_out="$(PATH="$FAKEBIN_PR3:$PATH" "$BL" parity "$WT_PR3" 2>&1)"; pr3_rc=$?
+pr3_parity_file="$WT_PR3/target/autobuilder/receipts/box-parity.json"
+expect "parityr AC3: parity exits 0" "[ $pr3_rc -eq 0 ]"
+expect "parityr AC3: exactly one rerun journaled for the no-output suite (box side)" \
+  "[ \"\$(grep -c 'burst-lane  parity  rerun  (suite=parity::flaky side=box)' \"$BURST_LANE_JOURNAL\")\" = 1 ]"
+expect "parityr AC3: the rerun actually executed exactly once" \
+  "[ \"\$(wc -l < \"$PARITYR_RERUN_MARK\" 2>/dev/null || echo 0)\" -eq 1 ]"
+expect "parityr AC3: after the rerun reports, diff=0 (the recovered result is used, not left as a false diff)" \
+  "grep -q 'diff=0' <<<\"$pr3_out\""
+pr3_json_rc=0
+python3 -c "
+import json
+d = json.load(open('$pr3_parity_file'))
+assert d['suites']['parity::flaky'] == {'box': 'ok', 'local': 'ok'}, d['suites']['parity::flaky']
+" || pr3_json_rc=1
+expect "parityr AC3: box-parity.json shows the recovered suite as ok/ok, not no-output" "[ $pr3_json_rc -eq 0 ]"
+
+# ---- parityr AC6 (P1): this fixture set exits 0 and names the parityr
+# cases — an explicit, in-band assertion of the requirement's own selftest
+# check, matching every sibling AC's "does the suite name its own cases"
+# convention (see burstuser AC7 just below).
+expect "parityr AC6: every parityr case above ran green" "[ $fail -eq 0 ]"
 
 # ---- burstuser AC7: the fixture set (this file) exits 0 and names the
 # burstuser cases — checked here as an explicit, in-band assertion (rather

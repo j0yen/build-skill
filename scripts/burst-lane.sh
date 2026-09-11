@@ -313,6 +313,14 @@ load_env
 ROOT_RUSTUP_HOME="${BURST_LANE_ROOT_RUSTUP_HOME:-/root/.rustup}"
 ROOT_CARGO_HOME="${BURST_LANE_ROOT_CARGO_HOME:-/root/.cargo}"
 
+# PRD-build-burst-parity-robust requirement 1: the CARGO_TARGET_*_RUNNER env
+# var name for the box's host triple — the `cargo test` fallback path (used
+# only when cargo-nextest is absent on a side) wraps every test binary in
+# `stdbuf -o0` through this, since `--test-threads=1` alone does not fix
+# stdout/stderr inter-stream reordering by itself (see Technical
+# considerations). Overridable for a box whose triple differs.
+CARGO_TEST_RUNNER_TARGET_ENV="${BURST_LANE_CARGO_TEST_RUNNER_TARGET_ENV:-CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER}"
+
 # ---- remote paths (PRD-build-burst-unprivileged-user requirement 1) -------
 # Computed only now that $REMOTE_USER is resolved. root keeps its historical
 # /root-rooted defaults exactly (the documented rollback restores today's
@@ -335,6 +343,14 @@ else
   REMOTE_SCCACHE_DIR_DEFAULT="$REMOTE_HOME/.cache/sccache"
 fi
 REMOTE_ROOT="${BURST_LANE_REMOTE_ROOT:-$REMOTE_HOME/build}"
+# PRD-build-burst-parity-robust requirement 4: the FIXED historical root a
+# pre-unprivileged-user (or rolled-back) session always used, independent of
+# whatever $REMOTE_ROOT resolves to today — this is where `reap` looks for
+# migration residue the direct verified-copy-then-remove step in
+# migrate_remote_user() didn't (or couldn't) clear. Equal to $REMOTE_ROOT
+# itself under the REMOTE_USER=root rollback, in which case the old-root scan
+# is a deliberate no-op (nothing "old" to distinguish).
+OLD_ROOT_REMOTE_ROOT="${BURST_LANE_OLD_ROOT_REMOTE_ROOT:-/root/build}"
 GATE_TOOLS_REMOTE_BIN_DIR="${BURST_LANE_GATE_TOOLS_REMOTE_BIN_DIR:-$GATE_TOOLS_REMOTE_BIN_DIR_DEFAULT}"
 # PRD-build-gate-on-casper requirement 4 / PRD-build-burst-unprivileged-user
 # requirement 5: reviewer credential placement, now under $REMOTE_HOME.
@@ -976,6 +992,18 @@ cmd_verify() {
 # worktree whose copy fails goes cold (marker cleared) rather than blocking
 # migration — the next run/pull just re-syncs it fresh, exactly like a
 # worktree's first-ever run would.
+# `du -sb`+`find | wc -l` of a remote path, as root (the only identity that
+# can read both the old root-owned tree and, post-migration, the new
+# build-owned one) — a single ssh round trip returning "bytes\tcount",
+# "0\t0" for a path that doesn't exist. PRD-build-burst-parity-robust
+# requirement 4's verified-copy check.
+remote_dir_stats() {  # $1=ip $2=path -> stdout "bytes\tcount"
+  local ip="$1" path="$2" out
+  out="$("$SSH_BIN" -o StrictHostKeyChecking=no -o ConnectTimeout=8 -i "$SSH_KEY" "root@$ip" \
+    "if [ -d '$path' ]; then b=\$(du -sb '$path' 2>/dev/null | cut -f1); c=\$(find '$path' 2>/dev/null | wc -l); printf '%s\t%s\n' \"\${b:-0}\" \"\${c:-0}\"; else printf '0\t0\n'; fi" 2>/dev/null)"
+  [ -n "$out" ] && printf '%s\n' "$out" || printf '0\t0\n'
+}
+
 migrate_remote_user() {  # $1=ip $2=prior_user
   local ip="$1" prior_user="$2"
   create_remote_user "$ip"
@@ -1010,6 +1038,27 @@ except Exception:
          "mkdir -p '$new_remote_path' && cp -a '$old_remote_path/.' '$new_remote_path/' 2>/dev/null; rc=\$?; chown -R '$REMOTE_USER:$REMOTE_USER' '$new_remote_path' 2>/dev/null || true; exit \$rc" >/dev/null 2>&1; then
       mark_dirty "$wt" "$(state_read server_id)" "$new_remote_path" "$kind"
       journal_line "$(now_iso)  burst-lane  provision  migrated  (worktree=$wt from=$old_remote_path to=$new_remote_path)"
+
+      # PRD-build-burst-parity-robust requirement 4: the copy landing is not
+      # enough on its own to delete the source — verify size AND file count
+      # match before removing it, so a partial/corrupt copy never loses data;
+      # a mismatch keeps the old directory around (residue over data loss)
+      # and says why, rather than silently leaving it forever unexplained.
+      local old_stats new_stats old_bytes old_count new_bytes new_count
+      old_stats="$(remote_dir_stats "$ip" "$old_remote_path")"
+      new_stats="$(remote_dir_stats "$ip" "$new_remote_path")"
+      old_bytes="$(cut -f1 <<<"$old_stats")"; old_count="$(cut -f2 <<<"$old_stats")"
+      new_bytes="$(cut -f1 <<<"$new_stats")"; new_count="$(cut -f2 <<<"$new_stats")"
+      if [ "$old_bytes" = "$new_bytes" ] && [ "$old_count" = "$new_count" ]; then
+        if "$SSH_BIN" -o StrictHostKeyChecking=no -o ConnectTimeout=8 -i "$SSH_KEY" "root@$ip" \
+             "rm -rf '$old_remote_path'" >/dev/null 2>&1; then
+          journal_line "$(now_iso)  burst-lane  provision  migrated-removed  (from=$old_remote_path)"
+        else
+          journal_line "$(now_iso)  burst-lane  provision  migrate-keep  (cause=remove-failed from=$old_remote_path)"
+        fi
+      else
+        journal_line "$(now_iso)  burst-lane  provision  migrate-keep  (cause=copy-mismatch from=$old_remote_path old_bytes=$old_bytes new_bytes=$new_bytes old_count=$old_count new_count=$new_count)"
+      fi
     else
       clear_dirty "$wt"
       journal_line "$(now_iso)  burst-lane  provision  migrate-cold  (worktree=$wt cause=copy-failed old=$old_remote_path new=$new_remote_path)"
@@ -1897,6 +1946,136 @@ print(json.dumps(suites))
 '
 }
 
+# ---- nextest-based parity (PRD-build-burst-parity-robust requirement 1) ----
+# cargo-nextest is already provisioned on the box (GATE_TOOLS_LIST) and
+# RedBaron has it locally, so this is the PRIMARY capture path; the
+# `cargo_test_suites_json` parser above stays as the fallback used only when
+# a side lacks cargo-nextest (Migration/compatibility: rollback is the
+# previous parser).
+#
+# nextest's human run output is one line per test:
+#   PASS [   0.003s] (1/3) <binary-id> <test-name>
+# (the "(n/m)" progress counter is present under a tty/default profile and
+# absent under some profiles — treated as optional). Unlike the Running/
+# result pairing cargo_test_suites_json depends on, EVERY line carries its
+# own binary-id — there is no "current suite" state to lose track of, so a
+# suite that finishes in 0.00s and prints before, after, or interleaved with
+# any other binary's lines is never misattributed (requirement 1's actual
+# fix, not merely a symptom patch on top of the old parser).
+cargo_nextest_suites_json() {  # stdin=log -> stdout JSON object {binary_id: "ok"|"FAILED"}
+  python3 -c '
+import json, re, sys
+line_re = re.compile(r"^\s*(PASS|FAIL|TIMEOUT|LEAK|ABORT)\s+\[\s*[0-9.]+s\]\s+(?:\(\d+/\d+\)\s+)?(\S+)\s+\S")
+suites = {}
+for line in sys.stdin:
+    m = line_re.match(line)
+    if not m:
+        continue
+    status, binary = m.group(1), m.group(2)
+    st = "ok" if status == "PASS" else "FAILED"
+    # Once FAILED, stays FAILED regardless of what order any other line for
+    # the same binary-id shows up in (--no-fail-fast runs every test in a
+    # binary even after one fails).
+    if suites.get(binary) != "FAILED":
+        suites[binary] = st
+print(json.dumps(suites))
+'
+}
+
+# `cargo nextest list --workspace --message-format json`'s "rust-suites" keys
+# ARE the binary-ids cargo_nextest_suites_json() attributes result lines to —
+# this is the suite SET a run should have produced a result for. Used to seed
+# every listed name as "no-output" before the run-parsed results overwrite
+# whichever ones actually printed a line, so a suite with zero result lines
+# (crashed silently, filtered to zero tests, etc.) reads as the named state
+# "no-output" rather than being silently absent from the suites map.
+cargo_nextest_list_names() {  # stdin=list --message-format json -> stdout one binary-id per line
+  python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+for k in sorted(d.get("rust-suites", {}) or {}):
+    print(k)
+'
+}
+
+nextest_merge_suites() {  # $1=names(newline-separated) $2=results_json -> stdout JSON object
+  python3 -c '
+import json, sys
+names = [n for n in sys.argv[1].split("\n") if n]
+results = json.loads(sys.argv[2]) if sys.argv[2] else {}
+out = {n: results.get(n, "no-output") for n in names}
+# A result for a binary the list call did not enumerate (list/run skew,
+# e.g. a binary that only appears once built) is still recorded rather than
+# silently dropped.
+for k, v in results.items():
+    out.setdefault(k, v)
+print(json.dumps(out))
+' "$1" "$2"
+}
+
+# BURST_LANE_FORCE_NEXTEST_LOCAL ("0"/"1") is a selftest-only override —
+# unlike the box side (fully mediated through the fake ssh fixture, which
+# already answers "command -v cargo-nextest" deterministically), this local
+# check is a plain shell builtin against whatever REALLY happens to be on
+# this machine's $PATH. RedBaron genuinely has cargo-nextest in ~/.cargo/bin
+# (production's intended primary path), so an offline selftest that doesn't
+# opt into exercising the nextest path needs a way to force the pre-nextest
+# cargo-test fallback deterministically rather than silently depending on
+# whatever happens to be installed on whichever machine runs the suite.
+nextest_present_local() {
+  case "${BURST_LANE_FORCE_NEXTEST_LOCAL:-}" in
+    1) return 0 ;;
+    0) return 1 ;;
+  esac
+  command -v cargo-nextest >/dev/null 2>&1
+}
+
+# ---- nextest no-output rerun (PRD-build-burst-parity-robust requirement 3) -
+# A "no-output" suite (nextest's list enumerated it, but zero PASS/FAIL lines
+# for it showed up in the run log) is re-run ALONE — `-E 'binary_id(<name>)'`
+# is nextest's own filterset syntax for exactly one binary — once per side,
+# before comparison. Small, focused helpers so cmd_parity's box/local
+# branches stay symmetric instead of duplicating the parse-and-extract logic.
+nextest_rerun_result_local() {  # $1=repo $2=suite_name -> stdout "ok"|"FAILED"|"no-output"
+  local repo="$1" name="$2" log
+  log="$(cd "$repo" && cargo nextest run --workspace --no-fail-fast -E "binary_id($name)" 2>&1)"
+  printf '%s\n' "$log" | cargo_nextest_suites_json | python3 -c '
+import json, sys
+d = json.loads(sys.stdin.read())
+print(d.get(sys.argv[1], "no-output"))
+' "$name"
+}
+
+nextest_rerun_result_box() {  # $1=ip $2=remote_env_prefix $3=suite_name -> stdout result
+  local ip="$1" prefix="$2" name="$3" log
+  log="$("$SSH_BIN" -o StrictHostKeyChecking=no -i "$SSH_KEY" "$REMOTE_USER@$ip" \
+    "$prefix; cargo nextest run --workspace --no-fail-fast -E \"binary_id($name)\"" 2>&1)"
+  printf '%s\n' "$log" | cargo_nextest_suites_json | python3 -c '
+import json, sys
+d = json.loads(sys.stdin.read())
+print(d.get(sys.argv[1], "no-output"))
+' "$name"
+}
+
+json_set_str() {  # $1=json $2=key $3=value -> stdout updated json
+  python3 -c '
+import json, sys
+d = json.loads(sys.argv[1]); d[sys.argv[2]] = sys.argv[3]; print(json.dumps(d))
+' "$1" "$2" "$3"
+}
+
+json_names_with_value() {  # $1=json $2=value -> stdout one matching key per line
+  python3 -c '
+import json, sys
+d = json.loads(sys.argv[1])
+print("\n".join(sorted(k for k, v in d.items() if v == sys.argv[2])))
+' "$1" "$2"
+}
+
+# ---- parity (PRD-build-gate-on-casper requirement 2) ------------------------
 cmd_parity() {
   local repo="${1:-}"
   [ -n "$repo" ] && [ -d "$repo" ] || { echo "usage: burst-lane.sh parity <repo>" >&2; exit 2; }
@@ -1939,45 +2118,128 @@ cmd_parity() {
   # `checkcompat_ac02_ac03` failed under — mcphost's own root-guard makes
   # $REMOTE_USER=root an invalid identity to run its integration suite
   # under, hence build (RUSTUP_HOME/CARGO_HOME per requirement 2).
-  local box_log; box_log="$("$SSH_BIN" -o StrictHostKeyChecking=no -i "$SSH_KEY" "$REMOTE_USER@$ip" \
-    "cd $remote_path && export PATH=$GATE_TOOLS_REMOTE_BIN_DIR:\$PATH:$ROOT_CARGO_HOME/bin:/root/.local/bin RUSTUP_HOME=$ROOT_RUSTUP_HOME CARGO_HOME=$ROOT_CARGO_HOME CARGO_TARGET_DIR=$remote_path/target; cargo test --workspace --no-fail-fast" 2>&1)"
-  flock -u 206
-  local box_suites; box_suites="$(printf '%s\n' "$box_log" | cargo_test_suites_json)"
+  local remote_env_prefix="cd $remote_path && export PATH=$GATE_TOOLS_REMOTE_BIN_DIR:\$PATH:$ROOT_CARGO_HOME/bin:/root/.local/bin RUSTUP_HOME=$ROOT_RUSTUP_HOME CARGO_HOME=$ROOT_CARGO_HOME CARGO_TARGET_DIR=$remote_path/target"
 
-  local local_log_file="$repo/target/autobuilder/test-output.txt" local_log
-  if [ -f "$local_log_file" ]; then
-    local_log="$(cat "$local_log_file")"
-  else
-    mkdir -p "$(dirname "$local_log_file")" 2>/dev/null || true
-    local_log="$(cd "$repo" && cargo test --workspace --no-fail-fast 2>&1)"
-    printf '%s\n' "$local_log" > "$local_log_file"
+  # PRD-build-burst-parity-robust requirement 1: cargo-nextest is the
+  # PRIMARY capture on both sides (already provisioned on the box via
+  # GATE_TOOLS_LIST; RedBaron has it locally) — every result line carries
+  # its own binary name, so attribution never depends on stream-interleave
+  # ordering the way the old Running/result pairing did. A side lacking
+  # cargo-nextest falls back to `cargo test` (the previous parser, kept
+  # verbatim as the rollback path).
+  local box_capture="cargo-test"
+  if "$SSH_BIN" -o StrictHostKeyChecking=no -i "$SSH_KEY" "$REMOTE_USER@$ip" \
+       "$remote_env_prefix; command -v cargo-nextest" >/dev/null 2>&1; then
+    box_capture="nextest"
   fi
-  local local_suites; local_suites="$(printf '%s\n' "$local_log" | cargo_test_suites_json)"
+  local box_log box_suites
+  if [ "$box_capture" = "nextest" ]; then
+    box_log="$("$SSH_BIN" -o StrictHostKeyChecking=no -i "$SSH_KEY" "$REMOTE_USER@$ip" \
+      "$remote_env_prefix; cargo nextest run --workspace --no-fail-fast" 2>&1)"
+    local box_list_json; box_list_json="$("$SSH_BIN" -o StrictHostKeyChecking=no -i "$SSH_KEY" "$REMOTE_USER@$ip" \
+      "$remote_env_prefix; cargo nextest list --workspace --message-format json" 2>/dev/null)"
+    local box_names; box_names="$(printf '%s' "$box_list_json" | cargo_nextest_list_names)"
+    local box_results; box_results="$(printf '%s\n' "$box_log" | cargo_nextest_suites_json)"
+    box_suites="$(nextest_merge_suites "$box_names" "$box_results")"
+  else
+    journal_line "$(now_iso)  burst-lane  parity  capture=cargo-test  (side=box repo=$repo)"
+    box_log="$("$SSH_BIN" -o StrictHostKeyChecking=no -i "$SSH_KEY" "$REMOTE_USER@$ip" \
+      "$remote_env_prefix $CARGO_TEST_RUNNER_TARGET_ENV='stdbuf -o0'; cargo test --workspace --no-fail-fast -- --test-threads=1" 2>&1)"
+    box_suites="$(printf '%s\n' "$box_log" | cargo_test_suites_json)"
+  fi
+  flock -u 206
 
-  # PRD-build-burst-gate-tools-toolchain requirement 4: a suite the box
-  # actually ran but the cached local baseline simply never had (a stale
-  # test-output.txt predating that suite, or one that was never run here
-  # before) is "baseline-incomplete", not a diff — refresh the local
-  # baseline ONCE and recompare, rather than reporting a false diff
-  # against a null. Evidence: 2026-09-11 01:36Z, the first parity on
-  # 3b1fdbc reported diff=1 for a suite the stale local output simply
-  # lacked; the operator had to refresh the local suite by hand to clear
-  # it. This makes that refresh automatic.
-  local missing_locally; missing_locally="$(python3 -c '
+  local local_log_file="$repo/target/autobuilder/test-output.txt" local_log local_suites local_capture="cargo-test"
+  if nextest_present_local; then
+    local_capture="nextest"
+    local_log="$(cd "$repo" && cargo nextest run --workspace --no-fail-fast 2>&1)"
+    local local_list_json; local_list_json="$(cd "$repo" && cargo nextest list --workspace --message-format json 2>/dev/null)"
+    local local_names; local_names="$(printf '%s' "$local_list_json" | cargo_nextest_list_names)"
+    local local_results; local_results="$(printf '%s\n' "$local_log" | cargo_nextest_suites_json)"
+    local_suites="$(nextest_merge_suites "$local_names" "$local_results")"
+  else
+    journal_line "$(now_iso)  burst-lane  parity  capture=cargo-test  (side=local repo=$repo)"
+    if [ -f "$local_log_file" ]; then
+      local_log="$(cat "$local_log_file")"
+    else
+      mkdir -p "$(dirname "$local_log_file")" 2>/dev/null || true
+      local_log="$(cd "$repo" && env "$CARGO_TEST_RUNNER_TARGET_ENV=stdbuf -o0" cargo test --workspace --no-fail-fast -- --test-threads=1 2>&1)"
+      printf '%s\n' "$local_log" > "$local_log_file"
+    fi
+    local_suites="$(printf '%s\n' "$local_log" | cargo_test_suites_json)"
+
+    # PRD-build-burst-gate-tools-toolchain requirement 4 (cargo-test fallback
+    # only — nextest's own list-derived "no-output" state above already
+    # covers "box ran a suite this side never baselined" without a special
+    # case): a suite the box actually ran but the cached local baseline
+    # simply never had (a stale test-output.txt predating that suite, or one
+    # that was never run here before) is "baseline-incomplete", not a diff —
+    # refresh the local baseline ONCE and recompare, rather than reporting a
+    # false diff against a null. Evidence: 2026-09-11 01:36Z, the first
+    # parity on 3b1fdbc reported diff=1 for a suite the stale local output
+    # simply lacked; the operator had to refresh the local suite by hand to
+    # clear it. This makes that refresh automatic.
+    local missing_locally; missing_locally="$(python3 -c '
 import json, sys
 box = json.loads(sys.argv[1])
 local = json.loads(sys.argv[2])
 print(",".join(sorted(n for n in box if n not in local)))
 ' "$box_suites" "$local_suites")"
-  if [ -n "$missing_locally" ]; then
-    local_log="$(cd "$repo" && cargo test --workspace --no-fail-fast 2>&1)"
-    printf '%s\n' "$local_log" > "$local_log_file"
-    local_suites="$(printf '%s\n' "$local_log" | cargo_test_suites_json)"
-    journal_line "$(now_iso)  burst-lane  parity  baseline-refreshed  (repo=$repo names=$missing_locally)"
+    if [ -n "$missing_locally" ]; then
+      local_log="$(cd "$repo" && env "$CARGO_TEST_RUNNER_TARGET_ENV=stdbuf -o0" cargo test --workspace --no-fail-fast -- --test-threads=1 2>&1)"
+      printf '%s\n' "$local_log" > "$local_log_file"
+      local_suites="$(printf '%s\n' "$local_log" | cargo_test_suites_json)"
+      journal_line "$(now_iso)  burst-lane  parity  baseline-refreshed  (repo=$repo names=$missing_locally)"
+    fi
+  fi
+
+  if [ "$box_capture" != "$local_capture" ]; then
+    journal_line "$(now_iso)  burst-lane  parity  capture-mismatch  (repo=$repo box=$box_capture local=$local_capture)"
+  fi
+
+  # PRD-build-burst-parity-robust requirement 3: a "no-output" suite is
+  # re-run alone on that side once before comparison; if it then reports, the
+  # rerun result is used and journaled. A suite still "no-output" after this
+  # single rerun is left as-is — the diff computation below already treats
+  # any b != l (including two "no-output"s that happen to differ, or one
+  # side no-output against the other's ok/FAILED) as an ordinary diff, so a
+  # second no-output naturally counts without a separate special case.
+  if [ "$box_capture" = "nextest" ]; then
+    local name
+    while IFS= read -r name; do
+      [ -n "$name" ] || continue
+      exec 206>"$(wt_lock_file "$repo")"
+      flock 206
+      local rr; rr="$(nextest_rerun_result_box "$ip" "$remote_env_prefix" "$name")"
+      flock -u 206
+      if [ "$rr" != "no-output" ]; then
+        box_suites="$(json_set_str "$box_suites" "$name" "$rr")"
+        journal_line "$(now_iso)  burst-lane  parity  rerun  (suite=$name side=box)"
+      fi
+    done <<<"$(json_names_with_value "$box_suites" no-output)"
+  fi
+  if [ "$local_capture" = "nextest" ]; then
+    local name
+    while IFS= read -r name; do
+      [ -n "$name" ] || continue
+      local rr; rr="$(nextest_rerun_result_local "$repo" "$name")"
+      if [ "$rr" != "no-output" ]; then
+        local_suites="$(json_set_str "$local_suites" "$name" "$rr")"
+        journal_line "$(now_iso)  burst-lane  parity  rerun  (suite=$name side=local)"
+      fi
+    done <<<"$(json_names_with_value "$local_suites" no-output)"
   fi
 
   mkdir -p "$repo/target/autobuilder/receipts" 2>/dev/null || true
   local parity_file="$repo/target/autobuilder/receipts/box-parity.json"
+  # PRD-build-burst-parity-robust requirement 2: the raw box and local logs
+  # of THIS run, kept beside box-parity.json — a parity diff is diagnosable
+  # from one read of these instead of a live reproduction on the box (the
+  # 456s round trip the PRD's problem statement measured by hand).
+  local box_log_receipt="$repo/target/autobuilder/receipts/parity-box.log"
+  local local_log_receipt="$repo/target/autobuilder/receipts/parity-local.log"
+  printf '%s\n' "$box_log" > "$box_log_receipt"
+  printf '%s\n' "$local_log" > "$local_log_receipt"
   local diff_json status_word
   diff_json="$(python3 -c '
 import json, sys
@@ -2002,9 +2264,13 @@ print(json.dumps({"suites": suites, "diff": diff}))
   python3 -c '
 import json, sys
 d = json.loads(sys.argv[1])
-out = {"head_sha": sys.argv[2], "box_host": sys.argv[3], "suites": d["suites"], "diff": d["diff"]}
+out = {
+    "head_sha": sys.argv[2], "box_host": sys.argv[3], "suites": d["suites"], "diff": d["diff"],
+    "box_log": sys.argv[5], "local_log": sys.argv[6],
+    "box_capture": sys.argv[7], "local_capture": sys.argv[8],
+}
 json.dump(out, open(sys.argv[4], "w"), indent=2)
-' "$diff_json" "$head_sha" "$ip" "$parity_file"
+' "$diff_json" "$head_sha" "$ip" "$parity_file" "$box_log_receipt" "$local_log_receipt" "$box_capture" "$local_capture"
 
   local diff_count; diff_count="$(python3 -c 'import json,sys; print(len(json.loads(sys.argv[1])["diff"]))' "$diff_json")"
   if [ "$diff_count" -eq 0 ]; then status_word="ok"; else status_word="diff"; fi
@@ -2518,6 +2784,71 @@ for raw in sys.stdin:
 ' "$REAP_KEEP" "$(reap_candidate_roots)" "$DIRTY_DIR" "$ATTR_LEDGER"
 }
 
+# ---- old-root reap (PRD-build-burst-parity-robust requirement 4) ----------
+# migrate_remote_user()'s verified-copy-then-remove step above is the
+# PRIMARY fix for migration residue; this is the backstop for whatever it
+# left standing — a copy-mismatch migrate-keep, a leftover from before this
+# fix shipped, or a `reap` that ran before a migration's copy had landed.
+# Deliberately simpler than reap_plan()'s dirty/live/orphan classification:
+# that classification exists to protect a directory whose LOCAL worktree
+# might still need it, which is the right question for $REMOTE_ROOT (new
+# work lands there every day) but the wrong one for $OLD_ROOT_REMOTE_ROOT —
+# once REMOTE_USER != root, remote_path_for() never resolves a fresh path
+# under the old root again, so anything still sitting there is presumptively
+# residue regardless of whether its worktree is alive elsewhere. Only the
+# gate-inflight and wt-lock busy checks (the same ones reap_orphans applies)
+# still gate removal.
+reap_old_root() {
+  local reaped_dirs=0 reaped_bytes=0
+  if [ -z "$OLD_ROOT_REMOTE_ROOT" ] || [ "$OLD_ROOT_REMOTE_ROOT" = "$REMOTE_ROOT" ]; then
+    echo "reaped_dirs=0 reaped_bytes=0"; return 0
+  fi
+  state_active || { echo "reaped_dirs=0 reaped_bytes=0"; return 0; }
+  local ip; ip="$(state_read ip)"
+  local list_cmd="find '$OLD_ROOT_REMOTE_ROOT' -mindepth 1 -maxdepth 1 -not -name '.*' -printf '%f\n' 2>/dev/null"
+  local list_out; list_out="$("$SSH_BIN" -o StrictHostKeyChecking=no -o ConnectTimeout=8 -i "$SSH_KEY" \
+      "root@$ip" "$list_cmd" 2>/dev/null)"
+  if [ -z "$list_out" ]; then
+    echo "reaped_dirs=0 reaped_bytes=0"; return 0
+  fi
+
+  mkdir -p "$GATE_INFLIGHT_DIR" 2>/dev/null || true
+  local inflight_names="" im_marker im_repo
+  for im_marker in "$GATE_INFLIGHT_DIR"/*.json; do
+    [ -f "$im_marker" ] || continue
+    im_repo="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("repo",""))' "$im_marker" 2>/dev/null)"
+    [ -n "$im_repo" ] || continue
+    inflight_names="$inflight_names$(basename "$(remote_path_for "$im_repo")")"$'\n'
+  done
+
+  local name
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    if grep -qxF "$name" <<<"$inflight_names"; then
+      journal_line "$(now_iso)  burst-lane  reap  skip  (dir=$name root=$OLD_ROOT_REMOTE_ROOT reason=gate-inflight)"
+      continue
+    fi
+    if ! ( exec 208>"$(wt_lock_file "$OLD_ROOT_REMOTE_ROOT/$name")"; flock -n 208 ); then
+      journal_line "$(now_iso)  burst-lane  reap  skip  (dir=$name root=$OLD_ROOT_REMOTE_ROOT reason=busy)"
+      continue
+    fi
+    local bytes
+    bytes="$("$SSH_BIN" -o StrictHostKeyChecking=no -o ConnectTimeout=8 -i "$SSH_KEY" \
+        "root@$ip" "du -sb '$OLD_ROOT_REMOTE_ROOT/$name' 2>/dev/null | cut -f1" 2>/dev/null)"
+    bytes="${bytes:-0}"; case "$bytes" in ''|*[!0-9]*) bytes=0 ;; esac
+    if "$SSH_BIN" -o StrictHostKeyChecking=no -o ConnectTimeout=8 -i "$SSH_KEY" \
+         "root@$ip" "rm -rf '$OLD_ROOT_REMOTE_ROOT/$name'" 2>/dev/null; then
+      reaped_dirs=$((reaped_dirs + 1)); reaped_bytes=$((reaped_bytes + bytes))
+      journal_line "$(now_iso)  burst-lane  reap  ok  (dir=$name root=$OLD_ROOT_REMOTE_ROOT bytes=$bytes reason=old-root)"
+    else
+      journal_line "$(now_iso)  burst-lane  reap  fail  (dir=$name root=$OLD_ROOT_REMOTE_ROOT cause=rm-failed)"
+    fi
+  done <<<"$list_out"
+
+  echo "reaped_dirs=$reaped_dirs reaped_bytes=$reaped_bytes"
+  return 0
+}
+
 # Executes reap_plan()'s decisions against the live box: deletes each orphan
 # (skipping one whose worktree lock is currently held — a live run in
 # flight on a not-yet-dirty-marked worktree, requirement 5's other named
@@ -2525,12 +2856,28 @@ for raw in sys.stdin:
 # as plain "burst-lane reap <ok|skip|fail>" lines (same shape whether called
 # standalone or from down/watchdog below), never aborts on a single failure
 # (requirement 6). Always exits 0 to its caller — a reap trouble is
-# journaled, never fatal.
+# journaled, never fatal. Also sweeps $OLD_ROOT_REMOTE_ROOT (requirement 4 of
+# PRD-build-burst-parity-robust) so migration residue clears even when the
+# direct verified-copy-then-remove step in migrate_remote_user() couldn't.
+# Folds reap_old_root()'s own counts into $1/$2 (this call's REMOTE_ROOT
+# totals so far) and prints the combined "reaped_dirs=N reaped_bytes=N"
+# line — the single exit path every reap_orphans() return below funnels
+# through, so $OLD_ROOT_REMOTE_ROOT is swept EVERY time this runs
+# (PRD-build-burst-parity-robust requirement 4), not only on the one path
+# that happens to reach the bottom of the function.
+reap_finish() {  # $1=reaped_dirs $2=reaped_bytes -> stdout combined totals
+  local old_out old_dirs old_bytes
+  old_out="$(reap_old_root)"
+  old_dirs="$(sed -n 's/^reaped_dirs=\([0-9]*\).*/\1/p' <<<"$old_out")"
+  old_bytes="$(sed -n 's/.*reaped_bytes=\([0-9]*\)$/\1/p' <<<"$old_out")"
+  echo "reaped_dirs=$(( ${1:-0} + ${old_dirs:-0} )) reaped_bytes=$(( ${2:-0} + ${old_bytes:-0} ))"
+}
+
 reap_orphans() {
   local reaped_dirs=0 reaped_bytes=0
   mkdir -p "$DIRTY_DIR" "$STATE_DIR/locks" 2>/dev/null || true
   if ! state_active; then
-    echo "reaped_dirs=0 reaped_bytes=0"
+    reap_finish 0 0
     return 0
   fi
   local ip; ip="$(state_read ip)"
@@ -2543,11 +2890,11 @@ reap_orphans() {
       "$REMOTE_USER@$ip" "$list_cmd" 2>/dev/null)" || list_rc=$?
   if [ "$list_rc" -ne 0 ]; then
     journal_line "$(now_iso)  burst-lane  reap  fail  (cause=ssh rc=$list_rc)"
-    echo "reaped_dirs=0 reaped_bytes=0"
+    reap_finish 0 0
     return 0
   fi
   if [ -z "$list_out" ]; then
-    echo "reaped_dirs=0 reaped_bytes=0"
+    reap_finish 0 0
     return 0
   fi
 
@@ -2607,7 +2954,7 @@ reap_orphans() {
     esac
   done <<<"$plan"
 
-  echo "reaped_dirs=$reaped_dirs reaped_bytes=$reaped_bytes"
+  reap_finish "$reaped_dirs" "$reaped_bytes"
   return 0
 }
 
