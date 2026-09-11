@@ -63,6 +63,26 @@
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+
+# 2026-09-11 RedBaron-local policy (same gate as burst-lane-selftest.sh):
+# every AC below but AC3 fakes an active burst session via a real
+# `burst-lane.sh up` call against fully offline fixtures (fake hcloud/ssh,
+# tests/fixtures/burst-lane-fake) to exercise extend-gate.sh's cargo-route
+# attestation. `up`'s own burst_configured() gate (the money-critical fix
+# for the 2026-09-11 burst-idle-guard billing incident) now correctly
+# refuses that fixture's `up` call too, since the fixture env file never
+# declares BUILDER_IP/BUILDER_ID — it was never meant to simulate a real
+# opt-in. Gated here rather than working around the refusal, for the exact
+# reason lib/burst-configured.sh's header gives: a selftest must never
+# resurrect burst-lane coverage via a fake/simulated session while the real
+# lane is dormant policy, even to test something else (cargo routing).
+# shellcheck source=lib/burst-configured.sh
+source "$HERE/lib/burst-configured.sh"
+if ! burst_configured; then
+  echo "SKIP: burst lane dormant (RedBaron-local policy) — see burst-configured.sh"
+  exit 0
+fi
+
 EXTEND_GATE="$HERE/extend-gate.sh"
 FAKE="$HERE/../tests/fixtures/burst-lane-fake"
 [ -x "$EXTEND_GATE" ] || { echo "selftest: $EXTEND_GATE not executable" >&2; exit 2; }
