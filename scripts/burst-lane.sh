@@ -190,6 +190,18 @@ TICK_JOURNAL_DIR="${BURST_LANE_TICK_JOURNAL_DIR:-$HOME/brain/journal/build}"
 # so offline tests never touch the real ~/.cargo/bin or ~/.claude/skills.
 GATE_TOOLS_LIST="autobuilder jq gh mold cargo-deny cargo-nextest uv claude"
 GATE_TOOLS_STATE_FILE="$STATE_DIR/gate-tools.json"
+# PRD-build-burst-gate-tools-toolchain requirement 1: cargo-based installs
+# pin BOTH the toolchain and the crate version in one table, because the
+# box's default toolchain (rustc 1.85 as of 2026-09-11) is too old for
+# current cargo-deny/cargo-nextest releases — `cargo install --locked
+# cargo-deny` under 1.85 refuses with "cargo-deny 0.18.3 supports rustc
+# 1.85.0" (a version *floor*, not a match), and unpinned-latest
+# cargo-nextest 0.9.144 needs rustc 1.91, newer than even the 1.88 the box
+# already carries. `cargo +<newest-installed-toolchain> install` picks up
+# 1.88 without a snapshot rebuild; bump this table (not the install case
+# below) when the box's toolchain or these crates move.
+GATE_TOOLS_CARGO_DENY_VERSION="${BURST_LANE_GATE_TOOLS_CARGO_DENY_VERSION:-0.20.2}"
+GATE_TOOLS_CARGO_NEXTEST_VERSION="${BURST_LANE_GATE_TOOLS_CARGO_NEXTEST_VERSION:-0.9.114}"
 GATE_TOOLS_BUILD_SCRIPTS_SRC="${BURST_LANE_GATE_BUILD_SCRIPTS:-$HOME/.claude/skills/build/scripts}"
 GATE_TOOLS_RUSTBUILD_SCRIPTS_SRC="${BURST_LANE_GATE_RUSTBUILD_SCRIPTS:-$HOME/.claude/skills/rustbuild/scripts}"
 GATE_TOOLS_RUSTBUILD_PROMPTS_SRC="${BURST_LANE_GATE_RUSTBUILD_PROMPTS:-$HOME/.claude/skills/rustbuild/prompts}"
@@ -379,20 +391,45 @@ for t in $GATE_TOOLS_LIST; do
 done" 2>/dev/null
 }
 
+# Newest installed toolchain per `rustup toolchain list` (requirement 1) —
+# a shared snippet the cargo-deny/cargo-nextest cases below both splice in,
+# so there is exactly one place that decides how "newest" is picked. Falls
+# back to a bare `cargo install` (no `+toolchain`) when rustup isn't found
+# or lists nothing parseable, matching the pre-fix behavior rather than
+# hard-failing on a box that manages its toolchain differently.
+_gate_tools_cargo_toolchain_pick='tc="$(rustup toolchain list 2>/dev/null | grep -oE "[0-9]+\.[0-9]+\.[0-9]+" | sort -V | tail -n1)"'
+
 gate_tools_install_cmd() {  # $1=tool (never "autobuilder" — that's a push, see below) -> stdout: remote command
   local tool="$1"
   case "$tool" in
     jq)
-      printf '%s\napt-get update -qq && apt-get install -y -qq jq\n' "# gate-tools-install $tool" ;;
+      # apt-get update already ran once for this provision (see the
+      # apt-update snippet provision_gate_tools sends before this loop,
+      # requirement 3) — no need to repeat it per apt tool.
+      printf '%s\napt-get install -y -qq jq\n' "# gate-tools-install $tool" ;;
     gh)
+      # Adds its own apt source right before installing, so its second
+      # `apt-get update -qq` here is necessary (the shared pre-update ran
+      # before this source existed), not a duplicate of requirement 3.
       printf '%s\n%s\n' "# gate-tools-install $tool" \
         "(curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg -o /usr/share/keyrings/githubcli-archive-keyring.gpg && chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg && echo 'deb [arch=amd64 signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main' > /etc/apt/sources.list.d/github-cli.list && apt-get update -qq && apt-get install -y -qq gh)" ;;
     mold)
-      printf '%s\napt-get update -qq && apt-get install -y -qq mold\n' "# gate-tools-install $tool" ;;
+      printf '%s\napt-get install -y -qq mold\n' "# gate-tools-install $tool" ;;
     cargo-deny)
-      printf '%s\nexport PATH=/root/.cargo/bin:\$PATH; cargo install --locked cargo-deny\n' "# gate-tools-install $tool" ;;
+      # NOTE: the format string below is single-quoted bash source, not a
+      # double-quoted string — printf's builtin does NOT strip a backslash
+      # before an unrecognized escape like \$, so a literal $PATH/$tc here
+      # (no backslash) is what actually reaches the remote/eval side as
+      # "$PATH"/"$tc" for real expansion there; a backslash-escaped form
+      # was tried once and shipped PATH containing the four literal
+      # characters "$PATH" instead of this host's real search path —
+      # harmless for `cargo` itself (found via the /root/.cargo/bin prefix
+      # regardless) but it silently broke `rustup`/grep/sort/tail lookups.
+      printf '%s\nexport PATH=/root/.cargo/bin:$PATH; %s; if [ -n "$tc" ]; then cargo +"$tc" install --locked cargo-deny@%s; else cargo install --locked cargo-deny@%s; fi\n' \
+        "# gate-tools-install $tool" "$_gate_tools_cargo_toolchain_pick" "$GATE_TOOLS_CARGO_DENY_VERSION" "$GATE_TOOLS_CARGO_DENY_VERSION" ;;
     cargo-nextest)
-      printf '%s\nexport PATH=/root/.cargo/bin:\$PATH; cargo install --locked cargo-nextest\n' "# gate-tools-install $tool" ;;
+      printf '%s\nexport PATH=/root/.cargo/bin:$PATH; %s; if [ -n "$tc" ]; then cargo +"$tc" install --locked cargo-nextest@%s; else cargo install --locked cargo-nextest@%s; fi\n' \
+        "# gate-tools-install $tool" "$_gate_tools_cargo_toolchain_pick" "$GATE_TOOLS_CARGO_NEXTEST_VERSION" "$GATE_TOOLS_CARGO_NEXTEST_VERSION" ;;
     uv)
       printf '%s\ncurl -LsSf https://astral.sh/uv/install.sh | sh\n' "# gate-tools-install $tool" ;;
     claude)
@@ -401,6 +438,10 @@ gate_tools_install_cmd() {  # $1=tool (never "autobuilder" — that's a push, se
       printf '%s\ntrue\n' "# gate-tools-install $tool" ;;
   esac
 }
+
+# apt-based tools this box knows how to install — used to decide whether a
+# provision needs the shared `apt-get update -qq` at all (requirement 3).
+gate_tools_is_apt() { case "$1" in jq|gh|mold) return 0 ;; *) return 1 ;; esac; }
 
 # Read-only mirror of the two script trees a remote extend-gate.sh needs
 # (build-skill's own scripts/, rustbuild's scripts/+prompts/) — best-effort,
@@ -436,23 +477,58 @@ GATE_READY="false"
 GATE_TOOLS_MISSING=""
 provision_gate_tools() {  # $1=ip
   local ip="$1" probe_out name ver
+  mkdir -p "$STATE_DIR/logs" 2>/dev/null || true
 
   probe_out="$(gate_tools_probe "$ip")"
+
+  # requirement 3: apt-get update runs at most ONCE per provision, before
+  # the first apt-based install, and gets its own journal record either
+  # way — "ran=false" (no apt tool was missing) reads as deliberately
+  # skipped, not silently forgotten, the same ambiguity requirement 2
+  # exists to kill for individual tool installs.
+  local need_apt_update=0
+  while IFS='=' read -r name ver; do
+    [ -n "$name" ] && [ "$ver" = "MISSING" ] && gate_tools_is_apt "$name" && need_apt_update=1
+  done <<<"$probe_out"
+  if [ "$need_apt_update" = "1" ]; then
+    local apt_log="$STATE_DIR/logs/gate-tools-apt-update.$$.log" apt_rc=0
+    "$SSH_BIN" -o StrictHostKeyChecking=no -o ConnectTimeout=8 -i "$SSH_KEY" "$REMOTE_USER@$ip" \
+      "$(printf '%s\napt-get update -qq\n' "# gate-tools-apt-update")" >"$apt_log" 2>&1 || apt_rc=$?
+    journal_line "$(now_iso)  burst-lane  gate-tools  apt-update  (ran=true rc=$apt_rc)"
+    rm -f "$apt_log" 2>/dev/null || true
+  else
+    journal_line "$(now_iso)  burst-lane  gate-tools  apt-update  (ran=false)"
+  fi
+
   while IFS='=' read -r name ver; do
     [ -n "$name" ] || continue
     [ "$ver" = "MISSING" ] || continue
+    local start_ts rc secs err_log last_err
+    start_ts="$(now_epoch)"
+    err_log="$STATE_DIR/logs/gate-tools-install.$$-$name.log"
+    rc=0
     if [ "$name" = "autobuilder" ]; then
       if [ -f "$GATE_TOOLS_AUTOBUILDER_BIN" ]; then
         "$SSH_BIN" -o StrictHostKeyChecking=no -o ConnectTimeout=8 -i "$SSH_KEY" "$REMOTE_USER@$ip" \
           "$(printf '%s\nmkdir -p '"'"'%s'"'"'\n' "# gate-tools-install autobuilder" "$GATE_TOOLS_REMOTE_BIN_DIR")" >/dev/null 2>&1 || true
         "$RSYNC_BIN" -az -e "$SSH_BIN -o StrictHostKeyChecking=no -i $SSH_KEY" \
-          "$GATE_TOOLS_AUTOBUILDER_BIN" "$REMOTE_USER@$ip:$GATE_TOOLS_REMOTE_BIN_DIR/autobuilder" >/dev/null 2>&1 || true
+          "$GATE_TOOLS_AUTOBUILDER_BIN" "$REMOTE_USER@$ip:$GATE_TOOLS_REMOTE_BIN_DIR/autobuilder" >"$err_log" 2>&1 || rc=$?
         "$SSH_BIN" -o StrictHostKeyChecking=no -o ConnectTimeout=8 -i "$SSH_KEY" "$REMOTE_USER@$ip" \
           "chmod +x '$GATE_TOOLS_REMOTE_BIN_DIR/autobuilder'" 2>/dev/null || true
+      else
+        rc=1
+        printf 'local autobuilder binary not found at %s\n' "$GATE_TOOLS_AUTOBUILDER_BIN" >"$err_log"
       fi
     else
-      "$SSH_BIN" -o StrictHostKeyChecking=no -o ConnectTimeout=8 -i "$SSH_KEY" "$REMOTE_USER@$ip" "$(gate_tools_install_cmd "$name")" >/dev/null 2>&1 || true
+      "$SSH_BIN" -o StrictHostKeyChecking=no -o ConnectTimeout=8 -i "$SSH_KEY" "$REMOTE_USER@$ip" "$(gate_tools_install_cmd "$name")" >"$err_log" 2>&1 || rc=$?
     fi
+    secs="$(( $(now_epoch) - start_ts ))"
+    journal_line "$(now_iso)  burst-lane  gate-tools  install  (tool=$name rc=$rc secs=$secs)"
+    if [ "$rc" != "0" ]; then
+      last_err="$(grep -v '^[[:space:]]*$' "$err_log" 2>/dev/null | tail -n1)"
+      journal_line "$(now_iso)  burst-lane  gate-tools  install-failed  (tool=$name rc=$rc err=\"$last_err\")"
+    fi
+    rm -f "$err_log" 2>/dev/null || true
   done <<<"$probe_out"
 
   sync_gate_tools_scripts "$ip"

@@ -102,7 +102,10 @@ fresh_env() {
   # dedicated AC8 block below override it back to unset for its own case.
   export BURST_GATE_REMOTE=1
   unset FAKE_HCLOUD_AUTH_FAIL FAKE_HCLOUD_CREATE_FAIL FAKE_HCLOUD_DELETE_FAIL FAKE_SSH_REMOTE_FAIL FAKE_SSH_SANDBOX_FAIL FAKE_RSYNC_FAIL BURST_LANE_NOW \
-        FAKE_SSH_GATE_TOOLS_MISSING FAKE_SSH_GATE_TOOLS_INSTALL_FAIL FAKE_SSH_AUTOBUILDER_VERSION BURST_GATE_REVIEWER BURST_CLAUDE_CRED_SRC
+        FAKE_SSH_GATE_TOOLS_MISSING FAKE_SSH_GATE_TOOLS_INSTALL_FAIL FAKE_SSH_AUTOBUILDER_VERSION BURST_GATE_REVIEWER BURST_CLAUDE_CRED_SRC \
+        FAKE_SSH_GATE_TOOLS_INSTALL_FAIL_TOOL FAKE_SSH_GATE_TOOLS_INSTALL_FAIL_RC FAKE_SSH_GATE_TOOLS_INSTALL_FAIL_STDERR \
+        FAKE_SSH_GATE_TOOLS_TOOLCHAIN_SIM FAKE_GATE_TOOLS_TOOLCHAIN_BIN FAKE_RUSTUP_TOOLCHAINS FAKE_CARGO_REQUIRE_TOOLCHAIN \
+        FAKE_SSH_GATE_TOOLS_APT_UPDATE_FAIL
 }
 
 # ---- AC1: single-box refusal + adoption ------------------------------------
@@ -1576,6 +1579,80 @@ expect "gatetools AC5: gate_ready is false due to version drift" "grep -q '\"gat
 expect "gatetools AC5: journal names gate-tools version-drift" \
   "grep -q 'burst-lane  gate-tools  version-drift' \"$BURST_LANE_JOURNAL\""
 unset FAKE_SSH_AUTOBUILDER_VERSION
+
+# =============================================================================
+# PRD-build-burst-gate-tools-toolchain: cargo-based gate-tool installs run
+# under the newest toolchain the box has (not the too-old default), and
+# every install attempt — success or failure — leaves per-tool journal
+# evidence instead of only a single missing-tools summary line.
+# (test_prefix: gatetc)
+# =============================================================================
+
+# ---- gatetc AC1: given a fake box listing toolchains 1.85.0 and 1.88.0
+# whose fake cargo fails unless invoked with +1.88.0, `up` still installs
+# cargo-deny and cargo-nextest and reaches gate_ready=true — proves
+# gate_tools_install_cmd() really emits `cargo +<newest> install`, not a
+# bare `cargo install` that would fail under the box's default 1.85 (the
+# exact box-165449166 refusal: "cargo-deny 0.18.3 supports rustc 1.85.0").
+fresh_env
+export FAKE_SSH_GATE_TOOLS_MISSING="cargo-deny cargo-nextest"
+export FAKE_SSH_GATE_TOOLS_TOOLCHAIN_SIM=1
+export FAKE_GATE_TOOLS_TOOLCHAIN_BIN="$FAKE/toolchain-bin"
+export FAKE_RUSTUP_TOOLCHAINS="1.85.0 1.88.0"
+export FAKE_CARGO_REQUIRE_TOOLCHAIN="1.88.0"
+gtc1_out="$("$BL" up)"; gtc1_rc=$?
+expect "gatetc AC1: up succeeds (exit 0)" "[ $gtc1_rc -eq 0 ]"
+expect "gatetc AC1: gate_ready is true once cargo-deny/cargo-nextest install under +1.88.0" \
+  "grep -q '\"gate_ready\":\"true\"' \"$BURST_LANE_STATE_DIR/session.json\""
+expect "gatetc AC1: journal records cargo-deny install rc=0" \
+  "grep -q 'gate-tools  install  (tool=cargo-deny rc=0' \"$BURST_LANE_JOURNAL\""
+expect "gatetc AC1: journal records cargo-nextest install rc=0" \
+  "grep -q 'gate-tools  install  (tool=cargo-nextest rc=0' \"$BURST_LANE_JOURNAL\""
+unset FAKE_SSH_GATE_TOOLS_MISSING FAKE_SSH_GATE_TOOLS_TOOLCHAIN_SIM FAKE_GATE_TOOLS_TOOLCHAIN_BIN FAKE_RUSTUP_TOOLCHAINS FAKE_CARGO_REQUIRE_TOOLCHAIN
+
+# ---- gatetc AC2: given a fake box where the mold install exits 100 with
+# stderr "E: Unable to locate package mold", the journal has the exact
+# install-failed line and the provision summary line still lists mold.
+fresh_env
+export FAKE_SSH_GATE_TOOLS_MISSING="mold"
+export FAKE_SSH_GATE_TOOLS_INSTALL_FAIL_TOOL="mold"
+export FAKE_SSH_GATE_TOOLS_INSTALL_FAIL_RC=100
+export FAKE_SSH_GATE_TOOLS_INSTALL_FAIL_STDERR='E: Unable to locate package mold'
+"$BL" up >/dev/null
+gtc2_out="$("$BL" provision 2>&1)"; gtc2_rc=$?
+expect "gatetc AC2: provision exits 1 (mold still missing)" "[ $gtc2_rc -eq 1 ]"
+expect "gatetc AC2: journal has the exact install-failed line for mold" \
+  "grep -q 'gate-tools  install-failed  (tool=mold rc=100 err=\"E: Unable to locate package mold\")' \"$BURST_LANE_JOURNAL\""
+expect "gatetc AC2: provision summary line lists mold in gate_tools_missing" \
+  "grep -q 'burst-lane  provision  done.*gate_tools_missing=mold' \"$BURST_LANE_JOURNAL\""
+unset FAKE_SSH_GATE_TOOLS_MISSING FAKE_SSH_GATE_TOOLS_INSTALL_FAIL_TOOL FAKE_SSH_GATE_TOOLS_INSTALL_FAIL_RC FAKE_SSH_GATE_TOOLS_INSTALL_FAIL_STDERR
+
+# ---- gatetc AC3: any provision run journals exactly one gate-tools
+# install line per attempted tool, plus one apt-update record.
+fresh_env
+export FAKE_SSH_GATE_TOOLS_MISSING="jq mold gh"
+"$BL" up >/dev/null
+expect "gatetc AC3: exactly one apt-update record for this provision" \
+  "[ \"\$(grep -c 'burst-lane  gate-tools  apt-update' \"$BURST_LANE_JOURNAL\")\" -eq 1 ]"
+expect "gatetc AC3: apt-update record says ran=true (an apt tool was missing)" \
+  "grep -q 'gate-tools  apt-update  (ran=true' \"$BURST_LANE_JOURNAL\""
+for gtc3_t in jq mold gh; do
+  expect "gatetc AC3: exactly one install line for $gtc3_t" \
+    "[ \"\$(grep -c 'gate-tools  install  (tool='$gtc3_t' rc=' \"$BURST_LANE_JOURNAL\")\" -eq 1 ]"
+done
+unset FAKE_SSH_GATE_TOOLS_MISSING
+
+# ---- gatetc AC3b: a provision run where no apt tool was missing still
+# gets exactly one apt-update record, marked ran=false (never silently
+# skipped — see gatetc AC3's ran=true counterpart above for the apt case).
+# No FAKE_SSH_GATE_TOOLS_MISSING set at all — the fake probe's default
+# reports every one of the 8 tools already present.
+fresh_env
+"$BL" up >/dev/null
+expect "gatetc AC3b: exactly one apt-update record when no apt tool is missing" \
+  "[ \"\$(grep -c 'burst-lane  gate-tools  apt-update' \"$BURST_LANE_JOURNAL\")\" -eq 1 ]"
+expect "gatetc AC3b: apt-update record says ran=false" \
+  "grep -q 'gate-tools  apt-update  (ran=false)' \"$BURST_LANE_JOURNAL\""
 
 echo "=== $([ $fail -eq 0 ] && echo PASS || echo FAIL) ==="
 exit $fail

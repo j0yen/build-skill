@@ -52,14 +52,43 @@ case "$cmd" in
     done
     exit 0
     ;;
+  *'# gate-tools-apt-update'*)
+    # PRD-build-burst-gate-tools-toolchain requirement 3. Default success;
+    # FAKE_SSH_GATE_TOOLS_APT_UPDATE_FAIL=1 simulates an offline/blocked
+    # apt mirror without touching any other install knob.
+    [ "${FAKE_SSH_GATE_TOOLS_APT_UPDATE_FAIL:-0}" = "1" ] && exit "${FAKE_SSH_GATE_TOOLS_APT_UPDATE_RC:-1}"
+    exit 0
+    ;;
   *'# gate-tools-install '*)
-    [ "${FAKE_SSH_GATE_TOOLS_INSTALL_FAIL:-0}" = "1" ] && exit 1
     tool="$(printf '%s\n' "$cmd" | grep -oE '# gate-tools-install [a-zA-Z0-9_-]+' | head -n1 | awk '{print $3}')"
-    if [ -n "$tool" ] && [ -n "${FAKE_GATE_TOOLS_STATE:-}" ]; then
+    rc=0
+    errfile="$(mktemp "${TMPDIR:-/tmp}/fake-gate-install-err.XXXXXX")"
+    if [ "${FAKE_SSH_GATE_TOOLS_INSTALL_FAIL:-0}" = "1" ]; then
+      # Back-compat: every tool fails the same way (existing gatetools
+      # tests only assert on the missing-list/fallback side, never stderr).
+      echo "${FAKE_SSH_GATE_TOOLS_INSTALL_STDERR:-fake install failure}" >"$errfile"
+      rc="${FAKE_SSH_GATE_TOOLS_INSTALL_RC:-1}"
+    elif [ -n "${FAKE_SSH_GATE_TOOLS_INSTALL_FAIL_TOOL:-}" ] && [ "$tool" = "$FAKE_SSH_GATE_TOOLS_INSTALL_FAIL_TOOL" ]; then
+      # PRD-build-burst-gate-tools-toolchain AC2: fail exactly ONE named
+      # tool, with a caller-chosen rc/stderr, so a test can prove the
+      # per-tool install-failed journal line without failing every tool.
+      echo "${FAKE_SSH_GATE_TOOLS_INSTALL_FAIL_STDERR:-fake install failure}" >"$errfile"
+      rc="${FAKE_SSH_GATE_TOOLS_INSTALL_FAIL_RC:-1}"
+    elif [ "${FAKE_SSH_GATE_TOOLS_TOOLCHAIN_SIM:-0}" = "1" ] && { [ "$tool" = "cargo-deny" ] || [ "$tool" = "cargo-nextest" ]; }; then
+      # AC1: actually run the real install snippet burst-lane.sh generated
+      # (rustup toolchain list -> pick newest -> cargo +<newest> install),
+      # with a fake rustup/cargo on PATH ahead of everything else, so the
+      # toolchain-selection logic is proven for real rather than trusted.
+      PATH="${FAKE_GATE_TOOLS_TOOLCHAIN_BIN:-/nonexistent}:$PATH" eval "$cmd" >"$errfile" 2>&1
+      rc=$?
+    fi
+    cat "$errfile" >&2 2>/dev/null || true
+    if [ "$rc" = "0" ] && [ -n "$tool" ] && [ -n "${FAKE_GATE_TOOLS_STATE:-}" ]; then
       mkdir -p "$(dirname "$FAKE_GATE_TOOLS_STATE")" 2>/dev/null || true
       echo "$tool" >> "$FAKE_GATE_TOOLS_STATE"
     fi
-    exit 0
+    rm -f "$errfile"
+    exit "$rc"
     ;;
   *bwrap*)
     [ "${FAKE_SSH_SANDBOX_FAIL:-0}" = "1" ] && exit 1

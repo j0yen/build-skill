@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Fake cargo for the gate-tools toolchain selftest
+# (PRD-build-burst-gate-tools-toolchain AC1) — mirrors the box 165449166
+# failure mode: `cargo install` under the DEFAULT (too-old) toolchain
+# refuses with a version-floor message that looks like a normal cargo
+# error, not a crash; only `cargo +<FAKE_CARGO_REQUIRE_TOOLCHAIN> install`
+# succeeds. Only on PATH when explicitly prepended by the fake ssh's
+# toolchain-sim branch.
+set -uo pipefail
+req="${FAKE_CARGO_REQUIRE_TOOLCHAIN:-}"
+if [ -n "$req" ]; then
+  if [ "${1:-}" != "+$req" ]; then
+    echo "error: package \`cargo-deny\` cannot be built because it requires rustc \`+$req\` or newer, while the currently active rustc version is \`1.85.0\`" >&2
+    exit 101
+  fi
+fi
+exit 0

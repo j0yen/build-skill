@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Fake rustup for the gate-tools toolchain selftest
+# (PRD-build-burst-gate-tools-toolchain AC1). Only understands
+# `rustup toolchain list`, and only when explicitly put on PATH ahead of
+# everything else by the fake ssh's toolchain-sim branch — never on PATH
+# for the rest of the selftest. FAKE_RUSTUP_TOOLCHAINS is a space-
+# separated list of dotted versions (e.g. "1.85.0 1.88.0"); each is
+# printed the way the real rustup formats a line, so burst-lane.sh's
+# `grep -oE '[0-9]+\.[0-9]+\.[0-9]+'` pick logic exercises the real
+# parsing, not a pre-trimmed fixture.
+set -uo pipefail
+if [ "${1:-}" = "toolchain" ] && [ "${2:-}" = "list" ]; then
+  for t in ${FAKE_RUSTUP_TOOLCHAINS:-1.85.0}; do
+    echo "$t-x86_64-unknown-linux-gnu"
+  done
+  exit 0
+fi
+exit 1
