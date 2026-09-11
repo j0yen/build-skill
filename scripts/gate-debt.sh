@@ -469,8 +469,47 @@ PYEOF
   return 0
 }
 
+#  gate-debt.sh open [--prd-dir <dir>] [--format json|text]
+#
+#    Requirement 6 (P1, visibility — no dedicated numbered AC, so this
+#    subcommand doesn't gate archive; it exists for Joe/a status surface to
+#    query). Lists every gate-debt PRD currently open: a
+#    `PRD-*-gate-debt-*.md` file still under build-queue/ (once one
+#    archives it moves to built-prds/ and drops out of this list on its
+#    own — no separate bookkeeping needed). `--format json` prints
+#    `{"gate_debt_open":["PRD-...-gate-debt-....md", ...]}`; default text
+#    prints one name per line, or nothing (exit 0) when none are open.
+#    This is the computation only — wiring it into `burst-lane.sh status
+#    --json` / its daily rollup (User story 4's literal
+#    `burst-lane.sh status` / rollup surface) is left as a follow-up: that
+#    script is large, shared, and outside this PRD's Engineering target
+#    (extend-gate.sh / gate-debt.sh / lane-claim.sh / SKILL.md); querying
+#    `gate-debt.sh open` directly is the interim surface. `hawk-probe.sh`
+#    (this requirement's other named consumer) does not exist anywhere in
+#    this repo as of this PRD — also left for whoever owns that script.
+cmd_open() {
+  local prd_dir="$PRD_DIR_DEFAULT" format="text"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --prd-dir) prd_dir="$2"; shift 2 ;;
+      --format) format="$2"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  local f names=()
+  for f in "$prd_dir"/build-queue/PRD-*-gate-debt-*.md; do
+    [ -f "$f" ] || continue
+    names+=("$(basename "$f")")
+  done
+  if [ "$format" = json ]; then
+    python3 -c 'import json,sys; print(json.dumps({"gate_debt_open": sys.argv[1:]}))' "${names[@]:-}"
+  else
+    printf '%s\n' "${names[@]:-}"
+  fi
+}
+
 usage() {
-  echo "usage: gate-debt.sh {check <repo> <head> [opts]|release-check [opts]}" >&2
+  echo "usage: gate-debt.sh {check <repo> <head> [opts]|release-check [opts]|open [opts]}" >&2
   exit 2
 }
 
@@ -480,6 +519,7 @@ main() {
   case "$sub" in
     check) cmd_check "$@" ;;
     release-check) cmd_release_check "$@" ;;
+    open) cmd_open "$@" ;;
     *) usage ;;
   esac
 }
