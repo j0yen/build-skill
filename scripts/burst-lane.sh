@@ -393,6 +393,18 @@ load_env() {
 }
 load_env
 
+# 2026-09-11 policy: RedBaron-local — burst `up` must refuse unless an
+# operator has genuinely opted back in. burst_configured() is the single
+# shared predicate (also used by selftests); source it defensively so a
+# missing/moved lib file fails the gate open-safe (refuse), never silently
+# skips the check. See lib/burst-configured.sh for the full contract.
+# shellcheck disable=SC1091
+if [ -r "$HERE/lib/burst-configured.sh" ]; then
+  source "$HERE/lib/burst-configured.sh"
+else
+  burst_configured() { return 1; }
+fi
+
 # PRD-build-burst-unprivileged-user requirement 2: where root's ALREADY-WARM
 # toolchain actually lives — always real root's home in production, but
 # overridable so the offline selftest can point RUSTUP_HOME/CARGO_HOME at
@@ -1163,6 +1175,10 @@ shred_gate_credential() {  # $1=ip $2=caller(down|watchdog)
 }
 
 cmd_up() {
+  if ! burst_configured; then
+    echo "burst: refused — not configured (RedBaron-local policy); set BUILD_BURST_ENABLED=1 to allow" >&2
+    return 3
+  fi
   if state_active; then
     local id; id="$(state_read server_id)"
     if [ -n "$id" ] && server_alive "$id"; then
