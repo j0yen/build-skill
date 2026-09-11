@@ -400,6 +400,31 @@ def lint_file(path):
             if HOME_PATH_RE.search(s):
                 warn("home-path-in-ac", f"AC references a path under /home/: {it[0]!r}")
 
+    # -- fixture negative-case rule (PRD-build-post-ship-reality-check req 6) --
+    # A PRD that requires a selftest but only ever describes it in positive
+    # terms (ok/pass/reachable/match/...) with no failure-mode language
+    # (fail/reject/block/mismatch/unreachable/...) anywhere near the
+    # mention is a PRD whose fixture is likely to gain a new
+    # subcommand/state with only a success case — exactly the class this
+    # PRD's own TL;DR names (a receipt claiming 251/251 when the tree had
+    # 245). Heuristic, warning-only: it reads the PRD's own words, not the
+    # shipped fixture (verified-completed.sh's --check-fixture-negative-
+    # case does the shipped-fixture-diff half of this requirement, at
+    # archive time, on the real repo).
+    selftest_lines = [l for l in all_lines if re.search(r"selftest", l, re.I)]
+    if selftest_lines:
+        blob = "\n".join(selftest_lines)
+        pos_kw = re.compile(r"\b(ok|pass|passing|true|success|reachable|match)\b", re.I)
+        neg_kw = re.compile(
+            r"\b(fail|failing|reject|block|mismatch|missing|unreachable|false|"
+            r"negative|deny|refuse|error|invalid|bad|corrupt)\b", re.I)
+        if pos_kw.search(blob) and not neg_kw.search(blob):
+            warn("selftest-no-negative-case",
+                 "PRD mentions a selftest requirement with no apparent "
+                 "failure-mode/negative case (fail/reject/mismatch/"
+                 "unreachable/...) — a new subcommand or state risks "
+                 "shipping with only a success-path fixture")
+
     return slug, fails, warns
 
 
