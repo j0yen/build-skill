@@ -205,6 +205,11 @@ REVIEWER_PROMPT="${REVIEWER_PROMPT:-$HOME/.claude/skills/rustbuild/prompts/revie
 # autobuilder` convention).
 AUTOBUILDER_CANONICAL_CARGO_TOML="${AUTOBUILDER_CANONICAL_CARGO_TOML:-$HOME/wintermute/autobuilder/autobuilder/Cargo.toml}"
 GATE_DELTA="$BUILD_SCRIPTS/gate-delta.sh"
+# PRD-build-gate-debt-auto-prd requirement 1: attribute each blocking
+# finding as in-scope (the building PRD's own diff) or inherited (landed
+# by another PRD's merge). Overridable so tests/ can point at a fixture
+# without touching production behavior (default unchanged).
+GATE_ATTRIBUTION="${GATE_ATTRIBUTION:-$BUILD_SCRIPTS/gate-attribution.sh}"
 # Three-state retrofit (PRD-build-three-state-probes): fail-open sourcing so
 # an unshipped/missing library never breaks a gate run.
 if [ -r "$BUILD_SCRIPTS/probe-result.sh" ]; then
@@ -831,6 +836,43 @@ blockers_csv=""
 if [ "${#blocking_notes[@]}" -gt 0 ]; then
   blockers_csv="$(IFS='|'; echo "${blocking_notes[*]}")"
 fi
+
+# --- attribution (P0 requirement 1, PRD-build-gate-debt-auto-prd) --------
+# Split blocking_notes into in-scope (the building PRD's own diff touched
+# it) vs inherited (landed by an earlier merge). The diff range is the
+# building PRD's own merge: when HEAD is a no-ff merge commit (two
+# parents), that's exactly <head>^1..<head> — the merge's first parent is
+# mainline immediately before this PRD landed, so the diff against it is
+# what the PRD's own merge introduced (Technical considerations: "the
+# archive line already records base=... and the merge sha, so git
+# merge-base gives the diff range"). A non-merge HEAD (e.g. a fast-forward
+# land, or a gate run ahead of any merge) has no such single-parent split,
+# so this falls back to the wider $base_ref..HEAD range — less surgical,
+# but never crashes attribution into treating a fast-forwarded PRD's own
+# changes as "no diff at all".
+attribution_json=""
+attribution_inherited=0
+attribution_in_scope=0
+if [ "${#blocking_notes[@]}" -gt 0 ] && [ -x "$GATE_ATTRIBUTION" ]; then
+  attr_diff_base="$base_ref"
+  parent_count="$(git -C "$repo" rev-list --parents -n1 "$head_now" 2>/dev/null | awk '{print NF-1}')"
+  if [ "${parent_count:-0}" -eq 2 ]; then
+    attr_diff_base="${head_now}^1"
+  fi
+  attr_notes_file="$(mktemp "${TMPDIR:-/tmp}/extend-gate-attr-notes.XXXXXX")"
+  for n in "${blocking_notes[@]}"; do
+    # note_block strings are always "<receipt> — <detail>" (em dash,
+    # consistent across every note_block call above); split on the first
+    # occurrence so a detail that itself contains " — " stays intact.
+    printf '%s\n' "$n" | sed -E 's/^([^ ]+) — (.*)$/\1\t\2/' >> "$attr_notes_file"
+  done
+  if attr_out="$("$GATE_ATTRIBUTION" compute "$repo" "$attr_diff_base" "$head_now" "$attr_notes_file" 2>/dev/null)"; then
+    attribution_json="$attr_out"
+    attribution_in_scope="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("in_scope",0))' "$attribution_json" 2>/dev/null || echo 0)"
+    attribution_inherited="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("inherited",0))' "$attribution_json" 2>/dev/null || echo 0)"
+  fi
+  rm -f "$attr_notes_file"
+fi
 # Overridable so tests/ never writes into the real journal (default unchanged).
 journal="${EXTEND_GATE_JOURNAL:-$HOME/brain/journal/build/$(date -u +%Y-%m-%d).md}"
 mkdir -p "$(dirname "$journal")"
@@ -880,6 +922,13 @@ if [ "$baseline_state" = "present" ]; then
   outcome="$delta_verdict"
   journal_suffix=" verdict=$delta_verdict inherited_blocks=[${inherited_blocks}]"
 fi
+# Attribution suffix (requirement 1, AC1: "the journal gate line reads
+# inherited=1 in-scope=1") — appended whenever this run had at least one
+# blocking note, independent of the baseline-delta suffix above (a
+# different axis: "known before" vs "whose diff introduced it").
+if [ "${#blocking_notes[@]}" -gt 0 ]; then
+  journal_suffix="$journal_suffix inherited=$attribution_inherited in-scope=$attribution_in_scope"
+fi
 
 # One journal line per gate run (requirement 8 / AC13): crate, HEAD, base
 # tag, pass/block counts, blocking receipt names, wall seconds, (PRD-
@@ -906,11 +955,17 @@ fi
 # accurate attestation instead of silently dropping it. ------------------
 cache_verdict_val="$outcome"
 mkdir -p "$(dirname "$cache_file")"
+# attribution_json defaults to an empty blocks/counts object when this run
+# had no blocking notes, or gate-attribution.sh wasn't runnable — the
+# summary receipt always has the key, never sometimes-present (requirement
+# 1: "the tags land in the summary receipt").
+attribution_empty='{"blocks":[],"in_scope":0,"inherited":0}'
+attribution_for_cache="${attribution_json:-$attribution_empty}"
 jq -n --arg head "$head_now" --arg hash "$self_hash" --arg verdict "$cache_verdict_val" \
      --argjson rc "$final_rc" --arg new "$new_blocks" --arg inh "$inherited_blocks" \
      --arg intended "$route_intended" --argjson burst "$route_burst_n" \
      --argjson local "$route_local_n" --argjson passthrough "$route_passthrough_n" \
-     --arg host "$route_host" '
+     --arg host "$route_host" --argjson attribution "$attribution_for_cache" '
   {
     head_sha: $head,
     script_sha256: $hash,
@@ -918,7 +973,9 @@ jq -n --arg head "$head_now" --arg hash "$self_hash" --arg verdict "$cache_verdi
     exit_code: $rc,
     new_blocks: ($new | if . == "" then [] else split(",") end),
     inherited_blocks: ($inh | if . == "" then [] else split(",") end),
-    cargo_route: {intended: $intended, burst: $burst, local: $local, passthrough: $passthrough, host: $host}
+    cargo_route: {intended: $intended, burst: $burst, local: $local, passthrough: $passthrough, host: $host},
+    blocks: $attribution.blocks,
+    attribution: {in_scope: $attribution.in_scope, inherited: $attribution.inherited}
   }
 ' > "$cache_file" 2>/dev/null || true
 
