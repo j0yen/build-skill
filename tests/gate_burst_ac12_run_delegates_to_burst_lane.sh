@@ -25,6 +25,10 @@ T="$(mktemp -d "${TMPDIR:-/tmp}/gb-ac12.XXXXXX")"
 trap 'rm -rf "$T"' EXIT
 
 export PATH="$FAKE:$PATH"
+# PRD-build-burst-selftest-isolation: sentinel — every override in this
+# file is then REQUIRED; a forgotten one fails closed instead of silently
+# touching the real box/state.
+export BURST_LANE_TEST=1
 export BURST_LANE_STATE_DIR="$T/burst-lane-state"; mkdir -p "$BURST_LANE_STATE_DIR"
 export BURST_LANE_JOURNAL="$T/burst-lane-journal.log"
 export BURST_LANE_ENV_FILE="$T/burst-lane-env"; echo "SNAPSHOT_ID=427125061" > "$BURST_LANE_ENV_FILE"
@@ -35,6 +39,7 @@ export FAKE_HCLOUD_CALLLOG="$T/hcloud.calls"; : > "$FAKE_HCLOUD_CALLLOG"
 export BURST_LANE_COST_LEDGER="$T/cost.jsonl"
 
 export GATE_BURST_STATE_DIR="$T/gate-burst-state"; mkdir -p "$GATE_BURST_STATE_DIR"
+export GATE_BURST_LEDGER="$T/gate-burst-ledger.ndjson"
 export GATE_BURST_JOURNAL="$T/gate-burst-journal.log"
 export GATE_BURST_ENV_FILE="$T/gate-burst-env"; echo "SNAPSHOT_ID=427125061" > "$GATE_BURST_ENV_FILE"
 

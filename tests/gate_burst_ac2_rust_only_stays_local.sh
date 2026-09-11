@@ -13,7 +13,13 @@ FAKE="$HERE/fixtures/gate-burst-fake"
 T="$(mktemp -d "${TMPDIR:-/tmp}/gb-ac2.XXXXXX")"
 trap 'rm -rf "$T"' EXIT
 export PATH="$FAKE:$PATH"
+# PRD-build-burst-selftest-isolation: sentinel — every override below is
+# then REQUIRED; a forgotten one fails closed instead of silently touching
+# the real box/state.
+export BURST_LANE_TEST=1
 export GATE_BURST_STATE_DIR="$T/state"; mkdir -p "$GATE_BURST_STATE_DIR"
+export GATE_BURST_LEDGER="$T/ledger.ndjson"
+export GATE_BURST_JOURNAL="$T/journal.md"
 export FAKE_HCLOUD_STATE="$T/hcloud.state"
 # Isolate should-route's new burst-lane.sh status check (PRD-build-burst-
 # lane-ccx53 req 5) from whatever real session may or may not be up on

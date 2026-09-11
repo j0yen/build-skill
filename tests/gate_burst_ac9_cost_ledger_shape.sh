@@ -17,6 +17,13 @@ export GATE_BURST_STATE_DIR="$T/state"; mkdir -p "$GATE_BURST_STATE_DIR"
 export GATE_BURST_LEDGER="$T/ledger.ndjson"
 export GATE_BURST_JOURNAL="$T/journal.md"
 export GATE_BURST_ENV_FILE="$T/env"; echo "SNAPSHOT_ID=427125061" > "$GATE_BURST_ENV_FILE"
+# PRD-build-burst-selftest-isolation: sentinel + the nested burst-lane.sh
+# calls this test reaches (should-route/run delegate to it) sandboxed too —
+# without this override an unguarded call would touch the real live
+# session.json (the exact "acceptance fixtures routing to the real box"
+# leak this PRD closes).
+export BURST_LANE_TEST=1
+export BURST_LANE_STATE_DIR="$T/burst-lane-state"; mkdir -p "$BURST_LANE_STATE_DIR"
 export GATE_BURST_REMOTE_ROOT="$T/remote"
 export FAKE_HCLOUD_STATE="$T/hcloud.state"
 
