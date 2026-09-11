@@ -46,6 +46,31 @@
 #            "reachable", since the point is "the unit exists to probe",
 #            not "the unit happens to be running".
 #
+#   reality-check.sh open [--prd-dir <dir>] [--format json|text]
+#       Requirement 8 (P1, visibility — no dedicated numbered AC, matching
+#       gate-debt.sh's `open` precedent, so this subcommand doesn't gate
+#       archive; it exists as a status surface to query). Lists every
+#       archived PRD whose `reality: failed` drafted a `reality_followup:`
+#       that is still unresolved (the follow-up PRD file still sits in
+#       build-queue/, not yet built-prds/). `--format json` prints
+#       `{"reality_open":[{"parent":"PRD-....md","followup":"PRD-....md"}, ...]}`;
+#       default text prints `<parent> -> <followup>` one per line, or
+#       nothing (exit 0) when none are open. This is the computation only —
+#       wiring it into `hawk-probe.sh` (`REALITY:` emission — that script
+#       already greps the journal's `  reality  ` lines this PRD's `run`
+#       writes, at ~/.cache/hawk-probe.sh, so its producer side is already
+#       satisfied; the script itself lives outside any git repo, confirmed
+#       via `git rev-parse --show-toplevel` failing there and at every
+#       parent up to `/`, same as PRD-build-gate-wall-clock AC8's finding)
+#       and into a daily `reality_ok=<n> reality_failed=<n>` rollup line
+#       (no existing generic daily-rollup script in this repo to extend —
+#       `gate-wedge-rollup.sh` is gate-wedge-specific) or into
+#       `burst-lane.sh status --json` (that script is large, shared, and
+#       outside this PRD's Engineering target) is left as a follow-up,
+#       exactly as gate-debt.sh requirement 6 left the same two wiring
+#       points for its own visibility requirement: querying
+#       `reality-check.sh open` directly is the interim surface.
+#
 # Exit: 0 ran (see the printed verdict; a per-AC failure is reflected in
 #         `reality: failed`, not a nonzero exit — this command's own job is
 #         to RECORD reality, not to gate on it) | 2 usage/resolution error.
@@ -59,13 +84,14 @@ JOURNAL_DIR="${BUILD_JOURNAL_DIR:-$HOME/brain/journal/build}"
 RECEIPTS_DIR="${BUILD_RECEIPTS_DIR:-$JOURNAL_DIR/receipts}"
 JQ="${JQ:-$(command -v jq || echo /usr/bin/jq)}"
 GIT_ID=(-c user.email=jyen.tech@gmail.com -c "user.name=Joe Yen")
+PRD_DIR_DEFAULT="${PRD_DIR:-$HOME/Documents/PRDs}"
 
 log() { printf 'reality-check: %s\n' "$*" >&2; }
 die() { printf 'reality-check: %s\n' "$*" >&2; exit "${2:-2}"; }
 now_iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
 usage() {
-  sed -n '2,55p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '2,76p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
   exit 2
 }
 
@@ -547,9 +573,50 @@ do_run() {
   exit 0
 }
 
+# ---- open: list unresolved reality follow-ups (requirement 8's interim
+# status surface — see the `open` doc comment above for why the full
+# hawk-probe.sh/rollup/status --json wiring is a separate follow-up). -----
+do_open() {
+  local prd_dir="$PRD_DIR_DEFAULT" format="text"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --prd-dir) prd_dir="$2"; shift 2 ;;
+      --format) format="$2"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  local f parent followup rows=()
+  for f in "$prd_dir"/built-prds/PRD-*.md; do
+    [ -f "$f" ] || continue
+    grep -qE '^- reality: *failed' "$f" || continue
+    followup="$(grep -m1 -E '^- reality_followup:' "$f" | sed -E 's/^- reality_followup: *//')"
+    [ -n "$followup" ] || continue
+    [ -f "$prd_dir/build-queue/$followup" ] || continue
+    parent="$(basename "$f")"
+    rows+=("$parent:$followup")
+  done
+  if [ "$format" = json ]; then
+    python3 -c '
+import json, sys
+rows = []
+for r in sys.argv[1:]:
+    parent, _, followup = r.partition(":")
+    rows.append({"parent": parent, "followup": followup})
+print(json.dumps({"reality_open": rows}))
+' "${rows[@]:-}"
+  else
+    local r
+    for r in "${rows[@]:-}"; do
+      [ -n "$r" ] || continue
+      printf '%s -> %s\n' "${r%%:*}" "${r#*:}"
+    done
+  fi
+}
+
 case "$cmd" in
   plan) do_plan "$@" ;;
   run)  do_run "$@" ;;
+  open) do_open "$@" ;;
   -h|--help) usage ;;
   *) usage ;;
 esac

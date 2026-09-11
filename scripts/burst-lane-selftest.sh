@@ -2468,6 +2468,45 @@ git -C "$FR" add -A && git -C "$FR" commit -q -m "add success-only case" >/dev/n
 expect "reality AC7: verified-completed --check-fixture-negative-case blocks a success-only diff" \
   "[ $? -ne 0 ] && grep -q 'fixture-negative-case-missing' \"$RT/fnc-block.err\""
 
+# reality requirement 8's interim status surface (`open` — no dedicated
+# numbered AC, same as gate-debt.sh's own `open`): a closed follow-up
+# (already archived) is excluded, an open one (still in build-queue/) is
+# listed, in both text and --format json.
+OR="$(mktemp -d "${TMPDIR:-/tmp}/reality-open-selftest.XXXXXX")"
+ALL_TMPDIRS+=("$OR")
+mkdir -p "$OR/built-prds" "$OR/build-queue"
+cat >"$OR/built-prds/PRD-openreq8-closed.md" <<'EOF'
+- Status: built
+- reality: failed
+- reality_followup: PRD-openreq8-closed-reality-1.md
+EOF
+cat >"$OR/built-prds/PRD-openreq8-closed-reality-1.md" <<'EOF'
+- Status: built
+EOF
+cat >"$OR/built-prds/PRD-openreq8-open.md" <<'EOF'
+- Status: built
+- reality: failed
+- reality_followup: PRD-openreq8-open-reality-1.md
+EOF
+cat >"$OR/build-queue/PRD-openreq8-open-reality-1.md" <<'EOF'
+- Status: queued
+EOF
+or_out="$("$RC" open --prd-dir "$OR" 2>&1)"; or_rc=$?
+expect "reality open: exits 0" "[ $or_rc -eq 0 ]"
+expect "reality open: lists the still-open follow-up" \
+  "grep -qF 'PRD-openreq8-open.md -> PRD-openreq8-open-reality-1.md' <<<\"$or_out\""
+expect "reality open: excludes the already-archived (closed) follow-up" \
+  "! grep -qF 'PRD-openreq8-closed.md' <<<\"$or_out\""
+or_json="$("$RC" open --prd-dir "$OR" --format json 2>&1)"; or_json_rc=0
+python3 -c "
+import json
+d = json.loads('''$or_json''')
+rows = d['reality_open']
+assert len(rows) == 1, rows
+assert rows[0] == {'parent': 'PRD-openreq8-open.md', 'followup': 'PRD-openreq8-open-reality-1.md'}, rows
+" || or_json_rc=1
+expect "reality open --format json: shape matches {parent, followup} for the open row only" "[ $or_json_rc -eq 0 ]"
+
 # reality AC9: this fixture set exits 0 and names the reality cases —
 # checked here as an explicit, in-band assertion, matching every sibling
 # AC's own convention (see burstuser AC7 / parityr AC6 above).

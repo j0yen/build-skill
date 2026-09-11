@@ -1355,6 +1355,24 @@ substrate-naming AC the plan could derive a command for), run
   doctrine (a false deferral premise or a stale receipt claim blocks
   archive outright, before a PRD ever reaches `built-prds/` for this step
   to run against).
+- **Requirement 8 (P1, visibility) — interim surface only.** `reality-check.sh
+  open [--prd-dir <dir>] [--format json|text]` lists every archived PRD
+  with `reality: failed` whose drafted `reality_followup:` is still
+  unresolved (the follow-up file still sits in `build-queue/`) — the
+  computation only, matching gate-debt.sh's own `open` precedent (see
+  "Gate-debt attribution" requirement 6 below). The `REALITY: <slug>
+  ok|failed` half of requirement 8 needs no new wiring here: `hawk-probe.sh`
+  (`~/.cache/hawk-probe.sh`) already greps the journal's `  reality  ` lines
+  this step's `run` writes, and its producer side is exactly this step's
+  existing journal format — but the script itself lives outside any git
+  repo (`git rev-parse --show-toplevel` fails there and at every parent up
+  to `/`), same finding as PRD-build-gate-wall-clock AC8. Folding
+  `reality_ok=<n> reality_failed=<n>` into an actual daily rollup line (no
+  generic daily-rollup script exists yet to extend — `gate-wedge-rollup.sh`
+  is gate-wedge-specific) or into `burst-lane.sh status --json` (large,
+  shared, outside this PRD's Engineering target) is left as a follow-up;
+  `reality-check.sh open` is the interim query surface until one of those
+  lands.
 
 ## Parallelism (per-tick fan-out, added 2026-05-28)
 
