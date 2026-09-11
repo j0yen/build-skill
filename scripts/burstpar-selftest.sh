@@ -13,6 +13,20 @@ trap 'rm -rf "$T"' EXIT
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BL="$HERE/burst-lane.sh"
 
+# 2026-09-11 RedBaron-local policy: the real Hetzner burst box is deleted;
+# this suite proves burst-lane.sh's slot-cap/lock logic against fake
+# ssh/rsync stubs, which says nothing about whether burst is the fleet's
+# actual routing target right now. Gated, not deleted — see
+# lib/burst-configured.sh's header for the exact condition and how to
+# force this suite to run for real. Checked BEFORE the exports below
+# override BURST_LANE_ENV_FILE with this run's own fake one.
+# shellcheck source=lib/burst-configured.sh
+source "$HERE/lib/burst-configured.sh"
+if ! burst_configured; then
+  echo "SKIP: burst lane dormant (RedBaron-local policy) — see burst-configured.sh"
+  exit 0
+fi
+
 mkdir -p "$T/state" "$T/wa" "$T/wb" "$T/wc"
 cat > "$T/state/session.json" <<'JSON'
 {"server_id":1,"ip":"127.0.0.1","server_type":"test","boot_ts":"2026-01-01T00:00:00Z","boot_epoch":1,"ttl_hours":6,"hard_ttl_hours":12,"runs_served":0,"sandbox_ok":"true","teardown_scheduled":"false","teardown_epoch":"","verified":"true"}

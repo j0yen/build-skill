@@ -107,6 +107,21 @@ expect() {
   if eval "$cond"; then echo "ok  $label"; else echo "FAIL $label" >&2; fail=1; fi
 }
 
+# 2026-09-11 RedBaron-local policy: the real Hetzner burst box is deleted;
+# this whole suite exercises burst-lane.sh's routing/lifecycle logic
+# against a FAKE hcloud/ssh/rsync, which proves nothing about whether
+# burst is the box this fleet should actually be dispatching to right
+# now. Gated, not deleted — see lib/burst-configured.sh's header for the
+# exact condition and how to force this suite to run for real. Checked
+# before fresh_env's first call, which overrides BURST_LANE_ENV_FILE with
+# this run's own fake one.
+# shellcheck source=lib/burst-configured.sh
+source "$HERE/lib/burst-configured.sh"
+if ! burst_configured; then
+  echo "SKIP: burst lane dormant (RedBaron-local policy) — see burst-configured.sh"
+  exit 0
+fi
+
 # PRD-build-burst-parity-cadence: every hand-crafted box-parity.json fixture
 # in this suite must carry the ACTIVE session's session_id + toolchain_fp
 # (matching what a real `parity` run would write) so cmd_gate's session/
