@@ -2985,8 +2985,18 @@ cmd_parity() {
   # PRD-build-burst-unprivileged-user: this is the exact call
   # `checkcompat_ac02_ac03` failed under — mcphost's own root-guard makes
   # $REMOTE_USER=root an invalid identity to run its integration suite
-  # under, hence build (RUSTUP_HOME/CARGO_HOME per requirement 2).
-  local remote_env_prefix="cd $remote_path && export PATH=$GATE_TOOLS_REMOTE_BIN_DIR:\$PATH:$ROOT_CARGO_HOME/bin:/root/.local/bin RUSTUP_HOME=$ROOT_RUSTUP_HOME CARGO_HOME=$ROOT_CARGO_HOME CARGO_TARGET_DIR=$remote_path/target"
+  # under, hence build. CARGO_HOME is RUN_CARGO_HOME (build's own writable
+  # cargo home, requirement 5), NOT ROOT_CARGO_HOME — fixed 2026-09-11
+  # (cargo-deny-advisory-db-lock-fails-at-head): this line still pointed
+  # CARGO_HOME at root's shared, read+execute-only toolchain home after
+  # requirement 5 moved every other remote cargo invocation (cmd_run,
+  # cmd_verify) to RUN_CARGO_HOME, so any cargo subcommand needing a WRITE
+  # under CARGO_HOME (cargo-deny's advisory-dbs lock, a not-yet-cached
+  # registry fetch) failed here with a permission/lock error while the
+  # same box's cmd_run path worked fine. $ROOT_CARGO_HOME/bin stays on
+  # PATH so the cargo/rustup BINARIES still resolve to root's shared
+  # toolchain — only the data directory moved.
+  local remote_env_prefix="cd $remote_path && export PATH=$GATE_TOOLS_REMOTE_BIN_DIR:\$PATH:$ROOT_CARGO_HOME/bin:/root/.local/bin RUSTUP_HOME=$ROOT_RUSTUP_HOME CARGO_HOME=$RUN_CARGO_HOME CARGO_TARGET_DIR=$remote_path/target"
 
   # PRD-build-burst-parity-robust requirement 1: cargo-nextest is the
   # PRIMARY capture on both sides (already provisioned on the box via
@@ -3443,12 +3453,19 @@ cmd_gate() {
   # $REMOTE_USER's own $HOME, not RedBaron's, so it's redirected here into
   # target/autobuilder/ (already an rsync-back path) and appended onto
   # RedBaron's real tick journal below, keeping the journal single-writer
-  # per the PRD's technical considerations. PRD-build-burst-unprivileged-
-  # user requirement 2: RUSTUP_HOME/CARGO_HOME point extend-gate.sh's own
-  # cargo/rustup calls at root's shared, read-only toolchain the same way
-  # every other remote cargo invocation does.
+  # per the PRD's technical considerations. RUSTUP_HOME stays
+  # ROOT_RUSTUP_HOME (read-only toolchain, fine) but CARGO_HOME is
+  # RUN_CARGO_HOME, NOT ROOT_CARGO_HOME — fixed 2026-09-11
+  # (cargo-deny-advisory-db-lock-fails-at-head): pointing CARGO_HOME at
+  # root's shared, read+execute-only home broke any cargo-deny invocation
+  # inside extend-gate.sh's own audit-checks.sh (advisories check needs to
+  # create/lock $CARGO_HOME/advisory-dbs, a WRITE root's chmod o+rX never
+  # grants build) even though every other remote cargo invocation
+  # (cmd_run, cmd_verify) already uses RUN_CARGO_HOME per requirement 5.
+  # $ROOT_CARGO_HOME/bin stays on PATH so the cargo/rustup BINARIES still
+  # resolve to root's shared toolchain — only the data directory moved.
   local remote_journal="$remote_path/target/autobuilder/gate-journal.md"
-  local remote_cmd="cd $remote_path && export PATH=\$PATH:$GATE_TOOLS_REMOTE_BIN_DIR:$ROOT_CARGO_HOME/bin:/root/.local/bin:$REMOTE_ROOT/.gate-tools/build-scripts RUSTUP_HOME=$ROOT_RUSTUP_HOME CARGO_HOME=$ROOT_CARGO_HOME RUSTC_WRAPPER=sccache SCCACHE_DIR=$REMOTE_SCCACHE_DIR SCCACHE_CACHE_SIZE=${BURST_SCCACHE_GB}G BURST_LANE=0 RUSTBUILD_SCRIPTS=$REMOTE_ROOT/.gate-tools/rustbuild-scripts REVIEWER_PROMPT=$REMOTE_ROOT/.gate-tools/rustbuild-prompts/reviewer-agent.md EXTEND_GATE_JOURNAL=$remote_journal; extend-gate.sh . $(printf '%q ' "${extra_args[@]}")"
+  local remote_cmd="cd $remote_path && export PATH=\$PATH:$GATE_TOOLS_REMOTE_BIN_DIR:$ROOT_CARGO_HOME/bin:/root/.local/bin:$REMOTE_ROOT/.gate-tools/build-scripts RUSTUP_HOME=$ROOT_RUSTUP_HOME CARGO_HOME=$RUN_CARGO_HOME RUSTC_WRAPPER=sccache SCCACHE_DIR=$REMOTE_SCCACHE_DIR SCCACHE_CACHE_SIZE=${BURST_SCCACHE_GB}G BURST_LANE=0 RUSTBUILD_SCRIPTS=$REMOTE_ROOT/.gate-tools/rustbuild-scripts REVIEWER_PROMPT=$REMOTE_ROOT/.gate-tools/rustbuild-prompts/reviewer-agent.md EXTEND_GATE_JOURNAL=$remote_journal; extend-gate.sh . $(printf '%q ' "${extra_args[@]}")"
   "$SSH_BIN" -o StrictHostKeyChecking=no -i "$SSH_KEY" "$REMOTE_USER@$ip" "bash -lc $(printf '%q' "$remote_cmd")" || rc=$?
   t1="$(now_fractional)"
   rm -f "$inflight_marker"
