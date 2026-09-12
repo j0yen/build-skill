@@ -193,6 +193,76 @@ EOF
 expect_warn "$q/PRD-into-not-found.md" build-into-not-found "build-into-not-found/warn"
 expect_clean_no_id "$q/PRD-into-ok.md" warnings build-into-not-found "build-into-not-found/pass"
 
+# ================================================= build-into-substrate-mismatch
+# Real defect fixture (PRD-build-classification-self-heal, 2026-09-12): the
+# actual 09-12 pair -- build_target: python-cli committed against a real
+# Cargo workspace -- bounced three dispatches before a human fixed it by
+# hand, because lint never read build_into's substrate. This is that exact
+# frontmatter pair, not a synthetic one, per this PRD's own fixture rule.
+mkdir -p "$tmp/cargo-ws" "$tmp/py-ws"
+cat > "$tmp/cargo-ws/Cargo.toml" <<'EOF'
+[workspace]
+members = ["crates/foo"]
+EOF
+cat > "$tmp/py-ws/pyproject.toml" <<'EOF'
+[project]
+name = "example"
+EOF
+
+cat > "$q/PRD-substrate-09-12-defect.md" <<EOF
+- Status: queued
+- build_target: python-cli
+- build_into: $tmp/cargo-ws
+- Vision: visions/plain.md
+
+## Acceptance criteria
+
+1. P0 — Given a, When b, Then c.
+EOF
+expect_fail "$q/PRD-substrate-09-12-defect.md" build-into-substrate-mismatch "substrate-mismatch/fail (real 09-12 defect: python-cli vs Cargo workspace)"
+
+cat > "$q/PRD-substrate-09-12-fixed.md" <<EOF
+- Status: queued
+- build_target: rust-extend
+- build_into: $tmp/cargo-ws
+- Vision: visions/plain.md
+
+## Acceptance criteria
+
+1. P0 — Given a, When b, Then c.
+EOF
+expect_clean_no_id "$q/PRD-substrate-09-12-fixed.md" failures build-into-substrate-mismatch "substrate-mismatch/pass (rust-extend vs Cargo workspace, no false positive)"
+
+cat > "$q/PRD-substrate-rust-vs-py.md" <<EOF
+- Status: queued
+- build_target: rust-extend
+- build_into: $tmp/py-ws
+- Vision: visions/plain.md
+
+## Acceptance criteria
+
+1. P0 — Given a, When b, Then c.
+EOF
+expect_fail "$q/PRD-substrate-rust-vs-py.md" build-into-substrate-mismatch "substrate-mismatch/fail (rust-extend vs pyproject-only)"
+
+cat > "$q/PRD-substrate-py-vs-py.md" <<EOF
+- Status: queued
+- build_target: python-cli
+- build_into: $tmp/py-ws
+- Vision: visions/plain.md
+
+## Acceptance criteria
+
+1. P0 — Given a, When b, Then c.
+EOF
+expect_clean_no_id "$q/PRD-substrate-py-vs-py.md" failures build-into-substrate-mismatch "substrate-mismatch/pass (python-cli vs pyproject, no false positive)"
+
+# missing build_into path stays the pre-existing warn-only behavior
+# (requirement 1: "missing path stays the existing failure") -- this
+# fixture reuses PRD-into-not-found.md above and asserts the NEW check
+# does not also fire a failure for it (no compounding).
+expect_clean_no_id "$q/PRD-into-not-found.md" failures build-into-substrate-mismatch "substrate-mismatch/missing-path-unchanged"
+
 # =========================================================== deferred-acs-prose
 # Real defect (2026-09-03): PRD-mcphost-code-tools.md carried this exact line.
 cat > "$q/PRD-deferred-prose.md" <<'EOF'

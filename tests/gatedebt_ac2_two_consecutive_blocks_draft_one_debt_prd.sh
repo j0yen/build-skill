@@ -28,6 +28,12 @@ mkdir -p "$ROOT/prds/build-queue" "$ROOT/prds/built-prds" "$ROOT/prds/visions"
 : > "$ROOT/prds/visions/buildloop-operations.md"
 FAKE_REPO="$ROOT/fake-repo"
 mkdir -p "$FAKE_REPO"
+# gate-debt.sh always drafts build_target: rust-extend (its whole domain is
+# the Rust gate pipeline) -- give the fixture a real Cargo.toml so the
+# drafted PRD's build_into substrate actually matches build_target under
+# prd-lint.sh's build-into-substrate-mismatch check
+# (PRD-build-classification-self-heal), same as any real gate-debt target.
+printf '[package]\nname = "fake-repo"\nversion = "0.0.0"\n' > "$FAKE_REPO/Cargo.toml"
 git -C "$ROOT/prds" add -A
 git -C "$ROOT/prds" -c user.name=t -c user.email=t@t commit -q -m init
 BR="$(git -C "$ROOT/prds" symbolic-ref --short HEAD)"

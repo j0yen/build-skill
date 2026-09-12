@@ -96,6 +96,23 @@ an AC) are warnings and do not block selection. Run it standalone —
 `scripts/prd-lint.sh <file>... [--format text|json]` — before committing a
 new or edited PRD; exit 0 clean, 1 on any failure, 2 on usage error.
 
+**Substrate check, `build-into-substrate-mismatch` (PRD-build-classification-
+self-heal, 2026-09-12).** When `build_into` is set and exists locally, a
+`rust-*`/`kernel-extend` `build_target` requires a `Cargo.toml` at the path
+or in one of its immediate subdirectories, and a `python-*` target requires
+a `pyproject.toml` the same way — a mismatch (e.g. `build_target: python-cli`
+committed against a Cargo workspace, the real 2026-09-12 defect) is a lint
+FAILURE, not a silent pass. A `build_into` that doesn't exist on this host
+stays the pre-existing `build-into-not-found` WARNING (a PRD's `build_into`
+commonly lives on a different fleet host than wherever lint runs — see that
+check's own comment in prd-lint.sh); the two checks never compound. Shared
+substrate-detection algorithm: `scripts/substrate-probe.sh <path>` (also
+feeds `scan-prds.sh`'s per-PRD `substrate` manifest field). Bounce-budget
+and auto-resolution for a PRD this check parks live in
+`scripts/classification-self-heal.sh` (`bounce-check` / `resolve`
+subcommands, wired into `scan-prds.sh`'s lint pass) — see that script's own
+header for the full contract.
+
 ## Branch message trust (PRD-build-coordinator-message-distrust, 2026-09-08)
 
 A dispatched branch is not isolated — this fleet runs up to 30 concurrent

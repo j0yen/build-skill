@@ -215,6 +215,28 @@ the dependent `needs_classification` and say which name failed. Ordering
 within a tick follows the same rule: never dispatch a dependent in the same
 tick as the PRD it waits on.
 
+**Classification bounce budget (2026-09-12, PRD-build-classification-self-
+heal).** `needs_classification` is already outside this phase's candidate
+pool by construction (only `in_progress`/`queued` are gathered below), so
+the risk this closes isn't Phase 2 selecting a parked PRD directly — it's a
+`needs_classification` PRD getting silently restored to `queued` (the
+lint-gate one-way-trap fix, or `manifest-invariants.sh`'s equivalent heal)
+on a diagnosis that hasn't actually changed, which just re-admits the same
+mismatch to the pool next tick. `scan-prds.sh`'s lint pass now runs every
+`needs_classification` verdict through `scripts/classification-self-
+heal.sh bounce-check` before writing the manifest: an unchanged frontmatter-
+plus-diagnosis hash since the last bounce is journaled as one skip line
+(never a second one for the same unchanged state), and a second consecutive
+identical bounce raises one alarm (journal + `docket`, fail-open) instead of
+letting a third dispatch happen. The same lint pass also tries
+`classification-self-heal.sh resolve` first for the one check id
+(`build-into-substrate-mismatch`) whose evidence is mechanically
+unambiguous — exactly one of Cargo.toml/pyproject.toml present at
+`build_into` rewrites `build_target` and journals the probes, same evidence
+bar as a manual fix; a mixed or absent substrate declines and parks for a
+human exactly as before. See build-contract.md's Lint gate section and that
+script's own header for the full contract.
+
 Build a candidate pool in priority order:
 
 1. PRDs whose manifest `status` is `in_progress` and `last_action` is

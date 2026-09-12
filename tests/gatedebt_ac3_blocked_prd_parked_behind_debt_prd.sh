@@ -25,6 +25,10 @@ mkdir -p "$ROOT/prds/build-queue" "$ROOT/prds/built-prds" "$ROOT/prds/visions"
 : > "$ROOT/prds/visions/buildloop-operations.md"
 FAKE_REPO="$ROOT/fake-repo"
 mkdir -p "$FAKE_REPO"
+# gate-debt.sh always drafts build_target: rust-extend; give the fixture a
+# real Cargo.toml so build_into's substrate matches under prd-lint.sh's
+# build-into-substrate-mismatch check (PRD-build-classification-self-heal).
+printf '[package]\nname = "fake-repo"\nversion = "0.0.0"\n' > "$FAKE_REPO/Cargo.toml"
 
 # The PRD that was actually gate-pending on this repo when the block repeated.
 cat > "$ROOT/prds/build-queue/PRD-blocked-fixture.md" <<EOF

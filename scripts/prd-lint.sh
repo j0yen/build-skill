@@ -89,6 +89,13 @@ VALID_TARGETS = {
     "python-cli", "python-lib", "python-agent", "product",
 }
 EXTEND_TARGETS = {"rust-extend", "kernel-extend"}
+# PRD-build-classification-self-heal: the build_target families a substrate
+# check applies to. Deliberately mirrors substrate-probe.sh's depth<=1
+# algorithm rather than shelling out to it -- this script stays a single
+# self-contained python process for its <200ms/PRD budget; keep the two in
+# step by hand (see that script's own header for why it's duplicated here).
+RUST_SUBSTRATE_TARGETS = {"rust-cli", "rust-lib", "rust-extend", "kernel-extend"}
+PYTHON_SUBSTRATE_TARGETS = {"python-cli", "python-lib", "python-agent"}
 SLUG_RE = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
 FILENAME_RE = re.compile(r"^PRD-([a-z0-9]+(?:-[a-z0-9]+)*)\.md$")
 AC_HEADING_RE = re.compile(r"^##\s+Acceptance(?:\s+(criteria|tests))?\s*$", re.I)
@@ -137,6 +144,25 @@ def parse_frontmatter(path):
             continue
         fields[key] = strip_val(m.group(2))
     return fields
+
+
+def substrate_marker(base, filename):
+    """True + the subdir name (or '' for the root itself) if `filename`
+    lives directly at `base` or in any immediate subdirectory of it.
+    Mirrors substrate-probe.sh's depth<=1 algorithm -- see that script's
+    header for why this is duplicated rather than shelled out to."""
+    top = os.path.join(base, filename)
+    if os.path.isfile(top):
+        return True, []
+    members = []
+    try:
+        for name in sorted(os.listdir(base)):
+            sub = os.path.join(base, name)
+            if os.path.isdir(sub) and os.path.isfile(os.path.join(sub, filename)):
+                members.append(name)
+    except OSError:
+        pass
+    return bool(members), members
 
 
 def read_lines(path):
@@ -289,8 +315,40 @@ def lint_file(path):
     if build_into and not os.path.isdir(build_into):
         # Downgraded to a warning: a PRD's build_into commonly lives on a
         # different fleet host (e.g. RedBaron for Rust) than wherever this
-        # lint happens to run.
+        # lint happens to run. Left unchanged by PRD-build-classification-
+        # self-heal (requirement 1: "missing path stays the existing
+        # failure") -- promoting this to a FAIL would hard-block every
+        # extend PRD linted from a lane that isn't RedBaron, which is a much
+        # bigger regression than the substrate-mismatch bug this PRD fixes.
+        # The substrate-mismatch check below only ever runs when the path
+        # DOES exist locally, so the two checks never compound on this case.
         warn("build-into-not-found", f"build_into {build_into!r} does not exist on this host (may be a different build host)")
+    elif build_into and os.path.isdir(build_into):
+        # PRD-build-classification-self-heal, requirement 1: cross-check
+        # build_target against the actual substrate at build_into so a
+        # mismatched pair (e.g. build_target: python-cli against a Cargo
+        # workspace -- the real 2026-09-12 defect) fails lint instead of
+        # silently passing and bouncing at dispatch three times before a
+        # human fixes it by hand. Only the two language families that
+        # declare a `build_into` at all (rust-*/kernel-extend, python-*)
+        # are in scope, per the requirement text; shell/hooks/config/
+        # notebook/mixed/product carry no substrate expectation.
+        cargo_found, cargo_members = substrate_marker(build_into, "Cargo.toml")
+        pyproject_found, pyproject_dirs = substrate_marker(build_into, "pyproject.toml")
+        if build_target in RUST_SUBSTRATE_TARGETS and not cargo_found:
+            fail(
+                "build-into-substrate-mismatch",
+                f"build_target {build_target!r} requires a Cargo.toml at or under "
+                f"build_into {build_into!r}; none found "
+                f"(pyproject.toml present: {pyproject_found})",
+            )
+        elif build_target in PYTHON_SUBSTRATE_TARGETS and not pyproject_found:
+            fail(
+                "build-into-substrate-mismatch",
+                f"build_target {build_target!r} requires a pyproject.toml at or under "
+                f"build_into {build_into!r}; none found "
+                f"(Cargo.toml present: {cargo_found}, members: {cargo_members})",
+            )
 
     # -- deferred_acs ------------------------------------------------------------
     deferred_raw = fm.get("deferred_acs")

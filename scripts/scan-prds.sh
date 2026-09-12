@@ -44,6 +44,7 @@ PRD_DIR="${PRD_DIR:-$HOME/Documents/PRDs}"
 SCAN_HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 run_lint_pass() {
   local qdir="$PRD_DIR/build-queue" lint_sh="$SCAN_HERE/prd-lint.sh" set_sh="$SCAN_HERE/manifest-set.sh"
+  local heal_sh="$SCAN_HERE/classification-self-heal.sh"
   [ -d "$qdir" ] || return 0
   [ -x "$lint_sh" ] || return 0
   [ -x "$set_sh" ] || return 0
@@ -87,10 +88,13 @@ elif d.get("ok"):
     if [ "${line%%$'\t'*}" = "__LINT_OK__" ]; then
       # One-way-trap fix: a PRD parked as needs_classification whose file now
       # passes lint is restored to queued (only that status is ever touched —
-      # the case gate above already excluded every other status).
+      # the case gate above already excluded every other status). Also
+      # clears the bounce-tracking fields (PRD-build-classification-self-
+      # heal) so a FUTURE mismatch on this same PRD starts a clean bounce
+      # count rather than inheriting a stale hash from a resolved defect.
       if [ "$status" = "needs_classification" ]; then
         tmp="$(mktemp)" || continue
-        printf '{"status":"queued","needs_classification_reason":""}' >"$tmp"
+        printf '{"status":"queued","needs_classification_reason":"","needs_classification_hash":"","needs_classification_bounces":0}' >"$tmp"
         "$set_sh" "$slug" "$tmp" 1>&2 || echo "scan-prds: lint-restore manifest write failed for $slug" >&2
         rm -f "$tmp"
       fi
@@ -98,16 +102,42 @@ elif d.get("ok"):
     fi
     id="${line%%$'\t'*}"
     msg="${line#*$'\t'}"
-    tmp="$(mktemp)" || continue
-    python3 -c 'import json,sys; print(json.dumps({"status":"needs_classification","needs_classification_reason": sys.argv[1]+": "+sys.argv[2]}))' "$id" "$msg" >"$tmp" 2>/dev/null
-    "$set_sh" "$slug" "$tmp" 1>&2 || echo "scan-prds: lint-gate manifest write failed for $slug" >&2
-    rm -f "$tmp"
+    # PRD-build-classification-self-heal, requirement 3: a mechanically
+    # unambiguous substrate mismatch is resolved by this same tick instead
+    # of just being parked -- try that first, and only for this one check
+    # id (everything else this lint gate catches, e.g. a Depends-on cycle
+    # or malformed AC section, still just parks as before; those aren't
+    # "the substrate says exactly one target is consistent" cases).
+    if [ "$id" = "build-into-substrate-mismatch" ] && [ -x "$heal_sh" ]; then
+      if "$heal_sh" resolve "$f" 1>&2; then
+        continue
+      fi
+    fi
+    # Requirement 2 + P1: never blindly re-mark needs_classification every
+    # tick for an unchanged diagnosis -- classification-self-heal.sh's
+    # bounce-check does the manifest write itself (hash-tracked, journaled
+    # once per tick) instead of this loop hand-rolling another manifest-set
+    # call here.
+    if [ -x "$heal_sh" ]; then
+      "$heal_sh" bounce-check "$f" "$id" "$msg" 1>&2 \
+        || echo "scan-prds: bounce-check failed for $slug (falling back to a plain mark)" >&2
+    else
+      tmp="$(mktemp)" || continue
+      python3 -c 'import json,sys; print(json.dumps({"status":"needs_classification","needs_classification_reason": sys.argv[1]+": "+sys.argv[2]}))' "$id" "$msg" >"$tmp" 2>/dev/null
+      "$set_sh" "$slug" "$tmp" 1>&2 || echo "scan-prds: lint-gate manifest write failed for $slug" >&2
+      rm -f "$tmp"
+    fi
   done
   return 0
 }
 run_lint_pass || true
 
 # Fast path: use vellum if available (same output format, faster + more correct).
+# Known gap (PRD-build-classification-self-heal P2): the `substrate` field
+# added to the bash-fallback emit_one() below isn't backfilled onto vellum's
+# rows here -- vellum is an external binary this repo doesn't own. Whichever
+# lane doesn't have vellum installed still gets the field via the fallback
+# path below.
 # Emit BOTH top-level (buildable) and ARCHIVE/ (already-done) so Phase 1 diff
 # can distinguish archived from truly-vanished. Without this, PRDs moved to
 # ARCHIVE/ after shipping would be marked "vanished" on the next scan and
@@ -326,6 +356,27 @@ emit_one() {
     fi
   fi
 
+  # PRD-build-classification-self-heal, requirement 2 (P2): surface the
+  # probed substrate at build_into so the lint verdict is auditable without
+  # re-probing. "none" when build_into isn't set at all (nothing to probe) —
+  # substrate-probe.sh's own "none"/"absent" distinction (dir exists with
+  # no markers vs. doesn't exist) only applies once build_into is set.
+  local substrate="none"
+  if [ "$build_into" != "null" ]; then
+    local bi_path2 sp_sh; bi_path2="$(strip_val "$build_into")"
+    sp_sh="$SCAN_HERE/substrate-probe.sh"
+    if [ -x "$sp_sh" ]; then
+      substrate="$("$sp_sh" "$bi_path2" --format json 2>/dev/null | python3 -c '
+import json, sys
+try:
+    print(json.load(sys.stdin).get("substrate", "none"))
+except Exception:
+    print("none")
+' 2>/dev/null)"
+      [ -n "$substrate" ] || substrate="none"
+    fi
+  fi
+
   local size mtime
   size="$(stat -c%s "$path" 2>/dev/null || stat -f%z "$path" 2>/dev/null || echo 0)"
   mtime="$(date -u -r "$path" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
@@ -349,7 +400,8 @@ emit_one() {
     --argjson size "$size" \
     --arg mtime "$mtime" \
     --argjson gate_stale "$gate_stale" \
-    '{slug:$slug, path:$path, build_auto:$build_auto, build_target:$build_target, build_priority:$build_priority, build_into:$build_into, build_version_bump:$build_version_bump, publish:$publish, deferred_acs:$deferred_acs, deferred_acs_unparsed:$deferred_acs_unparsed, deferred_ac_reasons:$deferred_ac_reasons, test_prefix:$test_prefix, status_line:$status_line, size_bytes:$size, mtime_iso:$mtime, gate_stale:$gate_stale}'
+    --arg substrate "$substrate" \
+    '{slug:$slug, path:$path, build_auto:$build_auto, build_target:$build_target, build_priority:$build_priority, build_into:$build_into, build_version_bump:$build_version_bump, publish:$publish, deferred_acs:$deferred_acs, deferred_acs_unparsed:$deferred_acs_unparsed, deferred_ac_reasons:$deferred_ac_reasons, test_prefix:$test_prefix, status_line:$status_line, size_bytes:$size, mtime_iso:$mtime, gate_stale:$gate_stale, substrate:$substrate}'
 }
 
 # Emit top-level PRDs (buildable) AND ARCHIVE/ PRDs (already done).
