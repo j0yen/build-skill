@@ -1,0 +1,25 @@
+# loop-units.txt — the declared systemd --user unit set that makes the
+# buildloop whole, per host (PRD-buildloop-unit-liveness).
+#
+# Format: "<host> <unit>", one per line. Comments (#) and blank lines are
+# ignored. Host match is case-insensitive (same convention as
+# lane-claim.sh's same_lane()) — `hostname -s` on this box is lowercase
+# ("redbaron") while this file spells it "RedBaron" for readability.
+#
+# A host with NO lines here is not an alarm — loop-liveness.sh prints
+# `LIVENESS unknown host=<h>` and exits 0. carbon and ryzen7 disable lanes
+# by choice and must never false-alarm just for declaring nothing.
+#
+# RedBaron: the six units the loop depends on. Nothing declared this set
+# before this PRD — the only install line that ever ran
+# (carbon-lane-install.sh:93, pre-PRD) enabled just two of them. When the
+# loop was stopped 2026-09-11 05:27Z and restarted that evening, the
+# restart re-armed the build units and the two safety timers and left
+# claude-vibeloop-measure.timer inactive for 29 hours, unnoticed, because
+# no log or digest line said so. See the PRD's problem statement.
+RedBaron claude-build.path
+RedBaron claude-build.timer
+RedBaron prd-sync.timer
+RedBaron claude-vibeloop-measure.timer
+RedBaron burst-idle-guard.timer
+RedBaron agorabus-reap.timer

@@ -48,6 +48,15 @@
 # to the same log lane-has-work.sh uses:
 #   build-has-work  <work|no-work>  (buildable=[..] claimed=[..] gate-red-unchanged=[..] pace=<n>)
 #
+# Unit liveness (PRD-buildloop-unit-liveness): every invocation of this
+# script — work or no-work, including a paced skip — also runs
+# loop-liveness.sh once and appends its final `LIVENESS ...`-prefixed line
+# to the same log, so a handoff reading build-auto.log sees unit state
+# instead of assuming it (this is what caught claude-vibeloop-measure.timer
+# sitting inactive 29h unnoticed). loop-liveness.sh's own exit code is
+# never consulted here and never affects this script's decision or exit
+# code — a dead unit is visibility, not a reason to skip a tick.
+#
 # Env:
 #   BUILD_HASWORK_PACE     seconds to sleep before exit 1 (default 300).
 #   BUILD_HASWORK_DISABLE=1  always exit 0 immediately, no sleep — still
@@ -62,6 +71,7 @@ MANIFEST="${BUILD_MANIFEST:-$STATE_DIR/manifest.json}"
 LOG="${CLAUDE_BUILD_LOG:-$HOME/brain/journal/build-auto.log}"
 PACE="${BUILD_HASWORK_PACE:-300}"
 LANE_CLAIM="$HERE/lane-claim.sh"
+LIVENESS="${BUILD_LIVENESS_SCRIPT:-$HERE/loop-liveness.sh}"
 
 # Resolve external tools via `command -v` rather than hardcoded paths — a
 # past incident here (hardcoded /usr/sbin/jq) silently killed hooks.
@@ -195,6 +205,19 @@ decision="no-work"
 [ "${#buildable[@]}" -gt 0 ] && decision="work"
 
 logline "build-has-work  $decision  (buildable=$(fmt_list "${buildable[@]}") claimed=$(fmt_list "${claimed[@]}") gate-red-unchanged=$(fmt_list "${gate_red[@]}") pace=$PACE)"
+
+# Unit liveness (PRD-buildloop-unit-liveness): runs every invocation,
+# work or no-work, so build-auto.log always carries the newest unit state.
+# `tail -n1` of the LIVENESS-prefixed output keeps this to exactly one
+# appended line per tick regardless of how many units are down — full
+# multi-unit detail lives in the state file loop-liveness.sh itself
+# maintains and in `loop-liveness.sh --digest`'s streak-filtered view, not
+# in this per-tick heartbeat. Best-effort: a missing/failing script never
+# blocks or fails this pre-check.
+if [ -x "$LIVENESS" ]; then
+  liveness_line="$("$LIVENESS" 2>/dev/null | grep '^LIVENESS' | tail -n1)"
+  [ -n "$liveness_line" ] && logline "$liveness_line"
+fi
 
 if [ "$decision" = "work" ]; then
   exit 0

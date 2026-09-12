@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# fake systemctl for scripts/unitlive-selftest.sh (PRD-buildloop-unit-liveness).
+# Never touches a real unit. Logs every invocation's argv (one line, space
+# joined) to $FAKE_SYSTEMCTL_LOG so a test can assert exactly which units
+# were named in an `enable --now` call and that no unit outside the
+# declared set was ever touched.
+#
+# Scripted states come from $FAKE_SYSTEMCTL_STATES: a file of
+# "<unit>=<state>" lines. A unit with no line defaults to "active" — bias
+# toward the common case so a test only has to script the units it cares
+# about.
+set -uo pipefail
+
+[ -n "${FAKE_SYSTEMCTL_LOG:-}" ] && printf '%s\n' "$*" >> "$FAKE_SYSTEMCTL_LOG"
+
+state_of() {
+  local unit="$1"
+  if [ -n "${FAKE_SYSTEMCTL_STATES:-}" ] && [ -f "$FAKE_SYSTEMCTL_STATES" ]; then
+    local line
+    line="$(grep -E "^${unit}=" "$FAKE_SYSTEMCTL_STATES" | tail -n1)"
+    if [ -n "$line" ]; then
+      echo "${line#*=}"
+      return
+    fi
+  fi
+  echo "active"
+}
+
+# Drop leading global flags this fake doesn't care about (--user).
+args=()
+for a in "$@"; do
+  [ "$a" = "--user" ] && continue
+  args+=("$a")
+done
+
+cmd="${args[0]:-}"
+case "$cmd" in
+  is-active)
+    unit="${args[1]:-}"
+    st="$(state_of "$unit")"
+    echo "$st"
+    [ "$st" = "active" ] && exit 0
+    exit 3
+    ;;
+  enable)
+    # enable --now unit1 unit2 ... ; just echo systemd-ish noise and exit 0.
+    for u in "${args[@]:2}"; do
+      echo "Created symlink /fake/$u -> /fake/$u"
+    done
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac

@@ -342,7 +342,7 @@ carbon-local systemd install, done once:
 ```
 bash ~/.claude/skills/build/scripts/carbon-lane-install.sh        # dry-run: append --dry-run
 systemctl --user daemon-reload
-systemctl --user enable --now claude-build.path prd-sync.timer
+bash ~/.claude/skills/build/scripts/loop-arm.sh
 ```
 
 `carbon-lane-install.sh` symlinks `systemd/carbon/*` (this repo's versioned
@@ -358,6 +358,20 @@ travels to every box; the systemd install does not). With the units
 disabled, carbon's behavior is byte-identical to today (idle). RedBaron
 needs no equivalent step — its units already live in `~/dotfiles` and are
 unaffected by any of this.
+
+**`loop-arm.sh` is the only arming step (2026-09-12,
+PRD-buildloop-unit-liveness).** It reads `scripts/loop-units.txt` (per-host
+declared unit set), runs `systemctl --user enable --now` against exactly
+this host's declared units — nothing else — then verifies with
+`scripts/loop-liveness.sh` and prints its table, exiting non-zero if
+anything is still inactive. Carbon has no declared set today, so
+`loop-arm.sh` there prints `nothing to arm` and exits 0 — enabling
+`claude-build.path`/`prd-sync.timer` on carbon now requires adding
+carbon's lines to `loop-units.txt` first (Migration note: this is a
+deliberate behavior change from the old direct `enable --now`, not an
+oversight). RedBaron's declared six-unit set ships in `loop-units.txt` by
+default — see that file's own header for why (a restart that silently
+dropped one, unnoticed for 29h, is the whole reason this script exists).
 
 ### Phase 3 — Classify
 
@@ -2430,8 +2444,27 @@ vellum amend PRD-<slug>.md --append-iter-log "v0.1 — all ACs green"
 systemctl --user disable --now claude-build.timer
 ```
 
-Re-enable with `enable --now`. The skill itself stays usable manually
-either way.
+**Re-arm with `scripts/loop-arm.sh`** (PRD-buildloop-unit-liveness) — the
+only arming step for the buildloop's units, on any host. It enables+starts
+every unit this host declares in `scripts/loop-units.txt` (RedBaron's six —
+`claude-build.path`, `claude-build.timer`, `prd-sync.timer`,
+`claude-vibeloop-measure.timer`, `burst-idle-guard.timer`,
+`agorabus-reap.timer` — carbon and ryzen7 declare none today), then
+verifies with `scripts/loop-liveness.sh` and prints its table, exiting
+non-zero if anything is still inactive. A bare `systemctl --user enable
+--now` by hand is how the 2026-09-11 restart silently left
+`claude-vibeloop-measure.timer` inactive for 29 hours — do not use it for
+a full restart; `loop-arm.sh` is what verifies the whole declared set came
+back, not just whichever units you remembered to name. The skill itself
+stays usable manually either way.
+
+Every tick's pre-check (`build-has-work.sh`) also runs
+`scripts/loop-liveness.sh` read-only and appends its `LIVENESS ...` line to
+`build-auto.log`, so a handoff reading the log sees unit state instead of
+assuming it. `scripts/loop-liveness.sh --digest` renders only the units
+that have stayed inactive across at least two consecutive checks (the
+noise filter for a digest/rollup reader); it never calls `systemctl`
+itself, so it's free to run outside the tick cadence too.
 
 ## Local tool integration
 

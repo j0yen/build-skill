@@ -48,10 +48,10 @@ cat > "$C1/build-queue/PRD-fresh.md" <<'EOF'
 - build_into: /tmp/does-not-exist-case1
 EOF
 run_bhw "$C1" "$C1/state" 1 0
-if [ "$RC" -eq 0 ] && grep -q 'buildable=\[fresh\]' <<<"$(tail -1 "$ROOT/log.txt")"; then
+if [ "$RC" -eq 0 ] && grep -q 'buildable=\[fresh\]' <<<"$(grep 'build-has-work ' "$ROOT/log.txt" | tail -1)"; then
   ok "case 1: unclaimed never-gated PRD -> work (exit 0)"
 else
-  bad "case 1: expected exit 0 + buildable=[fresh], got rc=$RC log=$(tail -1 "$ROOT/log.txt")"
+  bad "case 1: expected exit 0 + buildable=[fresh], got rc=$RC log=$(grep 'build-has-work ' "$ROOT/log.txt" | tail -1)"
 fi
 
 # ---------------------------------------------------------------- case 2 --
@@ -67,10 +67,10 @@ cat > "$C2/build-queue/PRD-claimed.md" <<EOF
 - Lane: carbon $(fresh_claim_ts)
 EOF
 run_bhw "$C2" "$C2/state" 1 0
-if [ "$RC" -eq 1 ] && grep -q 'claimed=\[claimed\]' <<<"$(tail -1 "$ROOT/log.txt")" && [ "$ELAPSED" -ge 1 ]; then
+if [ "$RC" -eq 1 ] && grep -q 'claimed=\[claimed\]' <<<"$(grep 'build-has-work ' "$ROOT/log.txt" | tail -1)" && [ "$ELAPSED" -ge 1 ]; then
   ok "case 2: all PRDs live-claimed -> no-work (exit 1, paced)"
 else
-  bad "case 2: expected exit 1 + claimed=[claimed] + elapsed>=1, got rc=$RC elapsed=${ELAPSED}s log=$(tail -1 "$ROOT/log.txt")"
+  bad "case 2: expected exit 1 + claimed=[claimed] + elapsed>=1, got rc=$RC elapsed=${ELAPSED}s log=$(grep 'build-has-work ' "$ROOT/log.txt" | tail -1)"
 fi
 
 # ---------------------------------------------------------------- case 3 --
@@ -95,18 +95,18 @@ cat > "$C3/fakerepo/target/autobuilder/last-verdict.json" <<EOF
 {"head_sha": "$HEAD_X", "verdict": "block", "exit_code": 1}
 EOF
 run_bhw "$C3" "$C3/state" 1 0
-if [ "$RC" -eq 1 ] && grep -q 'gate-red-unchanged=\[gr\]' <<<"$(tail -1 "$ROOT/log.txt")"; then
+if [ "$RC" -eq 1 ] && grep -q 'gate-red-unchanged=\[gr\]' <<<"$(grep 'build-has-work ' "$ROOT/log.txt" | tail -1)"; then
   ok "case 3a: gate-red at unchanged HEAD -> no-work"
 else
-  bad "case 3a: expected exit 1 + gate-red-unchanged=[gr], got rc=$RC log=$(tail -1 "$ROOT/log.txt")"
+  bad "case 3a: expected exit 1 + gate-red-unchanged=[gr], got rc=$RC log=$(grep 'build-has-work ' "$ROOT/log.txt" | tail -1)"
 fi
 
 git -C "$C3/fakerepo" -c user.name=t -c user.email=t@t commit -q --allow-empty -m c2
 run_bhw "$C3" "$C3/state" 1 0
-if [ "$RC" -eq 0 ] && grep -q 'buildable=\[gr\]' <<<"$(tail -1 "$ROOT/log.txt")"; then
+if [ "$RC" -eq 0 ] && grep -q 'buildable=\[gr\]' <<<"$(grep 'build-has-work ' "$ROOT/log.txt" | tail -1)"; then
   ok "case 3b: HEAD moved past the gate-red verdict -> work (re-gate)"
 else
-  bad "case 3b: expected exit 0 + buildable=[gr], got rc=$RC log=$(tail -1 "$ROOT/log.txt")"
+  bad "case 3b: expected exit 0 + buildable=[gr], got rc=$RC log=$(grep 'build-has-work ' "$ROOT/log.txt" | tail -1)"
 fi
 
 # ---------------------------------------------------------------- case 4 --
@@ -122,10 +122,10 @@ cat > "$C4/build-queue/PRD-stale.md" <<EOF
 - Lane: carbon $(stale_claim_ts)
 EOF
 run_bhw "$C4" "$C4/state" 1 0
-if [ "$RC" -eq 0 ] && grep -q 'buildable=\[stale\]' <<<"$(tail -1 "$ROOT/log.txt")"; then
+if [ "$RC" -eq 0 ] && grep -q 'buildable=\[stale\]' <<<"$(grep 'build-has-work ' "$ROOT/log.txt" | tail -1)"; then
   ok "case 4: stale claim -> work (exit 0)"
 else
-  bad "case 4: expected exit 0 + buildable=[stale], got rc=$RC log=$(tail -1 "$ROOT/log.txt")"
+  bad "case 4: expected exit 0 + buildable=[stale], got rc=$RC log=$(grep 'build-has-work ' "$ROOT/log.txt" | tail -1)"
 fi
 
 # ---------------------------------------------------------------- case 5 --
@@ -135,10 +135,10 @@ fi
 # needed; case2's dir alone (100% claimed, zero buildable without the
 # bypass) is sufficient to prove the bypass.
 run_bhw "$C2" "$C2/state" 1 1
-if [ "$RC" -eq 0 ] && [ "$ELAPSED" -lt 1 ] && grep -q 'disabled-passthrough' <<<"$(tail -1 "$ROOT/log.txt")"; then
+if [ "$RC" -eq 0 ] && [ "$ELAPSED" -lt 1 ] && grep -q 'disabled-passthrough' <<<"$(grep 'build-has-work ' "$ROOT/log.txt" | tail -1)"; then
   ok "case 5: BUILD_HASWORK_DISABLE=1 bypasses an all-claimed queue -> work, no sleep"
 else
-  bad "case 5: expected exit 0 + disabled-passthrough + elapsed<1, got rc=$RC elapsed=${ELAPSED}s log=$(tail -1 "$ROOT/log.txt")"
+  bad "case 5: expected exit 0 + disabled-passthrough + elapsed<1, got rc=$RC elapsed=${ELAPSED}s log=$(grep 'build-has-work ' "$ROOT/log.txt" | tail -1)"
 fi
 
 # ---------------------------------------------------------------- case 6 --
@@ -149,6 +149,33 @@ if [ "$RC" -eq 1 ] && [ "$ELAPSED" -ge 1 ] && [ "$ELAPSED" -lt 10 ]; then
   ok "case 6: pace sleep honored (BUILD_HASWORK_PACE=1 -> elapsed=${ELAPSED}s, not instant, not 300s)"
 else
   bad "case 6: expected 1<=elapsed<10 on no-work path, got rc=$RC elapsed=${ELAPSED}s"
+fi
+
+# ---------------------------------------------------------------- case 7 --
+# unitlive_ac4 (PRD-buildloop-unit-liveness): the tick pre-check appends
+# exactly one new LIVENESS line on a tick that's skipped for no work, and
+# the liveness script's own exit code never changes this script's outcome.
+# Reuse case2 (100% claimed -> no-work) with a fake liveness script that
+# deliberately exits 1 (WARN-shaped) to prove the exit code is ignored.
+FAKE_LIVENESS="$ROOT/fake-liveness.sh"
+cat > "$FAKE_LIVENESS" <<'EOF'
+#!/usr/bin/env bash
+echo "LIVENESS WARN unit=fake.timer inactive_since=2026-01-01T00:00:00Z"
+exit 1
+EOF
+chmod +x "$FAKE_LIVENESS"
+before_lines=$(grep -c '^' "$ROOT/log.txt" 2>/dev/null || echo 0)
+OUT=$(PRD_DIR="$C2" BUILD_STATE_DIR="$C2/state" CLAUDE_BUILD_LOG="$ROOT/log.txt" \
+      BUILD_HASWORK_PACE=1 BUILD_HASWORK_DISABLE=0 \
+      BUILD_LIVENESS_SCRIPT="$FAKE_LIVENESS" \
+      "$BHW" 2>&1)
+RC=$?
+after_liveness_lines=$(grep -c 'LIVENESS WARN unit=fake.timer' "$ROOT/log.txt")
+new_liveness_lines_this_case=1  # exactly one call was made above
+if [ "$RC" -eq 1 ] && [ "$after_liveness_lines" -eq "$new_liveness_lines_this_case" ]; then
+  ok "case 7 (unitlive_ac4): exactly one new LIVENESS line appended on a skipped tick, exit code unaffected by liveness rc"
+else
+  bad "case 7 (unitlive_ac4): expected rc=1 + exactly 1 LIVENESS line, got rc=$RC liveness_lines=$after_liveness_lines before_lines=$before_lines"
 fi
 
 exit "$fail"

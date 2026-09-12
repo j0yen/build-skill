@@ -7,9 +7,13 @@
 # This script only SYMLINKS unit files into place; it never enables,
 # starts, or daemon-reloads anything ("Enabled state is carbon-local;
 # nothing syncs unit files to other machines" — the PRD's migration note).
-# A human runs `systemctl --user enable --now claude-build.path
-# prd-sync.timer` (and a `daemon-reload` if replacing live units) as an
-# explicit, separate, carbon-local step.
+# A human runs `systemctl --user daemon-reload` (if replacing live units)
+# and `scripts/loop-arm.sh` — the ONLY arming step for the buildloop's
+# units as of PRD-buildloop-unit-liveness — as an explicit, separate,
+# carbon-local step. loop-arm.sh enables+verifies whatever carbon declares
+# for itself in loop-units.txt; a host that declares nothing there gets
+# `LIVENESS unknown host=<h>` and loop-arm.sh does nothing, same as
+# before this PRD carbon armed nothing by way of this installer alone.
 #
 # Idempotent: re-running just re-points already-correct symlinks (no-op).
 # Existing regular (non-symlink) units are backed up to
@@ -90,5 +94,5 @@ done
 if [ "$DRY" -eq 0 ]; then
   echo "note: units are linked but NOT enabled. Run explicitly on carbon:"
   echo "  systemctl --user daemon-reload"
-  echo "  systemctl --user enable --now claude-build.path prd-sync.timer"
+  echo "  bash \"$HERE/scripts/loop-arm.sh\""
 fi
