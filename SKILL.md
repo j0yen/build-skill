@@ -915,19 +915,18 @@ read it before assuming a step is "the last one this tick".
   (extend mechanics).
 - **archive**: When the PRD passes the **verified-completed** checklist (all
   checks must hold — five for new-repo/python-*/kernel-extend, six for
-  rust-extend, see check #6 below) **AND the rebuild gate passes**, update manifest to
-  `status: shipped`, set the PRD's own `Status:` line to `built` (+ `Built:
-  <date>` and `Receipts: <path>` lines), then move the file into `built-prds/`
-  and commit +
-  push. Path depends on which workspace the PRD lives in:
-  - **`~/Documents/PRDs` (default)** — push to `j0yen/prds` (origin); pull
-    first so another machine's progress is never overwritten:
-    ```
-    cd ~/Documents/PRDs && git pull --rebase -q
-    git mv build-queue/PRD-<slug>.md built-prds/
-    git -c user.name="Joe Yen" -c user.email=jyen.tech@gmail.com commit -m "archive: <slug> shipped"
-    git push
-    ```
+  rust-extend, see check #6 below) **AND the rebuild gate passes**, run
+  `scripts/archive-commit.sh <slug>` as this step's ONE action
+  (PRD-build-archive-atomic-commit). It performs the whole write — header
+  lines, the move into `built-prds/`, the shared checkout's own
+  MANIFEST.md status flip, one commit, `git pull --rebase --autostash`,
+  push — as a single atomic sequence under the same per-repo integrate
+  lock `worktree-extend.sh`'s integrate/land use, so an archive never
+  interleaves with another archive or an integrate/land against the same
+  checkout: the checkout ends clean and pushed, or exactly as it started,
+  never half-archived. No builder agent sequences the header edit, the
+  move, and the commit by hand any more. See the script's own header for
+  exit codes and `--dry-run`.
   Record the five passing checks in the manifest entry's `verified_completed` field.
 
   **Rebuild gate (gap #68 — re-queues must prove they advanced the work;

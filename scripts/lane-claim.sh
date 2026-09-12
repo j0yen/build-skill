@@ -184,10 +184,45 @@ git_repo_root() { git -C "$(dirname "$1")" rev-parse --show-toplevel 2>/dev/null
 
 git_pull_or_die() {
   local root="$1"
-  if ! git -C "$root" pull --rebase -q 2>/tmp/lane-claim.pull.err; then
-    cat /tmp/lane-claim.pull.err >&2
-    die "origin unreachable for $root — idling, not claiming" 3
+  # --autostash (PRD-build-archive-atomic-commit): a sibling branch's own
+  # in-progress write (e.g. archive-commit.sh mid-commit, or any other
+  # branch's uncommitted edit to an unrelated PRD) must not fail this
+  # lane's claim pull just because the checkout happens to be dirty at
+  # this instant. git stashes the local dirt, rebases, then pops the
+  # stash back — so a transiently-dirty checkout now tolerates a pull
+  # that used to hard-fail here.
+  local pre_head; pre_head="$(git -C "$root" rev-parse HEAD 2>/dev/null)"
+  if git -C "$root" pull --rebase --autostash -q 2>/tmp/lane-claim.pull.err; then
+    # Gotcha (found by fixture, not by reading the docs): `git pull
+    # --rebase --autostash` reports SUCCESS even when its own final
+    # `stash pop` conflicts — that failure leaves unmerged paths and a
+    # retained autostash entry behind but neither a REBASE_HEAD nor a
+    # non-zero exit code, so a plain exit-code check here would silently
+    # let the caller (cmd_claim) commit on top of unresolved conflict
+    # markers. Check for unmerged paths explicitly before trusting a
+    # zero exit.
+    if [ -z "$(git -C "$root" diff --name-only --diff-filter=U 2>/dev/null)" ]; then
+      return 0
+    fi
   fi
+  # A real conflict between the sibling's uncommitted edit and the
+  # incoming commit either leaves a rebase in progress, or — the
+  # autostash-pop-only case above — leaves the rebase itself complete but
+  # the pop conflicted. Both are a busy condition, not an unreachable
+  # origin: unwind ALL the way back to the pre-pull HEAD and reapply the
+  # sibling's stashed edit exactly as it was, rather than leaving this
+  # attempt's incoming commit and a half-resolved conflict in place, then
+  # return the existing busy exit code with reason `checkout-conflict`.
+  if [ -d "$root/.git/rebase-apply" ] || [ -d "$root/.git/rebase-merge" ]; then
+    # rebase --abort restores pre-rebase HEAD and (git >=2.9) re-pops the
+    # autostash on its own.
+    git -C "$root" rebase --abort 2>/dev/null
+  else
+    git -C "$root" reset --hard -q "$pre_head" 2>/dev/null
+    git -C "$root" stash pop -q 2>/dev/null
+  fi
+  cat /tmp/lane-claim.pull.err >&2
+  die "checkout-conflict: rebase conflict pulling $root; aborted and restored" 2
 }
 
 # Write/replace Status + Lane lines in $1 (prd path) to Status: $2, Lane: $3.
