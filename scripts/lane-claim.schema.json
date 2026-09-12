@@ -1,0 +1,41 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "lane-claim.schema.json",
+  "title": "lane-claim.sh --json / status --json output",
+  "description": "PRD-build-lane-claim-integrity. Two shapes share this schema: the bulk `lane-claim.sh --json` / `lane-claim.sh claims` document (schema_version + claims array), and the single-PRD `lane-claim.sh status <prd> --json` document (schema_version + claimed + the same per-claim fields inlined, additive on top of the pre-existing claimed/lane/ts/age_seconds/stale fields).",
+  "type": "object",
+  "required": ["schema_version"],
+  "properties": {
+    "schema_version": { "type": "integer", "const": 1 },
+    "claimed": { "type": "boolean" },
+    "claims": {
+      "type": "array",
+      "items": { "$ref": "#/definitions/claim" }
+    }
+  },
+  "allOf": [
+    {
+      "if": { "required": ["claimed"], "properties": { "claimed": { "const": true } } },
+      "then": { "$ref": "#/definitions/claim" }
+    }
+  ],
+  "additionalProperties": true,
+  "definitions": {
+    "claim": {
+      "type": "object",
+      "required": ["prd", "lane", "host", "ts", "age_s", "state"],
+      "properties": {
+        "prd": { "type": "string" },
+        "lane": { "type": "string" },
+        "host": { "type": "string" },
+        "ts": { "type": "string" },
+        "age_s": { "type": "integer" },
+        "state": {
+          "type": "string",
+          "enum": ["live", "long-running", "stale", "unknown"]
+        }
+      },
+      "additionalProperties": true
+    }
+  }
+}

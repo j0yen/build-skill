@@ -415,13 +415,31 @@ if [ -x "$LANE_CLAIM" ]; then
     path="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["path"] or "")' "$row")"
     [ -n "$path" ] && [ -f "$path" ] || continue
     claim_json="$("$LANE_CLAIM" status "$path" --json 2>/dev/null || echo '{"claimed":false}')"
-    # NOTE: lane-claim.sh's own --json output emits `"stale":yes|no` as a
-    # bare word, not a quoted string or JSON boolean — not valid JSON. Match
-    # it with grep rather than json.loads (which would raise and, caught,
-    # silently read as "not claimed"/"not stale" — the exact false-negative
-    # this script hit in testing before this fix).
-    if grep -q '"claimed":true' <<<"$claim_json"; then
-      if grep -q '"stale":yes' <<<"$claim_json"; then
+    # PRD-build-lane-claim-integrity: lane-claim.sh's `status --json` is now
+    # valid JSON (built by jq, `stale` a real boolean) — this reads it with
+    # json.loads directly instead of the grep workaround the previous
+    # version needed for the "stale":yes bare-word bug. `state` carries the
+    # evidence-bar verdict (live/long-running/stale/unknown); only `stale`
+    # is ever alarmed+reclaimed here — `long-running` is journaled (never
+    # reclaimed, Requirement P0 #3) and `unknown` is silently left alone
+    # (AC5 — an unreachable host is never enough to reclaim).
+    claimed="$(python3 -c 'import json,sys
+try:
+    d=json.loads(sys.argv[1])
+except ValueError:
+    d={}
+print("true" if d.get("claimed") else "false")' "$claim_json")"
+    if [ "$claimed" = true ]; then
+      state="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("state",""))' "$claim_json")"
+      age="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("age_s",-1))' "$claim_json")"
+      probes="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("probes",""))' "$claim_json")"
+      if [ "$state" = "long-running" ]; then
+        # Requirement P0 #3: a claim that fails only the age check (a
+        # liveness probe fired) is journaled as long-running, never
+        # alarmed and never reclaimed.
+        printf '%s  %s  claim  long-running  (prd=%s age=%ss probes: %s lane=%s)\n' \
+          "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$slug" "$slug" "$age" "$probes" "$(hostname)" >> "$JOURNAL"
+      elif [ "$state" = "stale" ]; then
         alarms_json="$(python3 -c 'import json,sys
 alarms=json.loads(sys.argv[1])
 alarms.append({"slug": sys.argv[2], "class": "stale-claim",
@@ -435,17 +453,19 @@ print(json.dumps(alarms))' "$alarms_json" "$slug" "$claim_json")"
         # 05:43Z, nothing reclaimed it, the PRD sat gate-pending another
         # hour+ until a human intervened) — the alarm line above is kept
         # unchanged (it's the audit trail); this adds the actual release.
-        # claim_json is NOT valid JSON (see the NOTE above — "stale":yes|no
-        # is a bare word), so age_seconds is pulled the same way: pattern
-        # match, not json.loads.
-        age="$(grep -o '"age_seconds":-\?[0-9]*' <<<"$claim_json" | head -n1 | cut -d: -f2)"
+        # Requirement P1: the probes that justified this reclaim are
+        # carried into the journal line verbatim (a reclaim line without
+        # them is a lint failure — see lane-claim.sh's lint-reclaims).
         if release_out="$("$LANE_CLAIM" release "$path" 2>&1)"; then
-          printf '%s  %s  claim  reclaimed  (prd=%s age=%ss lane=%s)\n' \
-            "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$slug" "$slug" "$age" "$(hostname)" >> "$JOURNAL"
+          printf '%s  %s  claim  reclaimed  (prd=%s age=%ss probes: %s lane=%s)\n' \
+            "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$slug" "$slug" "$age" "$probes" "$(hostname)" >> "$JOURNAL"
         else
           log "lane-claim.sh release failed for $slug (stale claim alarmed but not reclaimed): $release_out"
         fi
       fi
+      # state == "live" or "unknown": no alarm, no reclaim, no journal
+      # noise — an unknown (unreachable-host) claim is exactly the AC5
+      # case this script must leave alone.
     fi
   done < <(python3 -c 'import json,sys
 m=json.load(open(sys.argv[1]))

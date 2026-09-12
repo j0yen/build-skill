@@ -24,8 +24,29 @@
 #       Same exit codes as claim, minus 2.
 #   lane-claim.sh status <prd-path> [--json]
 #       Print the current claim: free, or `<lane> <iso-ts> age=<s>s
-#       stale=<yes|no>` (stale threshold 3h, matching the PRD's
-#       stale-claim-recovery rule). Exit 0 always (read-only).
+#       stale=<yes|no>` (stale threshold 3h). `stale=yes` now means the
+#       PRD-build-lane-claim-integrity evidence bar was actually cleared
+#       (age past threshold AND no commit/iter_log/pid/journal liveness
+#       signal — see claim_state() below), not age alone — an
+#       age-exceeded claim with a live signal reads `stale=no` here even
+#       though it's also not simply "live" (see --json's `state` field
+#       for the long-running/unknown distinction text output doesn't
+#       carry). `--json` is built entirely by jq (never string
+#       interpolation, so quote/newline/UTF-8 values round-trip) and adds
+#       `schema_version`, `prd`, `host`, `state` fields on top of the
+#       original `claimed`/`lane`/`ts`/`age_seconds`/`stale` ones
+#       (additive — see lane-claim.schema.json). Exit 0 always (read-only).
+#   lane-claim.sh --json [--prd-dir <dir>]
+#   lane-claim.sh claims [--prd-dir <dir>]
+#       Scan build-queue/*.md for every live Lane: claim and print one
+#       JSON document: `{schema_version, claims:[{prd, lane, host, ts,
+#       age_s, state}, ...]}` — the machine-consumer shape a tick script
+#       can pipe straight into `jq .` (see lane-claim.schema.json beside
+#       this file). Read-only.
+#   lane-claim.sh lint-reclaims <journal-file>
+#       Flags any journal line containing "reclaimed" that doesn't also
+#       carry "probes:" (Requirement P1 — a reclaim without recorded
+#       evidence is a lint failure). Exit 0 clean, N = count of bad lines.
 #   lane-claim.sh target-busy <build_into-path> [--lane <name>] [--exclude-prd <path>] [--prd-dir <dir>]
 #       Scan build-queue/*.md for a live (non-stale) claim whose build_into
 #       matches. A claim held by a DIFFERENT lane than --lane (default
@@ -85,6 +106,15 @@ STALE_SECS=$((3 * 3600))
 # a further same-lane candidate (SKILL.md Selection rules #1 worktree cap).
 SAME_LANE_SUBCAP="${SAME_LANE_SUBCAP:-5}"
 
+# Where a host-local lane's own journal lives, for the journal-activity
+# liveness probe (PRD-build-lane-claim-integrity). Overridable so the
+# selftest never touches the real journal.
+JOURNAL_DIR="${JOURNAL_DIR:-$HOME/brain/journal/build}"
+
+# --json output schema version (PRD-build-lane-claim-integrity P2). Bump
+# this and the checked-in schema (lane-claim.schema.json) together.
+JSON_SCHEMA_VERSION=1
+
 # PRD-build-burst-lane-ccx53 requirement 7: path to burst-lane.sh, whose
 # `sub-cap` subcommand computes the box-wide same-target cap for rust
 # targets while a session is up. Overridable so selftests can point this
@@ -102,7 +132,7 @@ BURST_LANE_SH="${BURST_LANE_SH:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/bu
 die() { echo "lane-claim: $*" >&2; exit "${2:-4}"; }
 
 usage() {
-  echo "usage: lane-claim.sh {claim|release|status|target-busy} ..." >&2
+  echo "usage: lane-claim.sh {claim|release|status|target-busy|claims|lint-reclaims|--json} ..." >&2
   exit 4
 }
 
@@ -123,6 +153,14 @@ read_build_into() {
     | sed -E 's/[[:space:]]*#.*$//'
 }
 
+# Most recent `iter_log:` value (any of the three frontmatter forms,
+# same convention as mark-needs-classification.sh's read_last_iter_log) —
+# `<ISO-ts> <free text>`. Empty output = no iter_log line at all.
+read_last_iter_log_line() {
+  head -n 80 "$1" | grep -E '^(- *iter_log:|iter_log:|\*\*iter_log:\*\*)' | tail -n1 \
+    | sed -E 's/^(- *iter_log:|iter_log:|\*\*iter_log:\*\*)[[:space:]]*//'
+}
+
 # lane_value -> "lane host" "iso-ts" [pid=<n>] [boot=<id>] — host and ts are
 # the first two whitespace-separated tokens; pid/boot are optional trailer
 # tokens (absent on claims written before PRD-build-claims-resume-not-count).
@@ -139,6 +177,26 @@ age_seconds() {
 }
 
 current_boot_id() { cat /proc/sys/kernel/random/boot_id 2>/dev/null; }
+
+# Reachability probe for a remote (non-host-local) claim's host (AC5).
+# Overridable via LANE_CLAIM_REACHABLE_OVERRIDE ("host=yes|no host2=yes|no
+# ..."), so the selftest can pin fleet-hostname reachability deterministically
+# instead of depending on real network/DNS state from wherever tests run.
+# Echoes yes/no.
+host_reachable() {
+  local host="$1" pair h v
+  if [ -n "${LANE_CLAIM_REACHABLE_OVERRIDE:-}" ]; then
+    for pair in $LANE_CLAIM_REACHABLE_OVERRIDE; do
+      h="${pair%%=*}"; v="${pair#*=}"
+      if [ "$h" = "$host" ]; then echo "$v"; return; fi
+    done
+  fi
+  if command -v ping >/dev/null 2>&1 && ping -c1 -W2 "$host" >/dev/null 2>&1; then
+    echo yes
+  else
+    echo no
+  fi
+}
 
 pid_alive() { local pid="$1"; [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; }
 
@@ -162,13 +220,109 @@ coordinator_gone() {
   return 0
 }
 
-# $1=age $2=host $3=pid $4=boot (host/pid/boot optional; omitting them keeps
-# the original age-only behavior for call sites that predate the trailer).
+# Journal-activity probe (PRD-build-lane-claim-integrity, host-local only —
+# a remote lane's journal lives on that host, not here). Scans
+# $JOURNAL_DIR/*.md for any line mentioning $slug whose leading ISO-ts
+# token parses to an epoch after $since_epoch. Echoes yes/no.
+journal_activity_since() {
+  local slug="$1" since_epoch="$2" f line ts_tok epoch found=no
+  [ -d "$JOURNAL_DIR" ] || { echo no; return; }
+  for f in "$JOURNAL_DIR"/*.md; do
+    [ -f "$f" ] || continue
+    while IFS= read -r line; do
+      [[ "$line" == *"$slug"* ]] || continue
+      ts_tok=$(awk '{print $1}' <<<"$line")
+      epoch=$(date -u -d "$ts_tok" +%s 2>/dev/null) || continue
+      if [ "$epoch" -gt "$since_epoch" ]; then found=yes; fi
+    done < "$f"
+  done
+  echo "$found"
+}
+
+# Evidence-bar staleness (PRD-build-lane-claim-integrity, replaces the old
+# age-only is_stale). Sets CS_STATE to one of:
+#   live          age < STALE_SECS
+#   long-running  age >= STALE_SECS but a liveness probe fired (commit,
+#                 iter_log, host-local pid, or host-local journal) — never
+#                 reclaimed (Requirement P0 #3)
+#   stale         age >= STALE_SECS AND every probe this call could run
+#                 came back negative (or the coordinator is confirmed gone,
+#                 which is stale at any age — unchanged prior rule) —
+#                 reclaimable
+#   unknown       remote (non-host-local) claim whose host doesn't answer
+#                 a ping — cannot be probed further, so never reclaimed
+#                 (AC5 / open-question default)
+# CS_PROBES is a human-readable "k=v k=v ..." record of every probe this
+# call actually ran, for the reclaim-journal evidence contract
+# (Requirement P1). CS_AGE is the claim age in seconds.
+CS_STATE=""; CS_PROBES=""; CS_AGE=""
+claim_state() {
+  local prd="$1" host="$2" ts="$3" pid="${4:-}" boot="${5:-}"
+  local age; age=$(age_seconds "$ts")
+  CS_AGE="$age"
+  if [ "$age" -lt 0 ]; then
+    CS_STATE="stale"; CS_PROBES="ts=unparsable"; return
+  fi
+  if coordinator_gone "$host" "$pid" "$boot"; then
+    CS_STATE="stale"; CS_PROBES="coordinator=gone"; return
+  fi
+  if [ "$age" -lt "$STALE_SECS" ]; then
+    CS_STATE="live"; CS_PROBES="age=${age}s(<threshold)"; return
+  fi
+
+  local since_epoch; since_epoch=$(date -u -d "$ts" +%s 2>/dev/null) || since_epoch=0
+
+  local commit="no" commit_ts=""
+  local latest; latest=$(git -C "$(dirname "$prd")" log -1 --format=%ct -- "$(basename "$prd")" 2>/dev/null)
+  if [ -n "$latest" ] && [ "$latest" -gt $((since_epoch + 2)) ]; then
+    commit="yes"; commit_ts=$(date -u -d "@$latest" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)
+  fi
+
+  local iterlog="no" iterlog_ts=""
+  local last_il; last_il=$(read_last_iter_log_line "$prd")
+  if [ -n "$last_il" ]; then
+    local il_ts; il_ts=$(awk '{print $1}' <<<"$last_il")
+    local il_epoch; il_epoch=$(date -u -d "$il_ts" +%s 2>/dev/null)
+    if [ -n "$il_epoch" ] && [ "$il_epoch" -gt "$since_epoch" ]; then
+      iterlog="yes"; iterlog_ts="$il_ts"
+    fi
+  fi
+
+  if same_lane "$host" "$(hostname)"; then
+    local pidlive="no"
+    [ -n "$pid" ] && pid_alive "$pid" && pidlive="yes"
+    local journal; journal=$(journal_activity_since "$(slug_of "$prd")" "$since_epoch")
+    if [ "$commit" = no ] && [ "$iterlog" = no ] && [ "$pidlive" != yes ] && [ "$journal" != yes ]; then
+      CS_STATE="stale"
+    else
+      CS_STATE="long-running"
+    fi
+    CS_PROBES="commit=$commit${commit_ts:+@$commit_ts} iter_log=$iterlog${iterlog_ts:+@$iterlog_ts} pid=$pidlive journal=$journal"
+    return
+  fi
+
+  # Remote claim: no pid/journal probe reachable from here. Check
+  # reachability first — an unreachable host is unknown, never stale
+  # (AC5), regardless of what commit/iter_log show.
+  local reachable; reachable=$(host_reachable "$host")
+  if [ "$reachable" != yes ]; then
+    CS_STATE="unknown"
+    CS_PROBES="reachable=$reachable commit=$commit${commit_ts:+@$commit_ts} iter_log=$iterlog${iterlog_ts:+@$iterlog_ts}"
+    return
+  fi
+  if [ "$commit" = no ] && [ "$iterlog" = no ]; then
+    CS_STATE="stale"
+  else
+    CS_STATE="long-running"
+  fi
+  CS_PROBES="reachable=$reachable commit=$commit${commit_ts:+@$commit_ts} iter_log=$iterlog${iterlog_ts:+@$iterlog_ts}"
+}
+
+# $1=prd $2=host $3=ts $4=pid $5=boot (pid/boot optional). Thin boolean
+# wrapper over claim_state for call sites that only need yes/no.
 is_stale() {
-  local age="$1" host="${2:-}" pid="${3:-}" boot="${4:-}"
-  [ "$age" -lt 0 ] && return 0   # unparseable timestamp treated as stale
-  coordinator_gone "$host" "$pid" "$boot" && return 0
-  [ "$age" -ge "$STALE_SECS" ]
+  claim_state "$1" "$2" "$3" "${4:-}" "${5:-}"
+  [ "$CS_STATE" = "stale" ]
 }
 
 slug_of() { basename "$1" .md | sed -E 's/^PRD-//'; }
@@ -332,16 +486,30 @@ cmd_status() {
   local lane_val host ts pid boot age stale
   lane_val=$(read_lane_line "$prd")
   if [ -z "$lane_val" ]; then
-    if [ "$json" = 1 ]; then echo '{"claimed":false}'; else echo "free"; fi
+    if [ "$json" = 1 ]; then
+      jq -nc --argjson v "$JSON_SCHEMA_VERSION" '{schema_version:$v, claimed:false}'
+    else
+      echo "free"
+    fi
     exit 0
   fi
   host=$(lane_host_of "$lane_val"); ts=$(lane_ts_of "$lane_val")
   pid=$(lane_pid_of "$lane_val"); boot=$(lane_boot_of "$lane_val")
-  age=$(age_seconds "$ts")
-  is_stale "$age" "$host" "$pid" "$boot" && stale=yes || stale=no
+  claim_state "$prd" "$host" "$ts" "$pid" "$boot"
+  age="$CS_AGE"
+  [ "$CS_STATE" = "stale" ] && stale=yes || stale=no
   if [ "$json" = 1 ]; then
-    printf '{"claimed":true,"lane":"%s","ts":"%s","age_seconds":%s,"stale":%s}\n' \
-      "$host" "$ts" "$age" "$stale"
+    # Built entirely by jq (never string interpolation) so a host/ts/prd
+    # value containing quotes, newlines, or UTF-8 still round-trips —
+    # AC1/AC2. `stale` stays the pre-existing bare-word-bug field name but
+    # is now a real JSON boolean; `schema_version`/`prd`/`host`/`state`
+    # are additive (Migration/compatibility: schema is additive-only).
+    jq -nc --argjson v "$JSON_SCHEMA_VERSION" --arg prd "$prd" --arg lane "$host" \
+      --arg host "$host" --arg ts "$ts" --argjson age_s "$age" \
+      --arg state "$CS_STATE" --arg probes "$CS_PROBES" \
+      --argjson stale_bool "$([ "$stale" = yes ] && echo true || echo false)" \
+      '{schema_version:$v, claimed:true, prd:$prd, lane:$lane, host:$host, ts:$ts,
+        age_seconds:$age_s, age_s:$age_s, state:$state, probes:$probes, stale:$stale_bool}'
   else
     echo "$host $ts age=${age}s stale=$stale"
   fi
@@ -353,27 +521,29 @@ cmd_claim() {
   local root; root=$(git_repo_root "$prd") || die "not a git repo: $prd" 4
   git_pull_or_die "$root"
 
-  local existing host ts pid boot age
+  local existing host ts pid boot age was_stale=0
   existing=$(read_lane_line "$prd")
   if [ -n "$existing" ]; then
     host=$(lane_host_of "$existing"); ts=$(lane_ts_of "$existing")
     pid=$(lane_pid_of "$existing"); boot=$(lane_boot_of "$existing")
-    age=$(age_seconds "$ts")
-    if ! same_lane "$host" "$lane" && ! is_stale "$age" "$host" "$pid" "$boot"; then
-      echo "held: $host $ts age=${age}s"
+    claim_state "$prd" "$host" "$ts" "$pid" "$boot"
+    age="$CS_AGE"
+    if ! same_lane "$host" "$lane" && [ "$CS_STATE" != "stale" ]; then
+      # long-running/unknown claims are held exactly like a live claim
+      # (Requirement P0 #3, AC5) — the state is appended for operator
+      # visibility; the `held: $host $ts age=...` prefix that the
+      # existing selftest greps for is unchanged.
+      echo "held: $host $ts age=${age}s state=$CS_STATE"
       exit 2
     fi
-    if ! same_lane "$host" "$lane" && is_stale "$age" "$host" "$pid" "$boot"; then
-      # Stale-claim recovery receipt: age, and a best-effort probe of the
-      # claiming host (only meaningful for a fleet hostname on the same
-      # tailnet; failure is expected and just means "unreachable", not an
-      # error). A gone-coordinator claim is stale at any age (Requirement
-      # P0 #3); the receipt still reports the true age for the journal.
-      local probe="unreachable"
-      if command -v ping >/dev/null 2>&1 && ping -c1 -W2 "$host" >/dev/null 2>&1; then
-        probe="reachable"
-      fi
-      echo "reclaim-receipt: prev_lane=$host prev_ts=$ts age=${age}s probe=$probe"
+    if ! same_lane "$host" "$lane" && [ "$CS_STATE" = "stale" ]; then
+      # Stale-claim recovery receipt: age plus every probe claim_state
+      # actually ran, so the journal line names both/all probes and
+      # their timestamps (Requirement P1's evidence contract). A
+      # gone-coordinator claim is stale at any age (Requirement P0 #3);
+      # the receipt still reports the true age for the journal.
+      echo "reclaim-receipt: prev_lane=$host prev_ts=$ts age=${age}s probes: $CS_PROBES"
+      was_stale=1
     fi
   fi
 
@@ -386,7 +556,7 @@ cmd_claim() {
   git -C "$root" add -- "$prd"
   local slug; slug=$(slug_of "$prd")
   local subject="claim: $slug lane=$lane"
-  if [ -n "$existing" ] && is_stale "$(age_seconds "$(lane_ts_of "$existing")")" "$host" "$pid" "$boot" 2>/dev/null; then
+  if [ "$was_stale" -eq 1 ]; then
     subject="reclaim: $slug lane=$lane (prev stale)"
   fi
   git -C "$root" -c user.name="Joe Yen" -c user.email=jyen.tech@gmail.com \
@@ -493,7 +663,10 @@ cmd_target_busy() {
     host=$(lane_host_of "$lane_val"); ts=$(lane_ts_of "$lane_val")
     pid=$(lane_pid_of "$lane_val"); boot=$(lane_boot_of "$lane_val")
     age=$(age_seconds "$ts")
-    is_stale "$age" "$host" "$pid" "$boot" && continue
+    # A long-running or unknown claim is demonstrably (or possibly) still
+    # alive — PRD-build-lane-claim-integrity — so it must NOT be skipped
+    # here as if reclaimed; only a genuinely stale claim frees the slot.
+    is_stale "$f" "$host" "$ts" "$pid" "$boot" && continue
     if ! same_lane "$host" "$query_lane"; then
       # Foreign-lane claim: unconditional block, exactly as before
       # (cross-lane exclusivity is never relaxed).
@@ -518,14 +691,75 @@ cmd_target_busy() {
   exit 0
 }
 
+# Bulk claims listing (PRD-build-lane-claim-integrity), the `lane-claim.sh
+# --json | jq .` shape the lane predicate / any future machine consumer
+# wants: one JSON document, `{schema_version, claims:[...]}`, built
+# entirely by jq (one object per claim, then `jq -s` to wrap them) so a
+# prd path or diagnosis containing quotes/newlines/UTF-8 still round-trips
+# — never string interpolation. Each claim: prd, lane, host, ts, age_s,
+# state (state per claim_state() above: live/long-running/stale/unknown).
+# PRDs with no Lane: line are simply absent from the array (this lists
+# claims, not every PRD).
+cmd_json_all() {
+  local prd_dir="$HOME/Documents/PRDs"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --prd-dir) prd_dir="$2"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  local f lane_val host ts pid boot
+  local tmp; tmp=$(mktemp)
+  : > "$tmp"
+  for f in "$prd_dir"/build-queue/PRD-*.md; do
+    [ -f "$f" ] || continue
+    lane_val=$(read_lane_line "$f")
+    [ -z "$lane_val" ] && continue
+    host=$(lane_host_of "$lane_val"); ts=$(lane_ts_of "$lane_val")
+    pid=$(lane_pid_of "$lane_val"); boot=$(lane_boot_of "$lane_val")
+    claim_state "$f" "$host" "$ts" "$pid" "$boot"
+    jq -nc --arg prd "$f" --arg lane "$host" --arg host "$host" --arg ts "$ts" \
+      --argjson age_s "$CS_AGE" --arg state "$CS_STATE" --arg probes "$CS_PROBES" \
+      '{prd:$prd, lane:$lane, host:$host, ts:$ts, age_s:$age_s, state:$state, probes:$probes}' >> "$tmp"
+  done
+  jq -sc --argjson v "$JSON_SCHEMA_VERSION" '{schema_version:$v, claims: .}' "$tmp"
+  rm -f "$tmp"
+}
+
+# tick lint (Requirement P1 / AC6): a reclaim journal line that doesn't
+# name its probes is itself a lint failure. Scans $1 (a journal file) for
+# any line containing "reclaimed" and flags the ones missing "probes:".
+# Exit 0 clean, N = count of bad lines otherwise (usage errors still 4).
+cmd_lint_reclaims() {
+  local file="$1"
+  [ -f "$file" ] || die "no such file: $file" 4
+  local bad=0 line
+  while IFS= read -r line; do
+    if [[ "$line" == *"reclaimed"* ]] && [[ "$line" != *"probes:"* ]]; then
+      echo "FAIL $file: reclaim line missing probes: $line"
+      bad=$((bad + 1))
+    fi
+  done < "$file"
+  exit "$bad"
+}
+
 main() {
+  # `lane-claim.sh --json [--prd-dir <dir>]` — bare top-level flag, no
+  # subcommand keyword, matching the lane predicate's own invocation shape.
+  if [ "${1:-}" = "--json" ]; then
+    shift
+    cmd_json_all "$@"
+    return
+  fi
   [ $# -ge 1 ] || usage
   local sub="$1"; shift
   case "$sub" in
-    claim)        [ $# -ge 1 ] || usage; cmd_claim "$@" ;;
-    release)      [ $# -ge 1 ] || usage; cmd_release "$@" ;;
-    status)       [ $# -ge 1 ] || usage; cmd_status "$@" ;;
-    target-busy)  [ $# -ge 1 ] || usage; cmd_target_busy "$@" ;;
+    claim)          [ $# -ge 1 ] || usage; cmd_claim "$@" ;;
+    release)        [ $# -ge 1 ] || usage; cmd_release "$@" ;;
+    status)         [ $# -ge 1 ] || usage; cmd_status "$@" ;;
+    target-busy)    [ $# -ge 1 ] || usage; cmd_target_busy "$@" ;;
+    claims)         cmd_json_all "$@" ;;
+    lint-reclaims)  [ $# -ge 1 ] || usage; cmd_lint_reclaims "$@" ;;
     *) usage ;;
   esac
 }

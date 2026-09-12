@@ -45,12 +45,19 @@ git -C "$ROOT/clone" push -q origin "$BR"
 PRD="$ROOT/clone/build-queue/PRD-gatedebt-fixture.md"
 
 # Write a stale claim directly (age well past the 3h threshold, no pid/boot
-# trailer — the age-only rule applies regardless of hostname).
+# trailer — the age-only rule applies regardless of hostname). The claim
+# commit itself is backdated to the same instant (GIT_AUTHOR/COMMITTER_DATE)
+# — PRD-build-lane-claim-integrity's evidence bar checks for a commit AFTER
+# the claim, and without this the claim commit's own (real, "now") wall
+# clock timestamp would itself look like post-claim activity and read as
+# long-running rather than the genuinely-dead claim this fixture means to
+# simulate.
 STALE_TS="$(date -u -d '5 hours ago' +%Y-%m-%dT%H:%M:%SZ)"
 source "$LC"
 write_claim "$PRD" building "otherlane $STALE_TS"
 git -C "$ROOT/clone" add -A
-git -C "$ROOT/clone" -c user.name=t -c user.email=t@t commit -q -m "claim: gatedebt-fixture lane=otherlane"
+GIT_AUTHOR_DATE="$STALE_TS" GIT_COMMITTER_DATE="$STALE_TS" \
+  git -C "$ROOT/clone" -c user.name=t -c user.email=t@t commit -q -m "claim: gatedebt-fixture lane=otherlane"
 git -C "$ROOT/clone" push -q origin "$BR"
 
 STATE="$ROOT/state"
@@ -69,6 +76,11 @@ export BUILD_MANIFEST="$STATE/manifest.json"
 export LOCK="$STATE/tick.lock"
 export JOURNAL="$ROOT/journal.md"
 export LANE_CLAIM="$LC"
+# "otherlane" is a fake fleet hostname with no real network presence in
+# this scratch/CI environment — pin it reachable so the evidence-bar check
+# (PRD-build-lane-claim-integrity, AC5) doesn't read it as unknown/
+# unreachable and skip the reclaim this test is actually about.
+export LANE_CLAIM_REACHABLE_OVERRIDE="otherlane=yes"
 : > "$JOURNAL"
 
 out="$("$MI" --prd-dir "$ROOT/clone" --format json)"; rc=$?

@@ -14,6 +14,13 @@ SG="$HERE/select-guard.sh"
 LC="$HERE/lane-claim.sh"
 ROOT=$(mktemp -d /tmp/select-guard-selftest.XXXXXX)
 trap 'rm -rf "$ROOT"' EXIT
+# Never read the real ~/brain/journal/build for the journal-activity
+# liveness probe (PRD-build-lane-claim-integrity) — a real journal
+# frequently mentions common slug substrings like "holder" (e.g.
+# `holder_prd=...` in lock-contended lines) by sheer coincidence, which
+# would false-positive this selftest's stale-claim fixtures below.
+export JOURNAL_DIR="$ROOT/journal"
+mkdir -p "$JOURNAL_DIR"
 
 git init -q --bare "$ROOT/origin.git"
 git clone -q "$ROOT/origin.git" "$ROOT/clone"
@@ -77,7 +84,13 @@ with open(f, 'w') as fh:
     fh.write(text)
 PYEOF
 git -C "$ROOT/clone" add -A
-git -C "$ROOT/clone" -c user.name=t -c user.email=t@t commit -q -m stale-the-claim
+# Backdate the commit itself to match the backdated Lane: value
+# (PRD-build-lane-claim-integrity's evidence bar checks for a commit AFTER
+# the claim — an un-backdated "now" commit that merely carries a
+# stale-looking Lane: value would otherwise itself read as post-claim
+# activity, i.e. long-running rather than genuinely stale).
+GIT_AUTHOR_DATE=2020-01-01T00:00:00Z GIT_COMMITTER_DATE=2020-01-01T00:00:00Z \
+  git -C "$ROOT/clone" -c user.name=t -c user.email=t@t commit -q -m stale-the-claim
 git -C "$ROOT/clone" push -q origin "$BRANCH"
 
 out=$("$SG" victim carbon "$ROOT/clone")
