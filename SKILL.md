@@ -418,7 +418,8 @@ Read the PRD. Determine its implementation shape:
 - **Rust extend** (`build_target: rust-extend`) → the PRD declares an
   existing repo to extend, via `build_into: <abs-path>`. The skill
   validates the target with `scripts/extend-handler.sh validate <slug>`;
-  if validation fails, mark `needs_classification` and stop. Otherwise
+  if validation fails, call `scripts/mark-needs-classification.sh` (see
+  below) and stop. Otherwise
   set `status: in_progress`, set `output_repo_path` to the validated
   `build_into`, and route to the Phase 4 extend path. NEVER calls
   `gh repo create` for this target type — the repo already exists.
@@ -462,9 +463,17 @@ Read the PRD. Determine its implementation shape:
 - **Mixed** (Rust + hooks, or Rust + Python) → do the Rust portion via
   `/rustbuild` this tick; queue the hook or Python portion for the next tick.
 
-If classification is ambiguous, mark the PRD `status: needs_classification`
-and emit one line in the journal asking the user to add a hint to the PRD
-frontmatter (e.g., `build_target: rust-cli`).
+If classification is ambiguous, call `scripts/mark-needs-classification.sh
+<prd-path> "<reason>"` (per PRD-build-needs-classification-commit-
+durability) — it sets `Status: needs_classification`, releases any `Lane:`
+claim, appends the reason as an `iter_log:` line, and commits+pushes that
+edit itself so the verdict is durable on `origin/main` the instant it's
+reached, the same way `lane-claim.sh claim` / `archive-commit.sh` commit
+their own transitions. Do NOT hand-edit `Status:` and rely on a later step
+to commit it — an uncommitted working-tree edit is invisible to the next
+tick's Phase 1 reconcile, which stomps it back to buildable off the file
+still on `origin/main`. Also emit one line in the journal asking the user
+to add a hint to the PRD frontmatter (e.g., `build_target: rust-cli`).
 
 ### Phase 4 — Implement (one ATOMIC step at a time, chained while green)
 
