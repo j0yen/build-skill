@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Fake `claude` CLI for extend-gate-phase-timing-selftest.sh — stands in
+# for the headless Sonnet review spawn inside extend-gate.sh's
+# run_reviewer, so the "reviewer" phase's duration is controllable
+# (FAKE_REVCLAUDE_SLEEP) without a real network call or model spend.
+# Always answers with a minimal valid
+# autobuilder.reviewer_agent_receipt.v1 JSON object on stdout, matching
+# the schema extend-gate.sh's own prompt requires.
+set -uo pipefail
+sleep_for() { local s="${1:-0}"; [ "$s" = "0" ] || sleep "$s"; }
+sleep_for "${FAKE_REVCLAUDE_SLEEP:-0}"
+cat <<'EOF'
+{"schema":"autobuilder.reviewer_agent_receipt.v1","head_sha":"fake","intent_card_sha":"fake","decision":"pass","block_reasons":[],"concern_reasons":[],"falsification":{"test_audit":"ok","panic_audit":"ok","unsafe_audit":"ok","public_api_audit":"ok","deps_audit":"ok","drift_audit":"ok","counter_attack":{"description":"n/a","test_skeleton":"n/a"}}}
+EOF
+exit "${FAKE_REVCLAUDE_RC:-0}"

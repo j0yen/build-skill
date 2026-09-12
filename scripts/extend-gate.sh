@@ -6,6 +6,20 @@
 # usage: extend-gate.sh <build_into> [--base <tag>] [--head <sha>] [--dry-run]
 #                        [--project-root <rel>]
 #                        [--parallelism N] [--record-baseline] [--force]
+#                        [--phases-json]
+#
+# Phase timing (PRD-build-gate-phase-timing): every producer step below is
+# individually timed (never restructured — same order, same pass/block
+# contribution). The journal line's `wall=<s>s` gains a
+# `phases=<name>:<s>,...` field right after it, in invocation order; a step
+# this run never invoked (no scripts/audit.sh, gh unavailable, reviewer
+# bypassed by a prior block) reads `<name>:skip`, and a step whose own
+# subprocess exited non-zero reads `<name>:<s>!` — never a silent `:0`. The
+# same breakdown, plus `wall_s` and `head`, lands in the cached verdict
+# receipt (target/autobuilder/last-verdict.json) under a `phases` key.
+# `--phases-json` is a read-only mode: prints that cached `{phases,
+# wall_s, head}` for <build_into>'s last gate and exits 0 — no producer
+# runs, no lock taken, nothing journaled.
 #
 # On a clean main checkout, at HEAD, in this order:
 #   scripts/audit.sh                         (if the crate has one)
@@ -265,6 +279,7 @@ usage() {
   cat <<'EOF'
 usage: extend-gate.sh <build_into> [--base <tag>] [--head <sha>] [--dry-run]
                        [--parallelism N] [--record-baseline] [--force]
+                       [--phases-json]
 EOF
 }
 
@@ -293,6 +308,7 @@ parallelism=6
 record_baseline=false
 force=false
 project_root_override=""
+phases_json_mode=false
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -303,6 +319,7 @@ while [ $# -gt 0 ]; do
     --record-baseline)  record_baseline=true; shift ;;
     --force)            force=true; shift ;;
     --project-root)     project_root_override="${2:?extend-gate: --project-root needs a value}"; shift 2 ;;
+    --phases-json)      phases_json_mode=true; shift ;;
     *) die 1 "unknown argument: $1 (see --help)" ;;
   esac
 done
@@ -468,6 +485,25 @@ else
   project_abs="$(find_cargo_root "$repo")" || die 6 "$project_abs"
 fi
 project_rel="$(realpath --relative-to="$repo" "$project_abs")"
+
+# --- --phases-json (P1, PRD-build-gate-phase-timing requirement) ---------
+# Prints the `phases` object (plus wall_s/head) from the last gate's cached
+# verdict (target/autobuilder/last-verdict.json — the same file the verdict
+# cache above reads/writes) for <build_into>. Read-only: never runs a
+# producer, never takes the integration lock, never touches the journal.
+# `{}` (exit 0) when no cached verdict exists yet, or it predates this PRD
+# (no `phases` key) — a fresh repo or an old cache is a legitimate "nothing
+# to report yet", not an error.
+if $phases_json_mode; then
+  phases_cache_file="$project_abs/target/autobuilder/last-verdict.json"
+  if [ -f "$phases_cache_file" ]; then
+    jq -c '{phases: (.phases // {}), wall_s: (.wall_s // null), head: (.head // .head_sha // null)}' "$phases_cache_file" 2>/dev/null \
+      || echo '{"phases":{},"wall_s":null,"head":null}'
+  else
+    echo '{"phases":{},"wall_s":null,"head":null}'
+  fi
+  exit 0
+fi
 
 # --- base resolution ---------------------------------------------------
 # Mirrors autobuilder rollback-plan's own default exactly (see
@@ -692,6 +728,29 @@ t0=$(date +%s)
 blocking_notes=()
 note_block() { blocking_notes+=("$1"); echo "extend-gate: $1" >&2; }
 
+# --- per-step phase timing (PRD-build-gate-phase-timing) -----------------
+# Every invoked producer below is wrapped in a `date +%s` pair and recorded
+# here, in invocation order — never restructuring what a step does or its
+# pass/block contribution (Non-goals: "changing any gate step's behavior,
+# order, or verdict"). `record_phase <name> <seconds> <ok|skip|fail>`:
+#   ok   -> journal/receipt carry the plain second count
+#   skip -> the step was never invoked this run (e.g. no scripts/audit.sh,
+#           gh unavailable, reviewer bypassed because a block already
+#           landed) — reads `<name>:skip`, never a misleading `<name>:0`
+#   fail -> the step's own subprocess exited non-zero — reads `<name>:<s>!`
+# phase_names/phase_vals are parallel arrays (bash 3-compatible; no assoc
+# array needed) so invocation order is preserved for free.
+phase_names=()
+phase_vals=()
+record_phase() {  # $1=name $2=seconds $3=ok|skip|fail
+  phase_names+=("$1")
+  case "$3" in
+    skip) phase_vals+=("skip") ;;
+    fail) phase_vals+=("${2}!") ;;
+    *)    phase_vals+=("$2") ;;
+  esac
+}
+
 echo "extend-gate: $repo head=$head_now base=$base_ref parallelism=$parallelism"
 if [ "$project_rel" = "." ]; then
   echo "extend-gate: project-root: . (repo root)"
@@ -702,10 +761,17 @@ fi
 # 1. audit.sh, when the crate has one. Feeds the risk-gate receipt; a
 #    non-zero exit here is logged but does not abort the run — the final
 #    `autobuilder gate` is authoritative (see file header).
+_phase_t0=$(date +%s)
 if [ -x "$repo/scripts/audit.sh" ]; then
-  ( cd "$repo" && ./scripts/audit.sh ) 9>&- || note_block "risk-gate — scripts/audit.sh exited non-zero (see risk-gate receipt for detail)"
+  if ( cd "$repo" && ./scripts/audit.sh ) 9>&-; then
+    record_phase risk-gate $(( $(date +%s) - _phase_t0 )) ok
+  else
+    note_block "risk-gate — scripts/audit.sh exited non-zero (see risk-gate receipt for detail)"
+    record_phase risk-gate $(( $(date +%s) - _phase_t0 )) fail
+  fi
 else
   echo "extend-gate: no scripts/audit.sh in $repo — skipping"
+  record_phase risk-gate 0 skip
 fi
 
 # 2. intake — validates agent/intent-card.json against the schema and,
@@ -716,23 +782,43 @@ fi
 #    files behind"). A repo with no agent/intent-card.json fails here
 #    loudly, same as any other producer given a missing/invalid input —
 #    no silent no-op.
-( cd "$repo" && autobuilder intake --validate agent/intent-card.json --project "$project_rel" ) 9>&- \
-  || note_block "intake — autobuilder intake exited non-zero (schema violation in agent/intent-card.json, missing file, or receipt write failure — see output above)"
+_phase_t0=$(date +%s)
+if ( cd "$repo" && autobuilder intake --validate agent/intent-card.json --project "$project_rel" ) 9>&-; then
+  record_phase intake $(( $(date +%s) - _phase_t0 )) ok
+else
+  note_block "intake — autobuilder intake exited non-zero (schema violation in agent/intent-card.json, missing file, or receipt write failure — see output above)"
+  record_phase intake $(( $(date +%s) - _phase_t0 )) fail
+fi
 
 # 3. proof receipt + session trace. Budgeted (PRD-build-cargo-concurrency-
 #    budget): this producer shells to `cargo test`/`cargo build` internally,
 #    so the whole phase takes one cargo-budget slot rather than racing every
 #    other budgeted cargo caller on the host.
-( cd "$repo" && cargo_budgeted autobuilder loop --project "$project_rel" --iteration 0 --head-sha "$head_now" --trace ) 9>&- \
-  || note_block "proof-receipt — autobuilder loop --iteration 0 exited non-zero"
+_phase_t0=$(date +%s)
+if ( cd "$repo" && cargo_budgeted autobuilder loop --project "$project_rel" --iteration 0 --head-sha "$head_now" --trace ) 9>&-; then
+  record_phase proof-receipt $(( $(date +%s) - _phase_t0 )) ok
+else
+  note_block "proof-receipt — autobuilder loop --iteration 0 exited non-zero"
+  record_phase proof-receipt $(( $(date +%s) - _phase_t0 )) fail
+fi
 
 # 4. vti-plan.
-( cd "$repo" && autobuilder vti-plan --project "$project_rel" --base "$base_ref" ) 9>&- \
-  || note_block "vti-plan — autobuilder vti-plan exited non-zero"
+_phase_t0=$(date +%s)
+if ( cd "$repo" && autobuilder vti-plan --project "$project_rel" --base "$base_ref" ) 9>&-; then
+  record_phase vti-plan $(( $(date +%s) - _phase_t0 )) ok
+else
+  note_block "vti-plan — autobuilder vti-plan exited non-zero"
+  record_phase vti-plan $(( $(date +%s) - _phase_t0 )) fail
+fi
 
 # 5. rollback-plan over <base>..HEAD.
-( cd "$repo" && autobuilder rollback-plan --project "$project_rel" --base "$base_ref" ) 9>&- \
-  || note_block "rollback-plan — commits since $base_ref are not all revert-clean (see target/autobuilder/rollback.md); fix forward, or a human rewrites history and says so — this script never edits history to force a pass"
+_phase_t0=$(date +%s)
+if ( cd "$repo" && autobuilder rollback-plan --project "$project_rel" --base "$base_ref" ) 9>&-; then
+  record_phase rollback-plan $(( $(date +%s) - _phase_t0 )) ok
+else
+  note_block "rollback-plan — commits since $base_ref are not all revert-clean (see target/autobuilder/rollback.md); fix forward, or a human rewrites history and says so — this script never edits history to force a pass"
+  record_phase rollback-plan $(( $(date +%s) - _phase_t0 )) fail
+fi
 
 # 6. reviewer-agent: prepare, spawn the independent review headlessly via
 #    `claude -p --model sonnet` (same tier /rustbuild routes it to; the
@@ -783,11 +869,18 @@ json.dump(obj, open('$out', 'w'))
 # 7. ci-checks — needs `gh` authenticated against the pushed HEAD.
 if ! command -v gh >/dev/null 2>&1; then
   note_block "ci-checks — gh CLI not on \$PATH (install: https://cli.github.com)"
+  record_phase ci-checks 0 skip
 elif ! gh auth status >/dev/null 2>&1; then
   note_block "ci-checks — gh not authenticated: run 'gh auth login'"
+  record_phase ci-checks 0 skip
 else
-  ( cd "$repo" && autobuilder ci-checks --project "$project_rel" ) 9>&- \
-    || note_block "ci-checks — workflow(s) on HEAD are not green, or still pending (the next tick retries)"
+  _phase_t0=$(date +%s)
+  if ( cd "$repo" && autobuilder ci-checks --project "$project_rel" ) 9>&-; then
+    record_phase ci-checks $(( $(date +%s) - _phase_t0 )) ok
+  else
+    note_block "ci-checks — workflow(s) on HEAD are not green, or still pending (the next tick retries)"
+    record_phase ci-checks $(( $(date +%s) - _phase_t0 )) fail
+  fi
 fi
 
 # 8. the 17 extended-gates producers, in parallel. Passed the RESOLVED
@@ -801,21 +894,38 @@ fi
 # box" pattern the 2026-09-09 OOM came from, so the whole extended-receipts
 # run takes a single cargo-budget slot rather than each of its 17 producers
 # racing every other budgeted cargo caller independently.
-( cargo_budgeted "$RUSTBUILD_SCRIPTS/extended-receipts.sh" "$project_abs" "$parallelism" ) 9>&- \
-  || note_block "extended-receipts — one or more extended producers did not pass|skip (see output above)"
+_phase_t0=$(date +%s)
+if ( cargo_budgeted "$RUSTBUILD_SCRIPTS/extended-receipts.sh" "$project_abs" "$parallelism" ) 9>&-; then
+  record_phase receipts $(( $(date +%s) - _phase_t0 )) ok
+else
+  note_block "extended-receipts — one or more extended producers did not pass|skip (see output above)"
+  record_phase receipts $(( $(date +%s) - _phase_t0 )) fail
+fi
 
 # 9. the risk gate itself — authoritative pass/block, reads all 25 receipts.
 # Quota guard (Joe 2026-09-11): the reviewer is a Sonnet `claude -p` call. It runs LAST, and only
 # when every other producer passed — a red gate never pays for a review it cannot use. The next gate
 # on a fixed HEAD runs it. On 2026-09-11 five reviewer runs shipped nothing.
+_phase_t0=$(date +%s)
 if [ "${#blocking_notes[@]}" -eq 0 ]; then
-  run_reviewer || true
+  if run_reviewer; then
+    record_phase reviewer $(( $(date +%s) - _phase_t0 )) ok
+  else
+    record_phase reviewer $(( $(date +%s) - _phase_t0 )) fail
+  fi
 else
   echo "extend-gate: reviewer skipped — ${#blocking_notes[@]} block(s) already recorded (no Sonnet spend on a red gate)"
   echo "$(date -u +%FT%TZ)  gate  ${repo##*/}  reviewer-skipped  (blocks=${#blocking_notes[@]} head=${head_now:0:7})" >> "$HOME/brain/journal/build/$(date -u +%F).md"
+  record_phase reviewer 0 skip
 fi
+_phase_t0=$(date +%s)
 gate_out="$(exec 9>&-; cd "$repo" && autobuilder gate --project "$project_rel" 2>&1)"
 gate_rc=$?
+if [ "$gate_rc" -eq 0 ]; then
+  record_phase gate $(( $(date +%s) - _phase_t0 )) ok
+else
+  record_phase gate $(( $(date +%s) - _phase_t0 )) fail
+fi
 printf '%s\n' "$gate_out"
 summary="$(printf '%s\n' "$gate_out" | grep -m1 '^gate: ' || true)"
 
@@ -846,6 +956,38 @@ wall=$(( $(date +%s) - t0 ))
 blockers_csv=""
 if [ "${#blocking_notes[@]}" -gt 0 ]; then
   blockers_csv="$(IFS='|'; echo "${blocking_notes[*]}")"
+fi
+
+# --- phase timing summary (PRD-build-gate-phase-timing) -------------------
+# Builds `phases=<name>:<val>,...` in invocation order from the
+# record_phase calls above, and checks the sum of every non-skipped phase's
+# seconds (a fail's own `!`-suffixed seconds still count toward the sum —
+# only `skip` is excluded, requirement: "a phase that fails or is skipped
+# is recorded as such, never as zero") against `wall` within 5%; anything
+# wider is surfaced as `unattributed:<s>` rather than silently dropped
+# (requirement: "the sum of phase seconds is within 5% of wall or the line
+# carries unattributed:<s>").
+phases_str=""
+phase_sum=0
+for _pi in "${!phase_names[@]}"; do
+  _pname="${phase_names[$_pi]}"
+  _pval="${phase_vals[$_pi]}"
+  case "$_pval" in
+    skip) : ;;
+    *!)   phase_sum=$(( phase_sum + ${_pval%!} )) ;;
+    *)    phase_sum=$(( phase_sum + _pval )) ;;
+  esac
+  if [ -n "$phases_str" ]; then phases_str="$phases_str,$_pname:$_pval"; else phases_str="$_pname:$_pval"; fi
+done
+phase_unattributed=$(( wall - phase_sum ))
+[ "$phase_unattributed" -lt 0 ] && phase_unattributed=0
+phase_tolerance=0
+[ "$wall" -gt 0 ] && phase_tolerance=$(( wall * 5 / 100 ))
+phase_over_tolerance=false
+phases_field="phases=$phases_str"
+if [ "$phase_unattributed" -gt "$phase_tolerance" ]; then
+  phase_over_tolerance=true
+  phases_field="$phases_field,unattributed:$phase_unattributed"
 fi
 
 # --- attribution (P0 requirement 1, PRD-build-gate-debt-auto-prd) --------
@@ -911,9 +1053,9 @@ if $record_baseline; then
   rm -f "$gate_out_file"
   echo "extend-gate: recorded baseline to $repo/agent/gate-baseline.json"
   printf '%s\n' "$recorded"
-  printf '%s  gate  %s  record-baseline  (head=%s base=%s %s wall=%ss lock_wait=%ss cargo=burst:%s/local:%s)\n' \
+  printf '%s  gate  %s  record-baseline  (head=%s base=%s %s wall=%ss %s lock_wait=%ss cargo=burst:%s/local:%s)\n' \
     "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$crate_name" "$head_now" "$base_ref" \
-    "${summary:-gate: no-summary-line}" "$wall" "$lock_wait" "$route_burst_n" "$route_local_n" >>"$journal"
+    "${summary:-gate: no-summary-line}" "$wall" "$phases_field" "$lock_wait" "$route_burst_n" "$route_local_n" >>"$journal"
   if $route_mismatch; then
     printf '%s  gate  route-mismatch  (intended=%s burst=%s local=%s cause=%s)\n' \
       "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$route_intended" "$route_burst_n" "$route_local_n" "${route_first_local_cause:-unknown}" >>"$journal"
@@ -954,13 +1096,15 @@ fi
 
 # One journal line per gate run (requirement 8 / AC13): crate, HEAD, base
 # tag, pass/block counts, blocking receipt names, wall seconds, (PRD-
-# build-extend-gate-concurrent-isolation requirement 8 / P2) how long this
-# run waited for producer access before it started (0 when uncontended),
-# and (requirement 5 / AC5, PRD-build-gate-cargo-route-attest) how many of
-# this run's routed cargo calls actually reached the box vs stayed local.
-printf '%s  gate  %s  %s  (head=%s base=%s %s blocking=%s wall=%ss lock_wait=%ss cargo=burst:%s/local:%s)%s\n' \
+# build-gate-phase-timing) a per-step phase breakdown right after wall=,
+# (PRD-build-extend-gate-concurrent-isolation requirement 8 / P2) how long
+# this run waited for producer access before it started (0 when
+# uncontended), and (requirement 5 / AC5, PRD-build-gate-cargo-route-attest)
+# how many of this run's routed cargo calls actually reached the box vs
+# stayed local.
+printf '%s  gate  %s  %s  (head=%s base=%s %s blocking=%s wall=%ss %s lock_wait=%ss cargo=burst:%s/local:%s)%s\n' \
   "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$crate_name" "$outcome" "$head_now" "$base_ref" \
-  "${summary:-gate: no-summary-line}" "${blockers_csv:-none}" "$wall" "$lock_wait" \
+  "${summary:-gate: no-summary-line}" "${blockers_csv:-none}" "$wall" "$phases_field" "$lock_wait" \
   "$route_burst_n" "$route_local_n" "$journal_suffix" >>"$journal"
 
 # A route mismatch is a journaled guard event, never a block (Non-goals) —
@@ -983,13 +1127,24 @@ mkdir -p "$(dirname "$cache_file")"
 # 1: "the tags land in the summary receipt").
 attribution_empty='{"blocks":[],"in_scope":0,"inherited":0}'
 attribution_for_cache="${attribution_json:-$attribution_empty}"
+# Phase timing (PRD-build-gate-phase-timing requirement: "the gate receipt
+# ... gains a phases object with the same values plus wall_s and head") —
+# built from the same phase_names/phase_vals arrays the journal line's
+# phases_field above reads, so receipt and journal never disagree.
+phases_json='{}'
+for _pi in "${!phase_names[@]}"; do
+  phases_json="$(jq -c --arg k "${phase_names[$_pi]}" --arg v "${phase_vals[$_pi]}" '. + {($k): $v}' <<<"$phases_json")"
+done
 jq -n --arg head "$head_now" --arg hash "$self_hash" --arg verdict "$cache_verdict_val" \
      --argjson rc "$final_rc" --arg new "$new_blocks" --arg inh "$inherited_blocks" \
      --arg intended "$route_intended" --argjson burst "$route_burst_n" \
      --argjson local "$route_local_n" --argjson passthrough "$route_passthrough_n" \
-     --arg host "$route_host" --argjson attribution "$attribution_for_cache" '
+     --arg host "$route_host" --argjson attribution "$attribution_for_cache" \
+     --argjson phases "$phases_json" --argjson wall_s "$wall" \
+     --argjson over "$phase_over_tolerance" --argjson unattr "$phase_unattributed" '
   {
     head_sha: $head,
+    head: $head,
     script_sha256: $hash,
     verdict: $verdict,
     exit_code: $rc,
@@ -997,8 +1152,10 @@ jq -n --arg head "$head_now" --arg hash "$self_hash" --arg verdict "$cache_verdi
     inherited_blocks: ($inh | if . == "" then [] else split(",") end),
     cargo_route: {intended: $intended, burst: $burst, local: $local, passthrough: $passthrough, host: $host},
     blocks: $attribution.blocks,
-    attribution: {in_scope: $attribution.in_scope, inherited: $attribution.inherited}
-  }
+    attribution: {in_scope: $attribution.in_scope, inherited: $attribution.inherited},
+    phases: $phases,
+    wall_s: $wall_s
+  } + (if $over then {unattributed_s: $unattr} else {} end)
 ' > "$cache_file" 2>/dev/null || true
 
 # --- best-effort: merge cargo_route into autobuilder's own release

@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Fake `gh` CLI for extend-gate-phase-timing-selftest.sh. `auth status`
+# exits per FAKE_GH_AUTH_RC (default 0 = authenticated) so a test can
+# force extend-gate.sh's ci-checks "gh not authenticated" skip branch
+# without touching the box's real gh auth state. Every other subcommand
+# (e.g. a real `gh` never called by extend-gate.sh directly) is a no-op
+# success.
+set -uo pipefail
+case "${1:-}" in
+  auth) exit "${FAKE_GH_AUTH_RC:-0}" ;;
+  *)    exit 0 ;;
+esac

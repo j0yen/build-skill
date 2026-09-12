@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+# Fake `autobuilder` for extend-gate-phase-timing-selftest.sh
+# (PRD-build-gate-phase-timing). Unlike tests/fixtures/extend-gate-fake
+# (built for PRD-build-gate-delta-baseline, which only cares about the
+# final pass/block set), every subcommand here is independently
+# sleep-and-exit-code scriptable via env vars, so a test can pin an exact
+# number of seconds to each phase and assert extend-gate.sh's own timer
+# recorded it (±1s) without waiting on a real cargo compile.
+#
+# Env vars (all optional, default to instant success):
+#   FAKE_<STEP>_SLEEP   seconds to sleep before returning (STEP is the
+#                       subcommand name, upper-cased, hyphens -> underscores:
+#                       INTAKE, LOOP, VTI_PLAN, ROLLBACK_PLAN, REVPREPARE,
+#                       REVFINALIZE, CI_CHECKS, GATE)
+#   FAKE_<STEP>_RC      exit code to return (default 0)
+#   FAKE_GATE_VERDICT   "pass" or "block" — selects the `gate: ...` summary
+#                       line's own pass/block counts (verdict text only;
+#                       the actual exit code is FAKE_GATE_RC, scripted
+#                       independently so a test can prove the timing code
+#                       never changes the verdict)
+set -uo pipefail
+
+sub="${1:-}"
+[ $# -ge 1 ] && shift
+
+sleep_for() { local s="${1:-0}"; [ "$s" = "0" ] || sleep "$s"; }
+
+case "$sub" in
+  intake)
+    sleep_for "${FAKE_INTAKE_SLEEP:-0}"
+    exit "${FAKE_INTAKE_RC:-0}"
+    ;;
+  loop)
+    sleep_for "${FAKE_LOOP_SLEEP:-0}"
+    exit "${FAKE_LOOP_RC:-0}"
+    ;;
+  vti-plan)
+    sleep_for "${FAKE_VTI_PLAN_SLEEP:-0}"
+    exit "${FAKE_VTI_PLAN_RC:-0}"
+    ;;
+  rollback-plan)
+    sleep_for "${FAKE_ROLLBACK_PLAN_SLEEP:-0}"
+    exit "${FAKE_ROLLBACK_PLAN_RC:-0}"
+    ;;
+  reviewer-agent)
+    act="${1:-}"; [ $# -ge 1 ] && shift
+    case "$act" in
+      prepare)
+        # extend-gate.sh reads --project out of its own args to locate
+        # target/<project>/autobuilder/review-request.json.
+        proj="."
+        while [ $# -gt 0 ]; do
+          case "$1" in --project) proj="$2"; shift 2 ;; *) shift ;; esac
+        done
+        mkdir -p "$proj/target/autobuilder"
+        echo '{}' > "$proj/target/autobuilder/review-request.json"
+        sleep_for "${FAKE_REVPREPARE_SLEEP:-0}"
+        exit "${FAKE_REVPREPARE_RC:-0}"
+        ;;
+      finalize)
+        sleep_for "${FAKE_REVFINALIZE_SLEEP:-0}"
+        exit "${FAKE_REVFINALIZE_RC:-0}"
+        ;;
+      *) exit 0 ;;
+    esac
+    ;;
+  ci-checks)
+    sleep_for "${FAKE_CI_CHECKS_SLEEP:-0}"
+    exit "${FAKE_CI_CHECKS_RC:-0}"
+    ;;
+  gate)
+    sleep_for "${FAKE_GATE_SLEEP:-0}"
+    head_sha="$(git rev-parse HEAD 2>/dev/null || echo unknown)"
+    if [ "${FAKE_GATE_VERDICT:-pass}" = "block" ]; then
+      echo "gate: head=$head_sha pass=24 block=1 verdict=block"
+    else
+      echo "gate: head=$head_sha pass=25 block=0 verdict=pass"
+    fi
+    exit "${FAKE_GATE_RC:-0}"
+    ;;
+  --version)
+    echo "autobuilder 9.9.9"
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
