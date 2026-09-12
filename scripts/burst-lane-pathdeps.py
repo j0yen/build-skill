@@ -8,7 +8,7 @@ reader in build-contract.md) that answers exactly the two questions
 burst-lane.sh's `run` needs before it can sync a crate with path
 dependencies to the box:
 
-  discover <manifest.toml>
+  discover <manifest.toml> [workspace_root]
       Prints one absolute directory per line: every transitive path
       dependency of <manifest.toml> — its own [dependencies] /
       [dev-dependencies] / [build-dependencies] / [target.*.dependencies]
@@ -18,6 +18,17 @@ dependencies to the box:
       of resolved directories, so a dependency cycle or a diamond shape
       is only ever synced once). The root manifest's own directory is
       never printed.
+
+      [workspace_root] (PRD-build-burst-path-deps-workspaces requirement 1):
+      an optional absolute path. Any dependency directory that resolves
+      INSIDE it (equal to it or a descendant) is never printed — it is
+      already part of the one-tree workspace-root sync burst-lane.sh's
+      `run` performs for a workspace member, so mirroring it again under
+      deps/ would recreate the very collision (the same package present at
+      both <workspace_root>/crates/x and deps/x-<hash>) this PRD fixes.
+      Recursion still descends into that dependency's own Cargo.toml, so a
+      workspace member's OWN external sibling (outside the workspace
+      entirely) is still discovered and printed.
 
   rewrite <manifest.toml> <local-to-remote-map.tsv>
       Prints <manifest.toml>'s content to stdout with every `path = "..."`
@@ -90,11 +101,18 @@ def find_path_deps(manifest_path):
     return found
 
 
-def discover(manifest_path):
+def discover(manifest_path, workspace_root=None):
     root_dir = os.path.normpath(_manifest_dir(manifest_path))
     seen_dirs = {root_dir}
     seen_manifests = set()
     out = []
+    ws_root_norm = os.path.normpath(workspace_root) if workspace_root else None
+
+    def in_workspace(d):
+        if not ws_root_norm:
+            return False
+        return d == ws_root_norm or d.startswith(ws_root_norm + os.sep)
+
     stack = [os.path.abspath(manifest_path)]
     while stack:
         m = stack.pop()
@@ -115,7 +133,13 @@ def discover(manifest_path):
                 # exactly as it does today — a genuine build/resolution
                 # error, not an rsync error our own sync step invents.
                 continue
-            out.append(dep_dir)
+            # PRD-build-burst-path-deps-workspaces requirement 1: a dep
+            # already inside the workspace root arrives for free with the
+            # workspace-root sync — never mirror it under deps/ too. Still
+            # recurse into its manifest below, so a workspace member's own
+            # OUTSIDE-the-workspace sibling is still found.
+            if not in_workspace(dep_dir):
+                out.append(dep_dir)
             dep_manifest = os.path.join(dep_dir, "Cargo.toml")
             if os.path.isfile(dep_manifest):
                 stack.append(dep_manifest)
@@ -178,7 +202,8 @@ def main(argv):
         return 2
     cmd = argv[1]
     if cmd == "discover":
-        for d in discover(argv[2]):
+        ws_root = argv[3] if len(argv) > 3 and argv[3] else None
+        for d in discover(argv[2], ws_root):
             print(d)
         return 0
     if cmd == "rewrite":

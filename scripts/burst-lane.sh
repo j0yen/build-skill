@@ -251,6 +251,27 @@ ATTR_LEDGER="${BURST_LANE_ATTR_LEDGER:-$STATE_DIR/attribution.jsonl}"
 # print an `estimate: true` bytes_saved figure instead of a bare zero.
 DIRTY_DIR="$STATE_DIR/dirty"
 PULLSZ_DIR="$STATE_DIR/pull-sizes"
+# PRD-build-burst-path-deps-workspaces requirement 3: the lane-owned
+# directory manifest — every directory `run` creates under $REMOTE_ROOT that
+# does NOT correspond one-to-one with a local worktree (today, concretely,
+# each `deps/<name>-<hash8>` mirror; see dep_remote_path_for()) recorded here
+# with its owning worktree, so `reap` can tell "lane-created, still needed"
+# apart from "lane-created, orphaned" instead of only ever seeing an
+# unrecognized top-level `deps` dir and deleting it outright (the
+# 2026-09-11 autobuilder incident this PRD fixes — journal
+# `reap  ok  (dir=deps reason=legacy-no-local-match)` deleting a dep mirror
+# a live worktree needed the very next run). Plain JSON object, one lock
+# file guarding read-modify-write the same way STATE_FILE's flock 201
+# guards session state.
+REMOTE_DIRS_FILE="$STATE_DIR/remote-dirs.json"
+REMOTE_DIRS_LOCK="$STATE_DIR/remote-dirs.lock"
+# PRD-build-burst-path-deps-workspaces requirement 4: per-worktree repeat
+# guard for identical consecutive build-failed causes — one small JSON file
+# per worktree (same sha1-hash8 keying as dirty_marker_file()) recording the
+# cause/count/HEAD of the run of consecutive identical build failures, so a
+# repo that cannot build remotely stops burning a cargo invocation a minute
+# instead of looping until an operator notices the journal.
+BUILD_FAIL_DIR="$STATE_DIR/build-fail"
 ATTR_REPOS_DIR="${BURST_LANE_REPOS_DIR:-$HOME/wintermute}"
 ROLLUP_CURSOR="$STATE_DIR/.rollup-cursor"
 TICK_JOURNAL_DIR="${BURST_LANE_TICK_JOURNAL_DIR:-$HOME/brain/journal/build}"
@@ -1814,9 +1835,18 @@ cargo_target_dir_for() {  # $1=worktree -> stdout: absolute override, or ""
 # own pull-back and the standalone `sync-back` subcommand go through this one
 # `rsync --delete --stats` path so already-synced bytes on the box (warm from
 # a prior run on the same worktree) don't get re-counted or re-copied.
-pull_target_incremental() {  # $1=worktree $2=ip -> stdout: bytes transferred; rc 0/1
+pull_target_incremental() {  # $1=worktree $2=ip [$3=remote_path] -> stdout: bytes transferred; rc 0/1
   local worktree="$1" ip="$2" remote_path stats local_target remote_target override
-  remote_path="$(remote_path_for "$worktree")"
+  # PRD-build-burst-path-deps-workspaces requirement 1: a workspace member's
+  # remote_path is keyed by its SYNC ROOT, not the worktree itself (see
+  # cmd_run) — recomputing remote_path_for(worktree) fresh here would look
+  # in a directory `run` never actually synced to. $3, when passed, is the
+  # caller's own already-resolved value (do_marker_pull reads it straight off
+  # the dirty marker's own recorded "remote_path" field, the authoritative
+  # source); recomputing here remains the fallback for any caller that still
+  # only knows the worktree (byte-identical to today for a non-workspace run,
+  # where sync_root always equals the worktree itself).
+  remote_path="${3:-$(remote_path_for "$worktree")}"
   override="$(cargo_target_dir_for "$worktree")"
   # The BOX always builds into $remote_path/target (cmd_run sets no remote
   # CARGO_TARGET_DIR); only the LOCAL side honors the off-root override.
@@ -1998,6 +2028,206 @@ dep_remote_path_for() {  # $1=dep local abs dir -> stdout remote dir
 worktree_lock_key() { printf '%s' "$1" | sha1sum | cut -c1-16; }
 wt_lock_file() { printf '%s/locks/wt-%s.lock\n' "$STATE_DIR" "$(worktree_lock_key "$1")"; }
 
+# ---- workspace detection (PRD-build-burst-path-deps-workspaces req 1) -----
+# `run`'s local read of the crate's own workspace_root, via a real `cargo
+# metadata --no-deps` (the PRD's own explicit choice — `--no-deps` is enough
+# to learn workspace_root/workspace_members without paying for a full
+# dependency-graph resolve on every single `run`). Fails OPEN (empty stdout)
+# on anything short of a clean parse: no Cargo.toml, no local cargo, a
+# metadata error, or malformed JSON — a probe hiccup must never block a run
+# that a bare non-workspace-aware sync would still have handled correctly
+# (today's unchanged behavior when this returns empty). Deliberately reads
+# LOCALLY (never over ssh) — the worktree's own manifest is right here, and
+# reading it before the sync means the sync layout below can be decided
+# before a single byte moves.
+# BURST_LANE_FAKE_WORKSPACE_ROOT is the offline-test seam (mirrors every
+# other BURST_LANE_*-style override here, e.g. BURST_LANE_NOW) — a real
+# `cargo metadata` never runs under it.
+workspace_root_for() {  # $1 = crate dir (containing Cargo.toml) -> stdout: workspace_root or empty
+  local dir="$1"
+  [ -f "$dir/Cargo.toml" ] || { echo ""; return 0; }
+  if [ -n "${BURST_LANE_FAKE_WORKSPACE_ROOT+x}" ]; then
+    echo "$BURST_LANE_FAKE_WORKSPACE_ROOT"
+    return 0
+  fi
+  command -v cargo >/dev/null 2>&1 || { echo ""; return 0; }
+  local meta_json meta_rc=0
+  meta_json="$(cd "$dir" && timeout 20 cargo metadata --no-deps --format-version 1 2>/dev/null)" || meta_rc=$?
+  if [ "$meta_rc" -ne 0 ] || [ -z "$meta_json" ]; then echo ""; return 0; fi
+  python3 -c '
+import json, sys
+try:
+    d = json.loads(sys.stdin.read())
+    print(d.get("workspace_root") or "")
+except Exception:
+    print("")
+' <<<"$meta_json"
+}
+
+# ---- lane-owned remote directory manifest (PRD-build-burst-path-deps-
+# workspaces requirement 3) ---------------------------------------------
+# Plain JSON object: {"<relpath-under-REMOTE_ROOT>": {"owner": "<abs local
+# worktree/dep-declaring-crate path>", "ts": "<iso>"}}. Guarded by its own
+# flock (distinct from the global session lock 201 — this is mutated from
+# `run`, which only briefly re-takes 201 for session-state bookkeeping, and
+# from `reap`, which never touches session state at all).
+remote_dirs_record() {  # $1=relkey $2=owner
+  mkdir -p "$STATE_DIR" 2>/dev/null || true
+  exec 209>"$REMOTE_DIRS_LOCK"
+  flock 209
+  local cur; cur="$(cat "$REMOTE_DIRS_FILE" 2>/dev/null || echo '{}')"
+  [ -n "$cur" ] || cur='{}'
+  python3 -c '
+import json, sys
+path, relkey, owner, ts = sys.argv[1:5]
+try:
+    d = json.loads(sys.argv[5] or "{}")
+    if not isinstance(d, dict):
+        d = {}
+except Exception:
+    d = {}
+d[relkey] = {"owner": owner, "ts": ts}
+with open(path, "w") as fh:
+    fh.write(json.dumps(d))
+' "$REMOTE_DIRS_FILE" "$1" "$2" "$(now_iso)" "$cur"
+  flock -u 209
+}
+
+remote_dirs_remove() {  # $1=relkey
+  [ -f "$REMOTE_DIRS_FILE" ] || return 0
+  exec 209>"$REMOTE_DIRS_LOCK"
+  flock 209
+  local cur; cur="$(cat "$REMOTE_DIRS_FILE" 2>/dev/null || echo '{}')"
+  [ -n "$cur" ] || cur='{}'
+  python3 -c '
+import json, sys
+path, relkey = sys.argv[1:3]
+try:
+    d = json.loads(sys.argv[3] or "{}")
+    if not isinstance(d, dict):
+        d = {}
+except Exception:
+    d = {}
+d.pop(relkey, None)
+with open(path, "w") as fh:
+    fh.write(json.dumps(d))
+' "$REMOTE_DIRS_FILE" "$1" "$cur"
+  flock -u 209
+}
+
+remote_dirs_owner() {  # $1=relkey -> stdout owner or empty; rc1 if no entry
+  [ -f "$REMOTE_DIRS_FILE" ] || { echo ""; return 1; }
+  python3 -c '
+import json, sys
+path, relkey = sys.argv[1:3]
+try:
+    d = json.load(open(path))
+except Exception:
+    d = {}
+v = d.get(relkey)
+print((v or {}).get("owner", "") if isinstance(v, dict) else "")
+sys.exit(0 if v else 1)
+' "$REMOTE_DIRS_FILE" "$1"
+}
+
+remote_dirs_list_prefix() {  # $1=prefix (e.g. "deps/") -> stdout "relkey\towner" per line
+  [ -f "$REMOTE_DIRS_FILE" ] || return 0
+  python3 -c '
+import json, sys
+path, prefix = sys.argv[1:3]
+try:
+    d = json.load(open(path))
+    if not isinstance(d, dict):
+        d = {}
+except Exception:
+    d = {}
+for k, v in d.items():
+    if k.startswith(prefix) and isinstance(v, dict):
+        print("%s\t%s" % (k, v.get("owner", "")))
+' "$REMOTE_DIRS_FILE" "$1"
+}
+
+# ---- repeat-build-failure guard (PRD-build-burst-path-deps-workspaces
+# requirement 4) -------------------------------------------------------
+# One small JSON file per worktree recording the cause/count/HEAD of the
+# CURRENT run of consecutive identical build failures on that worktree.
+# build_fail_guard_check() runs BEFORE any rsync/ssh — a worktree already at
+# 3 identical failures at its current HEAD is refused with no cargo
+# invocation at all (exit 3, `build-failed  repeated`). build_fail_guard_record()
+# runs AFTER a build-classified failure to advance (or reset) the counter.
+# worktree_head_for() is its own tiny helper so a non-git fixture (or a test)
+# can seam it via BURST_LANE_FAKE_HEAD without every caller needing to know
+# that — same "fail open to today's behavior" doctrine as workspace_root_for()
+# above: no readable HEAD means the guard simply never engages for that
+# worktree (today's unchanged behavior).
+worktree_head_for() {  # $1=worktree -> stdout: HEAD sha, or empty
+  if [ -n "${BURST_LANE_FAKE_HEAD+x}" ]; then echo "$BURST_LANE_FAKE_HEAD"; return 0; fi
+  git -C "$1" rev-parse HEAD 2>/dev/null || echo ""
+}
+
+build_fail_guard_file() {  # $1=worktree -> stdout path
+  local wkey; wkey="$(printf '%s' "$1" | sha1sum | cut -c1-8)"
+  printf '%s/%s.json\n' "$BUILD_FAIL_DIR" "$wkey"
+}
+
+# rc0 = proceed (guard not tripped); rc1 = blocked — stdout is the cause to
+# journal. Reads only; never mutates the guard file (that is
+# build_fail_guard_record()'s job, called only after an actual attempt).
+build_fail_guard_check() {  # $1=worktree -> stdout cause (if blocked); rc0 proceed / rc1 blocked
+  local f; f="$(build_fail_guard_file "$1")"
+  [ -s "$f" ] || return 0
+  local head; head="$(worktree_head_for "$1")"
+  [ -n "$head" ] || return 0
+  python3 -c '
+import json, sys
+path, head = sys.argv[1:3]
+try:
+    d = json.load(open(path))
+except Exception:
+    sys.exit(0)
+if d.get("head") == head and int(d.get("count", 0)) >= 3:
+    print(d.get("cause", ""))
+    sys.exit(1)
+sys.exit(0)
+' "$f" "$head"
+}
+
+# Advances the guard's counter for a just-observed build failure: same
+# HEAD + same cause (string-equal) within BURST_BUILD_FAIL_WINDOW_S
+# (default 900s, requirement 4's "within 15 minutes") of the run of
+# failures' FIRST timestamp increments the count; anything else (new HEAD,
+# different cause, or the window elapsed) resets the run to count=1. Prints
+# the post-update count to stdout so the caller can decide whether THIS
+# occurrence is the one that just reached 3 (still journaled as an ordinary
+# `build-failed` line — the `repeated` line is reserved for the NEXT, BLOCKED
+# attempt via build_fail_guard_check() above).
+build_fail_guard_record() {  # $1=worktree $2=cause -> stdout: new count
+  mkdir -p "$BUILD_FAIL_DIR" 2>/dev/null || true
+  local f; f="$(build_fail_guard_file "$1")"
+  local head; head="$(worktree_head_for "$1")"
+  [ -n "$head" ] || { echo 0; return 0; }
+  local now; now="$(now_epoch)"
+  local window="${BURST_BUILD_FAIL_WINDOW_S:-900}"
+  python3 -c '
+import json, sys
+path, head, cause, now, window = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4]), int(sys.argv[5])
+try:
+    d = json.load(open(path))
+except Exception:
+    d = {}
+if d.get("head") == head and d.get("cause") == cause and (now - int(d.get("first_ts", 0))) <= window:
+    d["count"] = int(d.get("count", 1)) + 1
+else:
+    d = {"head": head, "cause": cause, "first_ts": now, "count": 1}
+d["last_ts"] = now
+with open(path, "w") as fh:
+    fh.write(json.dumps(d))
+print(d["count"])
+' "$f" "$head" "$2" "$now" "$window"
+}
+
+build_fail_guard_clear() { rm -f "$(build_fail_guard_file "$1")"; }  # $1=worktree
+
 # ---- lazy pull: dirty marker (PRD-build-burst-pull-on-demand requirement 1) -
 # One marker file per worktree, keyed the same way remote_path_for() keys its
 # remote dir — so the marker survives a worktree's own git resets (state
@@ -2009,15 +2239,25 @@ dirty_marker_file() {  # $1=worktree -> stdout path
   printf '%s/%s.json\n' "$DIRTY_DIR" "$wkey"
 }
 
-mark_dirty() {  # $1=worktree $2=session_id $3=remote_path $4=kind (target|pybuilder)
+mark_dirty() {  # $1=worktree $2=session_id $3=remote_path $4=kind (target|pybuilder) [$5=sync_root]
   mkdir -p "$DIRTY_DIR" 2>/dev/null || true
+  # PRD-build-burst-path-deps-workspaces requirement 1/3: $5=sync_root (the
+  # workspace root when the worktree is a member, else the worktree itself —
+  # cmd_run always passes it now) rides along as its own field so
+  # reap_plan()'s "is this remote dir still needed locally" check has the
+  # ACTUAL directory $remote_path was synced FROM to test for existence, not
+  # only the worktree path a plain (non-workspace) run would already share
+  # with it. Without this, a workspace-root sync (remote dir keyed by
+  # hash8(sync_root), a directory reap_plan never otherwise learns about)
+  # always misses every existence check keyed off "worktree" alone and gets
+  # reaped as a false orphan on every pass.
   python3 -c '
 import json, sys
-worktree, sid, remote_path, kind, ts, path = sys.argv[1:7]
-row = {"worktree": worktree, "session_id": sid, "remote_path": remote_path, "kind": kind, "marked_ts": ts}
+worktree, sid, remote_path, kind, sync_root, ts, path = sys.argv[1:8]
+row = {"worktree": worktree, "session_id": sid, "remote_path": remote_path, "kind": kind, "sync_root": sync_root, "marked_ts": ts}
 with open(path, "w") as fh:
     fh.write(json.dumps(row))
-' "$1" "$2" "$3" "$4" "$(now_iso)" "$(dirty_marker_file "$1")"
+' "$1" "$2" "$3" "$4" "${5:-$1}" "$(now_iso)" "$(dirty_marker_file "$1")"
 }
 
 is_dirty() { [ -s "$(dirty_marker_file "$1")" ]; }  # $1=worktree -> rc0 dirty
@@ -2161,7 +2401,11 @@ do_marker_pull() {  # $1=worktree $2=trigger(local-read|explicit|teardown) -> rc
   if [ "$kind" = "pybuilder" ]; then
     bytes="$(pull_pybuilder_incremental "$worktree" "$ip")" || prc=1
   else
-    bytes="$(pull_target_incremental "$worktree" "$ip")" || prc=1
+    # PRD-build-burst-path-deps-workspaces requirement 1: pass the marker's
+    # own $remote_path (read above) straight through — a workspace member's
+    # actual sync destination, which remote_path_for(worktree) alone can no
+    # longer reliably recompute.
+    bytes="$(pull_target_incremental "$worktree" "$ip" "$remote_path")" || prc=1
   fi
   t1="$(now_fractional)"
   if [ "$prc" -ne 0 ]; then
@@ -2237,6 +2481,21 @@ cmd_run() {
   [ -n "$worktree" ] && [ $# -ge 1 ] || { echo "usage: burst-lane.sh run <worktree> -- <cargo args...>" >&2; exit 2; }
   [ -d "$worktree" ] || die "no such worktree: $worktree" 2
 
+  # PRD-build-burst-path-deps-workspaces requirement 4: refuse a repeat
+  # attempt on a worktree already three-for-three on the SAME build-failed
+  # cause at its CURRENT HEAD, before any lock is taken and before a single
+  # byte moves — a repo that cannot build remotely burns no further cargo
+  # invocations until an operator (or a new commit) changes something. Never
+  # touches cargo, never talks to the box.
+  local bfg_cause
+  if bfg_cause="$(build_fail_guard_check "$worktree")"; then
+    :
+  else
+    journal_line "$(now_iso)  burst-lane  run  build-failed  repeated  (n=3 cause=\"$bfg_cause\" worktree=$worktree)"
+    echo "fallback: build-failed repeated 3x on this worktree's HEAD (cause=\"$bfg_cause\") — refusing to re-run until HEAD changes"
+    exit 3
+  fi
+
   # Global lock (201) held ONLY for session ensure/verify — the old
   # whole-run hold serialized the box to width-1 (2026-09-10 5-whys).
   exec 201>"$RUN_LOCK"
@@ -2269,7 +2528,35 @@ cmd_run() {
   exec 203>"$STATE_DIR/locks/wt-$(worktree_lock_key "$worktree").lock"
   flock 203
 
-  local remote_path; remote_path="$(remote_path_for "$worktree")"
+  # PRD-build-burst-path-deps-workspaces requirement 1: when this worktree
+  # is itself a cargo workspace member, the thing that needs to land on the
+  # box as ONE tree is the whole workspace root — not just this worktree
+  # (whose own siblings under the workspace, e.g. autobuilder's crates/x,
+  # would otherwise get treated as ordinary external path deps and mirrored
+  # a second time under deps/, colliding with the copy already inside the
+  # worktree's own rsync). `worktree_abs` is the canonical (symlink-
+  # resolved) form so string-prefix comparison against cargo metadata's own
+  # canonical `workspace_root` is reliable. Two shapes: the worktree itself
+  # IS the workspace root (the common case for a `git worktree add` of a
+  # whole workspace repo — member_rel stays empty), or the worktree is a
+  # member SUBDIRECTORY of a workspace root that lies above it (member_rel
+  # is that relative path, and remote_cwd below cds into it after the
+  # workspace-root sync). A workspace_root outside the worktree's own tree
+  # entirely (neither equal nor an ancestor) is treated as "no workspace" —
+  # defensive; cargo metadata should never report that shape.
+  local worktree_abs; worktree_abs="$(cd "$worktree" && pwd -P)"
+  local ws_root; ws_root="$(workspace_root_for "$worktree_abs")"
+  local sync_root="$worktree_abs" member_rel=""
+  if [ -n "$ws_root" ] && [ -d "$ws_root" ]; then
+    ws_root="$(cd "$ws_root" && pwd -P)"
+    case "$worktree_abs" in
+      "$ws_root") sync_root="$ws_root" ;;
+      "$ws_root"/*) sync_root="$ws_root"; member_rel="${worktree_abs#"$ws_root"/}" ;;
+      *) ws_root="" ;;
+    esac
+  fi
+  local remote_path; remote_path="$(remote_path_for "$sync_root")"
+  local remote_cwd="$remote_path${member_rel:+/$member_rel}"
 
   # PRD-build-burst-persistent-volume requirement 5: warm attribution — did
   # this worktree's target dir (or .pybuilder/, for a uv-routed run) already
@@ -2334,15 +2621,23 @@ cmd_run() {
   # a `path = "../sibling"` dependency that was never there, and the
   # operator had to mirror the crates onto the box by hand (this PRD's
   # five-whys levels 1-3).
+  # PRD-build-burst-path-deps-workspaces requirement 1: a dependency that
+  # resolves INSIDE $ws_root is excluded here — it is already part of the
+  # workspace-root tree the sync below copies as a whole, so mirroring it a
+  # second time under deps/ would recreate the exact autobuilder collision
+  # (the same package present at both <sync_root>/crates/x and
+  # deps/x-<hash>) this PRD exists to fix. discover() still recurses INTO
+  # that dependency's own manifest, so a workspace member's OWN external
+  # sibling (outside the workspace entirely) is still found and mirrored.
   local pathdeps=() map_file=""
-  if [ -f "$worktree/Cargo.toml" ] && [ -f "$HERE/burst-lane-pathdeps.py" ]; then
+  if [ -f "$worktree_abs/Cargo.toml" ] && [ -f "$HERE/burst-lane-pathdeps.py" ]; then
     while IFS= read -r pd_d; do [ -n "$pd_d" ] && pathdeps+=("$pd_d"); done \
-      < <(python3 "$HERE/burst-lane-pathdeps.py" discover "$worktree/Cargo.toml" 2>/dev/null)
+      < <(python3 "$HERE/burst-lane-pathdeps.py" discover "$worktree_abs/Cargo.toml" "$ws_root" 2>/dev/null)
   fi
   mkdir -p "$STATE_DIR/logs" 2>/dev/null || true
   if [ "${#pathdeps[@]}" -gt 0 ]; then
     map_file="$(mktemp)"; : > "$map_file"
-    printf '%s\t%s\n' "$worktree" "$remote_path" >> "$map_file"
+    printf '%s\t%s\n' "$worktree_abs" "$remote_path" >> "$map_file"
     local pd_dep pd_remote
     for pd_dep in "${pathdeps[@]}"; do
       printf '%s\t%s\n' "$pd_dep" "$(dep_remote_path_for "$pd_dep")" >> "$map_file"
@@ -2362,6 +2657,14 @@ cmd_run() {
         rm -f "$map_file"
         exit 3
       fi
+      # PRD-build-burst-path-deps-workspaces requirement 3: record this
+      # mirror in the lane-owned directory manifest, keyed by its path
+      # relative to $REMOTE_ROOT (e.g. "deps/sibling-a1b2c3d4") — the thing
+      # `reap` cannot otherwise tell apart from a genuine orphan, since
+      # neither the candidate worktree roots nor the dirty/attribution
+      # ledgers reap_plan() already consults ever contain an arbitrary
+      # external sibling crate's own path.
+      remote_dirs_record "${pd_remote#"$REMOTE_ROOT"/}" "$worktree_abs"
       # Transitive rewrite: this dep's OWN Cargo.toml may itself declare a
       # path dependency on another dep already in the map — rewrite its
       # synced copy the same way the worktree's own manifest is rewritten
@@ -2378,11 +2681,15 @@ cmd_run() {
     journal_line "$(now_iso)  burst-lane  run  pathdeps  (worktree=$worktree deps=${#pathdeps[@]} paths=$(IFS=,; echo "${pathdeps[*]}"))"
   fi
 
+  # PRD-build-burst-path-deps-workspaces requirement 1: sync $sync_root (the
+  # workspace root when the worktree is a member, else the worktree itself,
+  # byte-identical to today) so a workspace member's own siblings arrive as
+  # part of this ONE copy rather than needing a second, colliding one.
   local up_log="$STATE_DIR/logs/rsync-up.$$.log" rsync_up_rc=0
   "$RSYNC_BIN" -az --delete --exclude target --exclude .git --exclude .venv \
         --rsync-path="mkdir -p '$remote_path' && rsync" \
         -e "$SSH_BIN -o StrictHostKeyChecking=no -i $SSH_KEY" \
-        "$worktree/" "$REMOTE_USER@$ip:$remote_path/" >"$up_log" 2>&1 || rsync_up_rc=$?
+        "$sync_root/" "$REMOTE_USER@$ip:$remote_path/" >"$up_log" 2>&1 || rsync_up_rc=$?
   if [ "$rsync_up_rc" -ne 0 ]; then
     local up_err; up_err="$(grep -v '^[[:space:]]*$' "$up_log" 2>/dev/null | tail -n1)"
     journal_line "$(now_iso)  burst-lane  run  fallback  (cause=rsync-up-failed rc=$rsync_up_rc err=\"$up_err\" worktree=$worktree)"
@@ -2398,9 +2705,9 @@ cmd_run() {
   # build/test on the box then resolves it with no operator step (AC1, AC5).
   if [ -n "$map_file" ]; then
     local wt_tmp; wt_tmp="$(mktemp)"
-    if python3 "$HERE/burst-lane-pathdeps.py" rewrite "$worktree/Cargo.toml" "$map_file" > "$wt_tmp" 2>/dev/null; then
+    if python3 "$HERE/burst-lane-pathdeps.py" rewrite "$worktree_abs/Cargo.toml" "$map_file" > "$wt_tmp" 2>/dev/null; then
       "$RSYNC_BIN" -az -e "$SSH_BIN -o StrictHostKeyChecking=no -i $SSH_KEY" \
-        "$wt_tmp" "$REMOTE_USER@$ip:$remote_path/Cargo.toml" >>"$up_log" 2>&1 || true
+        "$wt_tmp" "$REMOTE_USER@$ip:$remote_cwd/Cargo.toml" >>"$up_log" 2>&1 || true
     fi
     rm -f "$wt_tmp" "$map_file"
   fi
@@ -2440,7 +2747,15 @@ cmd_run() {
   # sccache's cache dir needs write, not just read. SCCACHE_CACHE_SIZE
   # (PRD-build-burst-persistent-volume) caps the cache against
   # $BURST_SCCACHE_GB regardless of which CARGO_HOME is in play.
-  local remote_cmd="cd $remote_path && export PATH=$GATE_TOOLS_REMOTE_BIN_DIR:\$PATH:$ROOT_CARGO_HOME/bin:/root/.local/bin RUSTUP_HOME=$ROOT_RUSTUP_HOME CARGO_HOME=$RUN_CARGO_HOME CARGO_TARGET_DIR=$remote_path/target RUSTC_WRAPPER=sccache SCCACHE_DIR=$REMOTE_SCCACHE_DIR SCCACHE_CACHE_SIZE=${BURST_SCCACHE_GB}G; timeout 5 sccache --show-stats >/dev/null 2>&1 || { sccache --stop-server >/dev/null 2>&1; sccache --start-server >/dev/null 2>&1; sleep 1; }; timeout 5 sccache --show-stats >/dev/null 2>&1 || { echo 'burst-lane: sccache_unreachable on remote box' >&2; exit 97; }; $first $*"
+  # PRD-build-burst-path-deps-workspaces requirement 1: cd into the
+  # member's own relative path INSIDE the synced tree ($remote_cwd, equal to
+  # $remote_path when there is no workspace or the worktree IS the workspace
+  # root) so a workspace member's `cargo build`/`test` runs from exactly
+  # where it would locally; CARGO_TARGET_DIR still pins the WHOLE workspace's
+  # target dir at $remote_path/target regardless of $remote_cwd, matching
+  # ordinary cargo workspace semantics (one target dir at the workspace
+  # root, not one per member).
+  local remote_cmd="cd $remote_cwd && export PATH=$GATE_TOOLS_REMOTE_BIN_DIR:\$PATH:$ROOT_CARGO_HOME/bin:/root/.local/bin RUSTUP_HOME=$ROOT_RUSTUP_HOME CARGO_HOME=$RUN_CARGO_HOME CARGO_TARGET_DIR=$remote_path/target RUSTC_WRAPPER=sccache SCCACHE_DIR=$REMOTE_SCCACHE_DIR SCCACHE_CACHE_SIZE=${BURST_SCCACHE_GB}G; timeout 5 sccache --show-stats >/dev/null 2>&1 || { sccache --stop-server >/dev/null 2>&1; sccache --start-server >/dev/null 2>&1; sleep 1; }; timeout 5 sccache --show-stats >/dev/null 2>&1 || { echo 'burst-lane: sccache_unreachable on remote box' >&2; exit 97; }; $first $*"
   local rc=0
   local remote_out_log="$STATE_DIR/logs/run-remote.$$.log"
   "$SSH_BIN" -o StrictHostKeyChecking=no -i "$SSH_KEY" "$REMOTE_USER@$ip" "$remote_cmd" 2>&1 | tee "$remote_out_log"
@@ -2494,6 +2809,17 @@ cmd_run() {
     local build_cause; build_cause="$(grep -iE 'error(\[|:)|error:' "$remote_out_log" 2>/dev/null | head -n1)"
     [ -z "$build_cause" ] && build_cause="$(grep -v '^[[:space:]]*$' "$remote_out_log" 2>/dev/null | tail -n1)"
     journal_line "$(now_iso)  burst-lane  run  build-failed  (worktree=$worktree cause=\"$build_cause\")"
+    # PRD-build-burst-path-deps-workspaces requirement 4: advance the
+    # per-worktree repeat counter — the NEXT attempt's build_fail_guard_check
+    # (top of cmd_run) is what actually refuses a 4th run once this reaches 3.
+    build_fail_guard_record "$worktree" "$build_cause" >/dev/null
+  else
+    # A run that did NOT fail at the build phase (success, or a genuine
+    # red-test-suite failure — the build itself worked) means this HEAD's
+    # build is not broken; clear any stale repeat-guard record so a later,
+    # unrelated build failure at the same HEAD starts its own fresh count
+    # instead of inheriting one from an earlier, different cause.
+    build_fail_guard_clear "$worktree"
   fi
   rm -f "$remote_out_log" 2>/dev/null || true
 
@@ -2505,7 +2831,7 @@ cmd_run() {
   # laziness: 19 of 21 pulls in the PRD's own baseline session sat between
   # two remote runs where nothing local ever read the worktree.
   local kind; kind="$([ "$first" = "uv" ] && echo pybuilder || echo target)"
-  mark_dirty "$worktree" "$id" "$remote_path" "$kind"
+  mark_dirty "$worktree" "$id" "$remote_path" "$kind" "$sync_root"
 
   # Read-modify-write of session state back under the brief global lock.
   flock 201
@@ -2576,7 +2902,14 @@ cmd_sync_back() {
   fi
   local ip; ip="$(state_read ip)"
   local bytes
-  if ! bytes="$(pull_target_incremental "$worktree" "$ip")"; then
+  # PRD-build-burst-path-deps-workspaces requirement 1: prefer the dirty
+  # marker's own recorded remote_path (the sync_root a workspace member's
+  # `run` actually used), same as do_marker_pull below — falls back to
+  # pull_target_incremental's own remote_path_for(worktree) default when
+  # there is no marker (this command predates pull-on-demand and never
+  # required one).
+  local sb_remote_path; sb_remote_path="$(dirty_field "$worktree" remote_path 2>/dev/null || true)"
+  if ! bytes="$(pull_target_incremental "$worktree" "$ip" "$sb_remote_path")"; then
     journal_line "$(now_iso)  burst-lane  sync-back  fallback  (cause=rsync-failed worktree=$worktree)"
     echo "fallback: rsync from $ip failed"
     exit 3
@@ -3655,6 +3988,15 @@ try:
         w = d.get("worktree", "")
         if w:
             extra_paths.add(w)
+        # PRD-build-burst-path-deps-workspaces requirement 1/3: a workspace
+        # sync remote dir is keyed by hash8(sync_root), not hash8(worktree)
+        # -- add it too so the found-by-hash8 search below (roots/extra_paths)
+        # can actually match it. A plain (non-workspace) run always has
+        # sync_root equal to its own worktree, so this is a harmless
+        # no-op duplicate in that case.
+        sr = d.get("sync_root", "")
+        if sr:
+            extra_paths.add(sr)
 except OSError:
     pass
 try:
@@ -3684,6 +4026,18 @@ for raw in sys.stdin:
     _mtime, name = parts
     if name in keep:
         print("%s\tkeep\tkeep-listed\t" % name)
+        continue
+    # PRD-build-burst-path-deps-workspaces requirement 3: "deps" itself is
+    # the lane own container directory for external path-dependency
+    # mirrors, never a worktree -- it matches neither the hash8-suffixed nor
+    # the legacy-basename shape below, so without this it always fell
+    # through to "no local worktree of that name" and got deleted outright
+    # (the exact 2026-09-11 autobuilder incident: reap ok (dir=deps
+    # reason=legacy-no-local-match), taking a live dependency mirror with
+    # it). Its CHILDREN are reaped individually, by the lane-owned-directory
+    # manifest, in reap_orphans() own second pass -- never here.
+    if name == "deps":
+        print("%s\tcontainer\tlane-owned\t" % name)
         continue
     m = pat.match(name)
     if m:
@@ -3814,6 +4168,81 @@ reap_finish() {  # $1=reaped_dirs $2=reaped_bytes -> stdout combined totals
   echo "reaped_dirs=$(( ${1:-0} + ${old_dirs:-0} )) reaped_bytes=$(( ${2:-0} + ${old_bytes:-0} ))"
 }
 
+# ---- deps/ children reap (PRD-build-burst-path-deps-workspaces requirement
+# 3) ---------------------------------------------------------------------
+# reap_plan()'s top-level scan treats "deps" as a single opaque container
+# (action=container, never deleted by the loop above) — its INDIVIDUAL
+# mirror subdirectories are what actually need reaping, and neither of
+# reap_plan()'s existing "found" sources (the fixed candidate worktree
+# roots, the dirty/attribution ledgers) can ever resolve one, since a
+# mirrored dependency's local path is an arbitrary external sibling crate
+# directory, not a worktree. The lane-owned directory manifest
+# (remote_dirs_record(), written by `run`) is what actually answers "is
+# this mirror still needed": kept while its recorded owner worktree exists
+# locally, reaped with reason=owner-gone the moment it doesn't. A child with
+# NO manifest entry (a mirror created before this PRD shipped, per the PRD's
+# own migration note) is reaped outright as reason=legacy-no-local-match —
+# it is "adopted" into the manifest instead, automatically, the next time
+# its owning worktree actually runs and re-syncs it (record happens on
+# every dep sync, live or not).
+reap_deps_manifest_dirs() {  # $1=ip $2=inflight_names(newline list) -> stdout "reaped_dirs=N reaped_bytes=N"
+  local ip="$1" inflight_names="$2"
+  local reaped_dirs=0 reaped_bytes=0
+  local deps_list_cmd="find '$REMOTE_ROOT/deps' -mindepth 1 -maxdepth 1 -not -name '.*' -printf '%f\n' 2>/dev/null"
+  local deps_out
+  deps_out="$("$SSH_BIN" -o StrictHostKeyChecking=no -o ConnectTimeout=8 -i "$SSH_KEY" \
+      "$REMOTE_USER@$ip" "$deps_list_cmd" 2>/dev/null)"
+  if [ -z "$deps_out" ]; then
+    echo "reaped_dirs=0 reaped_bytes=0"; return 0
+  fi
+  local child relkey owner
+  while IFS= read -r child; do
+    [ -n "$child" ] || continue
+    relkey="deps/$child"
+    if grep -qxF "$relkey" <<<"$inflight_names"; then
+      journal_line "$(now_iso)  burst-lane  reap  skip  (dir=$relkey reason=gate-inflight)"
+      continue
+    fi
+    owner=""
+    if owner="$(remote_dirs_owner "$relkey")" && [ -n "$owner" ]; then
+      if [ -d "$owner" ]; then
+        continue  # live: untouched, no journal noise (matches top-level "live")
+      fi
+      if ! ( exec 210>"$(wt_lock_file "$owner")"; flock -n 210 ); then
+        journal_line "$(now_iso)  burst-lane  reap  skip  (dir=$relkey reason=busy)"
+        continue
+      fi
+      local bytes
+      bytes="$("$SSH_BIN" -o StrictHostKeyChecking=no -o ConnectTimeout=8 -i "$SSH_KEY" \
+          "$REMOTE_USER@$ip" "du -sb '$REMOTE_ROOT/$relkey' 2>/dev/null | cut -f1" 2>/dev/null)"
+      bytes="${bytes:-0}"; case "$bytes" in ''|*[!0-9]*) bytes=0 ;; esac
+      if "$SSH_BIN" -o StrictHostKeyChecking=no -o ConnectTimeout=8 -i "$SSH_KEY" \
+           "$REMOTE_USER@$ip" "rm -rf '$REMOTE_ROOT/$relkey'" 2>/dev/null; then
+        reaped_dirs=$((reaped_dirs + 1)); reaped_bytes=$((reaped_bytes + bytes))
+        remote_dirs_remove "$relkey"
+        journal_line "$(now_iso)  burst-lane  reap  ok  (dir=$relkey bytes=$bytes reason=owner-gone)"
+      else
+        journal_line "$(now_iso)  burst-lane  reap  fail  (dir=$relkey cause=rm-failed)"
+      fi
+    else
+      # No manifest entry — legacy pre-PRD mirror (or a race with a run
+      # that hasn't recorded it yet). Reaped, not adopted; see header note.
+      local lbytes
+      lbytes="$("$SSH_BIN" -o StrictHostKeyChecking=no -o ConnectTimeout=8 -i "$SSH_KEY" \
+          "$REMOTE_USER@$ip" "du -sb '$REMOTE_ROOT/$relkey' 2>/dev/null | cut -f1" 2>/dev/null)"
+      lbytes="${lbytes:-0}"; case "$lbytes" in ''|*[!0-9]*) lbytes=0 ;; esac
+      if "$SSH_BIN" -o StrictHostKeyChecking=no -o ConnectTimeout=8 -i "$SSH_KEY" \
+           "$REMOTE_USER@$ip" "rm -rf '$REMOTE_ROOT/$relkey'" 2>/dev/null; then
+        reaped_dirs=$((reaped_dirs + 1)); reaped_bytes=$((reaped_bytes + lbytes))
+        journal_line "$(now_iso)  burst-lane  reap  ok  (dir=$relkey bytes=$lbytes reason=legacy-no-local-match)"
+      else
+        journal_line "$(now_iso)  burst-lane  reap  fail  (dir=$relkey cause=rm-failed)"
+      fi
+    fi
+  done <<<"$deps_out"
+  echo "reaped_dirs=$reaped_dirs reaped_bytes=$reaped_bytes"
+}
+
 reap_orphans() {
   local reaped_dirs=0 reaped_bytes=0
   mkdir -p "$DIRTY_DIR" "$STATE_DIR/locks" 2>/dev/null || true
@@ -3867,6 +4296,7 @@ reap_orphans() {
       keep)  journal_line "$(now_iso)  burst-lane  reap  skip  (dir=$name reason=keep)" ;;
       dirty) journal_line "$(now_iso)  burst-lane  reap  skip  (dir=$name reason=dirty)" ;;
       live)  : ;;  # untouched, no journal noise on every healthy pass
+      container) : ;;  # "deps" itself — its children are reaped below, never this container
       orphan)
         if grep -qxF "$name" <<<"$inflight_names"; then
           journal_line "$(now_iso)  burst-lane  reap  skip  (dir=$name reason=gate-inflight)"
@@ -3894,6 +4324,16 @@ reap_orphans() {
         ;;
     esac
   done <<<"$plan"
+
+  # PRD-build-burst-path-deps-workspaces requirement 3: deps/'s own children,
+  # judged against the lane-owned directory manifest rather than reap_plan's
+  # worktree-shaped classification (see reap_deps_manifest_dirs()'s header).
+  local deps_out deps_dirs deps_bytes
+  deps_out="$(reap_deps_manifest_dirs "$ip" "$inflight_names")"
+  deps_dirs="$(sed -n 's/^reaped_dirs=\([0-9]*\).*/\1/p' <<<"$deps_out")"
+  deps_bytes="$(sed -n 's/.*reaped_bytes=\([0-9]*\)$/\1/p' <<<"$deps_out")"
+  reaped_dirs=$((reaped_dirs + ${deps_dirs:-0}))
+  reaped_bytes=$((reaped_bytes + ${deps_bytes:-0}))
 
   reap_finish "$reaped_dirs" "$reaped_bytes"
   return 0

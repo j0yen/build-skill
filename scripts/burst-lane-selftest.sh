@@ -3320,5 +3320,235 @@ expect "pathdeps AC4 (structural): gate_tools_probe's PATH export is now conditi
 # with (see burstuser AC7 / parityr AC6 just above).
 expect "pathdeps AC6: every pathdeps case above ran green" "[ $fail -eq 0 ]"
 
+# ============================================================================
+# PRD-build-burst-path-deps-workspaces (test_prefix: pathws): the 2026-09-11
+# autobuilder incident — a cargo WORKSPACE's own members (crates/x) got
+# treated as ordinary external path deps and mirrored a second time under
+# deps/, colliding in the lockfile; the mirror then had no local worktree of
+# its own name, so `reap` deleted it out from under the very next run. Five
+# cases: a workspace member's siblings arrive via ONE workspace-root sync,
+# never a second deps/ copy (AC1); an external sibling OUTSIDE the workspace
+# is still mirrored under deps/ and recorded in the lane-owned directory
+# manifest with its owner worktree (AC2); `reap` keeps that mirror while its
+# owner exists and removes it with reason=owner-gone once the owner is gone,
+# never blindly deleting the whole deps/ container (AC3); a worktree stuck at
+# three identical consecutive build failures is refused a fourth remote
+# attempt entirely (no rsync, no ssh, no cargo) until its HEAD changes (AC4).
+# AC5 (a real casper/autobuilder repo building green) needs real infra this
+# offline harness cannot provide. AC6 is the closing assertion below.
+# ============================================================================
+
+# ---- pathws AC1: a workspace member's own in-workspace sibling arrives via
+# ONE sync of the whole workspace root — never a second, colliding deps/
+# mirror. `run` is invoked against member "a"'s own subdirectory (not the
+# workspace root itself), proving the general worktree-is-a-member-
+# subdirectory shape, not just "the worktree happens to equal the root".
+fresh_env
+"$BL" up >/dev/null 2>&1
+WS1_ROOT="$T/pathws-ws1"
+mkdir -p "$WS1_ROOT/a/src" "$WS1_ROOT/b/src"
+cat > "$WS1_ROOT/Cargo.toml" <<EOF
+[workspace]
+members = ["a", "b"]
+resolver = "2"
+EOF
+cat > "$WS1_ROOT/a/Cargo.toml" <<EOF
+[package]
+name = "pathws-a"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+pathws-b = { path = "../b" }
+EOF
+echo 'fn main() {}' > "$WS1_ROOT/a/src/main.rs"
+cat > "$WS1_ROOT/b/Cargo.toml" <<EOF
+[package]
+name = "pathws-b"
+version = "0.1.0"
+edition = "2021"
+EOF
+echo '' > "$WS1_ROOT/b/src/lib.rs"
+WT_WS1A="$WS1_ROOT/a"
+export FAKE_RSYNC_CALL_LOG="$T/rsync.calls.ws1"; : > "$FAKE_RSYNC_CALL_LOG"
+ws1_out="$("$BL" run "$WT_WS1A" -- cargo metadata --format-version 1 2>&1)"; ws1_rc=$?
+expect "pathws AC1: run against a workspace member exits 0" "[ $ws1_rc -eq 0 ]"
+expect "pathws AC1: cargo metadata really resolved the in-workspace sibling" \
+  "! grep -qi 'failed to load source\|failed to read' <<<\"$ws1_out\""
+expect "pathws AC1: the WHOLE workspace root was synced as one tree" \
+  "awk -F'\t' -v s=\"$WS1_ROOT/\" '\$1==s{f=1} END{exit !f}' \"$FAKE_RSYNC_CALL_LOG\""
+expect "pathws AC1: the member subdirectory was never synced as its own separate source" \
+  "! awk -F'\t' -v s=\"$WT_WS1A/\" '\$1==s{f=1} END{exit !f}' \"$FAKE_RSYNC_CALL_LOG\""
+expect "pathws AC1: no deps/ mirror was created for the in-workspace sibling" \
+  "[ ! -d \"$BURST_LANE_REMOTE_ROOT/deps\" ]"
+expect "pathws AC1: no pathdeps journal line was written (nothing external to mirror)" \
+  "! grep -q \"pathdeps  (worktree=$WT_WS1A\" \"$BURST_LANE_JOURNAL\""
+
+# ---- pathws AC2: the SAME workspace member also depends on a sibling
+# OUTSIDE the workspace entirely — that one is still mirrored under deps/
+# exactly as a non-workspace path dep would be, and recorded in the
+# lane-owned directory manifest ($STATE_DIR/remote-dirs.json) with owner =
+# "a"'s own worktree path (the crate that actually declared the dependency).
+fresh_env
+"$BL" up >/dev/null 2>&1
+WS2_ROOT="$T/pathws-ws2"
+mkdir -p "$WS2_ROOT/a/src" "$WS2_ROOT/b/src"
+EXT2_ROOT="$T/pathws-ext2"
+mkdir -p "$EXT2_ROOT/c/src"
+cat > "$WS2_ROOT/Cargo.toml" <<EOF
+[workspace]
+members = ["a", "b"]
+resolver = "2"
+EOF
+cat > "$WS2_ROOT/a/Cargo.toml" <<EOF
+[package]
+name = "pathws2-a"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+pathws2-b = { path = "../b" }
+pathws2-c = { path = "../../pathws-ext2/c" }
+EOF
+echo 'fn main() {}' > "$WS2_ROOT/a/src/main.rs"
+cat > "$WS2_ROOT/b/Cargo.toml" <<EOF
+[package]
+name = "pathws2-b"
+version = "0.1.0"
+edition = "2021"
+EOF
+echo '' > "$WS2_ROOT/b/src/lib.rs"
+cat > "$EXT2_ROOT/c/Cargo.toml" <<EOF
+[package]
+name = "pathws2-c"
+version = "0.1.0"
+edition = "2021"
+EOF
+echo '' > "$EXT2_ROOT/c/src/lib.rs"
+WT_WS2A="$WS2_ROOT/a"
+ws2_out="$("$BL" run "$WT_WS2A" -- cargo metadata --format-version 1 2>&1)"; ws2_rc=$?
+expect "pathws AC2: run against a workspace member with an external sibling exits 0" "[ $ws2_rc -eq 0 ]"
+expect "pathws AC2: cargo metadata resolved both the in-workspace and external siblings" \
+  "! grep -qi 'failed to load source\|failed to read' <<<\"$ws2_out\""
+expect "pathws AC2: the external sibling WAS mirrored under deps/" \
+  "[ -d \"$BURST_LANE_REMOTE_ROOT/deps\" ] && find \"$BURST_LANE_REMOTE_ROOT/deps\" -maxdepth 1 -type d -name 'c-*' | grep -q ."
+ws2_manifest_rc=1
+python3 -c "
+import json
+try:
+    d = json.load(open('$BURST_LANE_STATE_DIR/remote-dirs.json'))
+except Exception:
+    d = {}
+ok = any(k.startswith('deps/c-') and v.get('owner') == '$WT_WS2A' for k, v in d.items())
+raise SystemExit(0 if ok else 1)
+" && ws2_manifest_rc=0
+expect "pathws AC2: remote-dirs.json records the mirror with owner = a's own worktree" "[ $ws2_manifest_rc -eq 0 ]"
+
+# ---- pathws AC3: `reap` keeps a deps/ mirror while its recorded owner
+# worktree still exists locally, and removes ONLY that mirror (never the
+# deps/ container itself, never guessing from the unhashed "deps" name) once
+# the owner is gone — the direct fix for the incident's own journal line
+# `reap  ok  (dir=deps reason=legacy-no-local-match)`.
+fresh_env
+"$BL" up >/dev/null 2>&1
+WS3_ROOT="$T/pathws-ws3"
+mkdir -p "$WS3_ROOT/a/src"
+EXT3_ROOT="$T/pathws-ext3"
+mkdir -p "$EXT3_ROOT/c/src"
+cat > "$WS3_ROOT/Cargo.toml" <<EOF
+[workspace]
+members = ["a"]
+resolver = "2"
+EOF
+cat > "$WS3_ROOT/a/Cargo.toml" <<EOF
+[package]
+name = "pathws3-a"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+pathws3-c = { path = "../../pathws-ext3/c" }
+EOF
+echo 'fn main() {}' > "$WS3_ROOT/a/src/main.rs"
+cat > "$EXT3_ROOT/c/Cargo.toml" <<EOF
+[package]
+name = "pathws3-c"
+version = "0.1.0"
+edition = "2021"
+EOF
+echo '' > "$EXT3_ROOT/c/src/lib.rs"
+WT_WS3A="$WS3_ROOT/a"
+"$BL" run "$WT_WS3A" -- cargo metadata --format-version 1 >/dev/null 2>&1
+ws3_dep_dir="$(find "$BURST_LANE_REMOTE_ROOT/deps" -maxdepth 1 -type d -name 'c-*' | head -n1)"
+expect "pathws AC3: setup — the external sibling mirror exists before reap" "[ -n \"$ws3_dep_dir\" ] && [ -d \"$ws3_dep_dir\" ]"
+: > "$BURST_LANE_JOURNAL"
+reap3a_out="$("$BL" reap 2>&1)"
+expect "pathws AC3: reap keeps the mirror while its owner worktree still exists" "[ -d \"$ws3_dep_dir\" ]"
+expect "pathws AC3: reap journaled no removal for the still-owned mirror" \
+  "! grep -qF \"reap  ok  (dir=deps/$(basename "$ws3_dep_dir")\" \"$BURST_LANE_JOURNAL\""
+rm -rf "$WT_WS3A"
+: > "$BURST_LANE_JOURNAL"
+reap3b_out="$("$BL" reap 2>&1)"
+expect "pathws AC3: reap removes the mirror once its owner worktree is gone" "[ ! -d \"$ws3_dep_dir\" ]"
+expect "pathws AC3: reap journals reason=owner-gone (never the bare deps/ container)" \
+  "grep -qE 'reap  ok  \\(dir=deps/[^ ]+ bytes=[0-9]+ reason=owner-gone\\)' \"$BURST_LANE_JOURNAL\""
+
+# ---- pathws AC4: three consecutive identical build-failed causes on one
+# worktree's HEAD refuse a fourth remote attempt outright (no rsync, no ssh,
+# no cargo) — the loop-burning defect the TL;DR's five-cycle casper journal
+# names — and a new HEAD lets attempts resume.
+fresh_env
+"$BL" up >/dev/null 2>&1
+PW4_ROOT="$T/pathws-broken"
+mkdir -p "$PW4_ROOT/main-crate/src"
+cat > "$PW4_ROOT/main-crate/Cargo.toml" <<EOF
+[package]
+name = "pathws4-main"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+missing-sibling = { path = "../missing-sibling" }
+EOF
+echo 'fn main() {}' > "$PW4_ROOT/main-crate/src/main.rs"
+WT_PW4="$PW4_ROOT/main-crate"
+export BURST_LANE_FAKE_HEAD="pathws4headA"
+export FAKE_SSH_CALL_LOG="$T/ssh.calls.pw4"; : > "$FAKE_SSH_CALL_LOG"
+"$BL" run "$WT_PW4" -- cargo metadata --format-version 1 >/dev/null 2>&1
+"$BL" run "$WT_PW4" -- cargo metadata --format-version 1 >/dev/null 2>&1
+"$BL" run "$WT_PW4" -- cargo metadata --format-version 1 >/dev/null 2>&1
+pw4_calls_before="$(wc -l < "$FAKE_SSH_CALL_LOG")"
+pw4_4th_out="$("$BL" run "$WT_PW4" -- cargo metadata --format-version 1 2>&1)"; pw4_4th_rc=$?
+pw4_calls_after="$(wc -l < "$FAKE_SSH_CALL_LOG")"
+expect "pathws AC4: the 4th attempt at an unchanged HEAD is refused (exit 3)" "[ $pw4_4th_rc -eq 3 ]"
+# pw4_4th_out carries the real cargo error text as its stored "cause" (it
+# rides through unchanged into the refusal message) — parens/backticks/
+# quotes from a real compiler error are NOT safe to re-embed into another
+# eval'd condition string, so the check runs directly here (never through
+# expect's own eval) and only a plain, already-boolean result crosses that
+# boundary. Same for the AC4 new-HEAD check below.
+pw4_repeated_rc=1; grep -qi 'repeated' <<<"$pw4_4th_out" && pw4_repeated_rc=0
+expect "pathws AC4: the refusal names it as repeated" "[ $pw4_repeated_rc -eq 0 ]"
+expect "pathws AC4: journal names n=3 and the worktree" \
+  "grep -qF \"build-failed  repeated  (n=3\" \"$BURST_LANE_JOURNAL\" && grep -qF \"worktree=$WT_PW4\" \"$BURST_LANE_JOURNAL\""
+expect "pathws AC4: the 4th attempt made no ssh call at all (no cargo ever ran)" "[ \"$pw4_calls_after\" -eq \"$pw4_calls_before\" ]"
+export BURST_LANE_FAKE_HEAD="pathws4headB"
+pw4_5th_out="$("$BL" run "$WT_PW4" -- cargo metadata --format-version 1 2>&1)"; pw4_5th_rc=$?
+pw4_5th_ok_rc=1
+if [ "$pw4_5th_rc" -ne 3 ]; then
+  pw4_5th_ok_rc=0
+elif ! grep -qi 'repeated' <<<"$pw4_5th_out"; then
+  pw4_5th_ok_rc=0
+fi
+expect "pathws AC4: a new HEAD lets attempts resume (not the repeated refusal)" "[ $pw4_5th_ok_rc -eq 0 ]"
+expect "pathws AC4: the resumed attempt actually reached the box" \
+  "grep -qF \"run  build-failed  (worktree=$WT_PW4\" \"$BURST_LANE_JOURNAL\""
+unset BURST_LANE_FAKE_HEAD
+
+# ---- pathws AC6 (P1): this fixture set exits 0 and names its own pathws
+# cases — same in-band closing assertion every sibling PRD's own block ends
+# with (see pathdeps AC6 just above).
+expect "pathws AC6: every pathws case above ran green" "[ $fail -eq 0 ]"
+
 echo "=== $([ $fail -eq 0 ] && echo PASS || echo FAIL) ==="
 exit $fail
