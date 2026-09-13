@@ -1,4 +1,9 @@
 state/
+# Explicit even though state/ already covers it (PRD-build-tenant-secret-
+# continuity): runtime secrets a branch dispatch mints (tenant keys,
+# tokens) must never be git-tracked, so this line stays true even if the
+# blanket state/ entry above is ever narrowed.
+state/secrets/
 *.lock
 *.bak.*
 repos/

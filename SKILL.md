@@ -2082,6 +2082,47 @@ those before every step and defers to them exactly as selection would.
   `worktree-extend.sh integrate` so same-repo integrations serialize.
   Internal to the helper; branches don't manage it directly.
 
+### Runtime secrets (PRD-build-tenant-secret-continuity, 2026-09-13)
+
+A branch dispatch is a fresh process with no memory of any prior dispatch —
+that's the whole premise of "check the PRD's `Blocked:`/`Next:` line
+first." If a dispatch mints a credential a *later* dispatch will need (a
+tenant API key, a session token, anything not recoverable from the
+provider afterward), holding it only in that process's memory is
+equivalent to losing it the instant the process exits. This actually
+happened: a 2026-09-13 dispatch signed up mcphost.dev tenant `t_ea9749c3`,
+wrote "key already held, not re-signing-up" into the PRD's own text, and
+left the key nowhere a later process could read — read-only DB inspection
+confirmed the server only stores a non-reversible `key_hash`, so the key
+was gone for good.
+
+**Convention:** `state/secrets/<slug>/<name>.json` — one file per named
+secret under a per-PRD-slug directory. Directory mode `700`, file mode
+`600`. Never git-tracked (`state/` is gitignored wholesale, and
+`state/secrets/` is called out explicitly in `.gitignore` so this stays
+true even if `state/`'s blanket entry is ever narrowed). Never echoed into
+PRD prose, `iter_log`/`Next:` lines, or the journal — those reference the
+*path* (`state/secrets/<slug>/tenant_key.json`) or just the fact that a
+secret exists, never the value itself.
+
+**Mechanism:** `scripts/secret-store.sh write <slug> <name> [value]`
+(reads stdin if `value` is omitted or `-`) and `scripts/secret-store.sh
+read <slug> <name>` (prints the value to stdout, exit 4 if absent). A
+dispatch that mints a credential a continuation plan depends on writes it
+here before exiting; a dispatch whose `Blocked:`/`Next:` line claims a
+credential is "already held" reads it back from here first instead of
+assuming in-process continuity. `scripts/secret-store-selftest.sh` proves
+this survives a real dispatch boundary (write in one spawned process, read
+in a separately spawned process, distinct PIDs asserted) rather than a
+same-process illusion.
+
+**Guard:** `scripts/prd-lint.sh`'s `credential-reuse-unbacked` check (warn,
+not fail) flags a PRD whose text claims a credential is "already held" (or
+similar — already have/got/captured a key/token/credential/secret) with no
+matching `*.json` file under its `state/secrets/<slug>/` — the same
+accountability shape `verdict-receipts.sh` already applies to reserved-word
+claims.
+
 ### Worktree isolation (shared `build_into`, added 2026-05-28; python-cli/
 python-lib/python-agent added 2026-09-10, PRD-build-python-worktree-isolation)
 
@@ -2321,6 +2362,11 @@ to 5" wording. The cap is a number in the doc, not in code.
 │                           # written by loom-serial-fallback.sh; read at Phase-2 selection
 │                           # to gate serial vs parallel fan-out for a build_into target.
 │                           # Fail-open: absent/malformed → all streaks read as 0.
+├── secrets/<slug>/<name>.json  # runtime secrets a dispatch mints that a LATER
+│                           # dispatch must reuse (tenant keys, tokens); dir mode
+│                           # 700, file mode 600, never git-tracked, never echoed
+│                           # into PRD prose/journal — see "Runtime secrets" above.
+│                           # Written/read via scripts/secret-store.sh.
 └── prd-<slug>.lock         # one per in-flight PRD branch; ephemeral
 ```
 

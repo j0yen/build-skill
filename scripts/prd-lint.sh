@@ -19,6 +19,9 @@
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# PRD-build-tenant-secret-continuity: exported so the python heredoc below
+# can resolve state/secrets/<slug>/ without re-deriving SKILL_DIR itself.
+export LINT_STATE_DIR="${BUILD_STATE_DIR:-$HERE/../state}"
 
 usage() {
   echo "usage: prd-lint.sh <file>... [--format text|json]" >&2
@@ -105,6 +108,18 @@ AC_LEGACY_RE = re.compile(r"^AC-\d+\s*:")
 SHA40_RE = re.compile(r"\b[0-9a-f]{40}\b")
 BASE_SHA_RE = re.compile(r"--base\s+([0-9a-f]{7,40})\b")
 HOME_PATH_RE = re.compile(r"/home/[A-Za-z0-9_.-]+/")
+# PRD-build-tenant-secret-continuity, AC3: "key/token/credential already
+# held" (or have/got/captured) in either word order, loosely anchored so it
+# catches the real 2026-09-13 phrasing ("key already held") without
+# requiring an exact string.
+CRED_WORD = r"(?:key|token|credential|credentials|secret|api[ _-]?key)"
+ALREADY_HELD = r"already\s+(?:held|have|has|got|possess(?:es)?|exists?|captured)"
+CRED_CLAIM_RE = re.compile(
+    rf"\b{CRED_WORD}\b[^.\n]{{0,60}}\b{ALREADY_HELD}\b"
+    rf"|\b{ALREADY_HELD}\b[^.\n]{{0,60}}\b{CRED_WORD}\b",
+    re.I,
+)
+LINT_STATE_DIR = os.environ.get("LINT_STATE_DIR", "")
 
 
 def strip_val(v):
@@ -457,6 +472,32 @@ def lint_file(path):
             s = " ".join(it)
             if HOME_PATH_RE.search(s):
                 warn("home-path-in-ac", f"AC references a path under /home/: {it[0]!r}")
+
+    # -- credential-reuse claim with no backing secrets-path file ------------
+    # PRD-build-tenant-secret-continuity, AC3: a PRD whose own text (frontmatter,
+    # iter_log, Next:/Blocked: lines -- this checks the whole file, since those
+    # sections aren't structurally distinguished from prose here) claims a
+    # credential is "already held" is making a promise the NEXT dispatch (a
+    # fresh process) cannot keep unless that credential actually landed under
+    # state/secrets/<slug>/. Warning, not a fail -- a doc-only false positive
+    # (e.g. a PRD *discussing* this convention) shouldn't block selection.
+    body_text = "\n".join(all_lines)
+    if CRED_CLAIM_RE.search(body_text):
+        secrets_dir = os.path.join(LINT_STATE_DIR, "secrets", slug) if LINT_STATE_DIR else ""
+        has_secret_file = False
+        if secrets_dir:
+            try:
+                has_secret_file = any(n.endswith(".json") for n in os.listdir(secrets_dir))
+            except OSError:
+                has_secret_file = False
+        if not has_secret_file:
+            warn(
+                "credential-reuse-unbacked",
+                f"PRD text claims a credential/key/token is 'already held' (or "
+                f"similar) with no *.json file under state/secrets/{slug}/ "
+                f"backing that claim -- the next dispatch (a fresh process) "
+                f"cannot verify or reuse it (see SKILL.md 'Runtime secrets')",
+            )
 
     # -- fixture negative-case rule (PRD-build-post-ship-reality-check req 6) --
     # A PRD that requires a selftest but only ever describes it in positive

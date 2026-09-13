@@ -543,6 +543,26 @@ EOF
 expect_warn "$q/PRD-home-path.md" home-path-in-ac "home-path-in-ac/warn"
 expect_clean_no_id "$q/PRD-status-ok.md" warnings home-path-in-ac "home-path-in-ac/pass"
 
+# ============================================================ credential-reuse-unbacked
+# PRD-build-tenant-secret-continuity, AC3: a PRD claiming a credential is
+# "already held" with nothing under state/secrets/<slug>/ backing it up.
+cred_state="$tmp/state-scratch"
+cat > "$q/PRD-cred-claim.md" <<'EOF'
+- Status: building
+- build_target: shell
+- Vision: visions/plain.md
+
+## Acceptance criteria
+
+1. P0 — Given the tenant key already held from a prior dispatch, When reused, Then it just works.
+EOF
+BUILD_STATE_DIR="$cred_state" expect_warn "$q/PRD-cred-claim.md" credential-reuse-unbacked "credential-reuse-unbacked/warn (no secret file)"
+
+mkdir -p "$cred_state/secrets/cred-claim"
+echo '{"value":"x","written_at":"2026-01-01T00:00:00Z"}' > "$cred_state/secrets/cred-claim/tenant_key.json"
+BUILD_STATE_DIR="$cred_state" expect_clean_no_id "$q/PRD-cred-claim.md" warnings credential-reuse-unbacked "credential-reuse-unbacked/pass (secret file present)"
+expect_clean_no_id "$q/PRD-status-ok.md" warnings credential-reuse-unbacked "credential-reuse-unbacked/pass (no claim in text)"
+
 # ================================================================================ OK
 cat > "$b/PRD-clean-built.md" <<'EOF'
 - Status: built
