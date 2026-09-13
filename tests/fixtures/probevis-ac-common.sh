@@ -24,7 +24,23 @@ run_probevis_suite_and_expect_labels() {  # $@ = exact "ok  <label>" lines requi
   # the fixture already self-exports this at its own top, but every
   # tests/*.sh is required to export it too, so this wrapper does not rely
   # solely on the suite it calls remembering to.
-  out="$(BURST_LANE_TEST=1 bash "$suite" 2>&1)"; rc=$?
+  #
+  # BUILD_BURST_ENABLED=1 (PRD-build-burst-probe-visibility gap found
+  # 2026-09-13): the suite's own header documents itself as run via
+  # `BUILD_BURST_ENABLED=1 bash burst-lane-probe-visibility-selftest.sh`
+  # because burst-lane.sh's `up`/`provision` subcommands genuinely refuse
+  # under the 2026-09-11 RedBaron-local policy unless burst_configured()
+  # is true (lib/burst-configured.sh) — without this the suite prints one
+  # `SKIP: burst lane dormant` line and exits 0 before running any of its
+  # 37 assertions, which every one of these AC wrappers then misread as
+  # "suite passed, labels just missing" -> FAIL. Setting it here is safe:
+  # it never reaches real infra — fresh_env() inside the suite overrides
+  # PATH to tests/fixtures/burst-lane-fake (fake hcloud/ssh/rsync) before
+  # `$BL up`/`$BL provision` ever runs, so this only unlocks the in-process
+  # fixture proof, on every host regardless of that host's real burst
+  # policy — exactly what a dormant-by-design host (RedBaron today) needs
+  # for these P0, fixture-only ACs to be provable at all.
+  out="$(BURST_LANE_TEST=1 BUILD_BURST_ENABLED=1 bash "$suite" 2>&1)"; rc=$?
   if [ "$rc" -ne 0 ]; then
     echo "FAIL: burst-lane-probe-visibility-selftest.sh exited $rc" >&2
     echo "$out" | tail -20 >&2
