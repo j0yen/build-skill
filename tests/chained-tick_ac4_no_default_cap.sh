@@ -31,6 +31,13 @@ reset_manifest() {
   cat > "$BUILD_MANIFEST" <<JSON
 {"prds": {"$SLUG": {"slug": "$SLUG", "status": "queued", "build_target": "shell", "blockers": [], "chained_steps": 0}}}
 JSON
+  # PRD-build-archive-verify-before-shipped requirement 3: chain-guard now
+  # re-verifies build-queue/built-prds placement before honoring `status:
+  # shipped` as archive-done, so this fixture needs a real PRD file to
+  # move, matching what the real archive-commit.sh step does.
+  rm -rf "$T/build-queue" "$T/built-prds"
+  mkdir -p "$T/build-queue"
+  printf '# PRD: %s\n- Status: queued\n- build_target: shell\n' "$SLUG" > "$T/build-queue/PRD-$SLUG.md"
 }
 
 # ---- Part 1: CHAIN_MAX_STEPS unset -> a 12-step green fixture reaches
@@ -42,10 +49,12 @@ for k in $(seq 1 12); do
   if [ "$k" -lt 12 ]; then
     patch "{\"status\":\"in_progress\",\"chained_steps\":$k}"
   else
+    mkdir -p "$T/built-prds"
+    mv "$T/build-queue/PRD-$SLUG.md" "$T/built-prds/PRD-$SLUG.md"
     patch "{\"status\":\"shipped\",\"chained_steps\":$k}"
   fi
   if [ "$k" -lt 12 ]; then
-    out="$("$CG" check "$SLUG" --step-count "$k" --skip-select-guard)"; rc=$?
+    out="$("$CG" check "$SLUG" --step-count "$k" --prd-dir "$T" --skip-select-guard)"; rc=$?
     if [ "$rc" -ne 0 ]; then all_continued=0; echo "  (step $k) $out" >&2; fi
   fi
 done
@@ -53,7 +62,7 @@ expect "unset cap: chain-guard said continue after every one of steps 1..11" "[ 
 expect "unset cap: fixture reached shipped in one dispatch (12 steps)"       "[ \"\$(get "$SLUG" status)\" = shipped ]"
 expect "unset cap: chained_steps telemetry shows all 12"                    "[ \"\$(get "$SLUG" chained_steps)\" = 12 ]"
 
-out="$("$CG" check "$SLUG" --step-count 12 --skip-select-guard)"; rc=$?
+out="$("$CG" check "$SLUG" --step-count 12 --prd-dir "$T" --skip-select-guard)"; rc=$?
 expect "post-archive re-check stops on archive-done, not a cap" \
   "[ $rc -eq 1 ] && grep -q 'archive-done' <<<\"\$out\""
 
@@ -62,15 +71,15 @@ expect "post-archive re-check stops on archive-done, not a cap" \
 export CHAIN_MAX_STEPS=3
 reset_manifest
 patch '{"status":"in_progress","chained_steps":1}'
-out="$("$CG" check "$SLUG" --step-count 1 --skip-select-guard)"; rc=$?
+out="$("$CG" check "$SLUG" --step-count 1 --prd-dir "$T" --skip-select-guard)"; rc=$?
 expect "cap=3: after step 1, continue (1 < 3)" "[ $rc -eq 0 ]"
 
 patch '{"status":"in_progress","chained_steps":2}'
-out="$("$CG" check "$SLUG" --step-count 2 --skip-select-guard)"; rc=$?
+out="$("$CG" check "$SLUG" --step-count 2 --prd-dir "$T" --skip-select-guard)"; rc=$?
 expect "cap=3: after step 2, continue (2 < 3)" "[ $rc -eq 0 ]"
 
 patch '{"status":"in_progress","chained_steps":3}'
-out="$("$CG" check "$SLUG" --step-count 3 --skip-select-guard)"; rc=$?
+out="$("$CG" check "$SLUG" --step-count 3 --prd-dir "$T" --skip-select-guard)"; rc=$?
 expect "cap=3: after step 3, stop"        "[ $rc -eq 1 ]"
 expect "cap=3: stop reason is cap"        "grep -q ': cap$' <<<\"\$out\""
 expect "cap=3: fixture did NOT reach shipped (stopped at 3/12)" \

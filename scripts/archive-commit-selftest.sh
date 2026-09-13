@@ -54,6 +54,25 @@
 #         a sibling's push/pull-rebase must still survive (lock/commit
 #         ordering, mirrors AC5 above for the base atomic-commit feature).
 #
+# PRD-build-archive-verify-before-shipped (test_prefix `archverify`) adds
+# the postcondition/retry/ordering coverage this same run also exposes as
+# `ARCHVERIFY AC<N>: ...` labels (`tests/archverify_ac<N>_*.sh` wrappers
+# pull them the same way the MANBACKFILL wrappers do above):
+#   ARCHVERIFY AC1/AC2 — requirement 5's own fixture: a `git push` that
+#         reports success without the commit ever reaching origin (a
+#         PATH-shimmed `git` whose `push` subcommand no-ops instead of
+#         a real one) is caught by the new postcondition check —
+#         archive-commit.sh exits non-zero naming `postcondition-failed`
+#         instead of the false success this PRD is named for, and
+#         origin never actually shows the archive commit.
+#   ARCHVERIFY AC3 — given that non-zero exit, the SKILL.md-documented
+#         ordering (Phase 7's manifest-set.sh patch gated on
+#         archive-commit.sh's own exit code) never flips `status` to
+#         `shipped`.
+#
+# `tests/archverify_ac4_*.sh` exercises chain-guard.sh's own filesystem
+# re-verification directly (no git fixture needed there — see that file).
+#
 # Run: bash scripts/archive-commit-selftest.sh   (exit 0 = all pass)
 
 set -uo pipefail
@@ -156,6 +175,34 @@ PY
   git -C "$d/prds" push -q origin "$defbr"
 }
 
+# ---- helper added for PRD-build-archive-verify-before-shipped (archverify) ----
+
+# Build a "git" shim in $1 that delegates every subcommand to the real
+# git EXCEPT `push`, which no-ops with exit 0 without touching the
+# remote at all — reproducing exactly the failure mode this PRD is named
+# for: a push that reports success while the commit never actually
+# lands on origin (the local `refs/remotes/origin/<branch>` tracking ref
+# is never updated either, since nothing real ran). Prepend $1 to PATH
+# when invoking archive-commit.sh to make it take effect.
+make_lying_push_git_shim() {
+  local dir="$1" real_git
+  real_git="$(command -v git)"
+  mkdir -p "$dir"
+  cat > "$dir/git" <<SH
+#!/usr/bin/env bash
+# archive-commit.sh always calls git as "git -C <dir> <subcommand> ...",
+# so the subcommand is \$3, not \$1 — check every arg (cheap, argc is
+# always tiny here) rather than assume a fixed position.
+for a in "\$@"; do
+  if [ "\$a" = "push" ]; then
+    exit 0
+  fi
+done
+exec "$real_git" "\$@"
+SH
+  chmod +x "$dir/git"
+}
+
 # ======================================================================
 # AC1 — clean archive lands atomically
 # ======================================================================
@@ -230,6 +277,15 @@ expect "AC3: the archive still landed"                       "[ ! -f '$D3/prds/b
 
 # ======================================================================
 # AC4 — lock held past the bound: times out, zero writes (failure-mode #2)
+#
+# PRD-build-archive-verify-before-shipped requirement 4 made lock-timeout
+# (exit 5) one of the two transient codes archive-commit.sh retries once
+# on its own — so a lock held only briefly past ONE attempt's bound no
+# longer proves a genuine stuck lock. This fixture now holds the lock
+# long enough to outlast BOTH attempts' wait bounds plus the (shortened,
+# via $ARCHIVE_COMMIT_RETRY_DELAY) retry delay between them, so the
+# double-timeout this asserts is the real "still stuck after the one
+# automatic retry" case, not a race against the holder's own release.
 # ======================================================================
 D4="$T/ac4"; mkdir -p "$D4"
 DEFBR4="$(new_prd_fixture "$D4")"
@@ -238,15 +294,16 @@ mkdir -p "$D4/receipts"; echo r > "$D4/receipts/r.txt"
 cat > "$D4/bmanifest.json" <<EOF
 {"prds":{"timeout":{"slug":"timeout","receipts_dir":"$D4/receipts"}}}
 EOF
-( exec 9>"$D4/prds/.git/autobuilder-integrate.lock"; flock 9; sleep 6 ) &
+( exec 9>"$D4/prds/.git/autobuilder-integrate.lock"; flock 9; sleep 12 ) &
 holder4=$!
 sleep 0.5
 head4_0="$(git -C "$D4/prds" rev-parse HEAD)"
-out4="$(PRD_DIR="$D4/prds" BUILD_MANIFEST="$D4/bmanifest.json" "$AC" timeout --lock-wait 2 2>&1)"; rc4=$?
+out4="$(PRD_DIR="$D4/prds" BUILD_MANIFEST="$D4/bmanifest.json" ARCHIVE_COMMIT_RETRY_DELAY=1 "$AC" timeout --lock-wait 2 2>&1)"; rc4=$?
 head4_1="$(git -C "$D4/prds" rev-parse HEAD)"
 wait "$holder4" 2>/dev/null
 expect "AC4: exits non-zero"                                 "[ $rc4 -ne 0 ]"
 expect "AC4: names lock-timeout"                             "grep -q 'lock-timeout' <<<\"\$out4\""
+expect "AC4: the one automatic retry ran and also failed"    "[ \"\$(grep -c 'lock-timeout' <<<\"\$out4\")\" -ge 2 ]"
 expect "AC4: no writes (HEAD unchanged)"                      "[ '$head4_0' = '$head4_1' ]"
 expect "AC4: working tree clean"                              "[ -z \"\$(git -C '$D4/prds' status --porcelain)\" ]"
 expect "AC4: PRD still queued"                                "grep -q '^- Status: queued\$' '$D4/prds/build-queue/PRD-timeout.md'"
@@ -456,6 +513,39 @@ expect "MANBACKFILL AC7: our archive commit is present on origin" "git -C '$D13/
 expect "MANBACKFILL AC7: backfill + flip survived the rebase"    "grep -q 'PRD-mbrace.md — shipped' '$D13/prds/MANIFEST.md'"
 expect "MANBACKFILL AC7: sibling's pulled-in file is present"    "[ -f '$D13/prds/build-queue/PRD-siblingrace.md' ]"
 expect "MANBACKFILL AC7: working tree is clean"                  "[ -z \"\$(git -C '$D13/prds' status --porcelain)\" ]"
+
+# ======================================================================
+# ARCHVERIFY AC1/AC2 — requirement 5's fixture: a `git push` that
+# reports success without the commit reaching origin is caught by the
+# new postcondition check, not treated as archived.
+# ======================================================================
+D14="$T/av2"; mkdir -p "$D14"
+DEFBR14="$(new_prd_fixture "$D14")"
+add_queued_prd "$D14" "lieshipped" "$DEFBR14"
+mkdir -p "$D14/receipts"; echo r > "$D14/receipts/r.txt"
+cat > "$D14/bmanifest.json" <<EOF
+{"prds":{"lieshipped":{"slug":"lieshipped","receipts_dir":"$D14/receipts"}}}
+EOF
+make_lying_push_git_shim "$D14/shimbin"
+out14="$(PATH="$D14/shimbin:$PATH" PRD_DIR="$D14/prds" BUILD_MANIFEST="$D14/bmanifest.json" ARCHIVE_COMMIT_RETRY_DELAY=1 "$AC" lieshipped 2>&1)"; rc14=$?
+expect "ARCHVERIFY AC1/AC2: exits non-zero despite the push reporting success" "[ $rc14 -ne 0 ]"
+expect "ARCHVERIFY AC1/AC2: names postcondition-failed"                        "grep -qi 'postcondition' <<<\"\$out14\""
+expect "ARCHVERIFY AC1/AC2: origin never actually received the commit"        "! git -C '$D14/origin.git' log --oneline --all | grep -q 'archive: lieshipped shipped'"
+expect "ARCHVERIFY AC1/AC2: exit code is 8 (postcondition-failed, not retried)" "[ $rc14 -eq 8 ]"
+
+# ======================================================================
+# ARCHVERIFY AC3 — given that non-zero exit, the documented ordering
+# (Phase 7's manifest-set.sh patch gated on archive-commit.sh's own exit
+# code) never flips status to shipped for this action.
+# ======================================================================
+cat > "$D14/orch_manifest.json" <<EOF
+{"prds":{"lieshipped":{"slug":"lieshipped","status":"in_progress"}}}
+EOF
+if [ "$rc14" -eq 0 ]; then
+  python3 -c "import json; p='$D14/orch_manifest.json'; d=json.load(open(p)); d['prds']['lieshipped']['status']='shipped'; json.dump(d, open(p,'w'))"
+fi
+expect "ARCHVERIFY AC3: ordering never patches status:shipped on a non-zero archive-commit exit" \
+  "grep -q '\"status\": *\"in_progress\"' '$D14/orch_manifest.json'"
 
 echo "----"
 echo "archive-commit-selftest: pass=$PASS fail=$FAIL"

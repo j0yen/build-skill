@@ -47,10 +47,18 @@
 # tests/manifest-set.sh already does.
 #
 # Exit 0 + "continue: <slug>: <reason>"   the next step may run now.
+#   Reason `archive-incomplete` (PRD-build-archive-verify-before-shipped)
+#   means manifest status is `shipped` but built-prds/PRD-<slug>.md is
+#   missing and/or build-queue/PRD-<slug>.md is still present — the
+#   archive step must be retried once, it is NOT done.
 # Exit 1 + "stop: <slug>: <reason>"       chaining stops; <reason> is one of:
 #   excluded-kernel-extend | excluded-reflect-candidate | archive-done |
 #   blockers | needs-user | cap | lock-contended | target-busy: <detail> |
 #   no-manifest-entry
+#   `archive-done` is only returned when status is `shipped` AND the
+#   filesystem agrees (built-prds/ present, build-queue/ absent) —
+#   requirement 3, re-verified against --prd-dir on every call, never
+#   taken on the manifest's word alone.
 # Exit 4                                   usage / IO error.
 set -uo pipefail
 
@@ -136,8 +144,22 @@ cmd_check() {
     return 1
   fi
   if [ "$status" = "shipped" ]; then
-    echo "stop: $slug: archive-done"
-    return 1
+    # PRD-build-archive-verify-before-shipped requirement 3: manifest
+    # status alone is not proof of archival — re-check the filesystem
+    # (built-prds/ present, build-queue/ absent) before trusting it. The
+    # 2026-09-13 incident this PRD is named for was exactly this: status
+    # said shipped, chain-guard said archive-done, and the PRD file was
+    # still sitting in build-queue/. A manifest that says shipped but the
+    # file hasn't actually moved is NOT archive-done — it's an
+    # incomplete archive that needs its one retry, not a stop.
+    local built_path="$prd_dir/built-prds/PRD-$slug.md"
+    local queue_path="$prd_dir/build-queue/PRD-$slug.md"
+    if [ -f "$built_path" ] && [ ! -f "$queue_path" ]; then
+      echo "stop: $slug: archive-done"
+      return 1
+    fi
+    echo "continue: $slug: archive-incomplete"
+    return 0
   fi
 
   local blockers_n; blockers_n="$(manifest_field "$slug" blockers)"

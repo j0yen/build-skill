@@ -76,7 +76,9 @@
 #
 # Exit codes:
 #   0   archived (or dry-run printed the plan, or already-archived no-op —
-#       see Idempotence below)
+#       see Idempotence below) — ONLY ever returned once the postcondition
+#       below is independently verified, never on the strength of the
+#       write steps having merely run without erroring.
 #   2   usage error
 #   3   not-queued (PRD missing from build-queue/) or receipt unresolved
 #   4   dirty checkout for the touched paths, or a write step failed
@@ -87,12 +89,29 @@
 #       our own commit) — not a corrupt state, just an unfinished push
 #   7   manifest-duplicate: MANIFEST.md carries two-or-more conflicting
 #       lines for this slug — genuine corruption, not absence; no writes
+#   8   postcondition-failed (PRD-build-archive-verify-before-shipped):
+#       the write steps and push all reported success, but re-checking
+#       the filesystem/reachability afterward disagrees — built-prds/
+#       missing, build-queue/ still present, or the commit isn't
+#       reachable from origin's current branch. Never treat a caller-side
+#       "it exited without dying" as success; only exit 0 satisfies this.
 #
 # Idempotence: if the slug is already gone from build-queue/, already
 # present in built-prds/, AND MANIFEST.md already shows it `shipped`,
 # this is a no-op: prints one line and exits 0 without touching the
 # checkout (a retry after a prior fully-successful archive, or a
-# duplicate dispatch, is always safe to re-run).
+# duplicate dispatch, is always safe to re-run) — PROVIDED the commit is
+# also reachable from origin (requirement 1); if the local state already
+# looks archived but the commit never reached origin, this finishes the
+# push under the lock instead of silently no-opping (see below).
+#
+# Retry (PRD-build-archive-verify-before-shipped requirement 4): a
+# transient failure — lock-timeout (5) or push-still-pending after a
+# local commit (6) — is retried ONCE, after a short delay
+# ($ARCHIVE_COMMIT_RETRY_DELAY, default 5s), by re-invoking this same
+# script as a fresh process. A real blocking condition (2/3/4/7/8) is
+# never retried — it fails loudly on the first attempt, exactly as
+# before.
 #
 # Stdout on a successful (or push-pending) run:
 #   archive-commit <slug> commit=<sha> pushed=<yes|pending> lock_wait=<s>
@@ -104,6 +123,7 @@ SKILL_DIR="$(cd "$HERE/.." && pwd)"
 JQ="${JQ:-/usr/bin/jq}"
 PRD_DIR="${PRD_DIR:-$HOME/Documents/PRDs}"
 BUILD_MANIFEST="${BUILD_MANIFEST:-$SKILL_DIR/state/manifest.json}"
+export JQ PRD_DIR BUILD_MANIFEST
 GIT_ID=(-c user.email=jyen.tech@gmail.com -c user.name="Joe Yen")
 
 log() { printf '%s\n' "archive-commit: $*" >&2; }
@@ -135,6 +155,48 @@ manifest_rel="MANIFEST.md"
 prd_path="$PRD_DIR/$prd_rel"
 manifest_md="$PRD_DIR/$manifest_rel"
 
+# ---- reachability helpers (requirement 1: a commit isn't "archived"
+# until it's reachable from origin, not just present in the local
+# working tree — checked against origin/<the branch actually checked
+# out here>, since this script only ever pushes the current branch and
+# never assumes the remote's name for it is "main"). --------------------
+current_branch() { git -C "$PRD_DIR" symbolic-ref --quiet --short HEAD 2>/dev/null; }
+commit_reachable() {
+  local sha="${1:-}" branch
+  [ -n "$sha" ] || return 1
+  branch="$(current_branch)"
+  [ -n "$branch" ] || return 1
+  git -C "$PRD_DIR" merge-base --is-ancestor "$sha" "origin/$branch" 2>/dev/null
+}
+
+# ---- requirement 4: retry once on a TRANSIENT failure (lock contention
+# / a concurrent rebase-push race), never on a real blocking condition.
+# A thin outer wrapper that re-invokes this same script once, as a fresh
+# child process, with $_ARCHIVE_COMMIT_ATTEMPT set — so the single-attempt
+# logic below (idempotence check through the final postcondition
+# verification) never has to know it might run twice. Skipped entirely
+# for --dry-run (read-only, nothing to retry) and inside the child
+# invocation itself (guarded by $_ARCHIVE_COMMIT_ATTEMPT). Exit 5
+# (lock-timeout, no writes yet) and exit 6 (push pending after a local
+# commit) are the two transient codes this retries; 2/3/4/7/8 are real
+# blocking conditions and pass straight through unretried on the first
+# attempt — retrying those would risk a false success on the second pass
+# instead of failing loudly, exactly what requirement 4 forbids.
+if [ "$dry_run" = false ] && [ -z "${_ARCHIVE_COMMIT_ATTEMPT:-}" ]; then
+  retry_delay="${ARCHIVE_COMMIT_RETRY_DELAY:-5}"
+  out="$(_ARCHIVE_COMMIT_ATTEMPT=1 bash "${BASH_SOURCE[0]}" "$slug" --lock-wait "$lock_wait")"
+  rc=$?
+  printf '%s\n' "$out"
+  if [ "$rc" -eq 5 ] || [ "$rc" -eq 6 ]; then
+    log "transient failure (exit $rc) on attempt 1 for $slug; retrying in ${retry_delay}s"
+    sleep "$retry_delay"
+    out="$(_ARCHIVE_COMMIT_ATTEMPT=2 bash "${BASH_SOURCE[0]}" "$slug" --lock-wait "$lock_wait")"
+    rc=$?
+    printf '%s\n' "$out"
+  fi
+  exit "$rc"
+fi
+
 # ---- idempotence: already fully archived is a no-op, not a failure ----
 # (PRD-build-archive-manifest-backfill requirement 5.) Only short-circuits
 # when ALL of: the PRD is gone from build-queue/, present in built-prds/,
@@ -143,9 +205,45 @@ manifest_md="$PRD_DIR/$manifest_rel"
 # partial/in-between state can't persist past this script's own atomic
 # commit, so this never masks a genuine not-queued/receipt-unresolved
 # failure.
+#
+# PRD-build-archive-verify-before-shipped requirement 1 extends this: the
+# check above only ever looked at this checkout's own working tree,
+# which is exactly the blind spot the whole PRD is about — a prior run's
+# commit can satisfy every local-file condition while never having
+# reached origin (a `git push` that silently no-ops, or a rebase that
+# drops it). When that's the state found here, this is NOT a no-op: the
+# write already happened locally, so finish the push under the lock
+# rather than re-doing the mv/header/manifest edit (which would just die
+# "nothing staged", having nothing new to write).
 if [ ! -f "$prd_path" ] && [ -f "$PRD_DIR/$built_rel" ] && [ -r "$manifest_md" ] \
    && grep -Eq -- "^-[[:space:]]*PRD-${slug}\.md[[:space:]]+—[[:space:]]+shipped([[:space:]]|·)" "$manifest_md"; then
-  printf 'archive-commit %s already-archived (no-op)\n' "$slug"
+  local_commit="$(git -C "$PRD_DIR" log -1 --format=%H -- "$built_rel" 2>/dev/null)"
+  if [ -n "$local_commit" ] && commit_reachable "$local_commit"; then
+    printf 'archive-commit %s already-archived (no-op) commit=%s\n' "$slug" "$local_commit"
+    exit 0
+  fi
+  log "already-archived locally (commit ${local_commit:-<unknown>}) but not yet reachable from origin/$(current_branch) — finishing the pending push under the lock rather than re-writing"
+  lock_file="$PRD_DIR/.git/autobuilder-integrate.lock"
+  exec 9>"$lock_file"
+  wait_start=$(date +%s)
+  if ! flock -w "$lock_wait" 9; then
+    die "lock-timeout: could not acquire integration lock to finish pending push for $slug" 5
+  fi
+  lock_wait_secs=$(( $(date +%s) - wait_start ))
+  if ! git -C "$PRD_DIR" pull --rebase --autostash -q 2>/tmp/archive-commit.pull.err; then
+    cat /tmp/archive-commit.pull.err >&2
+    git -C "$PRD_DIR" rebase --abort 2>/dev/null || true
+    die "push-pending: pull --rebase --autostash still failing while finishing $slug" 6
+  fi
+  if ! git -C "$PRD_DIR" push -q 2>/tmp/archive-commit.push.err; then
+    cat /tmp/archive-commit.push.err >&2
+    die "push-pending: push still failing while finishing $slug" 6
+  fi
+  local_commit="$(git -C "$PRD_DIR" log -1 --format=%H -- "$built_rel" 2>/dev/null)"
+  if ! commit_reachable "$local_commit"; then
+    die "postcondition-failed: $local_commit still not reachable from origin/$(current_branch) after finishing the push for $slug" 8
+  fi
+  printf 'archive-commit %s commit=%s pushed=yes lock_wait=%s\n' "$slug" "$local_commit" "$lock_wait_secs"
   exit 0
 fi
 
@@ -453,6 +551,29 @@ if [ "$pushed" = yes ] && ! git -C "$PRD_DIR" push -q 2>/tmp/archive-commit.push
   log "push failed after commit $commit_sha; commit kept, push pending"
   cat /tmp/archive-commit.push.err >&2
   pushed=pending
+fi
+
+# ---- postcondition (requirement 1): only a push-verified-yes result is
+# allowed to claim success — re-check the filesystem AND reachability
+# from origin before trusting our own "pushed=yes" bookkeeping. This is
+# the exact gap the PRD is named for: without this, a transient
+# rebase/push race can report success while the commit never actually
+# reached origin.
+#
+# `git pull --rebase` can REWRITE our own commit onto a new SHA when it
+# replays it on top of a sibling's commit that landed on origin first —
+# $commit_sha (captured right after our own `git commit`, before the
+# rebase) can therefore point at a SHA that no longer exists on any
+# branch at all, which would make an honest, fully-landed archive look
+# like a postcondition failure. Re-resolve it to whatever commit now
+# actually carries $built_rel (same technique the pending-push-finish
+# branch above uses) before checking reachability.
+if [ "$pushed" = yes ]; then
+  resolved_sha="$(git -C "$PRD_DIR" log -1 --format=%H -- "$built_rel" 2>/dev/null)"
+  [ -n "$resolved_sha" ] && commit_sha="$resolved_sha"
+  if [ ! -f "$PRD_DIR/$built_rel" ] || [ -f "$prd_path" ] || ! commit_reachable "$commit_sha"; then
+    die "postcondition-failed: pushed=yes for $commit_sha but built-prds/$slug.md presence, build-queue absence, or origin/$(current_branch) reachability doesn't hold for $slug — treat as NOT archived" 8
+  fi
 fi
 
 printf 'archive-commit %s commit=%s pushed=%s lock_wait=%s\n' "$slug" "$commit_sha" "$pushed" "$lock_wait_secs"

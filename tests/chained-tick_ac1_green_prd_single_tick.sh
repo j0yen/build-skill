@@ -76,6 +76,13 @@ out="$("$CG" check "$SLUG" --step-count 2 --prd-dir "$T")"; rc=$?
 expect "after step 2, chain-guard says continue" "[ $rc -eq 0 ]"
 
 # Step 3: archive (publish: none, so archive is the final step).
+# PRD-build-archive-verify-before-shipped requirement 3: chain-guard now
+# re-verifies the filesystem before honoring `status: shipped` as
+# archive-done, so this fixture's archive step has to actually do the
+# git-mv-equivalent (move the PRD out of build-queue/ into built-prds/)
+# the real archive-commit.sh performs, not just flip the manifest field.
+mkdir -p "$T/built-prds"
+mv "$T/build-queue/PRD-$SLUG.md" "$T/built-prds/PRD-$SLUG.md"
 step_and_log 3 archive '{"status":"shipped","last_action":"2026-09-09T00:00:03Z","chained_steps":3}'
 
 out="$("$CG" check "$SLUG" --step-count 3 --prd-dir "$T")"; rc=$?

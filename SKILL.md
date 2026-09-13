@@ -961,6 +961,24 @@ read it before assuming a step is "the last one this tick".
   never half-archived. No builder agent sequences the header edit, the
   move, and the commit by hand any more. See the script's own header for
   exit codes and `--dry-run`.
+
+  **Ordering, mandatory (PRD-build-archive-verify-before-shipped,
+  requirement 2):** the Phase 7 `manifest-set.sh` patch that sets
+  `status: shipped`/`built` for this action may ONLY be written after
+  `scripts/archive-commit.sh` itself exits 0 — its exit 0 now carries a
+  stricter postcondition (built-prds/ present, build-queue/ absent, AND
+  the commit reachable from origin) verified inside the script, and it
+  retries once on its own before giving up on a transient failure. These
+  are two independent script invocations (archive-commit.sh, then
+  manifest-set.sh) and always will be — do NOT collapse them into one
+  call — but the branch step MUST gate the second on the first's exit
+  code: any non-zero exit from archive-commit.sh (5/6/8 included) means
+  no `status: shipped`/`built` patch this step; record `last_error`
+  naming the exit reason and a `blockers` entry instead, exactly as any
+  other failed step would. This is the ordering gap the PRD closed —
+  writing `status: shipped` from a *separate*, unconditional
+  `manifest-set.sh` call was how a branch could report `archive-done`
+  while the PRD file never actually moved.
   Record the five passing checks in the manifest entry's `verified_completed` field.
 
   **Rebuild gate (gap #68 — re-queues must prove they advanced the work;
@@ -2002,7 +2020,7 @@ enforces these, in this order, and prints the matching reason:
 | `excluded-kernel-extend`       | `build_target: kernel-extend` — never chained (requirement 5).           |
 | `excluded-reflect-candidate`   | this tick's ≤1 Phase-6 reflect candidate — never chained (requirement 5).|
 | `no-manifest-entry`            | defensive: the slug has no manifest entry at all.                        |
-| `archive-done`                 | manifest `status: shipped` — nothing left to chain.                      |
+| `archive-done`                 | manifest `status: shipped` **AND** the filesystem agrees — `built-prds/PRD-<slug>.md` exists and `build-queue/PRD-<slug>.md` does not (PRD-build-archive-verify-before-shipped requirement 3; re-verified against `--prd-dir` on every call, never taken on the manifest's word alone). |
 | `blockers`                     | manifest `blockers` is non-empty — covers gate red and any step failure, since a failed step's own action already appends a `blockers` line (e.g. the `gate` action's `gate: <receipt> — <message>` on block) before returning here. |
 | `needs-user`                   | manifest `status: needs_classification` (or `needs_user`).               |
 | `cap`                          | `CHAIN_MAX_STEPS` is explicitly set (env var or `--max-steps`) and this step's count has reached it. |
@@ -2016,6 +2034,17 @@ manifest) and in its journal line, then returns per the normal Phase 7
 contract. A stop is not a branch failure; it is the chain doing exactly
 what a tick boundary used to do, just mechanically instead of by waiting
 for the timer.
+
+**`continue: <slug>: archive-incomplete`** (PRD-build-archive-verify-before-shipped
+requirement 3) is the one non-stop verdict this table doesn't cover: when
+`status` is `shipped` but the filesystem check above disagrees, the
+chain does NOT stop — it returns `continue` so the branch retries the
+`archive` action (re-running `scripts/archive-commit.sh <slug>`, which is
+itself a safe no-op or a pending-push finish, never a duplicate write —
+see the script's own idempotence section) once more in the same
+dispatch. If that retry still can't reach `archive-done`, the archive
+step's own failure path applies blockers exactly like any other failed
+step, so this can't loop forever.
 
 **No chain cap by default (requirement 4).** An unset `CHAIN_MAX_STEPS`
 means unlimited — the stop conditions above are the only limits, and a
