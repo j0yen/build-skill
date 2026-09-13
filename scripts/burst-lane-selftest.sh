@@ -210,6 +210,47 @@ if ! burst_configured; then
   exit 0
 fi
 
+# ---- PRD-build-burst-pull-back-restore P0/AC1: the suite controls the -----
+# pull-back disk guard instead of being silently governed by it. Every
+# fixture worktree below lands under fresh_env's own `mktemp -d
+# "${TMPDIR:-/tmp}/..."`, which on RedBaron (and this dev box) is a tmpfs
+# with single-digit GB free — far under do_marker_pull's production
+# BURST_LOCAL_DISK_FLOOR_GB default of 60. Left alone, every fixture pull
+# gets deferred by that guard before a single byte moves: ~14 red
+# burstpull/burstvol cases that never exercised the transfer layer at all
+# (the false diagnosis this PRD traces). Rather than let the suite inherit
+# the production floor by accident, it sets its OWN — small enough for its
+# own worktree filesystem to satisfy, honoring an operator's own
+# BURST_LOCAL_DISK_FLOOR_GB export if one is already present (e.g. the
+# tests/pullback_ac*.sh wrappers' BURST_LOCAL_DISK_FLOOR_GB=2, which now
+# becomes redundant with this default but is left alone rather than
+# fought over) — and journals which filesystem holds its worktrees and how
+# much free space it found, to this run's own stdout (read by every
+# tests/pullback_ac*.sh wrapper via combined stdout+stderr, since the real
+# BURST_LANE_JOURNAL doesn't exist yet at this point — fresh_env hasn't
+# run its first time). A worktree filesystem that cannot even satisfy the
+# small fixture floor fails the WHOLE suite fast, naming the filesystem,
+# the free space, and the floor — never another wall of misleading
+# `deferred` reds.
+: "${BURST_LOCAL_DISK_FLOOR_GB:=2}"
+export BURST_LOCAL_DISK_FLOOR_GB
+_pullback_wt_base="${TMPDIR:-/tmp}"
+_pullback_wt_fs="$(df -h --output=source,fstype "$_pullback_wt_base" 2>/dev/null | tail -n1 | tr -s ' ')"
+_pullback_wt_free_gb="$(df -BG --output=avail "$_pullback_wt_base" 2>/dev/null | tail -n1 | tr -dc '0-9')"
+echo "selftest: worktree filesystem $_pullback_wt_base (${_pullback_wt_fs:-unreadable}) free_gb=${_pullback_wt_free_gb:-unknown} — fixture floor set to BURST_LOCAL_DISK_FLOOR_GB=$BURST_LOCAL_DISK_FLOOR_GB"
+case "$_pullback_wt_free_gb" in
+  ''|*[!0-9]*)
+    echo "selftest: WARNING — could not read free space on $_pullback_wt_base; skipping the fail-fast floor precondition (fixture pulls may still defer)" >&2
+    ;;
+  *)
+    if [ "$_pullback_wt_free_gb" -lt "$BURST_LOCAL_DISK_FLOOR_GB" ]; then
+      echo "FATAL: worktree filesystem $_pullback_wt_base has only ${_pullback_wt_free_gb}GB free, below the fixture floor of ${BURST_LOCAL_DISK_FLOOR_GB}GB (BURST_LOCAL_DISK_FLOOR_GB) — every fixture pull would defer before transferring a byte; refusing to run rather than report a wall of misleading 'deferred' reds. Lower BURST_LOCAL_DISK_FLOOR_GB, free space on $_pullback_wt_base, or point \$TMPDIR at a roomier filesystem." >&2
+      exit 9
+    fi
+    ;;
+esac
+unset _pullback_wt_base _pullback_wt_fs _pullback_wt_free_gb
+
 # PRD-build-burst-parity-cadence: every hand-crafted box-parity.json fixture
 # in this suite must carry the ACTIVE session's session_id + toolchain_fp
 # (matching what a real `parity` run would write) so cmd_gate's session/
