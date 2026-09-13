@@ -4155,6 +4155,7 @@ fresh_env
 export BURST_VOLUME_NAME="wm-burst-volidfix1"
 vf1_out="$("$BL" up)"; vf1_rc=$?
 vf1_vid="$(grep -oE '"volume_id":"?[0-9]+"?' "$BURST_LANE_STATE_DIR/volume.json" 2>/dev/null | grep -oE '[0-9]+')"
+block_start "volidfix"
 expect "volidfix AC1: up exits 0 against a clean create" "[ $vf1_rc -eq 0 ]"
 expect "volidfix AC1: volume.json recorded the parsed id" "[ -n \"$vf1_vid\" ]"
 expect "volidfix AC1: no volume-create-failed line was journaled" \
@@ -4285,7 +4286,7 @@ expect "volidfix AC8b: the old mismatched volume no longer exists" \
 # real Hetzner box is authorized at build time to prove one full
 # up -> provision -> down cycle ends with an empty `hcloud volume list`.
 
-expect "volidfix: every volidfix case above ran green" "[ $fail -eq 0 ]"
+expect_block_green "volidfix" "volidfix: every volidfix case above ran green"
 
 echo "=== $([ $fail -eq 0 ] && echo PASS || echo FAIL) ==="
 exit $fail
