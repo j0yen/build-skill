@@ -22,8 +22,37 @@
 #          command) gets a `reality: fixture-only` receipt, not a silent
 #          skip and never a false `pending` (real failure-mode case: an
 #          absent PRD path must die, tested at the very end).
-#   regression — a REACHABLE box AC still runs live (tier=live), unaffected
-#          by the tier split; a failing live AC still drafts a follow-up.
+#   AC1  — the plain happy path: a reachable, PASSING substrate command
+#          writes `reality: ok`, a receipt file, and a journal line.
+#   AC3  — a deferred AC's justification claiming the box is unreachable
+#          is re-tested for real; a lane reporting ACTIVE while deferred
+#          as "unreachable" blocks with `deferral-premise-false` (the
+#          exact 2026-09-10/11 defect); a genuinely unreachable box passes.
+#   AC4  — the PRD's own `Receipts:` claim is re-derived from a fresh run
+#          of the named script; a stale claim (the 251-on-245 case) blocks
+#          naming both counts; a matching claim passes.
+#   AC5  — a shipped diff whose only new selftest case is success-only
+#          blocks archive with `fixture-negative-case-missing`; a matching
+#          `prd-lint.sh` warning on happy-path-only AC prose is covered too.
+#   AC6  — a `failed` reality run drafts a lint-clean follow-up PRD naming
+#          the failing command, an excerpt, and a P0 line; parent gains
+#          `reality_followup:`; the tick journals the draft.
+#
+# NOTE (this PRD's own dogfood finding, 2026-09-13): AC1/AC3/AC4/AC5/AC6
+# used to live only inside scripts/burst-lane-selftest.sh's own `reality`
+# fixture section — but that whole suite exits early (SKIP, exit 0) under
+# `lib/burst-configured.sh`'s RedBaron-local dormant-burst-lane policy, so
+# those cases never actually ran here and the `tests/reality_ac<N>_*.sh`
+# wrapper files pairing to them were false-green derive-pairings (a file
+# existed at the right name; the fixture inside it hadn't executed since
+# the policy went dormant). None of these cases exercise the REAL burst
+# lane — they use $FAKE_ACTIVE/$FAKE_INACTIVE fakes throughout, same as
+# every other case in this file — so gating them behind "is burst the
+# declared policy" was never correct. Moved here, ungated, so the archive
+# gate's own `--verify-run` gets real, current evidence instead of a
+# vacuous pass. The old in-suite copies stay in burst-lane-selftest.sh
+# unchanged (still correct once burst is reactivated) but are no longer
+# what `tests/reality_ac<N>_*.sh` pairs to.
 #
 # Run: bash scripts/reality-check-selftest.sh   (exit 0 = all pass)
 
@@ -31,7 +60,11 @@ set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 SKILL_DIR="$(cd "$HERE/.." && pwd -P)"
 RC="$HERE/reality-check.sh"
+VC="$HERE/verified-completed.sh"
+PL="$HERE/prd-lint.sh"
 [ -x "$RC" ] || { echo "selftest: $RC not executable" >&2; exit 2; }
+[ -x "$VC" ] || { echo "selftest: $VC not executable" >&2; exit 2; }
+[ -x "$PL" ] || { echo "selftest: $PL not executable" >&2; exit 2; }
 
 T="$(mktemp -d "${TMPDIR:-/tmp}/reality-check-selftest.XXXXXX")"
 trap 'rm -rf "$T"' EXIT
@@ -96,6 +129,33 @@ expect "plan AC1: default tier is container-coverable" \
   "[ \"\$(echo \"\$plan1\" | \"\${JQ:-jq}\" -r '.[0].tier')\" = container-coverable ]"
 expect "plan AC2: hcloud/snapshot keyword tags box-only" \
   "[ \"\$(echo \"\$plan1\" | \"\${JQ:-jq}\" -r '.[1].tier')\" = box-only ]"
+
+# ======================================================================
+# == AC1: the plain happy path — a reachable, PASSING substrate command
+#    writes reality: ok, a receipt file exists, and the journal names the
+#    slug with an ok verdict ==
+# ======================================================================
+D0="$T/d0"; new_fixture "$D0"
+cat > "$D0/prds/build-queue/PRD-reachable-ac1.md" <<'EOF'
+# PRD: reachable-ac1
+
+- Status: queued
+- build_target: shell
+
+## Acceptance criteria
+
+1. P0 — Given the real box, When `echo reachable-ac1-ran` runs against the live lane, Then it exits 0.
+EOF
+REALITY_CHECK_BURST_LANE="$FAKE_ACTIVE" \
+  "$RC" run "$D0/prds/build-queue/PRD-reachable-ac1.md" --no-push >"$T/ac1.out" 2>&1
+rc1=$?
+receipt1="$(grep -m1 '^- reality_receipt:' "$D0/prds/build-queue/PRD-reachable-ac1.md" | sed -E 's/^- reality_receipt: *//')"
+expect "AC1: run exits 0" "[ $rc1 -eq 0 ]"
+expect "AC1: reality=ok with a real pass/fail verdict" \
+  "grep -qxe '- reality: ok' '$D0/prds/build-queue/PRD-reachable-ac1.md'"
+expect "AC1: a reality receipt file exists" "[ -n \"$receipt1\" ] && [ -f \"$receipt1\" ]"
+expect "AC1: journal names the slug with an ok verdict" \
+  "grep -q 'reality  reachable-ac1  ok' \"$BUILD_JOURNAL_DIR/\$(date -u +%F).md\""
 
 # ======================================================================
 # == AC9: container-coverable AC runs in a fresh sandbox this same tick,
@@ -212,9 +272,127 @@ expect "AC7: the receipt itself says fixture-only" \
   "grep -q 'result: fixture-only' \"\$(grep -m1 '^- reality_receipt:' '$D4/prds/build-queue/PRD-fixtureonly-ac7.md' | sed -E 's/^- reality_receipt: *//')\""
 
 # ======================================================================
-# == regression: a REACHABLE box AC still runs live (tier=live), and a
-#    failing live AC still drafts a follow-up — unchanged by the tier
-#    split above (real failure-mode case: the live command fails) ==
+# == AC3: a deferred AC's justification claiming the box is unreachable
+#    is re-tested for real (not trusted as prose). A lane reporting
+#    ACTIVE while deferred as "unreachable" blocks with
+#    deferral-premise-false naming the contradicting evidence — the exact
+#    2026-09-10/11 defect (unprivileged-user's AC4 deferred as
+#    unreachable while the lane's own status showed active). A genuinely
+#    unreachable box is the real failure-mode case that must still pass. ==
+# ======================================================================
+mkdir -p "$T/ac3fix"
+cat > "$T/ac3fix/PRD-realitydefer-ac3.md" <<'EOF'
+# PRD — realitydefer-ac3: a fixture PRD with a deferred AC to premise-check
+
+- Status: built
+- build_target: shell
+- deferred_acs: [4]
+- mock_justifications:
+  - "AC4 needs a real box, which is not reachable/authorized from this sandboxed build session."
+
+## Acceptance criteria
+
+1. P0 — Given a thing, When it runs, Then it works.
+2. P0 — Given a thing, When it runs, Then it works.
+3. P0 — Given a thing, When it runs, Then it works.
+4. P0 — Given a thing, When it runs, Then it works.
+EOF
+VC_BURST_LANE="$FAKE_ACTIVE" "$VC" "$T/ac3fix/PRD-realitydefer-ac3.md" --check-deferral-premises \
+  >/dev/null 2>"$T/premise-false.err"
+rc_premise_false=$?
+expect "AC3: deferral-premise-false exits non-zero when the lane the deferral called unreachable is actually active" \
+  "[ $rc_premise_false -ne 0 ]"
+expect "AC3: names the contradicting AC and evidence" \
+  "grep -q 'deferral-premise-false: AC4' '$T/premise-false.err' && grep -qi 'reachable' '$T/premise-false.err'"
+VC_BURST_LANE="$FAKE_INACTIVE" "$VC" "$T/ac3fix/PRD-realitydefer-ac3.md" --check-deferral-premises \
+  >/dev/null 2>"$T/premise-true.err"
+expect "AC3 (real failure-mode case: genuinely unreachable) — the true premise passes archive" "[ $? -eq 0 ]"
+
+# ======================================================================
+# == AC4: the PRD's own Receipts: claim is re-derived from a fresh run of
+#    the named script; a claim that no longer matches the tree (the
+#    251-on-245 case) blocks naming both counts; a matching claim passes ==
+# ======================================================================
+mkdir -p "$T/ac4fix"
+cat > "$T/ac4fix/PRD-receiptclaim-ac4.md" <<'EOF'
+# PRD — receiptclaim-ac4: a fixture PRD to receipt-claim-check
+
+- Status: built
+- build_target: shell
+
+## Acceptance criteria
+
+1. P0 — Given a thing, When it runs, Then it works.
+EOF
+cat > "$T/fake-251.sh" <<'EOF'
+#!/usr/bin/env bash
+echo "251/251 ok, 0 FAIL"
+EOF
+cat > "$T/fake-245.sh" <<'EOF'
+#!/usr/bin/env bash
+echo "245/251 ok, 6 FAIL"
+exit 1
+EOF
+chmod +x "$T/fake-251.sh" "$T/fake-245.sh"
+"$VC" "$T/ac4fix/PRD-receiptclaim-ac4.md" --check-receipt-claim \
+  --receipt-text "some-selftest.sh 251/251 ok; 0 FAIL" --receipt-script "$T/fake-251.sh" >/dev/null 2>&1
+expect "AC4: a matching receipt claim exits 0" "[ $? -eq 0 ]"
+"$VC" "$T/ac4fix/PRD-receiptclaim-ac4.md" --check-receipt-claim \
+  --receipt-text "some-selftest.sh 251/251 ok; 0 FAIL" --receipt-script "$T/fake-245.sh" >/dev/null 2>"$T/mismatch.err"
+expect "AC4 (real failure-mode case: the 251-on-245 defect) — a mismatched claim blocks naming both counts" \
+  "[ $? -ne 0 ] && grep -q '251/251' '$T/mismatch.err' && grep -q '245/251' '$T/mismatch.err'"
+
+# ======================================================================
+# == AC5: a fixture-only test suite with no failure-mode case blocks
+#    archive naming the rule; prd-lint.sh warns the same gap pre-ship ==
+# ======================================================================
+FR="$T/fnc-repo"
+mkdir -p "$FR" "$T/visions"
+touch "$T/visions/fixture.md"
+git init -q "$FR" >/dev/null 2>&1
+git -C "$FR" config user.email t@t; git -C "$FR" config user.name t
+cat >"$FR/thing-selftest.sh" <<'EOF'
+echo "== base case =="
+EOF
+git -C "$FR" add -A && git -C "$FR" commit -q -m init >/dev/null
+git -C "$FR" tag v0.1.0
+cat >"$FR/PRD-fnc.md" <<EOF
+# PRD — fnc
+
+- Status: built
+- build_target: shell
+- build_into: $FR
+- Vision: visions/fixture.md
+
+## Acceptance criteria
+
+1. P0 — Given a thing, When it runs, Then it works.
+EOF
+echo 'echo "== new happy path =="' >>"$FR/thing-selftest.sh"
+git -C "$FR" add -A && git -C "$FR" commit -q -m "add success-only case" >/dev/null
+"$VC" "$FR/PRD-fnc.md" --check-fixture-negative-case >/dev/null 2>"$T/fnc-block.err"
+expect "AC5 (real failure-mode case: a success-only diff) — verified-completed blocks archive naming the rule" \
+  "[ $? -ne 0 ] && grep -q 'fixture-negative-case-missing' '$T/fnc-block.err'"
+cat >"$T/PRD-realitypositive-ac5.md" <<'EOF'
+# PRD — realitypositive-ac5: a fixture with a happy-path-only selftest mention
+
+- Status: queued
+- build_target: shell
+
+## Acceptance criteria
+
+1. P0 — Given the selftest fixture set, When `foo-selftest.sh` runs, Then it exits 0 and all cases pass and match.
+EOF
+"$PL" "$T/PRD-realitypositive-ac5.md" >"$T/lint-positive.out" 2>&1
+expect "AC5: prd-lint.sh warns selftest-no-negative-case on a happy-path-only AC mention" \
+  "grep -q selftest-no-negative-case '$T/lint-positive.out'"
+
+# ======================================================================
+# == AC6 / regression: a REACHABLE box AC still runs live (tier=live),
+#    unaffected by the tier split above; a FAILING live AC drafts a
+#    lint-clean follow-up naming the failing command and a P0 line, sets
+#    reality_followup: on the parent, and journals the draft
+#    (real failure-mode case: the live command fails) ==
 # ======================================================================
 D5="$T/d5"; new_fixture "$D5"
 cat > "$D5/prds/build-queue/PRD-live-regress.md" <<'EOF'
@@ -230,10 +408,17 @@ cat > "$D5/prds/build-queue/PRD-live-regress.md" <<'EOF'
 EOF
 REALITY_CHECK_BURST_LANE="$FAKE_ACTIVE" \
   "$RC" run "$D5/prds/build-queue/PRD-live-regress.md" --no-push >"$T/regress.out" 2>&1
-expect "regression: a reachable box still runs live and a real failure is recorded" \
+expect "AC6/regression: a reachable box still runs live and a real failure is recorded" \
   "grep -qxe '- reality: failed' '$D5/prds/build-queue/PRD-live-regress.md'"
-expect "regression: a failing live AC still drafts a follow-up PRD" \
+expect "AC6: reality_followup: set on the parent" \
   "grep -qE '^- reality_followup: PRD-live-regress-reality-[0-9]+\.md$' '$D5/prds/build-queue/PRD-live-regress.md'"
+followup6="$(grep -m1 '^- reality_followup:' "$D5/prds/build-queue/PRD-live-regress.md" | sed -E 's/^- reality_followup: *//')"
+expect "AC6: follow-up file exists" "[ -f \"$D5/prds/build-queue/$followup6\" ]"
+expect "AC6: follow-up passes prd-lint.sh" "\"$PL\" \"$D5/prds/build-queue/$followup6\" >/dev/null 2>&1"
+expect "AC6: follow-up names the failing command and carries a P0 line" \
+  "grep -q 'false' \"$D5/prds/build-queue/$followup6\" && grep -qE '^1\\. P0 —' \"$D5/prds/build-queue/$followup6\""
+expect "AC6: journal has 'reality  follow-up  drafted'" \
+  "grep -q 'reality  follow-up  drafted' \"$BUILD_JOURNAL_DIR/\$(date -u +%F).md\""
 
 # ======================================================================
 # == real failure-mode case: pending-run against an absent registration
