@@ -3326,6 +3326,20 @@ expect "burstvol AC9: the marker stays dirty (never cleared)" "dirty_has \"$WT_B
 # just above) the exit code stays 0 for this deliberately-skipped outcome.
 expect "burstpull AC3c: deferred pull's stdout never claims 'pulled'" "[ \"$bv9_pull_out\" != pulled ]"
 
+# ---- pullback AC3 (PRD-build-burst-pull-back-restore): after the floor is
+# restored, the SAME worktree's marker (left dirty by the deferral just
+# above — never touched, never re-run) transfers on the very next pull.
+# BURST_LANE_LOCAL_FREE_GB is already unset (line above), so this pull sees
+# the real underlying filesystem's free space, which vastly exceeds the 87
+# GB need_gb computed from this worktree's own last-observed pull size —
+# the same real-disk headroom that made AC1's own retry-free case above
+# transfer cleanly.
+bv9_retry_out="$("$BL" pull "$WT_BV9" 2>&1)"; bv9_retry_rc=$?
+expect "pullback AC3: retry after the floor is restored exits 0 and prints pulled" \
+  "[ $bv9_retry_rc -eq 0 ] && [ \"$bv9_retry_out\" = pulled ]"
+expect "pullback AC3: retry fetched target/ back" "[ -f \"$WT_BV9/target/out.txt\" ]"
+expect "pullback AC3: retry cleared the dirty marker" "! dirty_has \"$WT_BV9\""
+
 # ---- burstvol AC10: a dirty marker under a moved root (byte-identical to --
 # the 2026-09-11 user-migration evidence: a marker still naming /root/build
 # after $REMOTE_ROOT moved) is treated as cold on read, cleared, and NEVER
