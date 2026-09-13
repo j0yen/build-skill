@@ -324,6 +324,51 @@ HCLOUD="${BURST_LANE_HCLOUD_BIN:-hcloud}"
 SSH_BIN="${BURST_LANE_SSH_BIN:-ssh}"
 RSYNC_BIN="${BURST_LANE_RSYNC_BIN:-rsync}"
 
+# ---- session-scoped host keys (PRD-build-burst-session-hygiene) -----------
+# Every ssh/rsync call in this file must pin against a SESSION-scoped known-
+# hosts file, never ~/.ssh/known_hosts — a reused Hetzner IP with a stale
+# entry in the global file hard-failed `provision` before this PRD landed
+# (2026-09-13 04:44Z incident, see header). The file is named by session id
+# (the hcloud server id), so a session boundary is also a host-key boundary:
+# `up` points $KH_SESSION_ID at the new/adopted id (and truncates the file
+# fresh) before the first ssh/rsync call it makes; every other command falls
+# back to reading the active session's own server_id out of session.json;
+# `down`/`down --force` deletes the file with the rest of session state.
+# `accept-new` (not `no`) keeps first-contact pinning while still failing a
+# genuine MID-session key change (the Technical considerations tradeoff).
+#
+# ONE helper (ssh_kh_args) assembles the two -o flags every call site below
+# uses — grep showed the ssh option string assembled ad hoc at 40+ call
+# sites before this PRD; that is exactly the drift this centralizes.
+KH_SESSION_ID=""
+
+session_known_hosts_file() {  # -> stdout path for $1 (session id) or the
+                               # active session's own server_id
+  local sid="${1:-${KH_SESSION_ID:-$(state_read server_id 2>/dev/null)}}"
+  echo "$STATE_DIR/known_hosts.${sid:-none}"
+}
+
+ssh_kh_args() {  # -> stdout "-o UserKnownHostsFile=<path> -o StrictHostKeyChecking=accept-new"
+                  # Deliberately unquoted at every call site (four words,
+                  # no embedded whitespace — $STATE_DIR is always a plain
+                  # repo-relative path) so it drops straight into an
+                  # existing "$SSH_BIN" ... invocation without an array.
+  printf -- '-o UserKnownHostsFile=%s -o StrictHostKeyChecking=accept-new' "$(session_known_hosts_file)"
+}
+
+session_known_hosts_reset() {  # $1 = new session id -> point KH_SESSION_ID
+                                # at it and start the file fresh (up, both
+                                # the adopt and create-fresh branches)
+  KH_SESSION_ID="$1"
+  mkdir -p "$STATE_DIR" 2>/dev/null || true
+  : > "$(session_known_hosts_file "$1")"
+}
+
+session_known_hosts_remove() {  # remove the CURRENT session's known_hosts
+                                 # file (down / down --force)
+  rm -f "$(session_known_hosts_file)"
+}
+
 # Three-state retrofit (PRD-build-three-state-probes): fail-open sourcing so
 # an unshipped/missing library never breaks a burst-lane invocation.
 if [ -r "$HERE/probe-result.sh" ]; then
@@ -600,6 +645,61 @@ server_alive() {  # $1 = server id -> 0 if hcloud still sees it
   "$HCLOUD" server describe "$1" -o json >/dev/null 2>&1
 }
 
+volume_alive() {  # $1 = volume id -> 0 if hcloud still sees it
+  [ -n "$1" ] || return 1
+  "$HCLOUD" volume describe "$1" -o json >/dev/null 2>&1
+}
+
+# ---- stale-state archiving (PRD-build-burst-session-hygiene requirements --
+# 2/4/5) — a state file whose hcloud object is confirmed gone is archived,
+# never silently rm -f'd: an operator (or the next `status`) can still see
+# what the session/volume WAS, and a bug in the reconcile logic never looks
+# like "there was never a session" after the fact.
+archive_stale_file() {  # $1 = path to archive as <path>.stale-<utc-ts>
+  local f="$1"
+  [ -f "$f" ] || return 0
+  local ts; ts="$(date -u -d "@$(now_epoch)" +%Y%m%dT%H%M%SZ 2>/dev/null || date -u +%Y%m%dT%H%M%SZ)"
+  mv -f "$f" "$f.stale-$ts"
+}
+
+# Requirement 2/4: verify session.json's server_id against hcloud. Archives
+# and returns 1 if hcloud says the server is gone (or no id was recorded at
+# all); returns 0 (no-op) if the server is confirmed alive. Callers that
+# need the fresh-session side effects (state_clear-equivalent) do that
+# themselves — this only judges truth and archives.
+session_reconcile() {
+  state_active || return 0
+  local id; id="$(state_read server_id)"
+  if [ -n "$id" ] && server_alive "$id"; then
+    return 0
+  fi
+  archive_stale_file "$STATE_FILE"
+  rm -f "$SERVED_FILE"
+  journal_line "$(now_iso)  burst-lane  session  stale  (server_id=${id:-none} absent from hcloud — archived session.json, proceeding fresh)"
+  return 1
+}
+
+# Requirement 5: same treatment for the persistent-volume state file.
+# volume.json's own volume_id field (not just BURST_VOLUME_NAME's live
+# by-name lookup, which find_volume() already does independently) is what
+# gets verified here — an out-of-band `hcloud volume delete` leaves the by-
+# name lookup empty too, but this is the one place that ever LOOKS at
+# volume.json's claim and corrects it. Empty/absent volume_id (rollback, or
+# a session that never attached one) is vacuously verified — nothing to
+# reconcile. Returns 1 (and archives) only when a recorded volume_id is
+# confirmed gone from hcloud.
+volume_reconcile() {
+  [ -f "$VOLUME_STATE_FILE" ] || return 0
+  local vid; vid="$(volume_state_read volume_id)"
+  [ -n "$vid" ] || return 0
+  if volume_alive "$vid"; then
+    return 0
+  fi
+  archive_stale_file "$VOLUME_STATE_FILE"
+  journal_line "$(now_iso)  burst-lane  volume  stale  (volume_id=$vid absent from hcloud — archived volume.json)"
+  return 1
+}
+
 # find_by_name <name> -> prints "id ip" on stdout, rc 0 if found else rc 1
 find_by_name() {
   local out
@@ -654,19 +754,19 @@ chmod -R o+rX $ROOT_CARGO_HOME $ROOT_RUSTUP_HOME 2>/dev/null || true
 chmod 700 $REMOTE_HOME $REMOTE_HOME/.ssh
 chown -R $REMOTE_USER:$REMOTE_USER $REMOTE_HOME $REMOTE_ROOT"
   if [ -f "${SSH_KEY}.pub" ]; then
-    "$SSH_BIN" -o StrictHostKeyChecking=no -o ConnectTimeout=8 -i "$SSH_KEY" "root@$ip" "$setup
+    "$SSH_BIN" $(ssh_kh_args) -o ConnectTimeout=8 -i "$SSH_KEY" "root@$ip" "$setup
 [ -f $REMOTE_HOME/.ssh/.burst-lane-key-installed ] || { cat >> $REMOTE_HOME/.ssh/authorized_keys && chown $REMOTE_USER:$REMOTE_USER $REMOTE_HOME/.ssh/authorized_keys && touch $REMOTE_HOME/.ssh/.burst-lane-key-installed; }
 chmod 600 $REMOTE_HOME/.ssh/authorized_keys 2>/dev/null || true
 true" < "${SSH_KEY}.pub" 2>/dev/null || true
   else
-    "$SSH_BIN" -o StrictHostKeyChecking=no -o ConnectTimeout=8 -i "$SSH_KEY" "root@$ip" "$setup
+    "$SSH_BIN" $(ssh_kh_args) -o ConnectTimeout=8 -i "$SSH_KEY" "root@$ip" "$setup
 true" 2>/dev/null || true
   fi
 }
 
 box_bootstrap() {  # $1 = ip — make a snapshot box ready (idempotent, ~1s when already done)
   # Requirement 3: root only for the apparmor sysctl and apt-based installs.
-  "$SSH_BIN" -o StrictHostKeyChecking=no -o ConnectTimeout=8 -i "$SSH_KEY" "root@$1" "
+  "$SSH_BIN" $(ssh_kh_args) -o ConnectTimeout=8 -i "$SSH_KEY" "root@$1" "
     sysctl -qw kernel.apparmor_restrict_unprivileged_userns=0 2>/dev/null || true
     command -v bwrap >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y -qq bubblewrap; } >/dev/null 2>&1
     command -v python3 >/dev/null 2>&1 || apt-get install -y -qq python3-minimal python3 >/dev/null 2>&1
@@ -675,7 +775,7 @@ box_bootstrap() {  # $1 = ip — make a snapshot box ready (idempotent, ~1s when
   # Everything else — requirement 3's "everything else uses build@$ip" —
   # including uv, which has no business running as root just to land a
   # binary in a user's own $HOME/.local/bin.
-  "$SSH_BIN" -o StrictHostKeyChecking=no -o ConnectTimeout=8 -i "$SSH_KEY" "$REMOTE_USER@$1" "
+  "$SSH_BIN" $(ssh_kh_args) -o ConnectTimeout=8 -i "$SSH_KEY" "$REMOTE_USER@$1" "
     mkdir -p $REMOTE_ROOT
     # PRD-build-burst-path-deps requirement 5: the build user's own cargo
     # home (registry+git caches), created up front so the first `cargo`
@@ -688,7 +788,7 @@ box_bootstrap() {  # $1 = ip — make a snapshot box ready (idempotent, ~1s when
 }
 
 sandbox_probe() {  # $1 = ip -> echoes true|false
-  if "$SSH_BIN" -o StrictHostKeyChecking=no -o ConnectTimeout=8 -i "$SSH_KEY" "$REMOTE_USER@$1" \
+  if "$SSH_BIN" $(ssh_kh_args) -o ConnectTimeout=8 -i "$SSH_KEY" "$REMOTE_USER@$1" \
        'bwrap --ro-bind / / --dev /dev --proc /proc --unshare-user --unshare-pid --die-with-parent python3 -c "print(1)"' >/dev/null 2>&1; then
     echo true
   else
@@ -779,7 +879,7 @@ print("%s|%s|%s|%s" % (d.get("id",""), d.get("size",""), sid if sid is not None 
   # Requirement 2 (teardown-order counterpart): a volume left dirty by a
   # prior detach failure gets an fsck before this mount, exactly once.
   if [ "$(volume_state_read volume_dirty)" = "true" ]; then
-    "$SSH_BIN" -o StrictHostKeyChecking=no -o ConnectTimeout=8 -i "$SSH_KEY" "root@$ip" \
+    "$SSH_BIN" $(ssh_kh_args) -o ConnectTimeout=8 -i "$SSH_KEY" "root@$ip" \
       "fsck -y '$vdevice' >/dev/null 2>&1; true # volume-fsck" >/dev/null 2>&1 || true
     journal_line "$(now_iso)  burst-lane  up  volume  fsck  (id=$vid device=$vdevice cause=prior-detach-failed)"
   fi
@@ -790,7 +890,7 @@ print("%s|%s|%s|%s" % (d.get("id",""), d.get("size",""), sid if sid is not None 
   # $REMOTE_ROOT (never renames it) so every existing remote_path_for()/
   # dirty-marker path is unaffected by whether a volume happens to be there.
   local mount_out mount_rc=0
-  mount_out="$("$SSH_BIN" -o StrictHostKeyChecking=no -o ConnectTimeout=8 -i "$SSH_KEY" "root@$ip" "
+  mount_out="$("$SSH_BIN" $(ssh_kh_args) -o ConnectTimeout=8 -i "$SSH_KEY" "root@$ip" "
 # volume-mount
 label=\$(blkid -s LABEL -o value '$vdevice' 2>/dev/null)
 if [ -z \"\$label\" ]; then mkfs.ext4 -L $BURST_VOLUME_NAME '$vdevice' >/dev/null 2>&1 && echo FORMATTED; fi
@@ -806,7 +906,7 @@ echo MOUNTED
   fi
 
   local dfout used_gb size_gb pct
-  dfout="$("$SSH_BIN" -o StrictHostKeyChecking=no -o ConnectTimeout=8 -i "$SSH_KEY" "$REMOTE_USER@$ip" \
+  dfout="$("$SSH_BIN" $(ssh_kh_args) -o ConnectTimeout=8 -i "$SSH_KEY" "$REMOTE_USER@$ip" \
     "df -BG --output=used,size,pcent '$REMOTE_ROOT' 2>/dev/null | tail -n1 # volume-df" 2>/dev/null)"
   used_gb="$(awk '{print $1}' <<<"$dfout" | tr -dc '0-9')"
   size_gb="$(awk '{print $2}' <<<"$dfout" | tr -dc '0-9')"
@@ -831,9 +931,9 @@ volume_teardown() {  # $1=ip $2=caller(down|watchdog)
   local vid; vid="$(volume_state_read volume_id)"
   [ -n "$vid" ] || return 0
 
-  "$SSH_BIN" -o StrictHostKeyChecking=no -o ConnectTimeout=8 -i "$SSH_KEY" "$REMOTE_USER@$ip" \
+  "$SSH_BIN" $(ssh_kh_args) -o ConnectTimeout=8 -i "$SSH_KEY" "$REMOTE_USER@$ip" \
     "sync # volume-sync" >/dev/null 2>&1 || true
-  "$SSH_BIN" -o StrictHostKeyChecking=no -o ConnectTimeout=8 -i "$SSH_KEY" "root@$ip" \
+  "$SSH_BIN" $(ssh_kh_args) -o ConnectTimeout=8 -i "$SSH_KEY" "root@$ip" \
     "umount '$REMOTE_ROOT' 2>/dev/null; true # volume-umount" >/dev/null 2>&1 || true
 
   if ! "$HCLOUD" volume detach "$vid" >/dev/null 2>&1; then
@@ -866,7 +966,7 @@ volume_status_probe() {  # $1=ip -> stdout "id size_gb used_pct"; empty if no vo
   local vid; vid="$(volume_state_read volume_id)"
   [ -n "$vid" ] || return 0
   local dfout size_gb pct
-  dfout="$("$SSH_BIN" -o StrictHostKeyChecking=no -o ConnectTimeout=8 -i "$SSH_KEY" "$REMOTE_USER@$1" \
+  dfout="$("$SSH_BIN" $(ssh_kh_args) -o ConnectTimeout=8 -i "$SSH_KEY" "$REMOTE_USER@$1" \
     "df -BG --output=used,size,pcent '$REMOTE_ROOT' 2>/dev/null | tail -n1 # volume-df" 2>/dev/null)"
   size_gb="$(awk '{print $2}' <<<"$dfout" | tr -dc '0-9')"
   pct="$(awk '{print $3}' <<<"$dfout" | tr -dc '0-9')"
@@ -906,7 +1006,7 @@ gate_tools_probe() {  # $1=ip -> stdout: one "tool=version|MISSING" line per too
   # $ROOT_CARGO_HOME/bin, so root's own probe still needs both listed.
   local gt_probe_extra=""
   [ "$REMOTE_USER" = "root" ] && gt_probe_extra=":$ROOT_CARGO_HOME/bin:/root/.local/bin"
-  "$SSH_BIN" -o StrictHostKeyChecking=no -o ConnectTimeout=8 -i "$SSH_KEY" "$REMOTE_USER@$1" "
+  "$SSH_BIN" $(ssh_kh_args) -o ConnectTimeout=8 -i "$SSH_KEY" "$REMOTE_USER@$1" "
 # gate-tools-probe
 # PRD-build-burst-gate-tools-scope requirement 1: a non-login ssh shell's
 # PATH lacks the cargo-installed tools/uv/claude dirs, so a correctly-
@@ -1011,15 +1111,15 @@ sync_gate_tools_scripts() {  # $1=ip
   do
     src="${pair%%:*}"; dst="${pair#*:}"
     [ -d "$src" ] || continue
-    "$SSH_BIN" -o StrictHostKeyChecking=no -o ConnectTimeout=8 -i "$SSH_KEY" "$REMOTE_USER@$ip" "mkdir -p '$dst'" 2>/dev/null || true
-    "$RSYNC_BIN" -az --delete -e "$SSH_BIN -o StrictHostKeyChecking=no -i $SSH_KEY" \
+    "$SSH_BIN" $(ssh_kh_args) -o ConnectTimeout=8 -i "$SSH_KEY" "$REMOTE_USER@$ip" "mkdir -p '$dst'" 2>/dev/null || true
+    "$RSYNC_BIN" -az --delete -e "$SSH_BIN $(ssh_kh_args) -i $SSH_KEY" \
       "$src/" "$REMOTE_USER@$ip:$dst/" >/dev/null 2>&1 || true
     # Files only (never -R on the dirs themselves) — a directory stripped of
     # its own write bit can no longer have entries added/removed inside it,
     # which broke both a later re-sync (rsync --delete needs to unlink stale
     # files) and this selftest's own tmpdir cleanup (rm -rf) the first time
     # this shipped with a blanket `chmod -R a-w`.
-    "$SSH_BIN" -o StrictHostKeyChecking=no -o ConnectTimeout=8 -i "$SSH_KEY" "$REMOTE_USER@$ip" "find '$dst' -type f -exec chmod a-w {} +" 2>/dev/null || true
+    "$SSH_BIN" $(ssh_kh_args) -o ConnectTimeout=8 -i "$SSH_KEY" "$REMOTE_USER@$ip" "find '$dst' -type f -exec chmod a-w {} +" 2>/dev/null || true
   done
 }
 
@@ -1050,7 +1150,7 @@ provision_gate_tools() {  # $1=ip
     # Requirement 3: apt-get is root's job, never build's — hardcoded root@,
     # not $REMOTE_USER@, regardless of which user the rest of this function
     # routes to.
-    "$SSH_BIN" -o StrictHostKeyChecking=no -o ConnectTimeout=8 -i "$SSH_KEY" "root@$ip" \
+    "$SSH_BIN" $(ssh_kh_args) -o ConnectTimeout=8 -i "$SSH_KEY" "root@$ip" \
       "$(printf '%s\napt-get update -qq\n' "# gate-tools-apt-update")" >"$apt_log" 2>&1 || apt_rc=$?
     journal_line "$(now_iso)  burst-lane  gate-tools  apt-update  (ran=true rc=$apt_rc)"
     rm -f "$apt_log" 2>/dev/null || true
@@ -1067,11 +1167,11 @@ provision_gate_tools() {  # $1=ip
     rc=0
     if [ "$name" = "autobuilder" ]; then
       if [ -f "$GATE_TOOLS_AUTOBUILDER_BIN" ]; then
-        "$SSH_BIN" -o StrictHostKeyChecking=no -o ConnectTimeout=8 -i "$SSH_KEY" "$REMOTE_USER@$ip" \
+        "$SSH_BIN" $(ssh_kh_args) -o ConnectTimeout=8 -i "$SSH_KEY" "$REMOTE_USER@$ip" \
           "$(printf '%s\nmkdir -p '"'"'%s'"'"'\n' "# gate-tools-install autobuilder" "$GATE_TOOLS_REMOTE_BIN_DIR")" >/dev/null 2>&1 || true
-        "$RSYNC_BIN" -az -e "$SSH_BIN -o StrictHostKeyChecking=no -i $SSH_KEY" \
+        "$RSYNC_BIN" -az -e "$SSH_BIN $(ssh_kh_args) -i $SSH_KEY" \
           "$GATE_TOOLS_AUTOBUILDER_BIN" "$REMOTE_USER@$ip:$GATE_TOOLS_REMOTE_BIN_DIR/autobuilder" >"$err_log" 2>&1 || rc=$?
-        "$SSH_BIN" -o StrictHostKeyChecking=no -o ConnectTimeout=8 -i "$SSH_KEY" "$REMOTE_USER@$ip" \
+        "$SSH_BIN" $(ssh_kh_args) -o ConnectTimeout=8 -i "$SSH_KEY" "$REMOTE_USER@$ip" \
           "chmod +x '$GATE_TOOLS_REMOTE_BIN_DIR/autobuilder'" 2>/dev/null || true
       else
         rc=1
@@ -1083,7 +1183,7 @@ provision_gate_tools() {  # $1=ip
       # else (cargo-deny, cargo-nextest, uv, claude) installs as build.
       local install_user="$REMOTE_USER"
       gate_tools_is_apt "$name" && install_user="root"
-      "$SSH_BIN" -o StrictHostKeyChecking=no -o ConnectTimeout=8 -i "$SSH_KEY" "$install_user@$ip" "$(gate_tools_install_cmd "$name")" >"$err_log" 2>&1 || rc=$?
+      "$SSH_BIN" $(ssh_kh_args) -o ConnectTimeout=8 -i "$SSH_KEY" "$install_user@$ip" "$(gate_tools_install_cmd "$name")" >"$err_log" 2>&1 || rc=$?
     fi
     secs="$(( $(now_epoch) - start_ts ))"
     journal_line "$(now_iso)  burst-lane  gate-tools  install  (tool=$name rc=$rc secs=$secs)"
@@ -1174,11 +1274,11 @@ place_gate_credential() {  # $1=ip
     journal_line "$(now_iso)  burst-lane  up  cred-absent  (BURST_GATE_REVIEWER=1 but no credential file at $GATE_CRED_SRC — reviewer will not run)"
     return 0
   fi
-  "$SSH_BIN" -o StrictHostKeyChecking=no -o ConnectTimeout=8 -i "$SSH_KEY" "$REMOTE_USER@$ip" \
+  "$SSH_BIN" $(ssh_kh_args) -o ConnectTimeout=8 -i "$SSH_KEY" "$REMOTE_USER@$ip" \
     "mkdir -p '$(dirname "$GATE_CRED_REMOTE_PATH")'" >/dev/null 2>&1 || true
-  if "$RSYNC_BIN" -az -e "$SSH_BIN -o StrictHostKeyChecking=no -i $SSH_KEY" \
+  if "$RSYNC_BIN" -az -e "$SSH_BIN $(ssh_kh_args) -i $SSH_KEY" \
        "$GATE_CRED_SRC" "$REMOTE_USER@$ip:$GATE_CRED_REMOTE_PATH" >/dev/null 2>&1; then
-    "$SSH_BIN" -o StrictHostKeyChecking=no -o ConnectTimeout=8 -i "$SSH_KEY" "$REMOTE_USER@$ip" \
+    "$SSH_BIN" $(ssh_kh_args) -o ConnectTimeout=8 -i "$SSH_KEY" "$REMOTE_USER@$ip" \
       "chmod 600 '$GATE_CRED_REMOTE_PATH'" >/dev/null 2>&1 || true
     journal_line "$(now_iso)  burst-lane  up  cred  placed  (host=$ip)"
   else
@@ -1189,7 +1289,7 @@ place_gate_credential() {  # $1=ip
 shred_gate_credential() {  # $1=ip $2=caller(down|watchdog)
   local ip="${1:-}" caller="${2:-down}"
   [ -n "$ip" ] || return 0
-  if "$SSH_BIN" -o StrictHostKeyChecking=no -o ConnectTimeout=8 -i "$SSH_KEY" "$REMOTE_USER@$ip" \
+  if "$SSH_BIN" $(ssh_kh_args) -o ConnectTimeout=8 -i "$SSH_KEY" "$REMOTE_USER@$ip" \
        "shred -u -f '$GATE_CRED_REMOTE_PATH'" >/dev/null 2>&1; then
     journal_line "$(now_iso)  burst-lane  $caller  cred  shredded  (host=$ip)"
   fi
@@ -1200,14 +1300,26 @@ cmd_up() {
     echo "burst: refused — not configured (RedBaron-local policy); set BUILD_BURST_ENABLED=1 to allow" >&2
     return 3
   fi
+  # Requirement 5: reconcile the persistent-volume state file FIRST, before
+  # even the already-up short-circuit below — an operator calling `up`
+  # against a box that's still alive must still learn that its volume was
+  # deleted out-of-band (2026-09-13: volume 106857883); the already-up fast
+  # path returns before ever reaching volume_ensure, so this is the only
+  # place in `up` guaranteed to run every single time. Side-effect only
+  # (archive+journal); volume_ensure further down still does its own
+  # by-name hcloud lookup regardless of what this finds.
+  volume_reconcile || true
+
+  # Requirement 2: reconcile session.json against hcloud reality next — an
+  # absent server archives the file (session_reconcile) and this falls
+  # straight through to the adoption/fresh-create path below exactly as if
+  # no session.json had ever existed. A confirmed-alive server short-
+  # circuits here, same as the old behavior.
   if state_active; then
-    local id; id="$(state_read server_id)"
-    if [ -n "$id" ] && server_alive "$id"; then
-      echo "already-up: $id $(state_read ip)"
+    if session_reconcile; then
+      echo "already-up: $(state_read server_id) $(state_read ip)"
       exit 0
     fi
-    # Tracked box vanished under us — clear stale state and re-check by name.
-    state_clear
   fi
 
   # Adoption path: a session.json can be lost (crash, disk wipe) while the
@@ -1215,6 +1327,7 @@ cmd_up() {
   local adopt; adopt="$(find_by_name "$SERVER_NAME" 2>/dev/null || true)"
   if [ -n "$adopt" ]; then
     local aid aip; aid="${adopt%% *}"; aip="${adopt##* }"
+    session_known_hosts_reset "$aid"
     box_bootstrap "$aip"
     volume_ensure "$aip" "$aid"
     local sbx; sbx="$(sandbox_probe "$aip")"
@@ -1271,13 +1384,14 @@ print(d.get("id",""), d.get("public_net",{}).get("ipv4",{}).get("ip",""))
     echo "fallback: could not parse server id from hcloud output"
     exit 3
   fi
+  session_known_hosts_reset "$id"
 
   # Wait for ssh (bounded — never hang a tick forever). Hardcoded root@, not
   # $REMOTE_USER@ — on a truly fresh snapshot boot $REMOTE_USER (build) does
   # not exist yet, only root does; box_bootstrap below is what creates it.
   local tries=0
   while [ "$tries" -lt 30 ]; do
-    if "$SSH_BIN" -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=no \
+    if "$SSH_BIN" -o BatchMode=yes -o ConnectTimeout=5 $(ssh_kh_args) \
          -i "$SSH_KEY" "root@$ip" true >/dev/null 2>&1; then
       break
     fi
@@ -1329,7 +1443,7 @@ cmd_verify() {
   local fx; fx="$(mktemp -d)"; echo ok > "$fx/probe.txt"
   local rpath="$REMOTE_ROOT/.verify-fixture"
   "$RSYNC_BIN" -az --delete --rsync-path="mkdir -p '$rpath' && rsync" \
-      -e "$SSH_BIN -o StrictHostKeyChecking=no -i $SSH_KEY" \
+      -e "$SSH_BIN $(ssh_kh_args) -i $SSH_KEY" \
       "$fx/" "$REMOTE_USER@$ip:$rpath/" >/dev/null 2>&1 || vfail "rsync roundtrip (user=$REMOTE_USER)"
   rm -rf "$fx"
 
@@ -1342,7 +1456,7 @@ cmd_verify() {
   # for the check this PRD actually adds; this probe only proves `cargo`
   # itself runs under that CARGO_HOME, not that it can write.
   local rout
-  rout="$("$SSH_BIN" -o StrictHostKeyChecking=no -i "$SSH_KEY" "$REMOTE_USER@$ip" \
+  rout="$("$SSH_BIN" $(ssh_kh_args) -i "$SSH_KEY" "$REMOTE_USER@$ip" \
     "export PATH=$GATE_TOOLS_REMOTE_BIN_DIR:\$PATH:$ROOT_CARGO_HOME/bin:/root/.local/bin RUSTUP_HOME=$ROOT_RUSTUP_HOME CARGO_HOME=$RUN_CARGO_HOME; cargo --version && uv --version && python3 -c \"print(1)\"" 2>/dev/null)"
   printf '%s' "$rout" | grep -q "^cargo " || vfail "remote cargo (user=$REMOTE_USER)"
   printf '%s' "$rout" | grep -q "^uv "    || vfail "remote uv (user=$REMOTE_USER)"
@@ -1357,7 +1471,7 @@ cmd_verify() {
   # actually see (and, via mkdir -p, write into) the sccache dir — real
   # regardless of whether a volume is attached this session (a rollback
   # session still has $REMOTE_ROOT on the root disk, same path).
-  "$SSH_BIN" -o StrictHostKeyChecking=no -i "$SSH_KEY" "$REMOTE_USER@$ip" \
+  "$SSH_BIN" $(ssh_kh_args) -i "$SSH_KEY" "$REMOTE_USER@$ip" \
     "mkdir -p '$REMOTE_SCCACHE_DIR' && [ -d '$REMOTE_SCCACHE_DIR' ]" >/dev/null 2>&1 \
     || vfail "sccache dir ($REMOTE_SCCACHE_DIR)"
 
@@ -1369,7 +1483,7 @@ cmd_verify() {
   # the path, rather than a bare "verify FAIL" an operator has to go dig for.
   if [ "$REMOTE_USER" != "root" ] && [[ "$RUN_CARGO_HOME" == /root* ]]; then
     vfail "CARGO_HOME resolves under /root ($RUN_CARGO_HOME) — build user needs its own registry cache"
-  elif "$SSH_BIN" -o StrictHostKeyChecking=no -o ConnectTimeout=8 -i "$SSH_KEY" "$REMOTE_USER@$ip" \
+  elif "$SSH_BIN" $(ssh_kh_args) -o ConnectTimeout=8 -i "$SSH_KEY" "$REMOTE_USER@$ip" \
     "$(printf '%s\nmkdir -p '"'"'%s/registry'"'"' && touch '"'"'%s/registry/.burst-lane-write-test'"'"' && rm -f '"'"'%s/registry/.burst-lane-write-test'"'"'\n' \
        "# cargo-home-registry-probe" "$RUN_CARGO_HOME" "$RUN_CARGO_HOME" "$RUN_CARGO_HOME")" >/dev/null 2>&1
   then
@@ -1438,7 +1552,7 @@ cmd_verify() {
 # requirement 4's verified-copy check.
 remote_dir_stats() {  # $1=ip $2=path -> stdout "bytes\tcount"
   local ip="$1" path="$2" out
-  out="$("$SSH_BIN" -o StrictHostKeyChecking=no -o ConnectTimeout=8 -i "$SSH_KEY" "root@$ip" \
+  out="$("$SSH_BIN" $(ssh_kh_args) -o ConnectTimeout=8 -i "$SSH_KEY" "root@$ip" \
     "if [ -d '$path' ]; then b=\$(du -sb '$path' 2>/dev/null | cut -f1); c=\$(find '$path' 2>/dev/null | wc -l); printf '%s\t%s\n' \"\${b:-0}\" \"\${c:-0}\"; else printf '0\t0\n'; fi" 2>/dev/null)"
   [ -n "$out" ] && printf '%s\n' "$out" || printf '0\t0\n'
 }
@@ -1473,7 +1587,7 @@ except Exception:
     # re-syncs the worktree as build anyway, fixing ownership as a side
     # effect even if this chown failed); only mkdir+cp's own exit code
     # decides migrated vs cold, preserved past the chown via `exit $rc`.
-    if "$SSH_BIN" -o StrictHostKeyChecking=no -o ConnectTimeout=8 -i "$SSH_KEY" "root@$ip" \
+    if "$SSH_BIN" $(ssh_kh_args) -o ConnectTimeout=8 -i "$SSH_KEY" "root@$ip" \
          "mkdir -p '$new_remote_path' && cp -a '$old_remote_path/.' '$new_remote_path/' 2>/dev/null; rc=\$?; chown -R '$REMOTE_USER:$REMOTE_USER' '$new_remote_path' 2>/dev/null || true; exit \$rc" >/dev/null 2>&1; then
       mark_dirty "$wt" "$(state_read server_id)" "$new_remote_path" "$kind"
       journal_line "$(now_iso)  burst-lane  provision  migrated  (worktree=$wt from=$old_remote_path to=$new_remote_path)"
@@ -1489,7 +1603,7 @@ except Exception:
       old_bytes="$(cut -f1 <<<"$old_stats")"; old_count="$(cut -f2 <<<"$old_stats")"
       new_bytes="$(cut -f1 <<<"$new_stats")"; new_count="$(cut -f2 <<<"$new_stats")"
       if [ "$old_bytes" = "$new_bytes" ] && [ "$old_count" = "$new_count" ]; then
-        if "$SSH_BIN" -o StrictHostKeyChecking=no -o ConnectTimeout=8 -i "$SSH_KEY" "root@$ip" \
+        if "$SSH_BIN" $(ssh_kh_args) -o ConnectTimeout=8 -i "$SSH_KEY" "root@$ip" \
              "rm -rf '$old_remote_path'" >/dev/null 2>&1; then
           journal_line "$(now_iso)  burst-lane  provision  migrated-removed  (from=$old_remote_path)"
         else
@@ -1566,6 +1680,20 @@ cmd_status() {
     probe_emit burst-status could-not-check "session.json corrupted (unparseable): $STATE_FILE" >/dev/null
     journal_line "$(now_iso)  burst-lane  status  could-not-check  (session.json corrupted at $STATE_FILE — treating as no active session, falling back local)"
     if [ "$json" -eq 1 ]; then echo '{"active":false,"could_not_check":true}'; else echo "could-not-check: session.json corrupted — treating as no active session"; fi
+    exit 0
+  fi
+  # Requirement 4/AC6: verify the session's server against hcloud before
+  # reporting anything as active. An absent server archives session.json
+  # (session_reconcile, same helper `up` uses) and status reports
+  # active:false + server_verified:false — never the stale truth an out-of-
+  # band `hcloud server delete` left behind (2026-09-13 incident).
+  if ! session_reconcile; then
+    journal_line "$(now_iso)  burst-lane  status  session-stale  (archived session.json — reporting active:false)"
+    if [ "$json" -eq 1 ]; then
+      echo '{"active":false,"server_verified":false}'
+    else
+      echo "active:false server_verified:false — session.json archived (server absent from hcloud)"
+    fi
     exit 0
   fi
   local id ip alive ttl sbx conc
@@ -1670,6 +1798,15 @@ for r in json.loads(sys.argv[1]):
   # used_pct} — a live read (volume_status_probe), not last-boot's cached
   # figure, so an operator's `status` and the disk-guard's own numbers never
   # disagree about which filesystem is being described.
+  # Requirement 5/AC7: verify volume.json's own volume_id against hcloud
+  # before trusting/reporting it — an out-of-band `hcloud volume delete`
+  # (2026-09-13: volume 106857883) must never leave `status` still claiming
+  # a mount. volume_reconcile archives the file itself when stale;
+  # volume_verified reflects that outcome (true also when no volume is
+  # tracked at all — vacuously nothing to falsify).
+  local volume_verified=true
+  volume_reconcile || volume_verified=false
+
   local vol_json="null" vol_line=""
   local vol_probe; vol_probe="$(volume_status_probe "$ip" 2>/dev/null)"
   if [ -n "$vol_probe" ]; then
@@ -1712,8 +1849,8 @@ print(json.dumps(out))
 ' "$ATTR_REPOS_DIR" "$BURST_PARITY_REPOS")"
 
   if [ "$json" -eq 1 ]; then
-    printf '{"active":true,"server_id":"%s","ip":"%s","minutes_alive":%s,"ttl_hours":"%s","sandbox_ok":"%s","concurrent":"%s","free_disk_gb":%s,"disk_state":"%s","dirty":%s,"gates":%s,"gate_ready":"%s","gate_tools_missing":"%s","volume":%s,"redbaron_free_gb":%s,"parity":%s}\n' \
-      "$id" "$ip" "$alive" "$ttl" "$sbx" "$conc" "$free_disk_gb" "$disk_state" "$dirty_json" "$gates_json" "$(state_read gate_ready)" "$(state_read gate_tools_missing)" "$vol_json" "$redbaron_free_gb" "$parity_json"
+    printf '{"active":true,"server_verified":true,"server_id":"%s","ip":"%s","minutes_alive":%s,"ttl_hours":"%s","sandbox_ok":"%s","concurrent":"%s","free_disk_gb":%s,"disk_state":"%s","dirty":%s,"gates":%s,"gate_ready":"%s","gate_tools_missing":"%s","volume":%s,"volume_verified":%s,"redbaron_free_gb":%s,"parity":%s}\n' \
+      "$id" "$ip" "$alive" "$ttl" "$sbx" "$conc" "$free_disk_gb" "$disk_state" "$dirty_json" "$gates_json" "$(state_read gate_ready)" "$(state_read gate_tools_missing)" "$vol_json" "$volume_verified" "$redbaron_free_gb" "$parity_json"
   else
     local gate_count; gate_count="$(python3 -c 'import json,sys; print(len(json.loads(sys.argv[1])))' "$gates_json")"
     # PRD-build-burst-gate-tools-scope requirement 3: an operator (or
@@ -1863,7 +2000,7 @@ pull_target_incremental() {  # $1=worktree $2=ip [$3=remote_path] -> stdout: byt
   # --exclude autobuilder: gate receipts/verdicts live at target/autobuilder/
   # LOCALLY ONLY (producers run here; the box only runs cargo) — without this,
   # --delete erased the gate's own evidence on every routed shared-checkout run.
-  if ! stats="$("$RSYNC_BIN" -az --delete --stats --exclude autobuilder -e "$SSH_BIN -o StrictHostKeyChecking=no -i $SSH_KEY" \
+  if ! stats="$("$RSYNC_BIN" -az --delete --stats --exclude autobuilder -e "$SSH_BIN $(ssh_kh_args) -i $SSH_KEY" \
         "$REMOTE_USER@$ip:$remote_target/" "$local_target/" 2>&1)"; then
     return 1
   fi
@@ -1885,7 +2022,7 @@ pull_pybuilder_incremental() {  # $1=worktree $2=ip -> stdout: bytes transferred
   remote_path="$(remote_path_for "$worktree")"
   local_target="$worktree/.pybuilder"; remote_target="$remote_path/.pybuilder"
   mkdir -p "$local_target" 2>/dev/null || true
-  if ! stats="$("$RSYNC_BIN" -az --delete --stats -e "$SSH_BIN -o StrictHostKeyChecking=no -i $SSH_KEY" \
+  if ! stats="$("$RSYNC_BIN" -az --delete --stats -e "$SSH_BIN $(ssh_kh_args) -i $SSH_KEY" \
         "$REMOTE_USER@$ip:$remote_target/" "$local_target/" 2>&1)"; then
     return 1
   fi
@@ -2312,7 +2449,7 @@ local_disk_free_gb() {  # $1=path -> stdout free GB, or empty on an unreadable p
 # indistinguishable from "the dir is gone" here, and is treated the same:
 # correctness by recompile, never a silent stale read.
 remote_dir_exists() {  # $1=ip $2=remote_path -> rc0 exists
-  "$SSH_BIN" -o StrictHostKeyChecking=no -o ConnectTimeout=8 -i "$SSH_KEY" \
+  "$SSH_BIN" $(ssh_kh_args) -o ConnectTimeout=8 -i "$SSH_KEY" \
     "$REMOTE_USER@$1" "[ -d '$2' ]" 2>/dev/null
 }
 
@@ -2648,7 +2785,7 @@ cmd_run() {
       pd_rc=0
       "$RSYNC_BIN" -az --delete --exclude target --exclude .git --exclude .venv \
             --rsync-path="mkdir -p '$pd_remote' && rsync" \
-            -e "$SSH_BIN -o StrictHostKeyChecking=no -i $SSH_KEY" \
+            -e "$SSH_BIN $(ssh_kh_args) -i $SSH_KEY" \
             "$pd_dep/" "$REMOTE_USER@$ip:$pd_remote/" >"$pd_log" 2>&1 || pd_rc=$?
       if [ "$pd_rc" -ne 0 ]; then
         pd_err="$(grep -v '^[[:space:]]*$' "$pd_log" 2>/dev/null | tail -n1)"
@@ -2672,7 +2809,7 @@ cmd_run() {
       if [ -f "$pd_dep/Cargo.toml" ]; then
         local pd_tmp; pd_tmp="$(mktemp)"
         if python3 "$HERE/burst-lane-pathdeps.py" rewrite "$pd_dep/Cargo.toml" "$map_file" > "$pd_tmp" 2>/dev/null; then
-          "$RSYNC_BIN" -az -e "$SSH_BIN -o StrictHostKeyChecking=no -i $SSH_KEY" \
+          "$RSYNC_BIN" -az -e "$SSH_BIN $(ssh_kh_args) -i $SSH_KEY" \
             "$pd_tmp" "$REMOTE_USER@$ip:$pd_remote/Cargo.toml" >>"$pd_log" 2>&1 || true
         fi
         rm -f "$pd_tmp"
@@ -2688,7 +2825,7 @@ cmd_run() {
   local up_log="$STATE_DIR/logs/rsync-up.$$.log" rsync_up_rc=0
   "$RSYNC_BIN" -az --delete --exclude target --exclude .git --exclude .venv \
         --rsync-path="mkdir -p '$remote_path' && rsync" \
-        -e "$SSH_BIN -o StrictHostKeyChecking=no -i $SSH_KEY" \
+        -e "$SSH_BIN $(ssh_kh_args) -i $SSH_KEY" \
         "$sync_root/" "$REMOTE_USER@$ip:$remote_path/" >"$up_log" 2>&1 || rsync_up_rc=$?
   if [ "$rsync_up_rc" -ne 0 ]; then
     local up_err; up_err="$(grep -v '^[[:space:]]*$' "$up_log" 2>/dev/null | tail -n1)"
@@ -2706,7 +2843,7 @@ cmd_run() {
   if [ -n "$map_file" ]; then
     local wt_tmp; wt_tmp="$(mktemp)"
     if python3 "$HERE/burst-lane-pathdeps.py" rewrite "$worktree_abs/Cargo.toml" "$map_file" > "$wt_tmp" 2>/dev/null; then
-      "$RSYNC_BIN" -az -e "$SSH_BIN -o StrictHostKeyChecking=no -i $SSH_KEY" \
+      "$RSYNC_BIN" -az -e "$SSH_BIN $(ssh_kh_args) -i $SSH_KEY" \
         "$wt_tmp" "$REMOTE_USER@$ip:$remote_cwd/Cargo.toml" >>"$up_log" 2>&1 || true
     fi
     rm -f "$wt_tmp" "$map_file"
@@ -2758,7 +2895,7 @@ cmd_run() {
   local remote_cmd="cd $remote_cwd && export PATH=$GATE_TOOLS_REMOTE_BIN_DIR:\$PATH:$ROOT_CARGO_HOME/bin:/root/.local/bin RUSTUP_HOME=$ROOT_RUSTUP_HOME CARGO_HOME=$RUN_CARGO_HOME CARGO_TARGET_DIR=$remote_path/target RUSTC_WRAPPER=sccache SCCACHE_DIR=$REMOTE_SCCACHE_DIR SCCACHE_CACHE_SIZE=${BURST_SCCACHE_GB}G; timeout 5 sccache --show-stats >/dev/null 2>&1 || { sccache --stop-server >/dev/null 2>&1; sccache --start-server >/dev/null 2>&1; sleep 1; }; timeout 5 sccache --show-stats >/dev/null 2>&1 || { echo 'burst-lane: sccache_unreachable on remote box' >&2; exit 97; }; $first $*"
   local rc=0
   local remote_out_log="$STATE_DIR/logs/run-remote.$$.log"
-  "$SSH_BIN" -o StrictHostKeyChecking=no -i "$SSH_KEY" "$REMOTE_USER@$ip" "$remote_cmd" 2>&1 | tee "$remote_out_log"
+  "$SSH_BIN" $(ssh_kh_args) -i "$SSH_KEY" "$REMOTE_USER@$ip" "$remote_cmd" 2>&1 | tee "$remote_out_log"
   rc="${PIPESTATUS[0]}"
   t_remote_end="$(now_fractional)"
 
@@ -3091,7 +3228,7 @@ print(d.get(sys.argv[1], "no-output"))
 
 nextest_rerun_result_box() {  # $1=ip $2=remote_env_prefix $3=suite_name -> stdout result
   local ip="$1" prefix="$2" name="$3" log
-  log="$("$SSH_BIN" -o StrictHostKeyChecking=no -i "$SSH_KEY" "$REMOTE_USER@$ip" \
+  log="$("$SSH_BIN" $(ssh_kh_args) -i "$SSH_KEY" "$REMOTE_USER@$ip" \
     "$prefix; cargo nextest run --workspace --no-fail-fast -E \"binary_id($name)\"" 2>&1)"
   printf '%s\n' "$log" | cargo_nextest_suites_json | python3 -c '
 import json, sys
@@ -3305,7 +3442,7 @@ cmd_parity() {
   local up_log="$STATE_DIR/logs/rsync-parity.$$.log" rsync_up_rc=0
   "$RSYNC_BIN" -az --delete --exclude target --exclude .git --exclude .venv \
         --rsync-path="mkdir -p '$remote_path' && rsync" \
-        -e "$SSH_BIN -o StrictHostKeyChecking=no -i $SSH_KEY" \
+        -e "$SSH_BIN $(ssh_kh_args) -i $SSH_KEY" \
         "$repo/" "$REMOTE_USER@$ip:$remote_path/" >"$up_log" 2>&1 || rsync_up_rc=$?
   if [ "$rsync_up_rc" -ne 0 ]; then
     flock -u 206
@@ -3339,22 +3476,22 @@ cmd_parity() {
   # cargo-nextest falls back to `cargo test` (the previous parser, kept
   # verbatim as the rollback path).
   local box_capture="cargo-test"
-  if "$SSH_BIN" -o StrictHostKeyChecking=no -i "$SSH_KEY" "$REMOTE_USER@$ip" \
+  if "$SSH_BIN" $(ssh_kh_args) -i "$SSH_KEY" "$REMOTE_USER@$ip" \
        "$remote_env_prefix; command -v cargo-nextest" >/dev/null 2>&1; then
     box_capture="nextest"
   fi
   local box_log box_suites
   if [ "$box_capture" = "nextest" ]; then
-    box_log="$("$SSH_BIN" -o StrictHostKeyChecking=no -i "$SSH_KEY" "$REMOTE_USER@$ip" \
+    box_log="$("$SSH_BIN" $(ssh_kh_args) -i "$SSH_KEY" "$REMOTE_USER@$ip" \
       "$remote_env_prefix; cargo nextest run --workspace --no-fail-fast" 2>&1)"
-    local box_list_json; box_list_json="$("$SSH_BIN" -o StrictHostKeyChecking=no -i "$SSH_KEY" "$REMOTE_USER@$ip" \
+    local box_list_json; box_list_json="$("$SSH_BIN" $(ssh_kh_args) -i "$SSH_KEY" "$REMOTE_USER@$ip" \
       "$remote_env_prefix; cargo nextest list --workspace --message-format json" 2>/dev/null)"
     local box_names; box_names="$(printf '%s' "$box_list_json" | cargo_nextest_list_names)"
     local box_results; box_results="$(printf '%s\n' "$box_log" | cargo_nextest_suites_json)"
     box_suites="$(nextest_merge_suites "$box_names" "$box_results")"
   else
     journal_line "$(now_iso)  burst-lane  parity  capture=cargo-test  (side=box repo=$repo)"
-    box_log="$("$SSH_BIN" -o StrictHostKeyChecking=no -i "$SSH_KEY" "$REMOTE_USER@$ip" \
+    box_log="$("$SSH_BIN" $(ssh_kh_args) -i "$SSH_KEY" "$REMOTE_USER@$ip" \
       "$remote_env_prefix $CARGO_TEST_RUNNER_TARGET_ENV='stdbuf -o0'; cargo test --workspace --no-fail-fast -- --test-threads=1" 2>&1)"
     box_suites="$(printf '%s\n' "$box_log" | cargo_test_suites_json)"
   fi
@@ -3595,9 +3732,9 @@ gate_wait_for_inflight() {  # $1=caller(down|watchdog)
     if [ "$finished" -eq 1 ]; then
       local remote_path; remote_path="$(remote_path_for "$repo")"
       mkdir -p "$repo/target/autobuilder" 2>/dev/null || true
-      "$RSYNC_BIN" -az --delete -e "$SSH_BIN -o StrictHostKeyChecking=no -i $SSH_KEY" \
+      "$RSYNC_BIN" -az --delete -e "$SSH_BIN $(ssh_kh_args) -i $SSH_KEY" \
         "$REMOTE_USER@$ip:$remote_path/target/autobuilder/" "$repo/target/autobuilder/" >/dev/null 2>&1 || true
-      "$RSYNC_BIN" -az -e "$SSH_BIN -o StrictHostKeyChecking=no -i $SSH_KEY" \
+      "$RSYNC_BIN" -az -e "$SSH_BIN $(ssh_kh_args) -i $SSH_KEY" \
         "$REMOTE_USER@$ip:$remote_path/.gate-burst-host" "$repo/.gate-burst-host" >/dev/null 2>&1 || true
       local verdict; verdict="$(python3 -c '
 import json, sys
@@ -3757,7 +3894,7 @@ cmd_gate() {
   local up_log="$STATE_DIR/logs/rsync-gate.$$.log" rsync_up_rc=0
   "$RSYNC_BIN" -az --delete --exclude target --exclude .git --exclude .venv \
         --rsync-path="mkdir -p '$remote_path' && rsync" \
-        -e "$SSH_BIN -o StrictHostKeyChecking=no -i $SSH_KEY" \
+        -e "$SSH_BIN $(ssh_kh_args) -i $SSH_KEY" \
         "$repo/" "$REMOTE_USER@$ip:$remote_path/" >"$up_log" 2>&1 || rsync_up_rc=$?
   if [ "$rsync_up_rc" -ne 0 ]; then
     flock -u 212
@@ -3799,7 +3936,7 @@ cmd_gate() {
   # resolve to root's shared toolchain — only the data directory moved.
   local remote_journal="$remote_path/target/autobuilder/gate-journal.md"
   local remote_cmd="cd $remote_path && export PATH=\$PATH:$GATE_TOOLS_REMOTE_BIN_DIR:$ROOT_CARGO_HOME/bin:/root/.local/bin:$REMOTE_ROOT/.gate-tools/build-scripts RUSTUP_HOME=$ROOT_RUSTUP_HOME CARGO_HOME=$RUN_CARGO_HOME RUSTC_WRAPPER=sccache SCCACHE_DIR=$REMOTE_SCCACHE_DIR SCCACHE_CACHE_SIZE=${BURST_SCCACHE_GB}G BURST_LANE=0 RUSTBUILD_SCRIPTS=$REMOTE_ROOT/.gate-tools/rustbuild-scripts REVIEWER_PROMPT=$REMOTE_ROOT/.gate-tools/rustbuild-prompts/reviewer-agent.md EXTEND_GATE_JOURNAL=$remote_journal; extend-gate.sh . $(printf '%q ' "${extra_args[@]}")"
-  "$SSH_BIN" -o StrictHostKeyChecking=no -i "$SSH_KEY" "$REMOTE_USER@$ip" "bash -lc $(printf '%q' "$remote_cmd")" || rc=$?
+  "$SSH_BIN" $(ssh_kh_args) -i "$SSH_KEY" "$REMOTE_USER@$ip" "bash -lc $(printf '%q' "$remote_cmd")" || rc=$?
   t1="$(now_fractional)"
   rm -f "$inflight_marker"
 
@@ -3810,12 +3947,12 @@ cmd_gate() {
     exit 3
   fi
 
-  "$SSH_BIN" -o StrictHostKeyChecking=no -i "$SSH_KEY" "$REMOTE_USER@$ip" "echo $ip > $remote_path/.gate-burst-host" 2>/dev/null || true
+  "$SSH_BIN" $(ssh_kh_args) -i "$SSH_KEY" "$REMOTE_USER@$ip" "echo $ip > $remote_path/.gate-burst-host" 2>/dev/null || true
 
   mkdir -p "$repo/target/autobuilder" 2>/dev/null || true
-  "$RSYNC_BIN" -az --delete -e "$SSH_BIN -o StrictHostKeyChecking=no -i $SSH_KEY" \
+  "$RSYNC_BIN" -az --delete -e "$SSH_BIN $(ssh_kh_args) -i $SSH_KEY" \
     "$REMOTE_USER@$ip:$remote_path/target/autobuilder/" "$repo/target/autobuilder/" >/dev/null 2>&1 || true
-  "$RSYNC_BIN" -az -e "$SSH_BIN -o StrictHostKeyChecking=no -i $SSH_KEY" \
+  "$RSYNC_BIN" -az -e "$SSH_BIN $(ssh_kh_args) -i $SSH_KEY" \
     "$REMOTE_USER@$ip:$remote_path/.gate-burst-host" "$repo/.gate-burst-host" >/dev/null 2>&1 || true
 
   # Fold the box's redirected extend-gate.sh journal onto RedBaron's real
@@ -3828,7 +3965,7 @@ cmd_gate() {
     mkdir -p "$TICK_JOURNAL_DIR" 2>/dev/null || true
     cat "$pulled_journal" >> "$TICK_JOURNAL_DIR/$tj_today.md"
     rm -f "$pulled_journal"
-    "$SSH_BIN" -o StrictHostKeyChecking=no -i "$SSH_KEY" "$REMOTE_USER@$ip" "rm -f $remote_journal" 2>/dev/null || true
+    "$SSH_BIN" $(ssh_kh_args) -i "$SSH_KEY" "$REMOTE_USER@$ip" "rm -f $remote_journal" 2>/dev/null || true
   fi
   flock -u 212
 
@@ -4101,7 +4238,7 @@ reap_old_root() {
   state_active || { echo "reaped_dirs=0 reaped_bytes=0"; return 0; }
   local ip; ip="$(state_read ip)"
   local list_cmd="find '$OLD_ROOT_REMOTE_ROOT' -mindepth 1 -maxdepth 1 -not -name '.*' -printf '%f\n' 2>/dev/null"
-  local list_out; list_out="$("$SSH_BIN" -o StrictHostKeyChecking=no -o ConnectTimeout=8 -i "$SSH_KEY" \
+  local list_out; list_out="$("$SSH_BIN" $(ssh_kh_args) -o ConnectTimeout=8 -i "$SSH_KEY" \
       "root@$ip" "$list_cmd" 2>/dev/null)"
   if [ -z "$list_out" ]; then
     echo "reaped_dirs=0 reaped_bytes=0"; return 0
@@ -4128,10 +4265,10 @@ reap_old_root() {
       continue
     fi
     local bytes
-    bytes="$("$SSH_BIN" -o StrictHostKeyChecking=no -o ConnectTimeout=8 -i "$SSH_KEY" \
+    bytes="$("$SSH_BIN" $(ssh_kh_args) -o ConnectTimeout=8 -i "$SSH_KEY" \
         "root@$ip" "du -sb '$OLD_ROOT_REMOTE_ROOT/$name' 2>/dev/null | cut -f1" 2>/dev/null)"
     bytes="${bytes:-0}"; case "$bytes" in ''|*[!0-9]*) bytes=0 ;; esac
-    if "$SSH_BIN" -o StrictHostKeyChecking=no -o ConnectTimeout=8 -i "$SSH_KEY" \
+    if "$SSH_BIN" $(ssh_kh_args) -o ConnectTimeout=8 -i "$SSH_KEY" \
          "root@$ip" "rm -rf '$OLD_ROOT_REMOTE_ROOT/$name'" 2>/dev/null; then
       reaped_dirs=$((reaped_dirs + 1)); reaped_bytes=$((reaped_bytes + bytes))
       journal_line "$(now_iso)  burst-lane  reap  ok  (dir=$name root=$OLD_ROOT_REMOTE_ROOT bytes=$bytes reason=old-root)"
@@ -4190,7 +4327,7 @@ reap_deps_manifest_dirs() {  # $1=ip $2=inflight_names(newline list) -> stdout "
   local reaped_dirs=0 reaped_bytes=0
   local deps_list_cmd="find '$REMOTE_ROOT/deps' -mindepth 1 -maxdepth 1 -not -name '.*' -printf '%f\n' 2>/dev/null"
   local deps_out
-  deps_out="$("$SSH_BIN" -o StrictHostKeyChecking=no -o ConnectTimeout=8 -i "$SSH_KEY" \
+  deps_out="$("$SSH_BIN" $(ssh_kh_args) -o ConnectTimeout=8 -i "$SSH_KEY" \
       "$REMOTE_USER@$ip" "$deps_list_cmd" 2>/dev/null)"
   if [ -z "$deps_out" ]; then
     echo "reaped_dirs=0 reaped_bytes=0"; return 0
@@ -4213,10 +4350,10 @@ reap_deps_manifest_dirs() {  # $1=ip $2=inflight_names(newline list) -> stdout "
         continue
       fi
       local bytes
-      bytes="$("$SSH_BIN" -o StrictHostKeyChecking=no -o ConnectTimeout=8 -i "$SSH_KEY" \
+      bytes="$("$SSH_BIN" $(ssh_kh_args) -o ConnectTimeout=8 -i "$SSH_KEY" \
           "$REMOTE_USER@$ip" "du -sb '$REMOTE_ROOT/$relkey' 2>/dev/null | cut -f1" 2>/dev/null)"
       bytes="${bytes:-0}"; case "$bytes" in ''|*[!0-9]*) bytes=0 ;; esac
-      if "$SSH_BIN" -o StrictHostKeyChecking=no -o ConnectTimeout=8 -i "$SSH_KEY" \
+      if "$SSH_BIN" $(ssh_kh_args) -o ConnectTimeout=8 -i "$SSH_KEY" \
            "$REMOTE_USER@$ip" "rm -rf '$REMOTE_ROOT/$relkey'" 2>/dev/null; then
         reaped_dirs=$((reaped_dirs + 1)); reaped_bytes=$((reaped_bytes + bytes))
         remote_dirs_remove "$relkey"
@@ -4228,10 +4365,10 @@ reap_deps_manifest_dirs() {  # $1=ip $2=inflight_names(newline list) -> stdout "
       # No manifest entry — legacy pre-PRD mirror (or a race with a run
       # that hasn't recorded it yet). Reaped, not adopted; see header note.
       local lbytes
-      lbytes="$("$SSH_BIN" -o StrictHostKeyChecking=no -o ConnectTimeout=8 -i "$SSH_KEY" \
+      lbytes="$("$SSH_BIN" $(ssh_kh_args) -o ConnectTimeout=8 -i "$SSH_KEY" \
           "$REMOTE_USER@$ip" "du -sb '$REMOTE_ROOT/$relkey' 2>/dev/null | cut -f1" 2>/dev/null)"
       lbytes="${lbytes:-0}"; case "$lbytes" in ''|*[!0-9]*) lbytes=0 ;; esac
-      if "$SSH_BIN" -o StrictHostKeyChecking=no -o ConnectTimeout=8 -i "$SSH_KEY" \
+      if "$SSH_BIN" $(ssh_kh_args) -o ConnectTimeout=8 -i "$SSH_KEY" \
            "$REMOTE_USER@$ip" "rm -rf '$REMOTE_ROOT/$relkey'" 2>/dev/null; then
         reaped_dirs=$((reaped_dirs + 1)); reaped_bytes=$((reaped_bytes + lbytes))
         journal_line "$(now_iso)  burst-lane  reap  ok  (dir=$relkey bytes=$lbytes reason=legacy-no-local-match)"
@@ -4256,7 +4393,7 @@ reap_orphans() {
   # remnant, so never orphan-eligible.
   local list_cmd="find '$REMOTE_ROOT' -mindepth 1 -maxdepth 1 -not -name '.*' -printf '%T@\t%f\n' 2>/dev/null"
   local list_out list_rc=0
-  list_out="$("$SSH_BIN" -o StrictHostKeyChecking=no -o ConnectTimeout=8 -i "$SSH_KEY" \
+  list_out="$("$SSH_BIN" $(ssh_kh_args) -o ConnectTimeout=8 -i "$SSH_KEY" \
       "$REMOTE_USER@$ip" "$list_cmd" 2>/dev/null)" || list_rc=$?
   if [ "$list_rc" -ne 0 ]; then
     journal_line "$(now_iso)  burst-lane  reap  fail  (cause=ssh rc=$list_rc)"
@@ -4311,10 +4448,10 @@ reap_orphans() {
           continue
         fi
         local bytes
-        bytes="$("$SSH_BIN" -o StrictHostKeyChecking=no -o ConnectTimeout=8 -i "$SSH_KEY" \
+        bytes="$("$SSH_BIN" $(ssh_kh_args) -o ConnectTimeout=8 -i "$SSH_KEY" \
             "$REMOTE_USER@$ip" "du -sb '$REMOTE_ROOT/$name' 2>/dev/null | cut -f1" 2>/dev/null)"
         bytes="${bytes:-0}"; case "$bytes" in ''|*[!0-9]*) bytes=0 ;; esac
-        if "$SSH_BIN" -o StrictHostKeyChecking=no -o ConnectTimeout=8 -i "$SSH_KEY" \
+        if "$SSH_BIN" $(ssh_kh_args) -o ConnectTimeout=8 -i "$SSH_KEY" \
              "$REMOTE_USER@$ip" "rm -rf '$REMOTE_ROOT/$name'" 2>/dev/null; then
           reaped_dirs=$((reaped_dirs + 1)); reaped_bytes=$((reaped_bytes + bytes))
           journal_line "$(now_iso)  burst-lane  reap  ok  (dir=$name bytes=$bytes reason=$reason)"
@@ -4359,7 +4496,7 @@ box_isolation_check() {
   local ip; ip="$(state_read ip)"
   local list_cmd="find '$REMOTE_ROOT' -mindepth 1 -maxdepth 1 -not -name '.*' -printf '%f\n' 2>/dev/null"
   local list_out
-  list_out="$("$SSH_BIN" -o StrictHostKeyChecking=no -o ConnectTimeout=8 -i "$SSH_KEY" \
+  list_out="$("$SSH_BIN" $(ssh_kh_args) -o ConnectTimeout=8 -i "$SSH_KEY" \
       "$REMOTE_USER@$ip" "$list_cmd" 2>/dev/null)" || { echo "ok: box unreachable, nothing to check"; return 0; }
   local name breach=0
   while IFS= read -r name; do
@@ -4770,8 +4907,70 @@ print(sum(1 for v in first_warm.values() if v))
 }
 
 # ---- down ---------------------------------------------------------------------
+# Requirement 3: teardown-order side effects (dirty sweep, in-flight gate
+# wait, credential shred, volume detach) then destroy_verify — factored out
+# of `down`'s scheduled-window delete so requirement 3's new unproven-box
+# immediate-delete path (below) gets identical hygiene, not a shortcut
+# copy, and so `watchdog`'s matching block never drifts from `down`'s.
+# Prints "hrs|eur|served|alive" on stdout and returns 0 on a confirmed
+# destroy; prints nothing and returns 1 on a LEAK-FLAG (still present after
+# destroy_verify's 3 retries) — caller owns the decision/journal line.
+teardown_and_delete() {  # $1=id $2=caller_tag(down|watchdog)
+  local id="$1" caller="$2" ip alive
+  ip="$(state_read ip)"; alive="$(minutes_alive)"
+  sweep_dirty_worktrees "$caller"
+  gate_wait_for_inflight "$caller"
+  shred_gate_credential "$ip" "$caller"
+  volume_teardown "$ip" "$caller"
+  if destroy_verify "$id"; then
+    local hrs eur served
+    hrs="$(awk -v m="$alive" 'BEGIN{printf "%.4f", m/60.0}')"
+    eur="$(awk -v h="$hrs" -v r="$COST_PER_HOUR_EUR" 'BEGIN{printf "%.4f", h*r}')"
+    served="$( [ -f "$SERVED_FILE" ] && paste -sd, "$SERVED_FILE" 2>/dev/null || true)"
+    local prorate_out orphan_sid
+    prorate_out="$(prorate_attribution "$id" "$hrs" "$eur" "$caller")" || true
+    while IFS= read -r orphan_sid; do
+      case "$orphan_sid" in
+        ORPHANED:*)
+          journal_line "$(now_iso)  burst-lane  $caller  attribution-orphan-included  (session_id=${orphan_sid#ORPHANED:} — crashed prior session's rows folded into this teardown's proration)"
+          ;;
+      esac
+    done <<<"$prorate_out"
+    ledger_append "$hrs" "$eur" "$id"
+    printf '%s|%s|%s|%s\n' "$hrs" "$eur" "${served:-none}" "$alive"
+    return 0
+  fi
+  return 1
+}
+
+# Requirement 3: an explicit, unconditional teardown — bypasses every keep
+# rule, the billed-hour window, and cost/attribution bookkeeping entirely.
+# Always rc=0, even when the server hcloud once knew about is already gone
+# — this is the exact operator recovery step the 2026-09-13 incident needed
+# and didn't have (a raw hcloud delete plus a stale session.json left
+# behind after it).
+cmd_down_force() {
+  local id; id="$(state_read server_id)"
+  if [ -n "$id" ]; then
+    if destroy_verify "$id"; then
+      journal_line "$(now_iso)  burst-lane  down  decision=force-deleted  (server_id=$id)"
+    else
+      journal_line "$(now_iso)  burst-lane  down  LEAK-FLAG  (server_id=$id action=page-a-human — force-delete did not confirm destroyed after 3 retries)"
+    fi
+  else
+    journal_line "$(now_iso)  burst-lane  down  decision=force-deleted  (server_id=none — nothing tracked)"
+  fi
+  session_known_hosts_remove
+  rm -f "$STATE_FILE" "$SERVED_FILE"
+  echo "decision=force-deleted"
+  exit 0
+}
+
 cmd_down() {
   local more_work=0
+  if [ "${1:-}" = "--force" ]; then
+    cmd_down_force
+  fi
   [ "${1:-}" = "--more-work-queued" ] && more_work=1
 
   # PRD-build-cost-attribution requirement 4: cursor-guarded, so this is a
@@ -4796,19 +4995,46 @@ cmd_down() {
   reap_orphans >/dev/null 2>&1 || true
 
   if rust_work_remains || [ "$more_work" -eq 1 ]; then
-    if [ "$(state_read teardown_scheduled)" = "true" ]; then
-      state_write "server_id=$id" "ip=$(state_read ip)" "server_type=$(state_read server_type)" \
-        "boot_ts=$(state_read boot_ts)" "boot_epoch=$boot_epoch" "ttl_hours=$(state_read ttl_hours)" \
-        "hard_ttl_hours=$(state_read hard_ttl_hours)" "runs_served=$(state_read runs_served)" \
-        "sandbox_ok=$(state_read sandbox_ok)" "teardown_scheduled=false" "teardown_epoch=" "verified=$(state_read verified)" \
-        "remote_user=$(state_read remote_user)" \
-        "gate_ready=$(state_read gate_ready)" "gate_tools_missing=$(state_read gate_tools_missing)"
-      journal_line "$(now_iso)  burst-lane  down  decision=keep  (server_id=$id cause=rust-work-arrived, schedule cancelled)"
-    else
-      journal_line "$(now_iso)  burst-lane  down  decision=keep  (server_id=$id)"
+    # Requirement 3 (cost-safe keep rules): rust-work-remains — or any other
+    # keep rule — may only keep a box that has actually PROVEN useful:
+    # gate_ready AND runs_served>=1. The 2026-09-13 incident: a provision-
+    # failed box (gate_ready=false, runs_served=0) was kept anyway because a
+    # repo parity diff looked like remaining rust work, and sat billed-and-
+    # idle until an operator force-deleted it by hand. An unproven box is
+    # ALWAYS deleted here instead, immediately (not scheduled for the end of
+    # the billed hour — there is no reason to wait out a box that never
+    # earned its keep).
+    local gate_ready runs_served
+    gate_ready="$(state_read gate_ready)"
+    runs_served="$(state_read runs_served)"
+    case "$runs_served" in ''|*[!0-9]*) runs_served=0 ;; esac
+    if [ "$gate_ready" = "true" ] && [ "$runs_served" -ge 1 ]; then
+      if [ "$(state_read teardown_scheduled)" = "true" ]; then
+        state_write "server_id=$id" "ip=$(state_read ip)" "server_type=$(state_read server_type)" \
+          "boot_ts=$(state_read boot_ts)" "boot_epoch=$boot_epoch" "ttl_hours=$(state_read ttl_hours)" \
+          "hard_ttl_hours=$(state_read hard_ttl_hours)" "runs_served=$(state_read runs_served)" \
+          "sandbox_ok=$(state_read sandbox_ok)" "teardown_scheduled=false" "teardown_epoch=" "verified=$(state_read verified)" \
+          "remote_user=$(state_read remote_user)" \
+          "gate_ready=$(state_read gate_ready)" "gate_tools_missing=$(state_read gate_tools_missing)"
+        journal_line "$(now_iso)  burst-lane  down  decision=keep  (server_id=$id cause=rust-work-arrived, schedule cancelled)"
+      else
+        journal_line "$(now_iso)  burst-lane  down  decision=keep  (server_id=$id)"
+      fi
+      echo "decision=keep"
+      exit 0
     fi
-    echo "decision=keep"
-    exit 0
+    local result_u hrs_u eur_u served_u alive_u
+    if result_u="$(teardown_and_delete "$id" down)"; then
+      IFS='|' read -r hrs_u eur_u served_u alive_u <<<"$result_u"
+      journal_line "$(now_iso)  burst-lane  down  decision=deleted  (server_id=$id cause=unproven-box gate_ready=${gate_ready:-false} runs_served=$runs_served minutes=$alive_u cost_eur=$eur_u prds=$served_u)"
+      state_clear
+      session_known_hosts_remove
+      echo "decision=deleted"
+      exit 0
+    fi
+    journal_line "$(now_iso)  burst-lane  down  LEAK-FLAG  (server_id=$id action=page-a-human — destroy failed after 3 retries)"
+    echo "LEAK-FLAG: server $id did not confirm destroyed after 3 retries"
+    exit 1
   fi
 
   # No rust work remains anywhere in build-queue/. Schedule deletion for the
@@ -4823,47 +5049,12 @@ cmd_down() {
   window_start=$(( hour_end - 120 ))
 
   if [ "$now" -ge "$window_start" ]; then
-    local alive; alive="$(minutes_alive)"
-    # PRD-build-burst-pull-on-demand requirement 4: every still-dirty
-    # worktree gets pulled (or goes cold) before the box that would strand
-    # its artifacts is destroyed. Never blocks/aborts the teardown itself.
-    sweep_dirty_worktrees down
-    # PRD-build-gate-on-casper requirement 7: wait for (or, past budget,
-    # abandon) any remote gate still running before the box that's running
-    # it is destroyed.
-    gate_wait_for_inflight down
-    # PRD-build-gate-on-casper requirement 4: shred the reviewer credential
-    # (if one was ever placed — a no-op, un-journaled, otherwise) before the
-    # box that would carry it away is destroyed.
-    shred_gate_credential "$(state_read ip)" down
-    # PRD-build-burst-persistent-volume requirement 2: sync/unmount/detach
-    # BEFORE the server delete that follows — never blocks it (Hetzner
-    # detaches on delete regardless; a failure here only marks volume_dirty
-    # for the next up's fsck).
-    volume_teardown "$(state_read ip)" down
-    if destroy_verify "$id"; then
-      local hrs; hrs="$(awk -v m="$alive" 'BEGIN{printf "%.4f", m/60.0}')"
-      local eur; eur="$(awk -v h="$hrs" -v r="$COST_PER_HOUR_EUR" 'BEGIN{printf "%.4f", h*r}')"
-      local served; served="$( [ -f "$SERVED_FILE" ] && paste -sd, "$SERVED_FILE" 2>/dev/null || true)"
-      # PRD-build-cost-attribution requirement 2: prorate this session's
-      # cost across the slugs that were actually attributed to it (plus any
-      # orphaned rows a crashed prior session left behind — named below).
-      # Runs BEFORE ledger_append so the session-total row this teardown
-      # writes stays the LAST line in cost.jsonl (existing readers of
-      # requirement 13's row assume that positionally, e.g. "the row I just
-      # wrote is the tail").
-      local prorate_out orphan_sid
-      prorate_out="$(prorate_attribution "$id" "$hrs" "$eur" down)" || true
-      while IFS= read -r orphan_sid; do
-        case "$orphan_sid" in
-          ORPHANED:*)
-            journal_line "$(now_iso)  burst-lane  down  attribution-orphan-included  (session_id=${orphan_sid#ORPHANED:} — crashed prior session's rows folded into this teardown's proration)"
-            ;;
-        esac
-      done <<<"$prorate_out"
-      ledger_append "$hrs" "$eur" "$id"
-      journal_line "$(now_iso)  burst-lane  down  decision=deleted  (server_id=$id minutes=$alive cost_eur=$eur prds=${served:-none})"
+    local result hrs eur served alive
+    if result="$(teardown_and_delete "$id" down)"; then
+      IFS='|' read -r hrs eur served alive <<<"$result"
+      journal_line "$(now_iso)  burst-lane  down  decision=deleted  (server_id=$id minutes=$alive cost_eur=$eur prds=$served)"
       state_clear
+      session_known_hosts_remove
       echo "decision=deleted"
       exit 0
     fi
@@ -4917,39 +5108,15 @@ cmd_watchdog() {
     exit 0
   fi
 
-  local alive; alive="$(minutes_alive)"
-  # PRD-build-burst-pull-on-demand requirement 4: same sweep as `down`'s
-  # delete path — the watchdog is a teardown path too and must not strand
-  # artifacts either.
-  sweep_dirty_worktrees watchdog
-  # PRD-build-gate-on-casper requirement 7: same in-flight gate wait/abandon
-  # as `down`'s delete path — the watchdog is a teardown path too.
-  gate_wait_for_inflight watchdog
-  # PRD-build-gate-on-casper requirement 4: same credential shred as
-  # `down`'s delete path — the watchdog is a teardown path too.
-  shred_gate_credential "$(state_read ip)" watchdog
-  # PRD-build-burst-persistent-volume requirement 2: same teardown-order
-  # detach as `down`'s delete path — the watchdog is a teardown path too.
-  volume_teardown "$(state_read ip)" watchdog
-  if destroy_verify "$id"; then
-    local hrs eur
-    hrs="$(awk -v m="$alive" 'BEGIN{printf "%.4f", m/60.0}')"
-    eur="$(awk -v h="$hrs" -v r="$COST_PER_HOUR_EUR" 'BEGIN{printf "%.4f", h*r}')"
-    local served; served="$( [ -f "$SERVED_FILE" ] && paste -sd, "$SERVED_FILE" 2>/dev/null || true)"
-    # See cmd_down's matching comment: prorate BEFORE ledger_append so the
-    # session-total row stays the last line in cost.jsonl.
-    local prorate_out orphan_sid
-    prorate_out="$(prorate_attribution "$id" "$hrs" "$eur" watchdog)" || true
-    while IFS= read -r orphan_sid; do
-      case "$orphan_sid" in
-        ORPHANED:*)
-          journal_line "$(now_iso)  burst-lane  watchdog  attribution-orphan-included  (session_id=${orphan_sid#ORPHANED:} — crashed prior session's rows folded into this teardown's proration)"
-          ;;
-      esac
-    done <<<"$prorate_out"
-    ledger_append "$hrs" "$eur" "$id"
-    journal_line "$(now_iso)  burst-lane  watchdog  teardown  (server_id=$id uptime=${alive}m cost_eur=$eur prds=${served:-none})"
+  # The watchdog is a teardown path too — same hygiene (dirty sweep, gate
+  # wait, credential shred, volume detach) as `down`'s delete path, via the
+  # shared teardown_and_delete helper (PRD-build-burst-session-hygiene).
+  local result hrs eur served alive
+  if result="$(teardown_and_delete "$id" watchdog)"; then
+    IFS='|' read -r hrs eur served alive <<<"$result"
+    journal_line "$(now_iso)  burst-lane  watchdog  teardown  (server_id=$id uptime=${alive}m cost_eur=$eur prds=$served)"
     state_clear
+    session_known_hosts_remove
     echo "watchdog teardown: $id (${alive}m)"
     exit 0
   fi
@@ -4976,7 +5143,7 @@ cmd_watchdog() {
 probe_remote_capacity() {  # $1 = ip -> stdout "avail_gb nproc free_disk_gb"; rc 1 on failure
   local ip="$1" out
   local remote_cmd='avail_kb=$(grep MemAvailable /proc/meminfo | awk "{print \$2}"); disk_gb=$(df -BG --output=avail '"$REMOTE_ROOT"' 2>/dev/null | tail -n1 | tr -dc "0-9"); echo $((avail_kb/1024/1024)) $(nproc) ${disk_gb:-}'
-  out="$("$SSH_BIN" -o StrictHostKeyChecking=no -o ConnectTimeout=8 -i "$SSH_KEY" \
+  out="$("$SSH_BIN" $(ssh_kh_args) -o ConnectTimeout=8 -i "$SSH_KEY" \
         "$REMOTE_USER@$ip" "$remote_cmd" 2>/dev/null)" || return 1
   [ -n "$out" ] || return 1
   echo "$out"

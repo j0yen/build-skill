@@ -21,6 +21,41 @@ if [ "${FAKE_RSYNC_FAIL:-0}" = "1" ]; then
   echo "${FAKE_RSYNC_FAIL_MSG:-rsync: fake failure injected}" >&2
   exit "${FAKE_RSYNC_FAIL_RC:-23}"
 fi
+
+# PRD-build-burst-session-hygiene AC1: one line per rsync invocation, same
+# shape as the fake ssh's own FAKE_SSH_KH_LOG — this is what proves an
+# rsync call's own `-e "$SSH_BIN -o UserKnownHostsFile=... -o
+# StrictHostKeyChecking=accept-new -i $SSH_KEY"` string carries the same
+# session-scoped options every ssh call site does (rsync never gets bare
+# `-o` argv of its own — both flags are embedded as substrings of the single
+# `-e` argument, so this greps THAT argument rather than iterating argv
+# pieces the way the ssh fixture does).
+if [ -n "${FAKE_RSYNC_KH_LOG:-}" ]; then
+  _kh_e=""
+  for _kh_a in "$@"; do
+    case "$_kh_a" in *UserKnownHostsFile=*) _kh_e="$_kh_a" ;; esac
+  done
+  _kh_uh="NONE"; _kh_shc="NONE"
+  [[ "$_kh_e" == *UserKnownHostsFile=* ]] && _kh_uh="$(grep -oE 'UserKnownHostsFile=[^ ]+' <<<"$_kh_e")"
+  [[ "$_kh_e" == *StrictHostKeyChecking=* ]] && _kh_shc="$(grep -oE 'StrictHostKeyChecking=[^ ]+' <<<"$_kh_e")"
+  printf '%s %s\n' "$_kh_uh" "$_kh_shc" >> "$FAKE_RSYNC_KH_LOG"
+fi
+
+# PRD-build-burst-session-hygiene AC2/AC6: same changed-host-key fixture as
+# the fake ssh — a `-e` string naming a UserKnownHostsFile whose content is
+# exactly "STALE-HOST-KEY" fails exactly like a real rsync-over-ssh would
+# against a reused IP with a mismatching global known_hosts entry.
+for _kh_a in "$@"; do
+  case "$_kh_a" in
+    *UserKnownHostsFile=*)
+      _kh_file="${_kh_a#*UserKnownHostsFile=}"; _kh_file="${_kh_file%% *}"
+      if [ -f "$_kh_file" ] && grep -qx 'STALE-HOST-KEY' "$_kh_file" 2>/dev/null; then
+        echo "@WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!" >&2
+        exit 255
+      fi
+      ;;
+  esac
+done
 src="${*: -2:1}"
 dst="${*: -1:1}"
 local_dst="${dst#*:}"

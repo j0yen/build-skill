@@ -431,8 +431,17 @@ cat > "$BURST_LANE_PRD_DIR/build-queue/PRD-fake-rust.md" <<'EOF'
 - Status: queued
 - build_target: rust-extend
 EOF
+# PRD-build-burst-session-hygiene requirement 3: rust-work-remains may only
+# KEEP a box that has proven itself (gate_ready AND runs_served>=1) — this
+# session's own gate_ready is false (this dev host's real autobuilder check,
+# unrelated to this fixture's own concern), so simulate a proven box the
+# same way this suite already hand-patches other session.json fields
+# (sandbox_ok, remote_user above) rather than dragging in a full gate-tools
+# fixture just to flip one bit. runs_served is already >=1 from AC1/AC2's
+# four `run` calls above.
+sed -i 's/"gate_ready":"false"/"gate_ready":"true"/' "$BURST_LANE_STATE_DIR/session.json"
 down_out="$("$BL" down)"
-expect "down keeps the session while rust work is queued" "[ \"$down_out\" = 'decision=keep' ]"
+expect "down keeps the session while rust work is queued (proven box)" "[ \"$down_out\" = 'decision=keep' ]"
 expect "down journaled decision=keep" "grep -q 'decision=keep' \"$BURST_LANE_JOURNAL\""
 
 # ---- AC8: down schedules, then deletes at the hour boundary -----------------
@@ -3549,6 +3558,193 @@ unset BURST_LANE_FAKE_HEAD
 # cases — same in-band closing assertion every sibling PRD's own block ends
 # with (see pathdeps AC6 just above).
 expect "pathws AC6: every pathws case above ran green" "[ $fail -eq 0 ]"
+
+# ==============================================================================
+# ---- bursthyg: PRD-build-burst-session-hygiene ------------------------------
+# ==============================================================================
+# Three defects from the 2026-09-13 04:44Z instrumented real-box run: (1) a
+# reused Hetzner IP with a stale GLOBAL ~/.ssh/known_hosts entry hard-failed
+# every burst ssh/rsync; (2) `down` kept a provision-failed, zero-runs box
+# because a repo parity diff looked like remaining rust work; (3) `status`
+# kept reporting active:true (and volume.json kept claiming a mount) after
+# an out-of-band `hcloud server/volume delete`. Every case below is a
+# fixture-only proof of option-wiring/state-transitions (AC8, the real-box
+# proof, is deferred — see this PRD's own frontmatter).
+
+# ---- bursthyg AC1/AC2: every ssh/rsync call carries THIS session's
+# UserKnownHostsFile + StrictHostKeyChecking=accept-new, never
+# ~/.ssh/known_hosts — proven even with a stale GLOBAL known_hosts-shaped
+# file sitting on disk (the 2026-09-13 reused-IP incident), since
+# burst-lane.sh never names that path at all.
+fresh_env
+export FAKE_SSH_KH_LOG="$T/ssh-kh.log"; : > "$FAKE_SSH_KH_LOG"
+export FAKE_RSYNC_KH_LOG="$T/rsync-kh.log"; : > "$FAKE_RSYNC_KH_LOG"
+# A fixture stand-in for a stale, mismatching GLOBAL ~/.ssh/known_hosts —
+# scoped under $T (this suite must never touch the real one). Its content
+# is the fake ssh/rsync's own "changed host key" sentinel (see both
+# fixtures' AC2/AC6 comment): if burst-lane.sh ever pointed a call at this
+# path, that call would fail with rc=255, "REMOTE HOST IDENTIFICATION HAS
+# CHANGED!" — exactly like the real 2026-09-13 incident.
+HYG_STALE_GLOBAL_KH="$T/fake-global-known_hosts"
+echo "STALE-HOST-KEY" > "$HYG_STALE_GLOBAL_KH"
+hyg1_out="$("$BL" up)"; hyg1_rc=$?
+expect "bursthyg AC2: up succeeds despite a stale GLOBAL known_hosts-shaped file existing on disk" "[ $hyg1_rc -eq 0 ]"
+hyg1_sid="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+hyg1_khfile="$BURST_LANE_STATE_DIR/known_hosts.$hyg1_sid"
+expect "bursthyg AC1: a session known_hosts file was created, keyed by session_id" "[ -f \"$hyg1_khfile\" ]"
+# Round-trip a run+pull too, so the rsync log is exercised, not just ssh.
+HYG_WT="$T/hyg-wt"; mkdir -p "$HYG_WT"
+echo 'mkdir -p target && echo built > target/out.txt' > "$HYG_WT/build.sh"
+"$BL" run "$HYG_WT" -- bash build.sh >/dev/null 2>&1
+"$BL" pull "$HYG_WT" >/dev/null 2>&1
+expect "bursthyg AC1: at least one ssh call was logged" "[ -s \"$FAKE_SSH_KH_LOG\" ]"
+expect "bursthyg AC1: at least one rsync call was logged" "[ -s \"$FAKE_RSYNC_KH_LOG\" ]"
+expect "bursthyg AC1: every ssh call carries this session's UserKnownHostsFile" \
+  "! grep -qvF \"UserKnownHostsFile=$hyg1_khfile\" \"$FAKE_SSH_KH_LOG\""
+expect "bursthyg AC1: every ssh call carries StrictHostKeyChecking=accept-new" \
+  "! grep -qv 'StrictHostKeyChecking=accept-new' \"$FAKE_SSH_KH_LOG\""
+expect "bursthyg AC1: every rsync call also carries this session's UserKnownHostsFile" \
+  "! grep -qvF \"UserKnownHostsFile=$hyg1_khfile\" \"$FAKE_RSYNC_KH_LOG\""
+expect "bursthyg AC1: every rsync call also carries StrictHostKeyChecking=accept-new" \
+  "! grep -qv 'StrictHostKeyChecking=accept-new' \"$FAKE_RSYNC_KH_LOG\""
+expect "bursthyg AC1: no ssh call ever names a real-shaped ~/.ssh/known_hosts path" \
+  "! grep -q '\.ssh/known_hosts' \"$FAKE_SSH_KH_LOG\""
+expect "bursthyg AC1: no ssh call ever names this test's stale-global fixture file" \
+  "! grep -qF \"$HYG_STALE_GLOBAL_KH\" \"$FAKE_SSH_KH_LOG\" \"$FAKE_RSYNC_KH_LOG\""
+
+# ---- bursthyg AC2 negative case (prd-lint's selftest-no-negative-case
+# convention): the STALE-HOST-KEY sentinel really does fail a call when a
+# UserKnownHostsFile actually IS the poisoned one — proving the fixture
+# models the real defect, not just an inert grep target the happy-path case
+# above could pass by accident.
+hyg2_neg_out="$(ssh -o UserKnownHostsFile="$HYG_STALE_GLOBAL_KH" -o StrictHostKeyChecking=accept-new -i /dev/null root@127.0.0.1 true 2>&1)"; hyg2_neg_rc=$?
+expect "bursthyg AC2 (negative case): the fixture itself fails against a genuinely poisoned known_hosts file" "[ $hyg2_neg_rc -eq 255 ]"
+expect "bursthyg AC2 (negative case): failure names the real ssh wording" "grep -qi 'REMOTE HOST IDENTIFICATION HAS CHANGED' <<<\"$hyg2_neg_out\""
+
+# ---- bursthyg AC3: up reconciles session.json against hcloud reality ------
+fresh_env
+"$BL" up >/dev/null 2>&1
+hyg3_sid="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+hcloud server delete "$hyg3_sid" >/dev/null 2>&1   # out-of-band delete, the 2026-09-13 incident
+hyg3_out="$("$BL" up)"; hyg3_rc=$?
+expect "bursthyg AC3: up succeeds after reconciling an absent server" "[ $hyg3_rc -eq 0 ]"
+expect "bursthyg AC3: up reports a genuinely NEW box, not an adoption" "grep -q '^up: ' <<<\"$hyg3_out\""
+expect "bursthyg AC3: the stale session.json was archived (not silently deleted)" \
+  "ls \"$BURST_LANE_STATE_DIR\"/session.json.stale-* >/dev/null 2>&1"
+hyg3_new_sid="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+expect "bursthyg AC3: the new session has a different server_id than the absent one" "[ \"$hyg3_new_sid\" != \"$hyg3_sid\" ]"
+expect "bursthyg AC3: journal recorded the stale-session reconcile" "grep -q 'burst-lane  session  stale' \"$BURST_LANE_JOURNAL\""
+
+# ---- bursthyg AC4: down's cost-safe keep rule ------------------------------
+# rust-work-remains (a repo-parity-diff-shaped signal) may not keep a box
+# that never proved itself: gate_ready defaults false on this dev host's own
+# real autobuilder check (see the pre-existing AC8 block's sed-patch,
+# earlier in this file) and runs_served defaults 0 on a box that never
+# served a `run` — this session is "unproven" by construction.
+fresh_env
+"$BL" up >/dev/null 2>&1
+hyg4_sid="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+cat > "$BURST_LANE_PRD_DIR/build-queue/PRD-fake-rust-hyg.md" <<'EOF'
+# PRD — fake-rust-hyg
+
+- Status: queued
+- build_target: rust-extend
+EOF
+hyg4_out="$("$BL" down)"
+expect "bursthyg AC4: down deletes an unproven box despite rust-work-remains" "[ \"$hyg4_out\" = 'decision=deleted' ]"
+expect "bursthyg AC4: journal names the cause as unproven-box" \
+  "grep -q 'burst-lane  down  decision=deleted.*cause=unproven-box' \"$BURST_LANE_JOURNAL\""
+expect "bursthyg AC4: session.json is gone" "[ ! -f \"$BURST_LANE_STATE_DIR/session.json\" ]"
+expect "bursthyg AC4: the fake hcloud confirms the server is actually gone" "! hcloud server describe \"$hyg4_sid\" -o json >/dev/null 2>&1"
+rm -f "$BURST_LANE_PRD_DIR/build-queue/PRD-fake-rust-hyg.md"
+
+# ---- bursthyg AC5: down --force --------------------------------------------
+fresh_env
+"$BL" up >/dev/null 2>&1
+hyg5a_sid="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+hyg5a_kh="$BURST_LANE_STATE_DIR/known_hosts.$hyg5a_sid"
+expect "bursthyg AC5 setup: session known_hosts file exists before force" "[ -f \"$hyg5a_kh\" ]"
+hyg5a_out="$("$BL" down --force)"; hyg5a_rc=$?
+expect "bursthyg AC5: down --force exits 0 against a live box" "[ $hyg5a_rc -eq 0 ]"
+expect "bursthyg AC5: down --force reports force-deleted" "[ \"$hyg5a_out\" = 'decision=force-deleted' ]"
+expect "bursthyg AC5: down --force actually deleted the fake server" "! hcloud server describe \"$hyg5a_sid\" -o json >/dev/null 2>&1"
+expect "bursthyg AC5: session.json is removed" "[ ! -f \"$BURST_LANE_STATE_DIR/session.json\" ]"
+expect "bursthyg AC5: the session known_hosts file is removed" "[ ! -f \"$hyg5a_kh\" ]"
+
+# AC5's own literal scenario: session state naming a server that's ALREADY
+# gone (an operator's raw hcloud delete, or a crashed prior force call).
+"$BL" up >/dev/null 2>&1
+hyg5b_sid="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+hyg5b_kh="$BURST_LANE_STATE_DIR/known_hosts.$hyg5b_sid"
+hcloud server delete "$hyg5b_sid" >/dev/null 2>&1
+hyg5b_out="$("$BL" down --force)"; hyg5b_rc=$?
+expect "bursthyg AC5: down --force exits 0 even when the server is already gone" "[ $hyg5b_rc -eq 0 ]"
+expect "bursthyg AC5: down --force still reports force-deleted for an already-gone server" "[ \"$hyg5b_out\" = 'decision=force-deleted' ]"
+expect "bursthyg AC5: session.json is still removed" "[ ! -f \"$BURST_LANE_STATE_DIR/session.json\" ]"
+expect "bursthyg AC5: the session known_hosts file is still removed" "[ ! -f \"$hyg5b_kh\" ]"
+
+# down --force with NO session at all must also stay rc=0 (nothing to do).
+hyg5c_out="$("$BL" down --force)"; hyg5c_rc=$?
+expect "bursthyg AC5: down --force exits 0 with no active session at all" "[ $hyg5c_rc -eq 0 ]"
+
+# ---- bursthyg AC6: status --json reconciles the session's server ----------
+fresh_env
+"$BL" up >/dev/null 2>&1
+hyg6_pos_json="$("$BL" status --json)"
+# Computed OUTSIDE expect's own eval — a JSON blob's embedded quotes/braces
+# is exactly the kind of content that corrupts an eval'd condition string
+# if interpolated directly into one (the pw4_repeated_rc pattern earlier in
+# this file uses the same guard, for the same reason).
+hyg6_pos_rc=1
+grep -q '"active":true' <<<"$hyg6_pos_json" && grep -q '"server_verified":true' <<<"$hyg6_pos_json" && hyg6_pos_rc=0
+expect "bursthyg AC6: a live, hcloud-confirmed session reports active:true + server_verified:true" "[ $hyg6_pos_rc -eq 0 ]"
+hyg6_sid="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+hcloud server delete "$hyg6_sid" >/dev/null 2>&1
+hyg6_json="$("$BL" status --json)"; hyg6_rc=$?
+expect "bursthyg AC6: status --json exits 0 even when the tracked server is gone" "[ $hyg6_rc -eq 0 ]"
+hyg6_active_rc=1; grep -q '"active":false' <<<"$hyg6_json" && hyg6_active_rc=0
+hyg6_verified_rc=1; grep -q '"server_verified":false' <<<"$hyg6_json" && hyg6_verified_rc=0
+expect "bursthyg AC6: status reports active:false" "[ $hyg6_active_rc -eq 0 ]"
+expect "bursthyg AC6: status reports server_verified:false" "[ $hyg6_verified_rc -eq 0 ]"
+expect "bursthyg AC6: session.json was archived" "ls \"$BURST_LANE_STATE_DIR\"/session.json.stale-* >/dev/null 2>&1"
+
+# ---- bursthyg AC7: volume.json gets the same reconcile treatment ----------
+fresh_env
+export BURST_VOLUME_NAME="wm-burst-build-hyg"
+"$BL" up >/dev/null 2>&1
+hyg7_vid="$(grep -oE '"volume_id":"?[0-9]+"?' "$BURST_LANE_STATE_DIR/volume.json" | grep -oE '[0-9]+')"
+expect "bursthyg AC7 setup: volume.json recorded a volume_id after up" "[ -n \"$hyg7_vid\" ]"
+# Out-of-band volume delete (2026-09-13: volume 106857883) — the fake hcloud
+# has no `volume delete` verb of its own, so drop the line directly; same
+# end state ("hcloud reports it absent") a real delete leaves.
+sed -i "/^$hyg7_vid|/d" "$FAKE_HCLOUD_VOLUME_STATE"
+hyg7_json="$("$BL" status --json)"; hyg7_rc=$?
+expect "bursthyg AC7: status --json exits 0 even when the tracked volume is gone" "[ $hyg7_rc -eq 0 ]"
+hyg7_verified_rc=1; grep -q '"volume_verified":false' <<<"$hyg7_json" && hyg7_verified_rc=0
+expect "bursthyg AC7: status reports volume_verified:false" "[ $hyg7_verified_rc -eq 0 ]"
+expect "bursthyg AC7: volume.json was archived" "ls \"$BURST_LANE_STATE_DIR\"/volume.json.stale-* >/dev/null 2>&1"
+
+# `up` reconciles the volume too — even down the already-up fast path, which
+# returns before volume_ensure ever runs, so this is the only way an
+# operator calling `up` against a still-alive box learns the volume died. A
+# fresh session (not the already-archived one above) so this volume.json
+# starts real and unarchived.
+fresh_env
+export BURST_VOLUME_NAME="wm-burst-build-hyg3"
+"$BL" up >/dev/null 2>&1
+hyg7b_vid="$(grep -oE '"volume_id":"?[0-9]+"?' "$BURST_LANE_STATE_DIR/volume.json" | grep -oE '[0-9]+')"
+expect "bursthyg AC7b setup: volume.json recorded a volume_id after up" "[ -n \"$hyg7b_vid\" ]"
+sed -i "/^$hyg7b_vid|/d" "$FAKE_HCLOUD_VOLUME_STATE"
+"$BL" up >/dev/null 2>&1   # session still alive -> already-up fast path
+expect "bursthyg AC7: up (already-up fast path) also archives a volume.json whose volume hcloud reports absent" \
+  "ls \"$BURST_LANE_STATE_DIR\"/volume.json.stale-* >/dev/null 2>&1"
+
+# ---- bursthyg AC9 (P1 style closer): this fixture set exits 0 and names
+# its own bursthyg cases — same in-band closing assertion every sibling
+# PRD's own block ends with (see pathws AC6 just above). AC8 (a real-box
+# up -> provision -> down cycle) is deferred — see this PRD's own
+# deferred_acs/mock_justifications frontmatter.
+expect "bursthyg: every bursthyg case above ran green" "[ $fail -eq 0 ]"
 
 echo "=== $([ $fail -eq 0 ] && echo PASS || echo FAIL) ==="
 exit $fail

@@ -18,6 +18,51 @@
 set -uo pipefail
 args=("$@")
 cmd="${args[-1]}"
+
+# PRD-build-burst-session-hygiene AC1: one line per ssh invocation, holding
+# ONLY the two -o values this PRD cares about (never the whole "$*" —  a
+# remote command's own multi-line body can span many lines and would make a
+# naive whole-argv dump uncountable 1-line-per-call). "NONE" when a flag is
+# absent, so a selftest can assert every line names both, and none ever
+# names the real global known_hosts path. Opt-in (unset by default), so no
+# pre-existing test's call-count assertions change shape.
+if [ -n "${FAKE_SSH_KH_LOG:-}" ]; then
+  _kh_uh="NONE"; _kh_shc="NONE"
+  for _kh_a in "${args[@]}"; do
+    case "$_kh_a" in
+      UserKnownHostsFile=*)    _kh_uh="$_kh_a" ;;
+      StrictHostKeyChecking=*) _kh_shc="$_kh_a" ;;
+    esac
+  done
+  printf '%s %s\n' "$_kh_uh" "$_kh_shc" >> "$FAKE_SSH_KH_LOG"
+fi
+
+# PRD-build-burst-session-hygiene AC2/AC6: changed-host-key fixture. A
+# UserKnownHostsFile whose content is exactly the sentinel line
+# "STALE-HOST-KEY" simulates real ssh's behavior against a reused IP whose
+# known_hosts entry no longer matches the box's actual host key — real ssh
+# refuses with "REMOTE HOST IDENTIFICATION HAS CHANGED!" (exit 255) and
+# never runs the remote command at all. Any OTHER file (including a
+# freshly-created empty one — first contact, TOFU-pins and proceeds under
+# accept-new) connects normally. Checked before every other case below so it
+# applies uniformly to every call site (provision, gate, parity, reap
+# probes, the plain `true` reachability probe — everything).
+for ((_kh_i = 0; _kh_i < ${#args[@]}; _kh_i++)); do
+  if [ "${args[$_kh_i]}" = "-o" ]; then
+    case "${args[$((_kh_i + 1))]:-}" in
+      UserKnownHostsFile=*)
+        _kh_file="${args[$((_kh_i + 1))]#UserKnownHostsFile=}"
+        if [ -f "$_kh_file" ] && grep -qx 'STALE-HOST-KEY' "$_kh_file" 2>/dev/null; then
+          echo "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@" >&2
+          echo "@    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @" >&2
+          echo "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@" >&2
+          exit 255
+        fi
+        break
+        ;;
+    esac
+  fi
+done
 # PRD-build-burst-unprivileged-user: every invocation's "user@host" target
 # (always the arg immediately before the trailing command — every call site
 # in burst-lane.sh follows `ssh -o ... -i key user@host cmd`) is logged
