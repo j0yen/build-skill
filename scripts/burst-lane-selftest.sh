@@ -1778,8 +1778,12 @@ export FAKE_SSH_GATE_TOOLS_INSTALL_FAIL_STDERR='E: Unable to locate package mold
 "$BL" up >/dev/null
 gtc2_out="$("$BL" provision 2>&1)"; gtc2_rc=$?
 expect "gatetc AC2: provision exits 1 (mold still missing)" "[ $gtc2_rc -eq 1 ]"
+# PRD-build-burst-provision-forensics requirement 1: the terminal line now
+# carries secs=S too (install-start/install-failed grammar) — match on the
+# rc/err substring only, not the whole line, so this assertion doesn't pin
+# down the exact duration.
 expect "gatetc AC2: journal has the exact install-failed line for mold" \
-  "grep -q 'gate-tools  install-failed  (tool=mold rc=100 err=\"E: Unable to locate package mold\")' \"$BURST_LANE_JOURNAL\""
+  "grep -q 'gate-tools  install-failed  (tool=mold rc=100 secs=[0-9]* err=\"E: Unable to locate package mold\")' \"$BURST_LANE_JOURNAL\""
 expect "gatetc AC2: provision summary line lists mold in gate_tools_missing" \
   "grep -q 'burst-lane  provision  done.*gate_tools_missing=mold' \"$BURST_LANE_JOURNAL\""
 unset FAKE_SSH_GATE_TOOLS_MISSING FAKE_SSH_GATE_TOOLS_INSTALL_FAIL_TOOL FAKE_SSH_GATE_TOOLS_INSTALL_FAIL_RC FAKE_SSH_GATE_TOOLS_INSTALL_FAIL_STDERR
