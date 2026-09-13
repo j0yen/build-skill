@@ -2112,6 +2112,86 @@ json.dump(d, open(out_path, "w"), indent=2, sort_keys=True)
   exit 0
 }
 
+# ---- enable / disable (PRD-build-burst-dispatch-reenable requirement 4) --
+# The tick's ONLY opt-in surface. `enable` never edits
+# ~/.config/wm-burst/.env (that file also carries HCLOUD_TOKEN and
+# burst-configured.sh deliberately sources it only in a subshell — see that
+# file's header); instead it writes a diffable, single-purpose, one-`rm`-
+# reversible systemd user-service drop-in that sets BUILD_BURST_ENABLED=1
+# for claude-build.service specifically. It reads ONLY `resolve_boot_image`
+# (requirement 2, the same precedence `status`/`up` use) and `proof.json`
+# (requirement 3's own receipt) — never re-derives its own notion of "what
+# would `up` boot" or "is the proof fresh", so `enable` and `status --json`
+# can never disagree about either question.
+cmd_enable() {
+  local boot_image_id boot_image_source
+  read -r boot_image_id boot_image_source <<<"$(resolve_boot_image)"
+
+  local decision
+  decision="$(python3 -c '
+import calendar, json, sys, time
+
+proof_path, boot_image_id = sys.argv[1:3]
+
+def fail(cause):
+    print("refuse", cause)
+    raise SystemExit(0)
+
+try:
+    proof = json.load(open(proof_path))
+except Exception:
+    fail("no-proof")
+
+if proof.get("routed") is not True:
+    fail("not-routed")
+
+ts = proof.get("ts", "")
+try:
+    t = time.strptime(ts, "%Y-%m-%dT%H:%M:%SZ")
+    age_h = (time.time() - calendar.timegm(t)) / 3600.0
+except Exception:
+    fail("no-timestamp")
+
+if age_h > 168:
+    fail("stale")
+
+if proof.get("image_id") != boot_image_id:
+    fail("image-mismatch")
+
+print("allow", ts, proof.get("image_id", ""))
+' "$PROOF_STATE_FILE" "$boot_image_id")"
+
+  local verdict cause_or_ts image_id
+  read -r verdict cause_or_ts image_id <<<"$decision"
+
+  if [ "$verdict" != "allow" ]; then
+    journal_line "$(now_iso)  burst-lane  enable  refused  (cause=$cause_or_ts)"
+    echo "enable refused (cause=$cause_or_ts)" >&2
+    exit 3
+  fi
+
+  mkdir -p "$(dirname "$SYSTEMD_DROPIN")"
+  printf '[Service]\nEnvironment=BUILD_BURST_ENABLED=1\n' > "$SYSTEMD_DROPIN"
+  systemctl --user daemon-reload >/dev/null 2>&1 || true
+
+  journal_line "$(now_iso)  burst-lane  enable  done  (proof_ts=$cause_or_ts image_id=$image_id)"
+  echo "enable done: image_id=$image_id"
+  exit 0
+}
+
+cmd_disable() {
+  # $1 optional cause — defaults to "operator" (a manual `disable` call);
+  # the auto-disable trigger (requirement 5, a LATER step of this PRD) will
+  # pass its own cause (zero-run-sessions|eur-ceiling) through this same
+  # function rather than duplicating the drop-in removal.
+  local cause="${1:-operator}"
+  rm -f "$SYSTEMD_DROPIN"
+  systemctl --user daemon-reload >/dev/null 2>&1 || true
+  journal_line "$(now_iso)  burst-lane  disable  done  (cause=$cause)"
+  echo "disable done (cause=$cause)"
+  exit 0
+}
+
 cmd_up() {
   if ! burst_configured; then
     echo "burst: refused — not configured (RedBaron-local policy); set BUILD_BURST_ENABLED=1 to allow" >&2
@@ -6549,6 +6629,8 @@ main() {
     parity)    cmd_parity "$@" ;;
     gate)      cmd_gate "$@" ;;
     bake)      cmd_bake "$@" ;;
+    enable)    cmd_enable "$@" ;;
+    disable)   cmd_disable "$@" ;;
     # Undocumented/hidden — PRD-build-burst-unprivileged-user requirement 1:
     # a pure read-only print of the resolved remote identity/paths, no ssh,
     # no filesystem writes outside $STATE_DIR's own mkdir at file top. Exists

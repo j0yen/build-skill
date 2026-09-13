@@ -4355,9 +4355,11 @@ expect_block_green "volidfix" "volidfix: every volidfix case above ran green"
 
 # =============================================================================
 # PRD-build-burst-dispatch-reenable: bake/prove/enable/disable. This pass
-# covers requirement 1 (`bake`) only — AC1 (bake done) and AC2 (bake
-# refused); prove/enable/disable/up-image-resolution/fail-closed/auto-bake
-# land in later chained steps. (test_prefix: reenable)
+# covers requirement 1 (`bake`, AC1/AC2), requirement 2 (`up` image
+# resolution + baked-boot install-start behavior, AC3/AC4), requirement 6
+# (`status` extra fields, AC12), and requirement 4 (`enable`/`disable`,
+# AC7). `prove`/fail-closed/auto-bake/auto-disable land in later chained
+# steps. (test_prefix: reenable)
 # =============================================================================
 block_start "reenable"
 
@@ -4508,6 +4510,87 @@ r4b_install_line="$(grep -n 'burst-lane  gate-tools  install-start  (tool=jq)' "
 expect "reenable AC4b: bake-stale precedes install-start" \
   "[ -n \"$r4b_bakestale_line\" ] && [ -n \"$r4b_install_line\" ] && [ \"$r4b_bakestale_line\" -lt \"$r4b_install_line\" ]"
 unset FAKE_SSH_GATE_TOOLS_MISSING
+
+# ---- reenable AC7: `enable` writes the systemd drop-in only when
+# proof.json is routed=true, younger than 7 days, and names the image `up`
+# would boot now; otherwise it refuses (rc 3, no drop-in). `disable` always
+# removes the drop-in and journals cause=operator.
+# Case a: a fresh, routed, image-matching proof -> enable succeeds.
+fresh_env
+mkdir -p "$BURST_LANE_STATE_DIR"
+cat > "$BURST_LANE_STATE_DIR/snapshot.json" <<'JSON'
+{"image_id": "555777", "created": "2026-09-13T00:00:00Z", "base_image_id": "427125061", "build_skill_sha": "abc123", "gate_tool_versions": {}, "baked_history": ["555777"]}
+JSON
+r7a_now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+cat > "$BURST_LANE_STATE_DIR/proof.json" <<JSON
+{"ts": "$r7a_now", "image_id": "555777", "server_id": "1", "worktree": "/tmp/x", "sha": "deadbeef", "routed": true, "bytes": 100, "secs_remote": 5, "cause": ""}
+JSON
+r7a_out="$("$BL" enable)"; r7a_rc=$?
+expect "reenable AC7a: enable exits 0 on a fresh, routed, image-matching proof" "[ $r7a_rc -eq 0 ]"
+expect "reenable AC7a: the drop-in exists with Environment=BUILD_BURST_ENABLED=1" \
+  "grep -q '^Environment=BUILD_BURST_ENABLED=1$' \"$BURST_LANE_SYSTEMD_DROPIN\""
+expect "reenable AC7a: journal has enable done (proof_ts=... image_id=555777)" \
+  "grep -q \"burst-lane  enable  done  (proof_ts=$r7a_now image_id=555777)\" \"$BURST_LANE_JOURNAL\""
+expect "reenable AC7a: burst_configured() reads true in a fresh shell sourcing the drop-in's Environment= line" \
+  "bash -c 'set -a; source <(grep ^Environment= \"$BURST_LANE_SYSTEMD_DROPIN\"); set +a; source \"$HOME/wintermute/build-skill/scripts/lib/burst-configured.sh\"; burst_configured'"
+
+# Case b: no proof.json at all -> refused, no drop-in.
+fresh_env
+r7b_out="$("$BL" enable 2>&1)"; r7b_rc=$?
+expect "reenable AC7b: enable exits 3 with no proof.json" "[ $r7b_rc -eq 3 ]"
+expect "reenable AC7b: no drop-in was written" "[ ! -f \"$BURST_LANE_SYSTEMD_DROPIN\" ]"
+expect "reenable AC7b: journal names the refusal cause" \
+  "grep -q 'burst-lane  enable  refused  (cause=no-proof)' \"$BURST_LANE_JOURNAL\""
+
+# Case c: a proof.json older than 7 days -> refused (cause=stale), image
+# otherwise matching the env-resolved default (fresh_env's env file sets
+# SNAPSHOT_ID=427125061, no snapshot.json baked this case).
+fresh_env
+r7c_old="$(date -u -d '-30 days' +%Y-%m-%dT%H:%M:%SZ)"
+cat > "$BURST_LANE_STATE_DIR/proof.json" <<JSON
+{"ts": "$r7c_old", "image_id": "427125061", "server_id": "1", "worktree": "/tmp/x", "sha": "deadbeef", "routed": true, "bytes": 100, "secs_remote": 5, "cause": ""}
+JSON
+r7c_out="$("$BL" enable 2>&1)"; r7c_rc=$?
+expect "reenable AC7c: enable exits 3 on a proof older than 7 days" "[ $r7c_rc -eq 3 ]"
+expect "reenable AC7c: no drop-in was written" "[ ! -f \"$BURST_LANE_SYSTEMD_DROPIN\" ]"
+expect "reenable AC7c: journal names the refusal cause" \
+  "grep -q 'burst-lane  enable  refused  (cause=stale)' \"$BURST_LANE_JOURNAL\""
+
+# Case d: proof.json says routed=false -> refused (cause=not-routed).
+fresh_env
+r7d_now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+cat > "$BURST_LANE_STATE_DIR/proof.json" <<JSON
+{"ts": "$r7d_now", "image_id": "427125061", "server_id": "1", "worktree": "/tmp/x", "sha": "deadbeef", "routed": false, "bytes": 0, "secs_remote": 5, "cause": "host-mismatch"}
+JSON
+r7d_out="$("$BL" enable 2>&1)"; r7d_rc=$?
+expect "reenable AC7d: enable exits 3 when proof.routed is false" "[ $r7d_rc -eq 3 ]"
+expect "reenable AC7d: no drop-in was written" "[ ! -f \"$BURST_LANE_SYSTEMD_DROPIN\" ]"
+expect "reenable AC7d: journal names the refusal cause" \
+  "grep -q 'burst-lane  enable  refused  (cause=not-routed)' \"$BURST_LANE_JOURNAL\""
+
+# Case e: proof.json names an image other than the one `up` would boot now
+# -> refused (cause=image-mismatch).
+fresh_env
+r7e_now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+cat > "$BURST_LANE_STATE_DIR/proof.json" <<JSON
+{"ts": "$r7e_now", "image_id": "111222", "server_id": "1", "worktree": "/tmp/x", "sha": "deadbeef", "routed": true, "bytes": 100, "secs_remote": 5, "cause": ""}
+JSON
+r7e_out="$("$BL" enable 2>&1)"; r7e_rc=$?
+expect "reenable AC7e: enable exits 3 when the proof names a different image" "[ $r7e_rc -eq 3 ]"
+expect "reenable AC7e: no drop-in was written" "[ ! -f \"$BURST_LANE_SYSTEMD_DROPIN\" ]"
+expect "reenable AC7e: journal names the refusal cause" \
+  "grep -q 'burst-lane  enable  refused  (cause=image-mismatch)' \"$BURST_LANE_JOURNAL\""
+
+# Case f: `disable` always removes the drop-in and journals cause=operator,
+# whether or not one was present.
+fresh_env
+mkdir -p "$(dirname "$BURST_LANE_SYSTEMD_DROPIN")"
+printf '[Service]\nEnvironment=BUILD_BURST_ENABLED=1\n' > "$BURST_LANE_SYSTEMD_DROPIN"
+r7f_out="$("$BL" disable)"; r7f_rc=$?
+expect "reenable AC7f: disable exits 0" "[ $r7f_rc -eq 0 ]"
+expect "reenable AC7f: the drop-in no longer exists" "[ ! -f \"$BURST_LANE_SYSTEMD_DROPIN\" ]"
+expect "reenable AC7f: journal has disable done (cause=operator)" \
+  "grep -q 'burst-lane  disable  done  (cause=operator)' \"$BURST_LANE_JOURNAL\""
 
 # ---- reenable AC12: status (text and --json) reports image_id,
 # image_source, bake_age_h, proof_age_h, proof_routed, enabled — session-
