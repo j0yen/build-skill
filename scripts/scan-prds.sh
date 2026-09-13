@@ -30,6 +30,36 @@ fi
 
 PRD_DIR="${PRD_DIR:-$HOME/Documents/PRDs}"
 
+# PRD-build-selector-honors-priority: journal target for the one-line-per-
+# scan "priority-unknown" notice (an unrecognized build_priority value still
+# sorts in the normal band — see the priority_band()/journal_unknown_priority
+# helpers below — but a typo should surface somewhere a human reads).
+# Same $HOME/brain/journal/build/<date>.md convention every other script in
+# this directory uses (see classification-self-heal.sh, build-has-work.sh).
+JOURNAL="${JOURNAL:-$HOME/brain/journal/build/$(date -u +%F).md}"
+utc_now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+journal_unknown_priority() {
+  local slug="$1" value="$2"
+  mkdir -p "$(dirname "$JOURNAL")" 2>/dev/null || true
+  printf '%s  scan-prds  priority-unknown (slug=%s value=%s)  (host=%s)\n' \
+    "$(utc_now)" "$slug" "$value" "$(hostname)" >> "$JOURNAL" 2>/dev/null || true
+}
+# Priority band used both to journal an unrecognized value and (after the
+# array is built, see the final jq stage below) to order the emitted array
+# high -> normal -> low. build_priority arrives here as a jq-literal: either
+# `null` or a double-quoted string (see emit_one below) — strip the quotes
+# before comparing. Unrecognized/absent values are the "normal" band per
+# PRD-build-selector-honors-priority requirement 2 (no starvation, no
+# promotion for a typo or an unset field).
+priority_band() {
+  local raw="$1"
+  case "$raw" in
+    '"high"') echo 0 ;;
+    '"low"') echo 2 ;;
+    *) echo 1 ;;
+  esac
+}
+
 # --- PRD-build-prd-lint: contract-shape lint gate ---------------------------
 # Before anything else, run scripts/prd-lint.sh over every build-queue/ PRD.
 # A PRD that fails is written into the manifest as `needs_classification`
@@ -377,6 +407,19 @@ except Exception:
     fi
   fi
 
+  # PRD-build-selector-honors-priority requirement 2: a build_priority value
+  # that isn't high/normal/low sorts in the normal band (priority_band()'s
+  # default case handles that silently) but journals once here so a typo
+  # surfaces. Absent (build_priority still `null`) is NOT a typo — no journal.
+  if [ "$build_priority" != null ]; then
+    case "$build_priority" in
+      '"high"'|'"normal"'|'"low"') ;;
+      *)
+        journal_unknown_priority "$slug" "$(strip_val "$(printf '%s' "$build_priority" | sed -E 's/^"//;s/"$//')")"
+        ;;
+    esac
+  fi
+
   local size mtime
   size="$(stat -c%s "$path" 2>/dev/null || stat -f%z "$path" 2>/dev/null || echo 0)"
   mtime="$(date -u -r "$path" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
@@ -424,7 +467,7 @@ except Exception:
     case "$d" in archive) [ "$PRD_DIR/archive" -ef "$PRD_DIR/ARCHIVE" ] && continue;; esac
     find -L "$PRD_DIR/$d" -maxdepth 1 -type f -name 'PRD-*.md' -print0
   done
-} | sort -z \
+} | LC_ALL=C sort -z \
   | {
       first=true
       printf '['
@@ -434,4 +477,23 @@ except Exception:
         emit_one "$f"
       done
       printf ']\n'
-    }
+    } \
+  | LC_ALL=C "$JQ" -c '
+      # PRD-build-selector-honors-priority requirement 1: reorder the
+      # already-emitted array by priority band (high=0, normal/unknown=1,
+      # low=2), keeping the pre-existing path-sort emission order (.key,
+      # the array index from to_entries) as the stable tiebreak within a
+      # band — requirement 2 (goal 2: deterministic + stable) and the
+      # Technical considerations note ("priority is known only after
+      # emit_one parses the file, so ordering must happen after
+      # emission... do not try to pre-sort paths"). LC_ALL=C on this jq
+      # call plus the LC_ALL=C sort -z above make the whole ordering
+      # locale-independent (requirement 4).
+      to_entries
+      | sort_by(
+          (if .value.build_priority == "high" then 0
+           elif .value.build_priority == "low" then 2
+           else 1 end),
+          .key)
+      | map(.value)
+    '

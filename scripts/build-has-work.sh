@@ -64,6 +64,13 @@
 #                            is never silent either.
 set -uo pipefail
 
+# PRD-build-selector-honors-priority requirement 4: the buildable list this
+# script journals must order identically on every host regardless of the
+# locale the shell happens to start in (the glob below, and the sort used
+# to order by priority band, both collate under the current locale unless
+# pinned).
+export LC_ALL=C
+
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PRD_DIR="${PRD_DIR:-$HOME/Documents/PRDs}"
 STATE_DIR="${BUILD_STATE_DIR:-$HERE/../state}"
@@ -109,6 +116,27 @@ read_field() {
 }
 
 slug_of() { basename "$1" .md | sed -E 's/^PRD-//'; }
+
+# PRD-build-selector-honors-priority requirement 1/2: same band mapping as
+# scan-prds.sh's priority_band() (duplicated rather than sourced, matching
+# this directory's convention — see select-guard.sh's read_field comment
+# for the precedent). high=0, low=2, everything else (absent, or any
+# unrecognized value — a typo is scan-prds.sh's job to journal, not this
+# script's) is the normal band 1.
+priority_band_num() {
+  case "$1" in
+    high) echo 0 ;;
+    low) echo 2 ;;
+    *) echo 1 ;;
+  esac
+}
+priority_band_name() {
+  case "$1" in
+    high) echo high ;;
+    low) echo low ;;
+    *) echo normal ;;
+  esac
+}
 
 # (a) LIVE claim by any lane. Returns 0 = live claim exists (blocks
 # buildability), 1 = no live claim (or could-not-check — bias buildable).
@@ -180,7 +208,8 @@ print(d.get("head_sha") or "")
   [ "$head_cached" = "$head_now" ]
 }
 
-buildable=() claimed=() gate_red=()
+buildable=() claimed=() gate_red=() buildable_annotated=()
+buildable_raw=()
 
 if [ -d "$PRD_DIR/build-queue" ]; then
   for prd in "$PRD_DIR"/build-queue/*.md; do
@@ -197,14 +226,34 @@ if [ -d "$PRD_DIR/build-queue" ]; then
       gate_red+=("$slug")
       continue
     fi
-    buildable+=("$slug")
+    # PRD-build-selector-honors-priority requirement 1/3: buildable is
+    # ordered by build_priority band (high -> normal -> low), falling back
+    # to the path so the order this pre-check reports matches scan-prds.sh's
+    # own priority-then-path ordering exactly (requirement 3: same sorted
+    # sequence). Sorted below, once the full candidate set is known, not
+    # appended pre-sorted — same "read the file before you can rank it"
+    # constraint scan-prds.sh's Technical considerations note calls out.
+    bp="$(read_field "$prd" build_priority | sed -E 's/^[[:space:]]*//;s/[[:space:]]*$//;s/^"//;s/"$//')"
+    buildable_raw+=("$(priority_band_num "$bp")|$prd|$slug|$(priority_band_name "$bp")")
   done
+fi
+
+if [ "${#buildable_raw[@]}" -gt 0 ]; then
+  while IFS='|' read -r _band _path _slug _name; do
+    buildable+=("$_slug")
+    buildable_annotated+=("${_slug}:${_name}")
+  done < <(printf '%s\n' "${buildable_raw[@]}" | LC_ALL=C sort -t'|' -k1,1n -k2,2)
 fi
 
 decision="no-work"
 [ "${#buildable[@]}" -gt 0 ] && decision="work"
 
-logline "build-has-work  $decision  (buildable=$(fmt_list "${buildable[@]}") claimed=$(fmt_list "${claimed[@]}") gate-red-unchanged=$(fmt_list "${gate_red[@]}") pace=$PACE)"
+# PRD-build-selector-honors-priority requirement 5: buildable is annotated
+# slug:band (e.g. slug:high) in priority order so an operator can see the
+# order the selector will use without reading any PRD files; claimed/
+# gate-red-unchanged are unaffected (priority doesn't change why THEY were
+# excluded).
+logline "build-has-work  $decision  (buildable=$(fmt_list "${buildable_annotated[@]}") claimed=$(fmt_list "${claimed[@]}") gate-red-unchanged=$(fmt_list "${gate_red[@]}") pace=$PACE)"
 
 # Unit liveness (PRD-buildloop-unit-liveness): runs every invocation,
 # work or no-work, so build-auto.log always carries the newest unit state.

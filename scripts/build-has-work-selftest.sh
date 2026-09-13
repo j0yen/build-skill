@@ -48,10 +48,10 @@ cat > "$C1/build-queue/PRD-fresh.md" <<'EOF'
 - build_into: /tmp/does-not-exist-case1
 EOF
 run_bhw "$C1" "$C1/state" 1 0
-if [ "$RC" -eq 0 ] && grep -q 'buildable=\[fresh\]' <<<"$(grep 'build-has-work ' "$ROOT/log.txt" | tail -1)"; then
+if [ "$RC" -eq 0 ] && grep -q 'buildable=\[fresh:normal\]' <<<"$(grep 'build-has-work ' "$ROOT/log.txt" | tail -1)"; then
   ok "case 1: unclaimed never-gated PRD -> work (exit 0)"
 else
-  bad "case 1: expected exit 0 + buildable=[fresh], got rc=$RC log=$(grep 'build-has-work ' "$ROOT/log.txt" | tail -1)"
+  bad "case 1: expected exit 0 + buildable=[fresh:normal], got rc=$RC log=$(grep 'build-has-work ' "$ROOT/log.txt" | tail -1)"
 fi
 
 # ---------------------------------------------------------------- case 2 --
@@ -103,10 +103,10 @@ fi
 
 git -C "$C3/fakerepo" -c user.name=t -c user.email=t@t commit -q --allow-empty -m c2
 run_bhw "$C3" "$C3/state" 1 0
-if [ "$RC" -eq 0 ] && grep -q 'buildable=\[gr\]' <<<"$(grep 'build-has-work ' "$ROOT/log.txt" | tail -1)"; then
+if [ "$RC" -eq 0 ] && grep -q 'buildable=\[gr:normal\]' <<<"$(grep 'build-has-work ' "$ROOT/log.txt" | tail -1)"; then
   ok "case 3b: HEAD moved past the gate-red verdict -> work (re-gate)"
 else
-  bad "case 3b: expected exit 0 + buildable=[gr], got rc=$RC log=$(grep 'build-has-work ' "$ROOT/log.txt" | tail -1)"
+  bad "case 3b: expected exit 0 + buildable=[gr:normal], got rc=$RC log=$(grep 'build-has-work ' "$ROOT/log.txt" | tail -1)"
 fi
 
 # ---------------------------------------------------------------- case 4 --
@@ -122,10 +122,10 @@ cat > "$C4/build-queue/PRD-stale.md" <<EOF
 - Lane: carbon $(stale_claim_ts)
 EOF
 run_bhw "$C4" "$C4/state" 1 0
-if [ "$RC" -eq 0 ] && grep -q 'buildable=\[stale\]' <<<"$(grep 'build-has-work ' "$ROOT/log.txt" | tail -1)"; then
+if [ "$RC" -eq 0 ] && grep -q 'buildable=\[stale:normal\]' <<<"$(grep 'build-has-work ' "$ROOT/log.txt" | tail -1)"; then
   ok "case 4: stale claim -> work (exit 0)"
 else
-  bad "case 4: expected exit 0 + buildable=[stale], got rc=$RC log=$(grep 'build-has-work ' "$ROOT/log.txt" | tail -1)"
+  bad "case 4: expected exit 0 + buildable=[stale:normal], got rc=$RC log=$(grep 'build-has-work ' "$ROOT/log.txt" | tail -1)"
 fi
 
 # ---------------------------------------------------------------- case 5 --
@@ -176,6 +176,51 @@ if [ "$RC" -eq 1 ] && [ "$after_liveness_lines" -eq "$new_liveness_lines_this_ca
   ok "case 7 (unitlive_ac4): exactly one new LIVENESS line appended on a skipped tick, exit code unaffected by liveness rc"
 else
   bad "case 7 (unitlive_ac4): expected rc=1 + exactly 1 LIVENESS line, got rc=$RC liveness_lines=$after_liveness_lines before_lines=$before_lines"
+fi
+
+# ---------------------------------------------------------------- case 8 --
+# PRD-build-selector-honors-priority AC5: a mixed-priority buildable queue
+# is journaled in priority order (high -> normal -> low), path-sorted
+# within a band, each slug annotated with its band — not filename order.
+# PRD-aaa (normal, alphabetically first) must NOT lead; PRD-zzz (high) does.
+C8="$ROOT/case8"
+mkdir -p "$C8/build-queue" "$C8/state"
+cat > "$C8/build-queue/PRD-aaa.md" <<'EOF'
+# PRD: aaa
+
+- Status: queued
+- build_target: shell
+- build_into: /tmp/does-not-exist-case8-aaa
+- build_priority: normal
+EOF
+cat > "$C8/build-queue/PRD-mid.md" <<'EOF'
+# PRD: mid
+
+- Status: queued
+- build_target: shell
+- build_into: /tmp/does-not-exist-case8-mid
+EOF
+cat > "$C8/build-queue/PRD-zzz.md" <<'EOF'
+# PRD: zzz
+
+- Status: queued
+- build_target: shell
+- build_into: /tmp/does-not-exist-case8-zzz
+- build_priority: high
+EOF
+cat > "$C8/build-queue/PRD-low.md" <<'EOF'
+# PRD: low
+
+- Status: queued
+- build_target: shell
+- build_into: /tmp/does-not-exist-case8-low
+- build_priority: low
+EOF
+run_bhw "$C8" "$C8/state" 1 0
+if [ "$RC" -eq 0 ] && grep -q 'buildable=\[zzz:high,aaa:normal,mid:normal,low:low\]' <<<"$(grep 'build-has-work ' "$ROOT/log.txt" | tail -1)"; then
+  ok "case 8: mixed-priority queue journals high -> normal (path-sorted) -> low"
+else
+  bad "case 8: expected buildable=[zzz:high,aaa:normal,mid:normal,low:low], got rc=$RC log=$(grep 'build-has-work ' "$ROOT/log.txt" | tail -1)"
 fi
 
 exit "$fail"

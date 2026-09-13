@@ -257,10 +257,13 @@ Build a candidate pool in priority order:
   will be picked if nothing newer is available.
 
 Within both buckets, sort by `build_priority` descending
-(`high` > `normal` > `low`; null counts as `normal`), then by
-`last_modified` ascending (oldest queued first within a priority).
-PRDs the user has explicitly bumped to `build_priority: high` get
-picked before their normal-priority siblings.
+(`high` > `normal` > `low`; null and any unrecognized value count as
+`normal`), then by the stable path sort `scan-prds.sh` already emits
+(PRD-build-selector-honors-priority, 2026-09-13 — this ordering is now
+real, done by `scan-prds.sh`'s emission itself, not aspirational prose:
+see "PRD frontmatter the skill reads" above). PRDs the user has
+explicitly bumped to `build_priority: high` get picked before their
+normal-priority siblings, with no filename change and no parking needed.
 
 Then pick **up to `BUILD_MAX_BRANCHES` PRDs** (default 30 — see
 "Parallelism") from the pool that mutually satisfy the parallel-dispatch
@@ -2485,6 +2488,15 @@ Parser notes (`scripts/scan-prds.sh`):
 - Lines inside ``` fenced code blocks are skipped, so PRDs can include
   the example block above without poisoning their own parse.
 - Trailing inline comments (` # ...`) are stripped from values.
+- The emitted array is ordered by `build_priority` band — `high` first,
+  then `normal` (also the band for absent/unrecognized values; an
+  unrecognized value additionally journals `priority-unknown (slug=...
+  value=...)` once to `$HOME/brain/journal/build/<date>.md`), then `low`
+  — falling back to the pre-existing path sort as a stable, locale-
+  independent (`LC_ALL=C`) tiebreak within a band
+  (PRD-build-selector-honors-priority, 2026-09-13). `build-has-work.sh`
+  orders and annotates its own `buildable=[slug:band,...]` journal list
+  the same way, so its journal line and the tick's actual pick agree.
 
 PRDs with `build_target: rust-extend` route into the extend Phase 4
 path; the existing repo is mutated in place rather than a new one
@@ -2503,7 +2515,7 @@ vellum amend PRD-<slug>.md --append-iter-log "v0.1 — all ACs green"
 
 `vellum amend` writes atomically (temp file + rename) and understands all three `deferred_acs` forms. Use `--dry-run` to preview changes. Falls back gracefully if vellum is absent.
 
-`scripts/scan-prds.sh` also uses `vellum scan` as a fast-path when the binary is on `$PATH`, falling back to the bash parser when absent. Both paths emit identical JSON output.
+`scripts/scan-prds.sh` also uses `vellum scan` as a fast-path when the binary is on `$PATH`, falling back to the bash parser when absent. Both paths emit identical per-PRD JSON shape; the priority-band ordering above is a bash-fallback-only addition as of 2026-09-13 (vellum is an external binary this repo doesn't own — same known gap as the `substrate` field noted in that script's own comments) — a lane running vellum still gets correct field values, just not the reordered array, until vellum's own scan gains it.
 
 ## Manual invocation
 
