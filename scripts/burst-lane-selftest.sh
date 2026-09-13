@@ -4371,6 +4371,84 @@ expect "reenable AC2b: journal names the refusal cause" \
   "grep -q 'burst-lane  bake  refused  (cause=gate-not-ready' \"$BURST_LANE_JOURNAL\""
 unset FAKE_SSH_GATE_TOOLS_MISSING FAKE_SSH_GATE_TOOLS_INSTALL_FAIL
 
+# ---- reenable AC3: `up` resolves the image as snapshot.json -> SNAPSHOT_ID
+# (env) -> DEFAULT_SNAPSHOT_ID, and journals which tier won.
+# Case a: a snapshot.json exists -> the fake hcloud `server create` gets
+# --image <that id>, and the journal names source=baked.
+fresh_env
+mkdir -p "$BURST_LANE_STATE_DIR"
+cat > "$BURST_LANE_STATE_DIR/snapshot.json" <<'JSON'
+{"image_id": "999888", "created": "2026-09-13T00:00:00Z", "base_image_id": "427125061", "build_skill_sha": "abc123", "gate_tool_versions": {}, "baked_history": ["999888"]}
+JSON
+r3a_out="$("$BL" up)"; r3a_rc=$?
+expect "reenable AC3a: up still exits 0 with a baked snapshot.json present" "[ $r3a_rc -eq 0 ]"
+expect "reenable AC3a: fake hcloud server create received --image 999888" \
+  "grep -qE '^server create .*--image 999888( |\$)' \"$FAKE_HCLOUD_CALLLOG\""
+expect "reenable AC3a: journal has up image (id=999888 source=baked)" \
+  "grep -q 'burst-lane  up  image  (id=999888 source=baked)' \"$BURST_LANE_JOURNAL\""
+
+# Case b: no snapshot.json -> source is env (fresh_env's own fake env file
+# always sets SNAPSHOT_ID=427125061) and behavior is unchanged from before
+# this PRD (same shape as the very first AC1 case at the top of this file).
+fresh_env
+r3b_out="$("$BL" up)"; r3b_rc=$?
+expect "reenable AC3b: up exits 0 with no snapshot.json (unchanged behavior)" "[ $r3b_rc -eq 0 ]"
+expect "reenable AC3b: up still prints 'up: <id> <ip>'" "grep -q '^up: ' <<<\"$r3b_out\""
+expect "reenable AC3b: fake hcloud server create received --image 427125061" \
+  "grep -qE '^server create .*--image 427125061( |\$)' \"$FAKE_HCLOUD_CALLLOG\""
+expect "reenable AC3b: journal has up image (id=427125061 source=env)" \
+  "grep -q 'burst-lane  up  image  (id=427125061 source=env)' \"$BURST_LANE_JOURNAL\""
+
+# ---- reenable AC4: a baked boot with every gate tool already present logs
+# zero install-start lines; a baked boot with exactly one tool missing logs
+# exactly one bake-stale line, preceding that tool's install-start.
+# Case a: every tool present (FAKE_SSH_GATE_TOOLS_MISSING unset -> default
+# fake probe reports all 8 tools present).
+fresh_env
+REEN4_AB_SRC="$T/fake-autobuilder-src"; mkdir -p "$REEN4_AB_SRC"
+cat > "$REEN4_AB_SRC/autobuilder" <<'EOF'
+#!/usr/bin/env bash
+echo "autobuilder 9.9.9"
+EOF
+chmod +x "$REEN4_AB_SRC/autobuilder"
+export BURST_LANE_AUTOBUILDER_BIN="$REEN4_AB_SRC/autobuilder"
+mkdir -p "$BURST_LANE_STATE_DIR"
+cat > "$BURST_LANE_STATE_DIR/snapshot.json" <<'JSON'
+{"image_id": "999889", "created": "2026-09-13T00:00:00Z", "base_image_id": "427125061", "build_skill_sha": "abc123", "gate_tool_versions": {}, "baked_history": ["999889"]}
+JSON
+"$BL" up >/dev/null 2>&1
+r4a_gate_ready="$(grep -oE '"gate_ready":"[^"]*"' "$BURST_LANE_STATE_DIR/session.json" | cut -d'"' -f4)"
+expect "reenable AC4a: a baked boot with every tool present reaches gate_ready=true" "[ \"$r4a_gate_ready\" = true ]"
+expect "reenable AC4a: zero install-start lines on an all-present baked boot" \
+  "[ \"$(grep -c 'burst-lane  gate-tools  install-start' "$BURST_LANE_JOURNAL")\" -eq 0 ]"
+expect "reenable AC4a: journal names the boot as gate_ready=true" \
+  "grep -q 'burst-lane  up  booted  .*gate_ready=true' \"$BURST_LANE_JOURNAL\""
+
+# Case b: exactly one tool (jq) missing on a baked boot.
+fresh_env
+REEN4B_AB_SRC="$T/fake-autobuilder-src"; mkdir -p "$REEN4B_AB_SRC"
+cat > "$REEN4B_AB_SRC/autobuilder" <<'EOF'
+#!/usr/bin/env bash
+echo "autobuilder 9.9.9"
+EOF
+chmod +x "$REEN4B_AB_SRC/autobuilder"
+export BURST_LANE_AUTOBUILDER_BIN="$REEN4B_AB_SRC/autobuilder"
+export FAKE_SSH_GATE_TOOLS_MISSING="jq"
+mkdir -p "$BURST_LANE_STATE_DIR"
+cat > "$BURST_LANE_STATE_DIR/snapshot.json" <<'JSON'
+{"image_id": "999890", "created": "2026-09-13T00:00:00Z", "base_image_id": "427125061", "build_skill_sha": "abc123", "gate_tool_versions": {}, "baked_history": ["999890"]}
+JSON
+"$BL" up >/dev/null 2>&1
+expect "reenable AC4b: exactly one bake-stale line (tool=jq)" \
+  "[ \"$(grep -c 'burst-lane  gate-tools  bake-stale  (tool=jq)' "$BURST_LANE_JOURNAL")\" -eq 1 ]"
+expect "reenable AC4b: exactly one install-start line (tool=jq)" \
+  "[ \"$(grep -c 'burst-lane  gate-tools  install-start  (tool=jq)' "$BURST_LANE_JOURNAL")\" -eq 1 ]"
+r4b_bakestale_line="$(grep -n 'burst-lane  gate-tools  bake-stale  (tool=jq)' "$BURST_LANE_JOURNAL" | head -1 | cut -d: -f1)"
+r4b_install_line="$(grep -n 'burst-lane  gate-tools  install-start  (tool=jq)' "$BURST_LANE_JOURNAL" | head -1 | cut -d: -f1)"
+expect "reenable AC4b: bake-stale precedes install-start" \
+  "[ -n \"$r4b_bakestale_line\" ] && [ -n \"$r4b_install_line\" ] && [ \"$r4b_bakestale_line\" -lt \"$r4b_install_line\" ]"
+unset FAKE_SSH_GATE_TOOLS_MISSING
+
 expect_block_green "reenable" "reenable: every reenable case above ran green"
 
 echo "=== $([ $fail -eq 0 ] && echo PASS || echo FAIL) ==="

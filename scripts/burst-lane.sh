@@ -234,6 +234,14 @@ STATE_FILE="$STATE_DIR/session.json"
 # `bake superseded` when a third bake lands. Absent file == "no baked image
 # yet" everywhere that reads it (`up`'s image resolution, `status`).
 SNAPSHOT_STATE_FILE="$STATE_DIR/snapshot.json"
+# PRD-build-burst-dispatch-reenable requirement 2: set by cmd_up's own
+# image-resolution step (baked|env|default) right before it calls
+# provision_gate_tools, so that function's install loop can journal
+# `bake-stale` when a baked boot still needs a tool install. Left "" (never
+# baked) on every OTHER call path (adoption, standalone `provision`) — this
+# script only tracks the origin of a boot it just created, not one it
+# merely adopted.
+CURRENT_BOOT_IMAGE_SOURCE=""
 COST_LEDGER="${BURST_LANE_COST_LEDGER:-$STATE_DIR/cost.jsonl}"
 # Requirement 13: which PRD slugs this session served, one per line,
 # deduped. Reset on a fresh boot/adopt (alongside runs_served=0), appended
@@ -505,12 +513,17 @@ mkdir -p "$STATE_DIR" 2>/dev/null || true
 
 # ---- config -------------------------------------------------------------
 load_env() {
-  SNAPSHOT_ID="$DEFAULT_SNAPSHOT_ID"
+  # PRD-build-burst-dispatch-reenable requirement 2: start empty (not the
+  # default) so the block below can tell whether the env file itself
+  # supplied SNAPSHOT_ID -- up's own image-source journal line
+  # (baked|env|default) needs to distinguish the latter two tiers, which
+  # collapsing straight to DEFAULT_SNAPSHOT_ID up front would erase.
+  SNAPSHOT_ID=""
   LOCATION="$DEFAULT_LOCATION"
   SSH_KEY="$HOME/.ssh/id_ed25519"
   # PRD-build-burst-unprivileged-user requirement 1: unprivileged by default.
   # BURST_LANE_REMOTE_USER=root (the selftest fixture's override point, and
-  # an operator's documented rollback — see the header note) is the only way
+  # an operator's documented rollback -- see the header note) is the only way
   # back to the old all-root behavior; an env-file REMOTE_USER= line (none
   # ship today) can still override it, same as every other load_env var.
   REMOTE_USER="${BURST_LANE_REMOTE_USER:-build}"
@@ -518,7 +531,12 @@ load_env() {
     # shellcheck disable=SC1090
     source "$ENV_FILE"
   fi
-  SNAPSHOT_ID="${SNAPSHOT_ID:-$DEFAULT_SNAPSHOT_ID}"
+  if [ -n "$SNAPSHOT_ID" ]; then
+    SNAPSHOT_ID_FROM_ENV=1
+  else
+    SNAPSHOT_ID_FROM_ENV=0
+    SNAPSHOT_ID="$DEFAULT_SNAPSHOT_ID"
+  fi
   LOCATION="${BUILDER_LOC:-$LOCATION}"
   # BURST_SERVER_TYPE from the env file must win over the pre-source default
   # (SERVER_TYPE is assigned before load_env runs).
@@ -1528,6 +1546,14 @@ provision_gate_tools() {  # $1=ip
     err_log="$STATE_DIR/logs/gate-tools-install.$$-$name.log"
     rc=0
     _GT_CURRENT_TOOL="$name"
+    # PRD-build-burst-dispatch-reenable requirement 2: a baked image is
+    # supposed to need zero installs — any tool still missing on a baked
+    # boot means the bake is out of date with respect to GATE_TOOLS_LIST,
+    # worth flagging distinctly from an ordinary (unbaked) first-boot
+    # install. Installation proceeds exactly as it does today either way.
+    if [ "${CURRENT_BOOT_IMAGE_SOURCE:-}" = "baked" ]; then
+      journal_line "$(now_iso)  burst-lane  gate-tools  bake-stale  (tool=$name)"
+    fi
     journal_line "$(now_iso)  burst-lane  gate-tools  install-start  (tool=$name)"
     if [ "$name" = "autobuilder" ]; then
       if [ -f "$GATE_TOOLS_AUTOBUILDER_BIN" ]; then
@@ -2042,6 +2068,34 @@ cmd_up() {
     exit 3
   fi
 
+  # PRD-build-burst-dispatch-reenable requirement 2: resolve the image to
+  # boot as snapshot.json -> SNAPSHOT_ID (env) -> DEFAULT_SNAPSHOT_ID (the
+  # same three-tier precedence bake/up were designed around), and record
+  # which tier won both for the journal and for provision_gate_tools'
+  # bake-stale check just below.
+  local image_id="" image_source=""
+  if [ -f "$SNAPSHOT_STATE_FILE" ]; then
+    image_id="$(python3 -c '
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    d = {}
+print(d.get("image_id", ""))
+' "$SNAPSHOT_STATE_FILE" 2>/dev/null)"
+  fi
+  if [ -n "$image_id" ]; then
+    image_source="baked"
+  elif [ "${SNAPSHOT_ID_FROM_ENV:-0}" = "1" ]; then
+    image_id="$SNAPSHOT_ID"
+    image_source="env"
+  else
+    image_id="$SNAPSHOT_ID"
+    image_source="default"
+  fi
+  CURRENT_BOOT_IMAGE_SOURCE="$image_source"
+  journal_line "$(now_iso)  burst-lane  up  image  (id=$image_id source=$image_source)"
+
   # AC14 (primary-IP billing): deliberately never pass --primary-ipv4 (attach
   # an existing, standalone Primary IP) or --without-ipv4 here. Left at the
   # default, hcloud auto-creates an ephemeral Primary IPv4 that is owned by
@@ -2054,7 +2108,7 @@ cmd_up() {
   # leaks a billed IP.
   local create_out create_err; create_err="$(mktemp)"
   if ! create_out="$("$HCLOUD" server create --name "$SERVER_NAME" --type "$SERVER_TYPE" \
-        --location "$LOCATION" --image "$SNAPSHOT_ID" --ssh-key "${HCLOUD_SSH_KEY:-default}" -o json 2>"$create_err")"; then
+        --location "$LOCATION" --image "$image_id" --ssh-key "${HCLOUD_SSH_KEY:-default}" -o json 2>"$create_err")"; then
     local emsg; emsg="$(tail -3 "$create_err" 2>/dev/null | tr '\n' ' ')"; rm -f "$create_err"
     journal_line "$(now_iso)  burst-lane  up  fallback  (cause=hcloud-server-create-failed: $emsg)"
     echo "fallback: hcloud server create failed - $emsg"
