@@ -31,9 +31,18 @@
 #   3. write `Status: built`, `Built: <date>`, `Receipts: <path>` into the
 #      PRD while it is still in build-queue/.
 #   4. `git mv` it into built-prds/.
-#   5. flip its line in the checkout's own MANIFEST.md to `shipped`.
+#   5. flip its line in the checkout's own MANIFEST.md to `shipped` — or,
+#      per PRD-build-archive-manifest-backfill, when no line exists yet
+#      for this slug (a hand-queued PRD /dream never reconciled),
+#      BACKFILL one into the `## built-prds` section instead of dying.
+#      The backfilled line's format is derived from a sibling entry
+#      already in the file (same field order/separators); if no sibling
+#      can be parsed, a documented fallback format is used and that fact
+#      is journaled. A MANIFEST.md that is unreadable, or that carries
+#      two-or-more conflicting lines for the same slug, still fails
+#      loudly (distinct exit codes — see below).
 #   6. `git add` exactly those two paths, one commit `archive: <slug>
-#      shipped`.
+#      shipped` (plus a body line naming the backfill, when one happened).
 #   7. `git pull --rebase --autostash` (tolerate a sibling's transient
 #      dirt the same way the hardened lane-claim.sh pull does).
 #   8. `git push`.
@@ -66,14 +75,24 @@
 #                   up (default 120).
 #
 # Exit codes:
-#   0   archived (or dry-run printed the plan)
+#   0   archived (or dry-run printed the plan, or already-archived no-op —
+#       see Idempotence below)
 #   2   usage error
 #   3   not-queued (PRD missing from build-queue/) or receipt unresolved
-#   4   dirty checkout for the touched paths, or a write step failed —
-#       working tree for those paths restored
+#   4   dirty checkout for the touched paths, or a write step failed
+#       (including an unreadable MANIFEST.md) — working tree for those
+#       paths restored
 #   5   lock-timeout — no writes
 #   6   commit landed but push is pending (network/rebase-conflict after
 #       our own commit) — not a corrupt state, just an unfinished push
+#   7   manifest-duplicate: MANIFEST.md carries two-or-more conflicting
+#       lines for this slug — genuine corruption, not absence; no writes
+#
+# Idempotence: if the slug is already gone from build-queue/, already
+# present in built-prds/, AND MANIFEST.md already shows it `shipped`,
+# this is a no-op: prints one line and exits 0 without touching the
+# checkout (a retry after a prior fully-successful archive, or a
+# duplicate dispatch, is always safe to re-run).
 #
 # Stdout on a successful (or push-pending) run:
 #   archive-commit <slug> commit=<sha> pushed=<yes|pending> lock_wait=<s>
@@ -115,6 +134,20 @@ built_rel="built-prds/PRD-$slug.md"
 manifest_rel="MANIFEST.md"
 prd_path="$PRD_DIR/$prd_rel"
 manifest_md="$PRD_DIR/$manifest_rel"
+
+# ---- idempotence: already fully archived is a no-op, not a failure ----
+# (PRD-build-archive-manifest-backfill requirement 5.) Only short-circuits
+# when ALL of: the PRD is gone from build-queue/, present in built-prds/,
+# and MANIFEST.md's own line for this slug already says shipped — i.e.
+# the whole atomic step-6 commit from a prior run already landed. A
+# partial/in-between state can't persist past this script's own atomic
+# commit, so this never masks a genuine not-queued/receipt-unresolved
+# failure.
+if [ ! -f "$prd_path" ] && [ -f "$PRD_DIR/$built_rel" ] && [ -r "$manifest_md" ] \
+   && grep -Eq -- "^-[[:space:]]*PRD-${slug}\.md[[:space:]]+—[[:space:]]+shipped([[:space:]]|·)" "$manifest_md"; then
+  printf 'archive-commit %s already-archived (no-op)\n' "$slug"
+  exit 0
+fi
 
 # ---- resolve the receipt + header values (state/manifest.json) --------
 resolve_receipt() {
@@ -185,28 +218,123 @@ PYEOF
 }
 
 # Flip this slug's own line in the checkout's MANIFEST.md to `shipped`,
-# preserving whatever build_target/date tail it already has. Exit 1 (no
-# write) if no such line is found.
+# preserving whatever build_target/date tail it already has — OR, per
+# PRD-build-archive-manifest-backfill, when no line exists yet for this
+# slug, BACKFILL one into the `## built-prds` section (the section the
+# slug's file now lives in, post-mv) instead of failing.
+#
+# $1 = MANIFEST.md path, $2 = slug, $3 = the PRD's now-built-prds/ path
+#      (read-only, to source build_target/Drafted for a backfilled line).
+#
+# Prints one of the following to stdout on success:
+#   FLIPPED               — an existing line was found and flipped
+#   BACKFILLED sibling     — no line existed; appended using a sibling
+#                            entry's exact format (field order/separators)
+#   BACKFILLED fallback    — no line existed and no sibling entry could be
+#                            parsed anywhere in the file; appended using
+#                            the documented hardcoded format instead
+#
+# Exit codes (no output, no write, on any nonzero):
+#   2   duplicate: more than one existing line matches this slug — real
+#       corruption, distinct from "absent" (mapped to exit 7 by the caller)
+#   3   no `## built-prds` section header found (can't place a backfill)
 update_manifest_md() {
-  local f="$1" slug="$2"
-  python3 - "$f" "$slug" <<'PYEOF'
+  local f="$1" slug="$2" prd_path_for_fields="${3:-}"
+  python3 - "$f" "$slug" "$prd_path_for_fields" <<'PYEOF'
 import re, sys
-f, slug = sys.argv[1], sys.argv[2]
+f, slug, prd_path_for_fields = sys.argv[1], sys.argv[2], (sys.argv[3] if len(sys.argv) > 3 else "")
 name = f"PRD-{slug}.md"
+
 with open(f) as fh:
     lines = fh.readlines()
-pat = re.compile(r'^(-\s*' + re.escape(name) + r'\s+—\s+)([^·]+?)(\s*·.*)$')
-changed = False
+
+# Any line naming this slug's PRD file with the "— <status> ..." shape.
+entry_pat = re.compile(r'^-\s*' + re.escape(name) + r'\s+—\s+([^·\n]+?)(\s*·.*)$')
+matches = [i for i, ln in enumerate(lines) if entry_pat.match(ln.rstrip('\n'))]
+
+if len(matches) > 1:
+    sys.stderr.write(f"duplicate: {len(matches)} MANIFEST.md lines match {name}\n")
+    sys.exit(2)
+
+if len(matches) == 1:
+    i = matches[0]
+    m = entry_pat.match(lines[i].rstrip('\n'))
+    prefix = lines[i].rstrip('\n')[:m.start(1)]
+    lines[i] = f"{prefix}shipped{m.group(2)}\n"
+    with open(f, 'w') as fh:
+        fh.writelines(lines)
+    print("FLIPPED")
+    sys.exit(0)
+
+# ---- no existing line: backfill into the built-prds section -----------
+sec_start = None
+sec_end = len(lines)
 for i, ln in enumerate(lines):
-    m = pat.match(ln.rstrip('\n'))
-    if m:
-        lines[i] = f"{m.group(1)}shipped{m.group(3)}\n"
-        changed = True
+    if ln.rstrip('\n') == "## built-prds":
+        sec_start = i
+    elif sec_start is not None and ln.startswith("## "):
+        sec_end = i
         break
-if not changed:
-    sys.exit(1)
+if sec_start is None:
+    sys.stderr.write("no '## built-prds' section header found in MANIFEST.md\n")
+    sys.exit(3)
+
+# A full sibling entry: "- PRD-<other>.md — <status> · <target> · <date>".
+# Group 1 ("lead") is only the bullet ("- "); the sibling's own
+# "PRD-<other>.md" is captured separately (and discarded) so it is never
+# accidentally prepended onto this slug's own name below.
+sib_pat = re.compile(
+    r'^(-\s*)PRD-([^ ]+\.md)(\s+—\s+)([^·\n]+?)(\s*·\s*)([^·\n]+?)(\s*·\s*)([^\n]+?)\s*$'
+)
+
+def find_sibling(idx_range):
+    for i in idx_range:
+        m = sib_pat.match(lines[i].rstrip('\n'))
+        if m:
+            return m
+    return None
+
+sib = find_sibling(range(sec_start + 1, sec_end)) or find_sibling(range(len(lines)))
+
+# Pull build_target / Drafted straight from the PRD file (already moved
+# into built-prds/ by step 4) so the backfilled line reflects real values,
+# never guesses.
+build_target = "?"
+drafted = "?"
+if prd_path_for_fields:
+    try:
+        with open(prd_path_for_fields) as pf:
+            body = pf.read()
+    except OSError:
+        body = ""
+    mt = re.search(r'^-\s*build_target:\s*(\S+)', body, re.MULTILINE)
+    if mt:
+        build_target = mt.group(1)
+    md_ = re.search(r'^-\s*Drafted:\s*(\S+)', body, re.MULTILINE)
+    if md_:
+        drafted = md_.group(1)
+
+if sib is None:
+    new_line = f"- {name} — shipped · {build_target} · {drafted}\n"
+    verdict = "BACKFILLED fallback"
+else:
+    lead, _sib_name, mid1, _sib_status, mid2, _sib_target, mid3, _sib_date = sib.groups()
+    # `lead` is just the "- " bullet (e.g. "- "); `name` already carries the
+    # full "PRD-<slug>.md" — do not also copy the sibling's own filename.
+    new_line = f"{lead}{name}{mid1}shipped{mid2}{build_target}{mid3}{drafted}\n"
+    verdict = "BACKFILLED sibling"
+
+# Insert right after the section's last real entry — before any blank
+# line(s) that separate this section from the next header — so a
+# backfilled line never leaves a stray gap ahead of it (matches /dream's
+# own contiguous-entries-then-one-blank-line convention).
+insert_at = sec_end
+while insert_at > sec_start + 1 and lines[insert_at - 1].strip() == "":
+    insert_at -= 1
+lines[insert_at:insert_at] = [new_line]
 with open(f, 'w') as fh:
     fh.writelines(lines)
+print(verdict)
 PYEOF
 }
 
@@ -266,9 +394,26 @@ write_archive_header "$prd_path" "$built_date" "$receipts_val" \
 git -C "$PRD_DIR" mv "$prd_rel" "$built_rel" \
   || die "mv: git mv $prd_rel -> $built_rel failed" 4
 
-# ---- step 5: flip the MANIFEST.md line ---------------------------------
-update_manifest_md "$manifest_md" "$slug" \
-  || die "manifest: no MANIFEST.md line found for $slug under $PRD_DIR" 4
+# ---- step 5: flip the MANIFEST.md line, or backfill a missing one -----
+[ -r "$manifest_md" ] || die "manifest: $manifest_rel unreadable under $PRD_DIR" 4
+manifest_result="$(update_manifest_md "$manifest_md" "$slug" "$PRD_DIR/$built_rel")"
+manifest_rc=$?
+if [ "$manifest_rc" -eq 2 ]; then
+  die "manifest: MANIFEST.md carries conflicting/duplicate lines for $slug under $PRD_DIR" 7
+elif [ "$manifest_rc" -ne 0 ]; then
+  die "manifest: could not update MANIFEST.md for $slug under $PRD_DIR (rc=$manifest_rc)" 4
+fi
+manifest_backfill_format=""
+case "$manifest_result" in
+  "BACKFILLED sibling")
+    manifest_backfill_format="sibling"
+    log "manifest-backfill (slug=$slug section=built-prds format=sibling)"
+    ;;
+  "BACKFILLED fallback")
+    manifest_backfill_format="fallback"
+    log "manifest-backfill (slug=$slug section=built-prds format=fallback)"
+    ;;
+esac
 
 # ---- step 6: one commit, exactly these three paths ---------------------
 # `git mv` already staged BOTH halves of the rename (delete $prd_rel, add
@@ -287,7 +432,11 @@ git -C "$PRD_DIR" add -- "$manifest_rel" \
 if git -C "$PRD_DIR" diff --cached --quiet -- "$prd_rel" "$built_rel" "$manifest_rel"; then
   die "commit: nothing staged after mv+header+manifest edit — aborting" 4
 fi
-git -C "$PRD_DIR" "${GIT_ID[@]}" commit -q -m "archive: $slug shipped" -- "$prd_rel" "$built_rel" "$manifest_rel" \
+commit_msg="archive: $slug shipped"
+if [ -n "$manifest_backfill_format" ]; then
+  commit_msg="$commit_msg"$'\n\n'"manifest-backfill: appended MANIFEST.md line for $slug (section=built-prds, format=$manifest_backfill_format)"
+fi
+git -C "$PRD_DIR" "${GIT_ID[@]}" commit -q -m "$commit_msg" -- "$prd_rel" "$built_rel" "$manifest_rel" \
   || die "commit: git commit failed" 4
 commit_sha="$(git -C "$PRD_DIR" rev-parse HEAD)"
 committed=true   # the write already landed atomically; disarm the revert

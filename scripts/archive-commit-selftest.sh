@@ -29,6 +29,31 @@
 #   AC7 — SKILL.md's archive step names archive-commit.sh and contains no
 #         `git mv` / `Status:`-editing instructions.
 #
+# PRD-build-archive-manifest-backfill (test_prefix `manbackfill`) extends
+# this same suite rather than duplicating it — `tests/manbackfill_ac<N>_*.sh`
+# wrappers (via tests/fixtures/manbackfill-ac-common.sh) pull labels
+# prefixed `MANBACKFILL AC<N>:` out of this same run, one per that PRD's
+# own numbered acceptance criteria:
+#   MANBACKFILL AC1 — no MANIFEST.md line exists for the slug: one is
+#         appended to the built-prds section, flipped to shipped, rc=0,
+#         and the journal names the backfill.
+#   MANBACKFILL AC2 — that backfilled line matches a sibling entry's exact
+#         format (field order/separators), and the commit message names
+#         the backfill.
+#   MANBACKFILL AC3 — a line already exists for the slug: no backfill
+#         occurs, it's flipped as today, and no manifest-backfill line is
+#         journaled.
+#   MANBACKFILL AC4 — two conflicting lines exist for the same slug: dies
+#         with a distinct exit code (not 4), naming the duplicate (real
+#         failure-mode case).
+#   MANBACKFILL AC5 — MANIFEST.md is unreadable: dies with exit 4, as
+#         before this PRD (real failure-mode case).
+#   MANBACKFILL AC6 — a slug already backfilled and flipped by a prior run:
+#         re-running is a no-op, exit 0, no second line or commit.
+#   MANBACKFILL AC7 — the backfill and flip land in the same commit that
+#         a sibling's push/pull-rebase must still survive (lock/commit
+#         ordering, mirrors AC5 above for the base atomic-commit feature).
+#
 # Run: bash scripts/archive-commit-selftest.sh   (exit 0 = all pass)
 
 set -uo pipefail
@@ -80,6 +105,54 @@ with open(f, 'w') as fh: fh.write(c)
 PY
   gc "$d/prds" add -A
   gc "$d/prds" commit -qm "add $slug"
+  git -C "$d/prds" push -q origin "$defbr"
+}
+
+# ---- helpers added for PRD-build-archive-manifest-backfill (manbackfill) ----
+
+# Add a queued PRD $2 (slug) to fixture $1 WITHOUT a MANIFEST.md line — the
+# exact shape this PRD exists to handle (a hand-queued PRD /dream never
+# reconciled). Carries a Drafted: date + build_target so a backfilled line
+# has real fields to source, not "?".
+add_queued_prd_no_manifest_line() {
+  local d="$1" slug="$2" defbr="$3" target="${4:-shell}" drafted="${5:-2026-09-13}"
+  printf '# PRD: %s\n\n- Status: queued\n- build_target: %s\n- build_into: /tmp/nowhere-%s\n- Drafted: %s\n' \
+    "$slug" "$target" "$slug" "$drafted" > "$d/prds/build-queue/PRD-$slug.md"
+  gc "$d/prds" add -A
+  gc "$d/prds" commit -qm "add $slug"
+  git -C "$d/prds" push -q origin "$defbr"
+}
+
+# Append one full sibling entry to fixture $1's "## built-prds" section (so
+# a backfill has a real sibling to derive its format from) and push.
+add_built_prds_sibling() {
+  local d="$1" defbr="$2" sib_slug="${3:-sibling-existing}"
+  python3 - "$d/prds/MANIFEST.md" "$sib_slug" <<'PY'
+import sys
+f, sib_slug = sys.argv[1], sys.argv[2]
+with open(f) as fh: c = fh.read()
+c = c.replace("## built-prds\n", f"## built-prds\n- PRD-{sib_slug}.md — built · rust-extend · 2026-09-01\n")
+with open(f, 'w') as fh: fh.write(c)
+PY
+  gc "$d/prds" add -A
+  gc "$d/prds" commit -qm "add sibling $sib_slug manifest line"
+  git -C "$d/prds" push -q origin "$defbr"
+}
+
+# Write TWO conflicting MANIFEST.md lines for the same slug $3 directly
+# (malformed real corruption, not the "absent" case) and push.
+add_duplicate_manifest_lines() {
+  local d="$1" defbr="$2" slug="$3"
+  python3 - "$d/prds/MANIFEST.md" "$slug" <<'PY'
+import sys
+f, slug = sys.argv[1], sys.argv[2]
+with open(f) as fh: c = fh.read()
+extra = f"- PRD-{slug}.md — queued · shell · 2026-09-01\n- PRD-{slug}.md — blocked · shell · 2026-09-02\n"
+c = c.replace("## built-prds\n", "## built-prds\n" + extra)
+with open(f, 'w') as fh: fh.write(c)
+PY
+  gc "$d/prds" add -A
+  gc "$d/prds" commit -qm "add duplicate $slug manifest lines"
   git -C "$d/prds" push -q origin "$defbr"
 }
 
@@ -244,6 +317,145 @@ archive_block="$(awk '/^- \*\*archive\*\*:/{p=1} p{print; if (/^$/) exit}' "$SKI
 expect "AC7: SKILL.md archive step names archive-commit.sh"    "grep -q 'archive-commit.sh' <<<\"\$archive_block\""
 expect "AC7: SKILL.md archive step has no git-mv instruction"  "! grep -q 'git mv' <<<\"\$archive_block\""
 expect "AC7: SKILL.md archive step has no manual Status: edit" "! grep -qE '^- Status:|Status:.*built' <<<\"\$archive_block\""
+
+# ======================================================================
+# MANBACKFILL AC1/AC2 — no MANIFEST.md line for the slug: backfilled into
+# built-prds, matching a sibling's format, flipped to shipped, journaled,
+# named in the commit message.
+# ======================================================================
+D8="$T/mb1"; mkdir -p "$D8"
+DEFBR8="$(new_prd_fixture "$D8")"
+add_built_prds_sibling "$D8" "$DEFBR8" "siborig"
+add_queued_prd_no_manifest_line "$D8" "mbfill1" "$DEFBR8" "shell" "2026-09-13"
+mkdir -p "$D8/receipts"; echo r > "$D8/receipts/r.txt"
+cat > "$D8/bmanifest.json" <<EOF
+{"prds":{"mbfill1":{"slug":"mbfill1","receipts_dir":"$D8/receipts"}}}
+EOF
+out8="$(PRD_DIR="$D8/prds" BUILD_MANIFEST="$D8/bmanifest.json" "$AC" mbfill1 2>&1)"; rc8=$?
+expect "MANBACKFILL AC1: archive-commit exits 0"                  "[ $rc8 -eq 0 ]"
+expect "MANBACKFILL AC1: build-queue/PRD-mbfill1.md is gone"      "[ ! -f '$D8/prds/build-queue/PRD-mbfill1.md' ]"
+expect "MANBACKFILL AC1: built-prds/PRD-mbfill1.md exists"        "[ -f '$D8/prds/built-prds/PRD-mbfill1.md' ]"
+expect "MANBACKFILL AC1: a shipped line now exists for mbfill1"   "grep -q '^- PRD-mbfill1.md — shipped ' '$D8/prds/MANIFEST.md'"
+built_prds_block8="$(awk '/^## built-prds/{p=1} p{print} /^## parked/{exit}' "$D8/prds/MANIFEST.md")"
+expect "MANBACKFILL AC1: backfilled line lands in built-prds section" "grep -q 'PRD-mbfill1.md — shipped' <<<\"\$built_prds_block8\""
+expect "MANBACKFILL AC1: journal names the backfill"              "grep -q 'manifest-backfill (slug=mbfill1 section=built-prds' <<<\"\$out8\""
+# AC2: the backfilled line's separators match the sibling's exactly.
+expect "MANBACKFILL AC2: backfilled line matches sibling's exact format" \
+  "grep -qxF -- '- PRD-mbfill1.md — shipped · shell · 2026-09-13' '$D8/prds/MANIFEST.md'"
+commit_msg8="$(git -C "$D8/prds" log -1 --format=%B)"
+expect "MANBACKFILL AC2: commit message names the backfill"       "grep -q 'manifest-backfill: appended MANIFEST.md line for mbfill1' <<<\"\$commit_msg8\""
+expect "MANBACKFILL AC2: commit subject is unchanged by the backfill note" \
+  "git -C '$D8/prds' log -1 --format=%s | grep -qx 'archive: mbfill1 shipped'"
+
+# ======================================================================
+# MANBACKFILL AC3 — a line already exists for the slug: flipped as today,
+# no backfill occurs, nothing is journaled.
+# ======================================================================
+D9="$T/mb3"; mkdir -p "$D9"
+DEFBR9="$(new_prd_fixture "$D9")"
+add_queued_prd "$D9" "mbexist" "$DEFBR9"
+mkdir -p "$D9/receipts"; echo r > "$D9/receipts/r.txt"
+cat > "$D9/bmanifest.json" <<EOF
+{"prds":{"mbexist":{"slug":"mbexist","receipts_dir":"$D9/receipts"}}}
+EOF
+out9="$(PRD_DIR="$D9/prds" BUILD_MANIFEST="$D9/bmanifest.json" "$AC" mbexist 2>&1)"; rc9=$?
+expect "MANBACKFILL AC3: archive-commit exits 0"                  "[ $rc9 -eq 0 ]"
+expect "MANBACKFILL AC3: existing line flipped to shipped"        "grep -q 'PRD-mbexist.md — shipped' '$D9/prds/MANIFEST.md'"
+expect "MANBACKFILL AC3: exactly one line for the slug (no dup appended)" \
+  "[ \"\$(grep -c 'PRD-mbexist.md' '$D9/prds/MANIFEST.md')\" -eq 1 ]"
+expect "MANBACKFILL AC3: no manifest-backfill line journaled"     "! grep -q 'manifest-backfill' <<<\"\$out9\""
+commit_msg9="$(git -C "$D9/prds" log -1 --format=%B)"
+expect "MANBACKFILL AC3: commit message has no backfill note"     "! grep -q 'manifest-backfill:' <<<\"\$commit_msg9\""
+
+# ======================================================================
+# MANBACKFILL AC4 — two conflicting lines for the same slug: real
+# corruption, dies with a distinct exit code (not 4), names the duplicate,
+# zero writes (required real failure-mode case).
+# ======================================================================
+D10="$T/mb4"; mkdir -p "$D10"
+DEFBR10="$(new_prd_fixture "$D10")"
+add_duplicate_manifest_lines "$D10" "$DEFBR10" "mbdup"
+add_queued_prd_no_manifest_line "$D10" "mbdup" "$DEFBR10"
+mkdir -p "$D10/receipts"; echo r > "$D10/receipts/r.txt"
+cat > "$D10/bmanifest.json" <<EOF
+{"prds":{"mbdup":{"slug":"mbdup","receipts_dir":"$D10/receipts"}}}
+EOF
+head10_0="$(git -C "$D10/prds" rev-parse HEAD)"
+out10="$(PRD_DIR="$D10/prds" BUILD_MANIFEST="$D10/bmanifest.json" "$AC" mbdup 2>&1)"; rc10=$?
+head10_1="$(git -C "$D10/prds" rev-parse HEAD)"
+expect "MANBACKFILL AC4: exits non-zero"                          "[ $rc10 -ne 0 ]"
+expect "MANBACKFILL AC4: exit code is distinct from 4"            "[ $rc10 -ne 4 ]"
+expect "MANBACKFILL AC4: names the duplicate"                     "grep -qi 'duplicate' <<<\"\$out10\""
+expect "MANBACKFILL AC4: no writes (HEAD unchanged)"              "[ '$head10_0' = '$head10_1' ]"
+expect "MANBACKFILL AC4: working tree clean"                      "[ -z \"\$(git -C '$D10/prds' status --porcelain)\" ]"
+expect "MANBACKFILL AC4: PRD still queued (untouched)"            "grep -q '^- Status: queued\$' '$D10/prds/build-queue/PRD-mbdup.md'"
+
+# ======================================================================
+# MANBACKFILL AC5 — MANIFEST.md unreadable: dies exit 4, as before this
+# PRD (real failure-mode case; the required OTHER failure mode).
+# ======================================================================
+D11="$T/mb5"; mkdir -p "$D11"
+DEFBR11="$(new_prd_fixture "$D11")"
+add_queued_prd_no_manifest_line "$D11" "mbunread" "$DEFBR11"
+mkdir -p "$D11/receipts"; echo r > "$D11/receipts/r.txt"
+cat > "$D11/bmanifest.json" <<EOF
+{"prds":{"mbunread":{"slug":"mbunread","receipts_dir":"$D11/receipts"}}}
+EOF
+chmod 000 "$D11/prds/MANIFEST.md"
+out11="$(PRD_DIR="$D11/prds" BUILD_MANIFEST="$D11/bmanifest.json" "$AC" mbunread 2>&1)"; rc11=$?
+chmod 644 "$D11/prds/MANIFEST.md"
+expect "MANBACKFILL AC5: exits with code 4"                       "[ $rc11 -eq 4 ]"
+expect "MANBACKFILL AC5: PRD still queued (untouched)"            "grep -q '^- Status: queued\$' '$D11/prds/build-queue/PRD-mbunread.md'"
+
+# ======================================================================
+# MANBACKFILL AC6 — idempotence: a slug already backfilled and flipped by
+# a prior run; re-running is a no-op (exit 0, no second line, no second
+# commit).
+# ======================================================================
+D12="$T/mb6"; mkdir -p "$D12"
+DEFBR12="$(new_prd_fixture "$D12")"
+add_built_prds_sibling "$D12" "$DEFBR12" "siborig2"
+add_queued_prd_no_manifest_line "$D12" "mbidem" "$DEFBR12"
+mkdir -p "$D12/receipts"; echo r > "$D12/receipts/r.txt"
+cat > "$D12/bmanifest.json" <<EOF
+{"prds":{"mbidem":{"slug":"mbidem","receipts_dir":"$D12/receipts"}}}
+EOF
+PRD_DIR="$D12/prds" BUILD_MANIFEST="$D12/bmanifest.json" "$AC" mbidem >/dev/null 2>&1
+head12_after1="$(git -C "$D12/origin.git" rev-parse HEAD)"
+out12b="$(PRD_DIR="$D12/prds" BUILD_MANIFEST="$D12/bmanifest.json" "$AC" mbidem 2>&1)"; rc12b=$?
+head12_after2="$(git -C "$D12/origin.git" rev-parse HEAD)"
+expect "MANBACKFILL AC6: re-run exits 0"                          "[ $rc12b -eq 0 ]"
+expect "MANBACKFILL AC6: re-run adds no new commit"               "[ '$head12_after1' = '$head12_after2' ]"
+expect "MANBACKFILL AC6: exactly one line for the slug (no dup)"  "[ \"\$(grep -c 'PRD-mbidem.md' '$D12/prds/MANIFEST.md')\" -eq 1 ]"
+
+# ======================================================================
+# MANBACKFILL AC7 — the backfill + flip land in the same commit, which
+# must still survive a sibling tick's own concurrent push (lock/commit
+# ordering fixture proof, P1).
+# ======================================================================
+D13="$T/mb7"; mkdir -p "$D13"
+DEFBR13="$(new_prd_fixture "$D13")"
+add_built_prds_sibling "$D13" "$DEFBR13" "siborig3"
+add_queued_prd_no_manifest_line "$D13" "mbrace" "$DEFBR13"
+mkdir -p "$D13/receipts"; echo r > "$D13/receipts/r.txt"
+cat > "$D13/bmanifest.json" <<EOF
+{"prds":{"mbrace":{"slug":"mbrace","receipts_dir":"$D13/receipts"}}}
+EOF
+# Sibling tick: an independent clone pushes an unrelated commit to origin
+# before archive-commit runs, so archive-commit's own post-commit
+# `git pull --rebase --autostash` has real upstream history to land on.
+git clone -q "$D13/origin.git" "$D13/sibling-clone" 2>/dev/null
+printf '# PRD: siblingrace\n\n- Status: queued\n- build_target: shell\n' > "$D13/sibling-clone/build-queue/PRD-siblingrace.md"
+gc "$D13/sibling-clone" add -A
+gc "$D13/sibling-clone" commit -qm "sibling: add siblingrace"
+git -C "$D13/sibling-clone" push -q origin "$DEFBR13"
+out13="$(PRD_DIR="$D13/prds" BUILD_MANIFEST="$D13/bmanifest.json" "$AC" mbrace 2>&1)"; rc13=$?
+expect "MANBACKFILL AC7: archive-commit exits 0"                  "[ $rc13 -eq 0 ]"
+expect "MANBACKFILL AC7: sibling's commit is present on origin"  "git -C '$D13/origin.git' log --oneline --all | grep -q 'sibling: add siblingrace'"
+expect "MANBACKFILL AC7: our archive commit is present on origin" "git -C '$D13/origin.git' log --oneline --all | grep -q 'archive: mbrace shipped'"
+expect "MANBACKFILL AC7: backfill + flip survived the rebase"    "grep -q 'PRD-mbrace.md — shipped' '$D13/prds/MANIFEST.md'"
+expect "MANBACKFILL AC7: sibling's pulled-in file is present"    "[ -f '$D13/prds/build-queue/PRD-siblingrace.md' ]"
+expect "MANBACKFILL AC7: working tree is clean"                  "[ -z \"\$(git -C '$D13/prds' status --porcelain)\" ]"
 
 echo "----"
 echo "archive-commit-selftest: pass=$PASS fail=$FAIL"
