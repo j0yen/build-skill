@@ -104,8 +104,96 @@ audit_snapshot "$ISO_LIVE_STATE_DIR" "$ISO_LIVE_JOURNAL" > "$iso_audit_before"
 
 expect() {
   local label="$1" cond="$2"
-  if eval "$cond"; then echo "ok  $label"; else echo "FAIL $label" >&2; fail=1; fi
+  local blk; blk="$(block_of "$label")"
+  [ -n "${BLOCK_OPENED[$blk]:-}" ] && BLOCK_TOTAL[$blk]=$(( ${BLOCK_TOTAL[$blk]} + 1 ))
+  if eval "$cond"; then
+    echo "ok  $label"
+  else
+    echo "FAIL $label" >&2
+    fail=1
+    [ -n "${BLOCK_OPENED[$blk]:-}" ] && BLOCK_FAIL[$blk]=$(( ${BLOCK_FAIL[$blk]} + 1 ))
+  fi
 }
+
+# ---- Block-scoped summaries (PRD-build-burst-selftest-block-scoped-summary)-
+# $fail above is suite-wide: every block's closing "every <block> case above
+# ran green" assertion used to read `[ $fail -eq 0 ]` directly, so one real
+# failure anywhere turned every LATER block's summary red too (observed
+# 2026-09-13: 8-9 of 23-24 reported failures were this cascade, including
+# `FAIL bursthyg: ...` with all 44 bursthyg cases individually green).
+#
+# block_start/expect_block_green give each block its own dedicated ok/fail
+# counters, keyed by NAME rather than by textual position or a single
+# "current block" pointer — parityr's own cases are physically interleaved
+# with burstuser's further down this file (parityr AC4 sits inside
+# burstuser's own commented section, and burstuser AC6 resumes in between
+# two parityr cases), so a position-based baseline/delta would misattribute
+# exactly the cases this PRD is trying to stop misattributing. Instead,
+# `expect` above attributes every case to the block named by the label's own
+# leading word (stripping a trailing colon covers both "parityr AC4: ..."
+# and "bursthyg: ..." forms) — the same word a human already reads first
+# when triaging a FAIL line.
+declare -A BLOCK_TOTAL=()
+declare -A BLOCK_FAIL=()
+declare -A BLOCK_OPENED=()
+declare -A BLOCK_SKIPPED=()
+
+block_of() {  # $1 = a case label -> its block name
+  local word="${1%% *}"
+  printf '%s' "${word%:}"
+}
+
+block_start() {  # $1 = block name. Call at every entry point of that
+  # block's cases (safe to call more than once for the same name across an
+  # interleaved resume — counters are dedicated to the name and are never
+  # reset once opened, only ever added to).
+  local name="$1"
+  BLOCK_OPENED["$name"]=1
+  : "${BLOCK_TOTAL[$name]:=0}"
+  : "${BLOCK_FAIL[$name]:=0}"
+}
+
+block_skip() {  # $1 = block name. The block did not run at all this pass
+  # (e.g. a feature it needs is dormant); its summary reports skipped —
+  # neither green nor red — and takes no baseline from a neighboring block.
+  BLOCK_SKIPPED["$1"]=1
+}
+
+expect_block_green() {  # $1 = block name, $2 = the exact passing-line text
+  # (kept byte-stable per block so existing greps on a passing line still
+  # match — see this PRD's Migration section).
+  local name="$1" label="$2"
+  if [ "${BLOCK_SKIPPED[$name]:-0}" = "1" ]; then
+    echo "SKIP $name: block skipped, no cases ran"
+    return
+  fi
+  if [ -z "${BLOCK_OPENED[$name]:-}" ]; then
+    echo "FAIL $name: block_start was never called for this block (0 cases counted, not necessarily 0 cases run)" >&2
+    fail=1
+    return
+  fi
+  local total="${BLOCK_TOTAL[$name]:-0}" bfail="${BLOCK_FAIL[$name]:-0}"
+  if [ "$bfail" -eq 0 ]; then
+    echo "ok  $label"
+  else
+    echo "FAIL $name: $bfail of $total cases failed" >&2
+    fail=1
+  fi
+}
+
+# ---- Regression lint (AC6): no block summary may hand-roll the global ------
+# counter. A future block that copies the old `[ $fail -eq 0 ]` pattern
+# instead of calling expect_block_green must be caught here, immediately,
+# not discovered as a cascading summary weeks later. Scans this script's own
+# source; the final suite verdict at the bottom is a plain `echo`, not an
+# `expect "... ran green ..."` call, so it can never match this pattern and
+# needs no special-case exclusion.
+blockscope_lint_hits="$(grep -nE 'expect "[^"]*ran green[^"]*"[[:space:]]+"\[ \$fail -eq 0 \]"' "$HERE/$(basename "$0")" 2>/dev/null || true)"
+if [ -n "$blockscope_lint_hits" ]; then
+  echo "FAIL block-summary-lint: a block summary hand-rolls the global \$fail counter instead of expect_block_green:" >&2
+  echo "$blockscope_lint_hits" >&2
+  fail=1
+fi
 
 # 2026-09-11 RedBaron-local policy: the real Hetzner burst box is deleted;
 # this whole suite exercises burst-lane.sh's routing/lifecycle logic
@@ -1923,6 +2011,7 @@ expect "gatetc AC4: box-parity.json compares the extra suite ok/ok, not baseline
 fresh_env
 export FAKE_SSH_CALL_LOG="$T/ssh.calls"; : > "$FAKE_SSH_CALL_LOG"
 bu1_out="$("$BL" up 2>&1)"; bu1_rc=$?
+block_start "burstuser"
 expect "burstuser AC1: up exits 0" "[ $bu1_rc -eq 0 ]"
 expect "burstuser AC1: root ssh received the user-creation call" \
   "grep -P '^root@\\S+\\t.*# user-create' \"$FAKE_SSH_CALL_LOG\" >/dev/null"
@@ -2078,6 +2167,7 @@ expect "burstuser AC6: the migration copy ran over root ssh (only user who can r
 # copy is a single small file, so its verified-copy check (size+count) must
 # match and the source directory must be gone afterward — no residue left
 # from a migration whose copy genuinely succeeded.
+block_start "parityr"
 expect "parityr AC4: old-root copy verified (bytes+count match) and removed after migration" \
   "[ ! -d \"$OLD_REMOTE_MIG\" ]"
 expect "parityr AC4: journal records migrated-removed naming the old path" \
@@ -2296,14 +2386,14 @@ expect "parityr AC3: box-parity.json shows the recovered suite as ok/ok, not no-
 # cases — an explicit, in-band assertion of the requirement's own selftest
 # check, matching every sibling AC's "does the suite name its own cases"
 # convention (see burstuser AC7 just below).
-expect "parityr AC6: every parityr case above ran green" "[ $fail -eq 0 ]"
+expect_block_green "parityr" "parityr AC6: every parityr case above ran green"
 
 # ---- burstuser AC7: the fixture set (this file) exits 0 and names the
 # burstuser cases — checked here as an explicit, in-band assertion (rather
 # than only by the exit code the harness wrapper around this file checks)
 # so tests/burstuser_ac7_*.sh has a real "ok" line of its own to grep for,
 # matching every sibling AC's own convention.
-expect "burstuser AC7: every burstuser case above ran green (fail=0 through AC1-AC6)" "[ $fail -eq 0 ]"
+expect_block_green "burstuser" "burstuser AC7: every burstuser case above ran green (fail=0 through AC1-AC6)"
 
 # ---- reality (PRD-build-post-ship-reality-check, test_prefix: reality) ----
 # reality-check.sh's plan/run + verified-completed.sh's two new archive
@@ -2361,6 +2451,7 @@ chmod +x "$RT/fake-bin/parity" "$RT/fake-bin/parity-fail"
 # literal command and lists the substrate-mention-with-no-command AC as
 # manual, naming a reason — never silently dropped.
 plan_out="$("$RC" plan "$RT/built-prds/PRD-realityfix.md")"
+block_start "reality"
 expect "reality AC1: plan lists AC1 kind=box with the literal parity command" \
   "printf '%s' \"\$plan_out\" | python3 -c \"import json,sys; d=json.load(sys.stdin); a=[x for x in d if x['ac']==1][0]; assert a['kind']=='box' and a['command']=='parity ~/wintermute/mcphost', a\""
 expect "reality AC1: AC2 (casper, no derivable command) is listed manual with a reason" \
@@ -2551,7 +2642,7 @@ expect "reality open --format json: shape matches {parent, followup} for the ope
 # reality AC9: this fixture set exits 0 and names the reality cases —
 # checked here as an explicit, in-band assertion, matching every sibling
 # AC's own convention (see burstuser AC7 / parityr AC6 above).
-expect "reality AC9: every reality case above ran green" "[ $fail -eq 0 ]"
+expect_block_green "reality" "reality AC9: every reality case above ran green"
 # ================================================================
 # isolate AC1-6 (PRD-build-burst-selftest-isolation) — every fixture in
 # this section is fully self-contained (its own tmpdir "fake home" or
@@ -2582,6 +2673,7 @@ printf '{}' > "$iso_fake_session"
 iso_ac1_before="$(stat -c %Y "$iso_fake_session" 2>/dev/null || stat -f %m "$iso_fake_session" 2>/dev/null)"
 iso_ac1_out="$(env -i HOME="$iso_fakehome" PATH="/usr/bin:/bin" BURST_LANE_TEST=1 "$iso_fake_bl" status 2>&1)"; iso_ac1_rc=$?
 iso_ac1_after="$(stat -c %Y "$iso_fake_session" 2>/dev/null || stat -f %m "$iso_fake_session" 2>/dev/null)"
+block_start "isolate"
 expect "isolate AC1: burst-lane.sh status exits 9 under the sentinel with no overrides" "[ $iso_ac1_rc -eq 9 ]"
 expect "isolate AC1: refusal names the live state path" "grep -qE 'test-isolation: live path .*state/burst-lane' <<<\"\$iso_ac1_out\""
 expect "isolate AC1: the live session file's mtime is unchanged" "[ \"\$iso_ac1_before\" = \"\$iso_ac1_after\" ]"
@@ -2663,7 +2755,7 @@ expect "isolate AC5: clean once the fixture-named dir is gone" "[ $iso_ac5b_rc -
 # ---- isolate AC6 (P1): this fixture set exits 0 and names the isolate
 # cases — matching every sibling AC's own "does the suite name its own
 # coverage" convention (parityr AC6, burstuser AC7 above).
-expect "isolate AC6: every isolate case above ran green" "[ $fail -eq 0 ]"
+expect_block_green "isolate" "isolate AC6: every isolate case above ran green"
 
 # ==============================================================================
 # paritycad AC1-AC6 (PRD-build-burst-parity-cadence): a parity receipt is
@@ -2733,6 +2825,7 @@ CARGOEOF
 chmod +x "$FAKEBIN_PC1/cargo"
 
 pc1_parity_out="$(PATH="$FAKEBIN_PC1:$PATH" "$BL" parity "$WT_PC1" 2>&1)"; pc1_parity_rc=$?
+block_start "paritycad"
 expect "paritycad AC1: initial parity exits 0 with a clean diff" "[ $pc1_parity_rc -eq 0 ] && grep -q 'diff=0' <<<\"\$pc1_parity_out\""
 pc1_receipt="$WT_PC1/target/autobuilder/receipts/box-parity.json"
 pc1_fields_rc=0
@@ -2982,7 +3075,7 @@ expect "paritycad AC5: the wrapped local run saw RUST_TEST_THREADS=4 (CARGO_BUDG
 # ---- paritycad AC6 (P1): this fixture set exits 0 and names the
 # paritycad cases — matching every sibling AC's own "does the suite name
 # its own coverage" convention (parityr AC6, isolate AC6 above).
-expect "paritycad AC6: every paritycad case above ran green" "[ $fail -eq 0 ]"
+expect_block_green "paritycad" "paritycad AC6: every paritycad case above ran green"
 
 # ---- isolate AC2 / requirement 3: the real top-level audit wrap (snapshot
 # taken at the very top of this file) closes here — every fixture case in
@@ -3013,6 +3106,7 @@ fresh_env
 export BURST_VOLUME_NAME="wm-burst-build"
 export FAKE_SSH_CALL_LOG="$T/ssh.calls"; : > "$FAKE_SSH_CALL_LOG"
 bv1_out="$("$BL" up)"; bv1_rc=$?
+block_start "burstvol"
 expect "burstvol AC1: up exits 0" "[ $bv1_rc -eq 0 ]"
 bv1_create_calls="$(grep -c 'volume create' "$FAKE_HCLOUD_CALLLOG")"
 expect "burstvol AC1: exactly one volume create call" "[ \"$bv1_create_calls\" -eq 1 ]"
@@ -3236,7 +3330,7 @@ expect "burstpull AC3b: the stale marker was cleared" "[ ! -e \"$BURST_LANE_STAT
 # ---- burstvol AC11: this fixture set exits 0 and names the burstvol cases -
 # (an explicit, in-band assertion, matching every sibling AC's own
 # convention — see burstuser AC7/parityr AC6 above).
-expect "burstvol AC11: every burstvol case above ran green" "[ $fail -eq 0 ]"
+expect_block_green "burstvol" "burstvol AC11: every burstvol case above ran green"
 # ============================================================================
 # PRD-build-burst-path-deps: a remote run syncs everything the crate needs to
 # build. Four cases: a fixture crate with a sibling path dependency actually
@@ -3284,6 +3378,7 @@ echo '' > "$PD_ROOT/sibling/src/lib.rs"
 WT_PD1="$PD_ROOT/main-crate"
 export FAKE_RSYNC_CALL_LOG="$T/rsync.calls.pd1"; : > "$FAKE_RSYNC_CALL_LOG"
 pd1_out="$("$BL" run "$WT_PD1" -- cargo metadata --format-version 1 2>&1)"; pd1_rc=$?
+block_start "pathdeps"
 expect "pathdeps AC1: run against a crate with a sibling path dep exits 0" "[ $pd1_rc -eq 0 ]"
 expect "pathdeps AC1: the worktree itself was rsynced" "grep -qF \"$WT_PD1/\" \"$FAKE_RSYNC_CALL_LOG\""
 expect "pathdeps AC1: the sibling path dependency was also rsynced" "grep -qF \"$PD_ROOT/sibling/\" \"$FAKE_RSYNC_CALL_LOG\""
@@ -3377,7 +3472,7 @@ expect "pathdeps AC4 (structural): gate_tools_probe's PATH export is now conditi
 # ---- pathdeps AC6 (P1): this fixture set exits 0 and names the pathdeps
 # cases — same in-band closing assertion every sibling PRD's own block ends
 # with (see burstuser AC7 / parityr AC6 just above).
-expect "pathdeps AC6: every pathdeps case above ran green" "[ $fail -eq 0 ]"
+expect_block_green "pathdeps" "pathdeps AC6: every pathdeps case above ran green"
 
 # ============================================================================
 # PRD-build-burst-path-deps-workspaces (test_prefix: pathws): the 2026-09-11
@@ -3431,6 +3526,7 @@ echo '' > "$WS1_ROOT/b/src/lib.rs"
 WT_WS1A="$WS1_ROOT/a"
 export FAKE_RSYNC_CALL_LOG="$T/rsync.calls.ws1"; : > "$FAKE_RSYNC_CALL_LOG"
 ws1_out="$("$BL" run "$WT_WS1A" -- cargo metadata --format-version 1 2>&1)"; ws1_rc=$?
+block_start "pathws"
 expect "pathws AC1: run against a workspace member exits 0" "[ $ws1_rc -eq 0 ]"
 expect "pathws AC1: cargo metadata really resolved the in-workspace sibling" \
   "! grep -qi 'failed to load source\|failed to read' <<<\"$ws1_out\""
@@ -3607,7 +3703,7 @@ unset BURST_LANE_FAKE_HEAD
 # ---- pathws AC6 (P1): this fixture set exits 0 and names its own pathws
 # cases — same in-band closing assertion every sibling PRD's own block ends
 # with (see pathdeps AC6 just above).
-expect "pathws AC6: every pathws case above ran green" "[ $fail -eq 0 ]"
+expect_block_green "pathws" "pathws AC6: every pathws case above ran green"
 
 # ==============================================================================
 # ---- bursthyg: PRD-build-burst-session-hygiene ------------------------------
@@ -3638,6 +3734,7 @@ export FAKE_RSYNC_KH_LOG="$T/rsync-kh.log"; : > "$FAKE_RSYNC_KH_LOG"
 HYG_STALE_GLOBAL_KH="$T/fake-global-known_hosts"
 echo "STALE-HOST-KEY" > "$HYG_STALE_GLOBAL_KH"
 hyg1_out="$("$BL" up)"; hyg1_rc=$?
+block_start "bursthyg"
 expect "bursthyg AC2: up succeeds despite a stale GLOBAL known_hosts-shaped file existing on disk" "[ $hyg1_rc -eq 0 ]"
 hyg1_sid="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
 hyg1_khfile="$BURST_LANE_STATE_DIR/known_hosts.$hyg1_sid"
@@ -3794,7 +3891,7 @@ expect "bursthyg AC7: up (already-up fast path) also archives a volume.json whos
 # PRD's own block ends with (see pathws AC6 just above). AC8 (a real-box
 # up -> provision -> down cycle) is deferred — see this PRD's own
 # deferred_acs/mock_justifications frontmatter.
-expect "bursthyg: every bursthyg case above ran green" "[ $fail -eq 0 ]"
+expect_block_green "bursthyg" "bursthyg: every bursthyg case above ran green"
 
 # ==============================================================================
 # ---- bursttdl: PRD-build-burst-teardown-lifecycle ---------------------------
@@ -3818,6 +3915,7 @@ fresh_env
 "$BL" up >/dev/null 2>&1
 btdl1_sid="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
 btdl1_boot="$(grep -oE '"boot_epoch":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+block_start "bursttdl"
 expect "bursttdl AC1 setup: a fresh session starts phase=setup" \
   "grep -q '\"phase\":\"setup\"' \"$BURST_LANE_STATE_DIR/session.json\""
 
@@ -4044,7 +4142,7 @@ unset FAKE_SSH_VOLUME_USED_PCT
 # ---- bursttdl AC9 (P1 style closer): this fixture set exits 0 and names
 # its own bursttdl cases — same in-band closing assertion every sibling
 # PRD's own block ends with (see bursthyg AC9 just above).
-expect "bursttdl: every bursttdl case above ran green" "[ $fail -eq 0 ]"
+expect_block_green "bursttdl" "bursttdl: every bursttdl case above ran green"
 
 # ---- volidfix: PRD-build-burst-volume-id-parse ----------------------------
 # A created volume is tracked or unwound, never abandoned. The bug: `up`
