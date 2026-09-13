@@ -277,6 +277,10 @@ fresh_env() {
   export BURST_LANE_PRD_DIR="$T/prds"; mkdir -p "$BURST_LANE_PRD_DIR/build-queue"
   export FAKE_HCLOUD_STATE="$T/hcloud.state"
   export FAKE_HCLOUD_CALLLOG="$T/hcloud.calls"; : > "$FAKE_HCLOUD_CALLLOG"
+  # PRD-build-burst-dispatch-reenable requirement 1 (bake): fake `hcloud
+  # server create-image` / `hcloud image describe` state, scoped under $T
+  # like every other fake-hcloud state file above.
+  export FAKE_HCLOUD_IMAGE_STATE="$T/hcloud-image.state"
   export FAKE_RSYNC_STATS_DIR="$T/rsync-stats"; mkdir -p "$FAKE_RSYNC_STATS_DIR"
   export BURST_LANE_COST_LEDGER="$T/cost.jsonl"
   # Three-state retrofit (PRD-build-three-state-probes): sandbox the shared
@@ -336,7 +340,8 @@ fresh_env() {
         FAKE_HCLOUD_VOLUME_CREATE_FAIL FAKE_HCLOUD_VOLUME_ATTACH_FAIL FAKE_HCLOUD_VOLUME_DETACH_FAIL \
         FAKE_HCLOUD_VOLUME_CREATE_STDERR_NOISE FAKE_HCLOUD_VOLUME_CREATE_GARBLED \
         FAKE_SSH_VOLUME_LABEL_PRESENT FAKE_SSH_VOLUME_MOUNT_FAIL FAKE_SSH_VOLUME_USED_GB FAKE_SSH_VOLUME_SIZE_GB FAKE_SSH_VOLUME_USED_PCT \
-        FAKE_SSH_VOLUME_FSCK_CALLLOG
+        FAKE_SSH_VOLUME_FSCK_CALLLOG \
+        FAKE_HCLOUD_CREATE_IMAGE_FAIL FAKE_HCLOUD_CREATE_IMAGE_PENDING
 }
 
 # ---- AC1: single-box refusal + adoption ------------------------------------
@@ -4287,6 +4292,86 @@ expect "volidfix AC8b: the old mismatched volume no longer exists" \
 # up -> provision -> down cycle ends with an empty `hcloud volume list`.
 
 expect_block_green "volidfix" "volidfix: every volidfix case above ran green"
+
+# =============================================================================
+# PRD-build-burst-dispatch-reenable: bake/prove/enable/disable. This pass
+# covers requirement 1 (`bake`) only — AC1 (bake done) and AC2 (bake
+# refused); prove/enable/disable/up-image-resolution/fail-closed/auto-bake
+# land in later chained steps. (test_prefix: reenable)
+# =============================================================================
+block_start "reenable"
+
+# ---- reenable AC1: bake succeeds against a gate_ready=true, sandbox_ok=true
+# session — snapshot.json gets the new image_id + build_skill_sha, the
+# journal records `bake done`, and the gate credential is shredded before
+# the image is taken.
+fresh_env
+REEN_AB_SRC="$T/fake-autobuilder-src"; mkdir -p "$REEN_AB_SRC"
+cat > "$REEN_AB_SRC/autobuilder" <<'EOF'
+#!/usr/bin/env bash
+echo "autobuilder 9.9.9"
+EOF
+chmod +x "$REEN_AB_SRC/autobuilder"
+export BURST_LANE_AUTOBUILDER_BIN="$REEN_AB_SRC/autobuilder"
+export BURST_GATE_REVIEWER=1
+export BURST_CLAUDE_CRED_SRC="$T/fake-cred-src.json"
+echo '{"fake":"cred"}' > "$BURST_CLAUDE_CRED_SRC"
+"$BL" up >/dev/null 2>&1
+r1_gate_ready="$(grep -oE '"gate_ready":"[^"]*"' "$BURST_LANE_STATE_DIR/session.json" | cut -d'"' -f4)"
+r1_sandbox_ok="$(grep -oE '"sandbox_ok":"[^"]*"' "$BURST_LANE_STATE_DIR/session.json" | cut -d'"' -f4)"
+expect "reenable AC1 setup: session is gate_ready=true after up" "[ \"$r1_gate_ready\" = true ]"
+expect "reenable AC1 setup: session is sandbox_ok=true after up" "[ \"$r1_sandbox_ok\" = true ]"
+r1_cred_path="$BURST_LANE_GATE_CRED_REMOTE_PATH"
+expect "reenable AC1 setup: the gate credential is present before bake" "[ -f \"$r1_cred_path\" ]"
+
+r1_out="$("$BL" bake)"; r1_rc=$?
+expect "reenable AC1: bake exits 0" "[ $r1_rc -eq 0 ]"
+expect "reenable AC1: bake prints the new image_id" "grep -q '^bake done: image_id=' <<<\"$r1_out\""
+expect "reenable AC1: snapshot.json holds a new image_id and the build_skill_sha" \
+  "python3 -c \"
+import json
+d = json.load(open('$BURST_LANE_STATE_DIR/snapshot.json'))
+assert d.get('image_id'), d
+assert d.get('build_skill_sha'), d
+assert d.get('created'), d
+assert isinstance(d.get('gate_tool_versions'), dict), d
+\""
+expect "reenable AC1: journal has bake done (image_id=... superseded=none secs=...)" \
+  "grep -qE 'burst-lane  bake  done  \\(image_id=[0-9]+ superseded=none secs=[0-9]+\\)' \"$BURST_LANE_JOURNAL\""
+expect "reenable AC1: the credential was shredded (no longer present after bake)" "[ ! -f \"$r1_cred_path\" ]"
+r1_shred_line="$(grep -n 'burst-lane  bake  cred  shredded' "$BURST_LANE_JOURNAL" | head -1 | cut -d: -f1)"
+r1_done_line="$(grep -n 'burst-lane  bake  done' "$BURST_LANE_JOURNAL" | head -1 | cut -d: -f1)"
+expect "reenable AC1: the credential shred is journaled before bake done (shred ran first)" \
+  "[ -n \"$r1_shred_line\" ] && [ -n \"$r1_done_line\" ] && [ \"$r1_shred_line\" -lt \"$r1_done_line\" ]"
+expect "reenable AC1: exactly one server create-image call happened" \
+  "[ \"$(grep -c 'server create-image' "$FAKE_HCLOUD_CALLLOG")\" -eq 1 ]"
+unset BURST_GATE_REVIEWER BURST_CLAUDE_CRED_SRC
+
+# ---- reenable AC2a: no active session -> bake refused, exits 3, writes ----
+# nothing.
+fresh_env
+r2a_out="$("$BL" bake 2>&1)"; r2a_rc=$?
+expect "reenable AC2a: bake exits 3 with no active session" "[ $r2a_rc -eq 3 ]"
+expect "reenable AC2a: no snapshot.json was written" "[ ! -f \"$BURST_LANE_STATE_DIR/snapshot.json\" ]"
+expect "reenable AC2a: journal names the refusal cause" \
+  "grep -q 'burst-lane  bake  refused  (cause=no-active-session)' \"$BURST_LANE_JOURNAL\""
+
+# ---- reenable AC2b: session active but gate_ready=false -> bake refused,
+# exits 3, writes nothing (same install-fail knob gatetools AC2 uses).
+fresh_env
+export FAKE_SSH_GATE_TOOLS_MISSING="autobuilder"
+export FAKE_SSH_GATE_TOOLS_INSTALL_FAIL=1
+"$BL" up >/dev/null 2>&1
+r2b_gate_ready="$(grep -oE '"gate_ready":"[^"]*"' "$BURST_LANE_STATE_DIR/session.json" | cut -d'"' -f4)"
+expect "reenable AC2b setup: session is gate_ready=false after up" "[ \"$r2b_gate_ready\" = false ]"
+r2b_out="$("$BL" bake 2>&1)"; r2b_rc=$?
+expect "reenable AC2b: bake exits 3 when gate_ready=false" "[ $r2b_rc -eq 3 ]"
+expect "reenable AC2b: no snapshot.json was written" "[ ! -f \"$BURST_LANE_STATE_DIR/snapshot.json\" ]"
+expect "reenable AC2b: journal names the refusal cause" \
+  "grep -q 'burst-lane  bake  refused  (cause=gate-not-ready' \"$BURST_LANE_JOURNAL\""
+unset FAKE_SSH_GATE_TOOLS_MISSING FAKE_SSH_GATE_TOOLS_INSTALL_FAIL
+
+expect_block_green "reenable" "reenable: every reenable case above ran green"
 
 echo "=== $([ $fail -eq 0 ] && echo PASS || echo FAIL) ==="
 exit $fail

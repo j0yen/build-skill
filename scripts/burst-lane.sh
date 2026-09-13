@@ -228,6 +228,12 @@ SKILL_DIR="$(cd "$HERE/.." && pwd)"
 
 STATE_DIR="${BURST_LANE_STATE_DIR:-$SKILL_DIR/state/burst-lane}"
 STATE_FILE="$STATE_DIR/session.json"
+# PRD-build-burst-dispatch-reenable requirement 1: the baked-image record —
+# `image_id`/`created`/`base_image_id`/`build_skill_sha`/`gate_tool_versions`
+# plus a capped `baked_history` (oldest-first, <=2 entries) used to journal
+# `bake superseded` when a third bake lands. Absent file == "no baked image
+# yet" everywhere that reads it (`up`'s image resolution, `status`).
+SNAPSHOT_STATE_FILE="$STATE_DIR/snapshot.json"
 COST_LEDGER="${BURST_LANE_COST_LEDGER:-$STATE_DIR/cost.jsonl}"
 # Requirement 13: which PRD slugs this session served, one per line,
 # deduped. Reset on a fresh boot/adopt (alongside runs_served=0), appended
@@ -489,7 +495,7 @@ BURST_SETUP_GRACE_MIN="${BURST_SETUP_GRACE_MIN:-30}"
 BURST_VOLUME_KEEP_MIN_PCT="${BURST_VOLUME_KEEP_MIN_PCT:-5}"
 
 die() { echo "burst-lane: $*" >&2; exit "${2:-1}"; }
-usage() { echo "usage: burst-lane.sh {up|status|run|sync-back|pull|ensure-fresh|down|watchdog|idle-guard|cost|sub-cap|verify|provision|reap|box-isolation-check|route-check|parity|gate} ..." >&2; exit 2; }
+usage() { echo "usage: burst-lane.sh {up|status|run|sync-back|pull|ensure-fresh|down|watchdog|idle-guard|cost|sub-cap|verify|provision|reap|box-isolation-check|route-check|parity|gate|bake} ..." >&2; exit 2; }
 
 now_epoch() { echo "${BURST_LANE_NOW:-$(date -u +%s)}"; }
 now_iso()   { date -u -d "@$(now_epoch)" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ; }
@@ -1789,6 +1795,177 @@ shred_gate_credential() {  # $1=ip $2=caller(down|watchdog)
        "shred -u -f '$GATE_CRED_REMOTE_PATH'" >/dev/null 2>&1; then
     journal_line "$(now_iso)  burst-lane  $caller  cred  shredded  (host=$ip)"
   fi
+}
+
+# ---- bake (PRD-build-burst-dispatch-reenable requirement 1) ---------------
+# Turns a verified, healthy session into a new snapshot image so the next
+# `up` boots ready without repeating box_bootstrap's per-tool installs. Never
+# invoked automatically by this step (the `down` auto-bake trigger — AC15 —
+# and `up`'s image resolution — requirement 2 — are separate, later steps of
+# this PRD); this is the standalone, operator/tick-invoked command.
+cmd_bake() {
+  if ! burst_configured; then
+    echo "burst: refused — not configured (RedBaron-local policy); set BUILD_BURST_ENABLED=1 to allow" >&2
+    exit 3
+  fi
+  if ! state_active; then
+    journal_line "$(now_iso)  burst-lane  bake  refused  (cause=no-active-session)"
+    echo "bake refused (cause=no-active-session)" >&2
+    exit 3
+  fi
+  local ip id gate_ready sandbox_ok
+  ip="$(state_read ip)"; id="$(state_read server_id)"
+  gate_ready="$(state_read gate_ready)"
+  sandbox_ok="$(state_read sandbox_ok)"
+  if [ "$gate_ready" != "true" ]; then
+    journal_line "$(now_iso)  burst-lane  bake  refused  (cause=gate-not-ready server_id=$id)"
+    echo "bake refused (cause=gate-not-ready)" >&2
+    exit 3
+  fi
+  if [ "$sandbox_ok" != "true" ]; then
+    journal_line "$(now_iso)  burst-lane  bake  refused  (cause=sandbox-not-ok server_id=$id)"
+    echo "bake refused (cause=sandbox-not-ok)" >&2
+    exit 3
+  fi
+  # Refuse while a `run` is in flight — a bake is a point-in-time credential
+  # shred + image freeze; racing a live run would either bake mid-write or
+  # yank the credential out from under it. Non-blocking contention probe:
+  # briefly try RUN_LOCK, release immediately either way (this is a refusal
+  # check, not a hold — cmd_run still owns the real critical section).
+  local bake_fd
+  exec {bake_fd}>"$RUN_LOCK"
+  if ! flock -n "$bake_fd"; then
+    journal_line "$(now_iso)  burst-lane  bake  refused  (cause=run-in-flight server_id=$id)"
+    echo "bake refused (cause=run-in-flight)" >&2
+    exec {bake_fd}>&-
+    exit 3
+  fi
+  flock -u "$bake_fd"
+  exec {bake_fd}>&-
+
+  local start_epoch; start_epoch="$(now_epoch)"
+
+  # Credential must never be baked into the image (Technical considerations).
+  shred_gate_credential "$ip" "bake"
+
+  local prev_image_id=""
+  if [ -f "$SNAPSHOT_STATE_FILE" ]; then
+    prev_image_id="$(python3 -c '
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    d = {}
+print(d.get("image_id", ""))
+' "$SNAPSHOT_STATE_FILE" 2>/dev/null)"
+  fi
+
+  local build_skill_sha; build_skill_sha="$(git -C "$SKILL_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+  local gate_tool_versions; gate_tool_versions="$(python3 -c '
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    d = {}
+print(json.dumps(d.get("gate_tool_versions", {}), sort_keys=True))
+' "$GATE_TOOLS_STATE_FILE" 2>/dev/null)"
+  [ -n "$gate_tool_versions" ] || gate_tool_versions="{}"
+  local n_tools; n_tools="$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); print(len(d))' "$gate_tool_versions" 2>/dev/null || echo 0)"
+
+  local created; created="$(now_iso)"
+  local description="wm-burst-lane baked ${created%%T*} build-skill=$build_skill_sha tools=$n_tools"
+
+  local create_out create_err; create_err="$(mktemp)"
+  if ! create_out="$("$HCLOUD" server create-image --type snapshot --description "$description" \
+        -o json "$id" 2>"$create_err")"; then
+    local emsg; emsg="$(tail -3 "$create_err" 2>/dev/null | tr '\n' ' ')"; rm -f "$create_err"
+    journal_line "$(now_iso)  burst-lane  bake  refused  (cause=hcloud-create-image-failed: $emsg)"
+    echo "bake refused (cause=hcloud-create-image-failed: $emsg)" >&2
+    exit 3
+  fi
+  rm -f "$create_err"
+
+  local new_image_id status
+  read -r new_image_id status <<<"$(python3 -c '
+import json, sys
+try:
+    d = json.loads(sys.stdin.read())
+except Exception:
+    print("", "")
+    raise SystemExit(0)
+img = d.get("image", d)
+print(img.get("id", ""), img.get("status", ""))
+' <<<"$create_out" 2>/dev/null)"
+  if [ -z "${new_image_id:-}" ]; then
+    journal_line "$(now_iso)  burst-lane  bake  refused  (cause=could-not-parse-image-id)"
+    echo "bake refused (cause=could-not-parse-image-id)" >&2
+    exit 3
+  fi
+
+  # Wait for the image to reach "available" (bounded — never hang a tick
+  # forever). Some responses already report it available synchronously.
+  local waits=0
+  while [ "$status" != "available" ] && [ "$waits" -lt 60 ]; do
+    status="$("$HCLOUD" image describe "$new_image_id" -o json 2>/dev/null | \
+      python3 -c 'import json,sys
+try:
+    d=json.loads(sys.stdin.read())
+except Exception:
+    d={}
+print(d.get("image", d).get("status",""))' 2>/dev/null)"
+    [ "$status" = "available" ] && break
+    waits=$((waits + 1)); sleep 1
+  done
+
+  # Cap baked_history at two entries; a third bake supersedes (journals,
+  # never deletes) the oldest.
+  local prior_history superseded_id
+  prior_history="$(python3 -c '
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    d = {}
+print(json.dumps(d.get("baked_history", [])))
+' "$SNAPSHOT_STATE_FILE" 2>/dev/null)"
+  [ -n "$prior_history" ] || prior_history="[]"
+  superseded_id="$(python3 -c '
+import json, sys
+hist = json.loads(sys.argv[1])
+new_id = sys.argv[2]
+hist.append(new_id)
+superseded = ""
+while len(hist) > 2:
+    superseded = hist.pop(0)
+print(superseded)
+print(json.dumps(hist))
+' "$prior_history" "$new_image_id" > "$STATE_DIR/.bake-history.tmp" 2>/dev/null; \
+    head -n1 "$STATE_DIR/.bake-history.tmp" 2>/dev/null)"
+  local new_history; new_history="$(tail -n1 "$STATE_DIR/.bake-history.tmp" 2>/dev/null || echo '[]')"
+  rm -f "$STATE_DIR/.bake-history.tmp"
+
+  python3 -c '
+import json, sys
+image_id, created, base_image_id, build_skill_sha, gate_tool_versions_json, history_json, out_path = sys.argv[1:8]
+d = {
+    "image_id": image_id,
+    "created": created,
+    "base_image_id": base_image_id,
+    "build_skill_sha": build_skill_sha,
+    "gate_tool_versions": json.loads(gate_tool_versions_json),
+    "baked_history": json.loads(history_json),
+}
+json.dump(d, open(out_path, "w"), indent=2, sort_keys=True)
+' "$new_image_id" "$created" "${SNAPSHOT_ID:-$DEFAULT_SNAPSHOT_ID}" "$build_skill_sha" \
+    "$gate_tool_versions" "$new_history" "$SNAPSHOT_STATE_FILE"
+
+  local secs=$(( $(now_epoch) - start_epoch ))
+  journal_line "$(now_iso)  burst-lane  bake  done  (image_id=$new_image_id superseded=${prev_image_id:-none} secs=$secs)"
+  if [ -n "$superseded_id" ]; then
+    journal_line "$(now_iso)  burst-lane  bake  superseded  (image_id=$superseded_id delete=operator)"
+  fi
+  echo "bake done: image_id=$new_image_id"
+  exit 0
 }
 
 cmd_up() {
@@ -6196,6 +6373,7 @@ main() {
     route-check) cmd_route_check "$@" ;;
     parity)    cmd_parity "$@" ;;
     gate)      cmd_gate "$@" ;;
+    bake)      cmd_bake "$@" ;;
     # Undocumented/hidden — PRD-build-burst-unprivileged-user requirement 1:
     # a pure read-only print of the resolved remote identity/paths, no ssh,
     # no filesystem writes outside $STATE_DIR's own mkdir at file top. Exists

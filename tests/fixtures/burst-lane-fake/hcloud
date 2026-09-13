@@ -30,8 +30,9 @@
 set -uo pipefail
 STATE="${FAKE_HCLOUD_STATE:-/tmp/bl-fake-hcloud.state}"
 VOLSTATE="${FAKE_HCLOUD_VOLUME_STATE:-/tmp/bl-fake-hcloud-volume.state}"
+IMGSTATE="${FAKE_HCLOUD_IMAGE_STATE:-/tmp/bl-fake-hcloud-image.state}"
 CALLLOG="${FAKE_HCLOUD_CALLLOG:-}"
-touch "$STATE" "$VOLSTATE"
+touch "$STATE" "$VOLSTATE" "$IMGSTATE"
 [ -n "$CALLLOG" ] && printf '%s\n' "$*" >> "$CALLLOG"
 
 case "${1:-}" in
@@ -83,6 +84,45 @@ case "${1:-}" in
       poweroff|shutdown|stop|reboot)
         echo "FAKE-HCLOUD-VIOLATION: burst-lane.sh must never call 'server $2' (a stopped server still bills)" >&2
         exit 99
+        ;;
+      create-image)
+        # PRD-build-burst-dispatch-reenable requirement 1 (bake): fake
+        # `hcloud server create-image --type snapshot --description "..." -o
+        # json <server-id>`. State: "id|status" lines appended to
+        # $FAKE_HCLOUD_IMAGE_STATE (default /tmp/bl-fake-hcloud-image.state).
+        # Returns status=available synchronously by default (real hcloud
+        # blocks on the action); FAKE_HCLOUD_CREATE_IMAGE_FAIL injects a
+        # failure, FAKE_HCLOUD_CREATE_IMAGE_PENDING makes the image start
+        # "pending" so a caller's poll loop (via `image describe`) is
+        # exercised — it flips to "available" after
+        # FAKE_HCLOUD_CREATE_IMAGE_PENDING poll calls.
+        [ "${FAKE_HCLOUD_CREATE_IMAGE_FAIL:-0}" = "1" ] && { echo "create-image failed" >&2; exit 1; }
+        img_id=$((RANDOM % 900000 + 100000))
+        img_status="available"
+        [ "${FAKE_HCLOUD_CREATE_IMAGE_PENDING:-0}" -gt 0 ] 2>/dev/null && img_status="pending"
+        echo "$img_id|$img_status|${FAKE_HCLOUD_CREATE_IMAGE_PENDING:-0}" >> "$IMGSTATE"
+        printf '{"image":{"id":%s,"status":"%s"},"action":{"progress":100}}\n' "$img_id" "$img_status"
+        exit 0
+        ;;
+      *) exit 2 ;;
+    esac
+    ;;
+  image)
+    case "${2:-}" in
+      describe)
+        key="$3"
+        line="$(grep -E "^$key\|" "$IMGSTATE" 2>/dev/null | head -n1)"
+        [ -z "$line" ] && exit 1
+        IFS='|' read -r iid istatus ileft <<<"$line"
+        if [ "$istatus" = "pending" ]; then
+          ileft=$((ileft - 1))
+          if [ "$ileft" -le 0 ]; then
+            istatus="available"
+          fi
+          sed -i -E "s/^$iid\|[^|]*\|[^|]*/$iid|$istatus|$ileft/" "$IMGSTATE" 2>/dev/null || true
+        fi
+        printf '{"image":{"id":%s,"status":"%s"}}\n' "$iid" "$istatus"
+        exit 0
         ;;
       *) exit 2 ;;
     esac
