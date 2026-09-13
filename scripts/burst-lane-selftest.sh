@@ -246,6 +246,7 @@ fresh_env() {
         FAKE_SSH_GATE_TOOLS_TOOLCHAIN_SIM FAKE_GATE_TOOLS_TOOLCHAIN_BIN FAKE_RUSTUP_TOOLCHAINS FAKE_CARGO_REQUIRE_TOOLCHAIN \
         FAKE_SSH_GATE_TOOLS_APT_UPDATE_FAIL FAKE_SSH_NEXTEST_PRESENT \
         FAKE_HCLOUD_VOLUME_CREATE_FAIL FAKE_HCLOUD_VOLUME_ATTACH_FAIL FAKE_HCLOUD_VOLUME_DETACH_FAIL \
+        FAKE_HCLOUD_VOLUME_CREATE_STDERR_NOISE FAKE_HCLOUD_VOLUME_CREATE_GARBLED \
         FAKE_SSH_VOLUME_LABEL_PRESENT FAKE_SSH_VOLUME_MOUNT_FAIL FAKE_SSH_VOLUME_USED_GB FAKE_SSH_VOLUME_SIZE_GB FAKE_SSH_VOLUME_USED_PCT \
         FAKE_SSH_VOLUME_FSCK_CALLLOG
 }
@@ -4044,6 +4045,149 @@ unset FAKE_SSH_VOLUME_USED_PCT
 # its own bursttdl cases — same in-band closing assertion every sibling
 # PRD's own block ends with (see bursthyg AC9 just above).
 expect "bursttdl: every bursttdl case above ran green" "[ $fail -eq 0 ]"
+
+# ---- volidfix: PRD-build-burst-volume-id-parse ----------------------------
+# A created volume is tracked or unwound, never abandoned. The bug: `up`
+# merged stderr progress text into the JSON parse target (`2>&1`), so the
+# parser silently failed, journaled a false volume-create-failed, and left
+# a real, billing, orphaned volume behind (5 hand-deleted on 2026-09-13).
+
+# ---- volidfix AC1: clean stdout-only create -> id parsed correctly -------
+fresh_env
+export BURST_VOLUME_NAME="wm-burst-volidfix1"
+vf1_out="$("$BL" up)"; vf1_rc=$?
+vf1_vid="$(grep -oE '"volume_id":"?[0-9]+"?' "$BURST_LANE_STATE_DIR/volume.json" 2>/dev/null | grep -oE '[0-9]+')"
+expect "volidfix AC1: up exits 0 against a clean create" "[ $vf1_rc -eq 0 ]"
+expect "volidfix AC1: volume.json recorded the parsed id" "[ -n \"$vf1_vid\" ]"
+expect "volidfix AC1: no volume-create-failed line was journaled" \
+  "! grep -q 'volume-create-failed' \"$BURST_LANE_JOURNAL\""
+
+# ---- volidfix AC2: stderr carries action-progress text, stdout stays -----
+# clean JSON -> the id is still parsed correctly (the exact shape that
+# broke before this fix: `2>&1` would have merged this progress text into
+# the parse target).
+fresh_env
+export BURST_VOLUME_NAME="wm-burst-volidfix2"
+export FAKE_HCLOUD_VOLUME_CREATE_STDERR_NOISE=1
+vf2_out="$("$BL" up)"; vf2_rc=$?
+vf2_vid="$(grep -oE '"volume_id":"?[0-9]+"?' "$BURST_LANE_STATE_DIR/volume.json" 2>/dev/null | grep -oE '[0-9]+')"
+expect "volidfix AC2: up exits 0 when create emits stderr progress noise" "[ $vf2_rc -eq 0 ]"
+expect "volidfix AC2: the id is parsed correctly from stdout alone" "[ -n \"$vf2_vid\" ]"
+expect "volidfix AC2: no volume-create-failed line was journaled despite stderr noise" \
+  "! grep -q 'volume-create-failed' \"$BURST_LANE_JOURNAL\""
+unset FAKE_HCLOUD_VOLUME_CREATE_STDERR_NOISE
+
+# ---- volidfix AC3/AC4: create exits 0 but the response can't be read -----
+# back -> the volume (real, server-side) is located by name and deleted;
+# volume-create-unwound is journaled (never volume-create-failed — the
+# create itself succeeded); the fake hcloud ends with zero volumes for
+# this name and the lane boots on the root disk.
+fresh_env
+export BURST_VOLUME_NAME="wm-burst-volidfix34"
+export FAKE_HCLOUD_VOLUME_CREATE_GARBLED=1
+vf34_out="$("$BL" up)"; vf34_rc=$?
+expect "volidfix AC3/4: up still exits 0, booting on root disk" "[ $vf34_rc -eq 0 ]"
+expect "volidfix AC3: volume-create-unwound is journaled with name, id, and cause" \
+  "grep -qE 'burst-lane  up  volume-create-unwound  \\(name=wm-burst-volidfix34 id=[0-9]+ cause=could-not-parse-id\\)' \"$BURST_LANE_JOURNAL\""
+expect "volidfix AC3: volume-create-failed is never journaled for this case" \
+  "! grep -q 'volume-create-failed' \"$BURST_LANE_JOURNAL\""
+expect "volidfix AC4: the fake hcloud holds zero volumes for this name afterward" \
+  "! hcloud volume describe \"$BURST_VOLUME_NAME\" -o json >/dev/null 2>&1"
+expect "volidfix AC4: volume.json records volume_mounted=false (booted on root disk)" \
+  "python3 -c \"import json,sys; d=json.load(open('$BURST_LANE_STATE_DIR/volume.json')); sys.exit(0 if d.get('volume_mounted')=='false' else 1)\""
+unset FAKE_HCLOUD_VOLUME_CREATE_GARBLED
+
+# ---- volidfix AC5: create itself exits non-zero -> honest journal grammar
+# volume-create-failed is journaled (nothing was ever made); no delete is
+# attempted and volume-create-unwound never fires for a genuinely failed
+# create.
+fresh_env
+export BURST_VOLUME_NAME="wm-burst-volidfix5"
+export FAKE_HCLOUD_VOLUME_CREATE_FAIL=1
+vf5_out="$("$BL" up)"; vf5_rc=$?
+expect "volidfix AC5: up still exits 0 (boots on root disk) when create itself fails" "[ $vf5_rc -eq 0 ]"
+expect "volidfix AC5: volume-create-failed is journaled" \
+  "grep -q 'burst-lane  up  volume-create-failed' \"$BURST_LANE_JOURNAL\""
+expect "volidfix AC5: no volume delete call was attempted (nothing was created)" \
+  "! grep -q 'volume delete' \"$FAKE_HCLOUD_CALLLOG\""
+expect "volidfix AC5: volume-create-unwound is never journaled for a failed create" \
+  "! grep -q 'volume-create-unwound' \"$BURST_LANE_JOURNAL\""
+unset FAKE_HCLOUD_VOLUME_CREATE_FAIL
+
+# ---- volidfix AC6: name-based orphan sweep reports id, size, and age -----
+fresh_env
+export BURST_VOLUME_NAME="wm-burst-volidfix6"
+export FAKE_SSH_VOLUME_USED_PCT=7
+"$BL" up >/dev/null 2>&1
+vf6_sid="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+vf6_vid="$(grep -oE '"volume_id":"?[0-9]+"?' "$BURST_LANE_STATE_DIR/volume.json" | grep -oE '[0-9]+')"
+hcloud server delete "$vf6_sid" >/dev/null 2>&1
+rm -f "$BURST_LANE_STATE_DIR/session.json"
+# Backdate the fixture's own "created" field 3 hours so age_h is provably
+# non-zero, without touching any other field.
+vf6_created3h="$(date -u -d "@$(( $(date -u +%s) - 10800 ))" +%Y-%m-%dT%H:%M:%SZ)"
+awk -F'|' -v OFS='|' -v vid="$vf6_vid" -v created="$vf6_created3h" \
+  '$1==vid{$6=created} {print}' "$FAKE_HCLOUD_VOLUME_STATE" > "$FAKE_HCLOUD_VOLUME_STATE.tmp" && mv "$FAKE_HCLOUD_VOLUME_STATE.tmp" "$FAKE_HCLOUD_VOLUME_STATE"
+vf6_out="$("$BL" reap --volumes)"
+expect "volidfix AC6: reap --volumes reports one volume reaped" "[ \"$vf6_out\" = 'volumes-reaped=1' ]"
+expect "volidfix AC6: the deletion is journaled with id, size, and a non-zero age" \
+  "grep -qE \"burst-lane  reap  volume-deleted  \\(id=$vf6_vid used_pct=7 size=500G age_h=[1-9][0-9]*\" \"$BURST_LANE_JOURNAL\""
+unset FAKE_SSH_VOLUME_USED_PCT
+
+# ---- volidfix AC7: a volume attached to a live server is left alone -----
+fresh_env
+export BURST_VOLUME_NAME="wm-burst-volidfix7"
+"$BL" up >/dev/null 2>&1
+vf7_vid="$(grep -oE '"volume_id":"?[0-9]+"?' "$BURST_LANE_STATE_DIR/volume.json" | grep -oE '[0-9]+')"
+vf7_out="$("$BL" reap --volumes)"
+expect "volidfix AC7: reap --volumes leaves an attached, live volume alone" "[ \"$vf7_out\" = 'volumes-reaped=0' ]"
+expect "volidfix AC7: no volume-deleted line was journaled for the attached volume" \
+  "! grep -q 'burst-lane  reap  volume-deleted' \"$BURST_LANE_JOURNAL\""
+expect "volidfix AC7: the volume still exists in hcloud afterward" \
+  "hcloud volume describe \"$vf7_vid\" -o json >/dev/null 2>&1"
+
+# ---- volidfix AC8: startup guard — unattached volume present at start ---
+# Case a: size already matches BURST_VOLUME_GB -> adopted, no new create.
+fresh_env
+export BURST_VOLUME_NAME="wm-burst-volidfix8a"
+hcloud volume create --name "$BURST_VOLUME_NAME" --size 500 >/dev/null 2>&1
+vf8a_pre_vid="$(awk -F'|' -v n="$BURST_VOLUME_NAME" '$2==n{print $1}' "$FAKE_HCLOUD_VOLUME_STATE" | head -1)"
+vf8a_out="$("$BL" up)"; vf8a_rc=$?
+vf8a_vid="$(grep -oE '"volume_id":"?[0-9]+"?' "$BURST_LANE_STATE_DIR/volume.json" | grep -oE '[0-9]+')"
+expect "volidfix AC8a: up exits 0 and adopts a pre-existing same-size volume" "[ $vf8a_rc -eq 0 ]"
+expect "volidfix AC8a: the adopted volume is the pre-existing one, not a new create" \
+  "[ \"$vf8a_vid\" = \"$vf8a_pre_vid\" ]"
+expect "volidfix AC8a: no volume create call happened during up (only the pre-seed's own)" \
+  "[ \"$(grep -c 'volume create' "$FAKE_HCLOUD_CALLLOG")\" -eq 1 ]"
+expect "volidfix AC8a: journal names the adoption" \
+  "grep -q 'burst-lane  up  volume  adopted' \"$BURST_LANE_JOURNAL\""
+expect "volidfix AC8a: exactly one volume exists for this name afterward" \
+  "[ \"$(grep -cF "|$BURST_VOLUME_NAME|" "$FAKE_HCLOUD_VOLUME_STATE")\" -eq 1 ]"
+
+# Case b: size does NOT match BURST_VOLUME_GB -> deleted, then created fresh.
+fresh_env
+export BURST_VOLUME_NAME="wm-burst-volidfix8b"
+hcloud volume create --name "$BURST_VOLUME_NAME" --size 100 >/dev/null 2>&1
+vf8b_pre_vid="$(awk -F'|' -v n="$BURST_VOLUME_NAME" '$2==n{print $1}' "$FAKE_HCLOUD_VOLUME_STATE" | head -1)"
+vf8b_out="$("$BL" up)"; vf8b_rc=$?
+vf8b_vid="$(grep -oE '"volume_id":"?[0-9]+"?' "$BURST_LANE_STATE_DIR/volume.json" | grep -oE '[0-9]+')"
+expect "volidfix AC8b: up exits 0 and replaces a size-mismatched pre-existing volume" "[ $vf8b_rc -eq 0 ]"
+expect "volidfix AC8b: the new volume is NOT the old mismatched one" \
+  "[ \"$vf8b_vid\" != \"$vf8b_pre_vid\" ]"
+expect "volidfix AC8b: journal names the size-mismatch replacement" \
+  "grep -q 'burst-lane  up  volume-guard-replaced' \"$BURST_LANE_JOURNAL\""
+expect "volidfix AC8b: journal also records the fresh create" \
+  "grep -q 'burst-lane  up  volume  created' \"$BURST_LANE_JOURNAL\""
+expect "volidfix AC8b: exactly one volume exists for this name afterward" \
+  "[ \"$(grep -cF "|$BURST_VOLUME_NAME|" "$FAKE_HCLOUD_VOLUME_STATE")\" -eq 1 ]"
+expect "volidfix AC8b: the old mismatched volume no longer exists" \
+  "! hcloud volume describe \"$vf8b_pre_vid\" -o json >/dev/null 2>&1"
+
+# ---- volidfix AC9 (P1, deferred — see this PRD's own frontmatter): no ----
+# real Hetzner box is authorized at build time to prove one full
+# up -> provision -> down cycle ends with an empty `hcloud volume list`.
+
+expect "volidfix: every volidfix case above ran green" "[ $fail -eq 0 ]"
 
 echo "=== $([ $fail -eq 0 ] && echo PASS || echo FAIL) ==="
 exit $fail

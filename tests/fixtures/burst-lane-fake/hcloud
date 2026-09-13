@@ -10,10 +10,23 @@
 #
 # PRD-build-burst-persistent-volume: `volume {create,describe,attach,detach}`
 # added, mirroring the server state file's own flat-line convention. State:
-# "id|name|size_gb|server_id|device" lines under $FAKE_HCLOUD_VOLUME_STATE
-# (default /tmp/bl-fake-hcloud-volume.state); server_id is empty when
-# unattached. Failure-injection: FAKE_HCLOUD_VOLUME_CREATE_FAIL,
-# FAKE_HCLOUD_VOLUME_ATTACH_FAIL, FAKE_HCLOUD_VOLUME_DETACH_FAIL.
+# "id|name|size_gb|server_id|device|created" lines under
+# $FAKE_HCLOUD_VOLUME_STATE (default /tmp/bl-fake-hcloud-volume.state);
+# server_id is empty when unattached, created is an ISO8601 timestamp
+# (honors BURST_LANE_NOW, same seam as burst-lane.sh's own now_epoch()).
+# Failure-injection: FAKE_HCLOUD_VOLUME_CREATE_FAIL,
+# FAKE_HCLOUD_VOLUME_ATTACH_FAIL, FAKE_HCLOUD_VOLUME_DETACH_FAIL,
+# FAKE_HCLOUD_VOLUME_DELETE_FAIL.
+#
+# PRD-build-burst-volume-id-parse: two more `volume create` behaviors, both
+# rc0 (the server-side create really did succeed) so the fixture reproduces
+# the two ways a real create response confuses a naive parser:
+# FAKE_HCLOUD_VOLUME_CREATE_STDERR_NOISE=1 emits hcloud-style action-
+# progress lines to STDERR around a clean JSON stdout (AC2 — proves the fix
+# parses stdout alone); FAKE_HCLOUD_VOLUME_CREATE_GARBLED=1 emits
+# non-JSON garbage to stdout instead of the real response, while still
+# recording the volume in $FAKE_HCLOUD_VOLUME_STATE (server-side create
+# succeeded — this is the untracked-create case, AC3/AC4).
 set -uo pipefail
 STATE="${FAKE_HCLOUD_STATE:-/tmp/bl-fake-hcloud.state}"
 VOLSTATE="${FAKE_HCLOUD_VOLUME_STATE:-/tmp/bl-fake-hcloud-volume.state}"
@@ -90,9 +103,29 @@ case "${1:-}" in
         vid=$((RANDOM % 900000 + 100000))
         size="${size:-500}"
         device="/dev/disk/by-id/scsi-0HC_Volume_$vid"
-        echo "$vid|$name|$size||$device" >> "$VOLSTATE"
-        printf '{"volume":{"id":%s,"name":"%s","size":%s,"linux_device":"%s","server":null}}\n' \
-          "$vid" "$name" "$size" "$device"
+        created_epoch="${BURST_LANE_NOW:-$(date -u +%s)}"
+        created="$(date -u -d "@$created_epoch" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ)"
+        # The server-side create below always happens first — every branch
+        # from here on (clean, noisy-stderr, garbled-stdout) reflects a
+        # volume that really exists and bills, mirroring the real API this
+        # PRD's why-chain describes.
+        echo "$vid|$name|$size||$device|$created" >> "$VOLSTATE"
+        if [ "${FAKE_HCLOUD_VOLUME_CREATE_GARBLED:-0}" = "1" ]; then
+          # PRD-build-burst-volume-id-parse AC3/AC4: rc0, but stdout is not
+          # the JSON response at all — reproduces a create whose result the
+          # lane cannot read even though nothing failed server-side.
+          echo "unexpected-response: volume provisioning queued"
+          exit 0
+        fi
+        if [ "${FAKE_HCLOUD_VOLUME_CREATE_STDERR_NOISE:-0}" = "1" ]; then
+          # PRD-build-burst-volume-id-parse AC2: real `hcloud volume create`
+          # (without --quiet) prints action-progress lines to stderr while
+          # the action runs — stdout stays clean JSON throughout.
+          printf '10%%\n' >&2
+          printf '100%%\n' >&2
+        fi
+        printf '{"volume":{"id":%s,"name":"%s","size":%s,"linux_device":"%s","server":null,"created":"%s"}}\n' \
+          "$vid" "$name" "$size" "$device" "$created"
         exit 0
         ;;
       describe)
@@ -100,13 +133,13 @@ case "${1:-}" in
         line="$(grep -E "^$key\|" "$VOLSTATE" 2>/dev/null | head -n1)"
         [ -z "$line" ] && line="$(awk -F'|' -v k="$key" '$2==k' "$VOLSTATE" 2>/dev/null | head -n1)"
         [ -z "$line" ] && exit 1
-        IFS='|' read -r vid name size sid device <<<"$line"
+        IFS='|' read -r vid name size sid device created <<<"$line"
         if [ -n "$sid" ]; then
-          printf '{"volume":{"id":%s,"name":"%s","size":%s,"linux_device":"%s","server":%s}}\n' \
-            "$vid" "$name" "$size" "$device" "$sid"
+          printf '{"volume":{"id":%s,"name":"%s","size":%s,"linux_device":"%s","server":%s,"created":"%s"}}\n' \
+            "$vid" "$name" "$size" "$device" "$sid" "$created"
         else
-          printf '{"volume":{"id":%s,"name":"%s","size":%s,"linux_device":"%s","server":null}}\n' \
-            "$vid" "$name" "$size" "$device"
+          printf '{"volume":{"id":%s,"name":"%s","size":%s,"linux_device":"%s","server":null,"created":"%s"}}\n' \
+            "$vid" "$name" "$size" "$device" "$created"
         fi
         exit 0
         ;;
@@ -123,9 +156,9 @@ case "${1:-}" in
         line="$(grep -E "^$key\|" "$VOLSTATE" 2>/dev/null | head -n1)"
         [ -z "$line" ] && line="$(awk -F'|' -v k="$key" '$2==k' "$VOLSTATE" 2>/dev/null | head -n1)"
         [ -z "$line" ] && exit 1
-        IFS='|' read -r vid name size old_sid device <<<"$line"
+        IFS='|' read -r vid name size old_sid device created <<<"$line"
         awk -F'|' -v k="$vid" 'BEGIN{OFS="|"} $1==k{next} {print}' "$VOLSTATE" > "$VOLSTATE.tmp" 2>/dev/null
-        printf '%s|%s|%s|%s|%s\n' "$vid" "$name" "$size" "$sid" "$device" >> "$VOLSTATE.tmp"
+        printf '%s|%s|%s|%s|%s|%s\n' "$vid" "$name" "$size" "$sid" "$device" "$created" >> "$VOLSTATE.tmp"
         mv "$VOLSTATE.tmp" "$VOLSTATE"
         exit 0
         ;;
@@ -135,9 +168,9 @@ case "${1:-}" in
         line="$(grep -E "^$key\|" "$VOLSTATE" 2>/dev/null | head -n1)"
         [ -z "$line" ] && line="$(awk -F'|' -v k="$key" '$2==k' "$VOLSTATE" 2>/dev/null | head -n1)"
         [ -z "$line" ] && exit 1
-        IFS='|' read -r vid name size old_sid device <<<"$line"
+        IFS='|' read -r vid name size old_sid device created <<<"$line"
         awk -F'|' -v k="$vid" 'BEGIN{OFS="|"} $1==k{next} {print}' "$VOLSTATE" > "$VOLSTATE.tmp" 2>/dev/null
-        printf '%s|%s|%s||%s\n' "$vid" "$name" "$size" "$device" >> "$VOLSTATE.tmp"
+        printf '%s|%s|%s||%s|%s\n' "$vid" "$name" "$size" "$device" "$created" >> "$VOLSTATE.tmp"
         mv "$VOLSTATE.tmp" "$VOLSTATE"
         exit 0
         ;;

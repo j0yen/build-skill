@@ -880,9 +880,30 @@ sandbox_probe() {  # $1 = ip -> echoes true|false
 # failed, mount-failed): the box boots and runs on the ephemeral root disk
 # exactly as it did before this PRD, with volume_mounted=false recorded so
 # `status`/`cost` never claim a durability this session doesn't have.
-find_volume() {  # -> stdout "id size_gb server_id device" (server_id empty
-                  # if unattached); rc1 if BURST_VOLUME_NAME is unset/empty
-                  # (the documented rollback) or hcloud reports no such volume
+# PRD-build-burst-volume-id-parse: single structural parser for every hcloud
+# volume JSON response (describe AND create) — id/size/server/linux_device/
+# created only, never text-scraped. Reads JSON on stdin, echoes
+# "id|size|server|device|created" (server empty when unattached; id empty
+# when stdin isn't parseable JSON shaped like a volume — the caller's own
+# unwind/failed branch, never this function's, decides what that means).
+volume_json_parse() {
+  python3 -c '
+import json, sys
+try:
+    d = json.loads(sys.stdin.read())
+except Exception:
+    print("")
+    sys.exit(0)
+d = d.get("volume", d)
+sid = d.get("server")
+print("%s|%s|%s|%s|%s" % (d.get("id",""), d.get("size",""), sid if sid is not None else "", d.get("linux_device",""), d.get("created","")))
+' 2>/dev/null
+}
+
+find_volume() {  # -> stdout "id size_gb server_id device created" (server_id
+                  # empty if unattached); rc1 if BURST_VOLUME_NAME is unset/
+                  # empty (the documented rollback) or hcloud reports no such
+                  # volume
   [ -n "$BURST_VOLUME_NAME" ] || return 1
   local out; out="$("$HCLOUD" volume describe "$BURST_VOLUME_NAME" -o json 2>/dev/null)" || return 1
   [ -n "$out" ] || return 1
@@ -892,13 +913,29 @@ find_volume() {  # -> stdout "id size_gb server_id device" (server_id empty
   # dropping an empty middle field and shifting linux_device into server_id's
   # slot (caught in offline testing: a fresh, never-attached volume read
   # back as "busy, attached to /dev/disk/by-id/...").
-  python3 -c '
-import json, sys
-d = json.loads(sys.stdin.read())
-d = d.get("volume", d)
-sid = d.get("server")
-print("%s|%s|%s|%s" % (d.get("id",""), d.get("size",""), sid if sid is not None else "", d.get("linux_device","")))
-' <<<"$out" 2>/dev/null
+  local parsed; parsed="$(volume_json_parse <<<"$out")"
+  [ -n "$parsed" ] || return 1
+  printf '%s\n' "$parsed"
+}
+
+# PRD-build-burst-volume-id-parse P0 (create is transactional): the only
+# caller is volume_ensure, right after a create exited 0 but the id could
+# not be read back. Locates the volume by NAME (never by a variable this
+# branch never got to set — that's the whole reason it's needed) and
+# deletes it, so a create the lane cannot track never outlives this
+# function call. Journals volume-create-unwound, never volume-create-failed
+# — the create itself succeeded; only the tracking of it failed.
+volume_unwind_untracked() {  # $1=cause
+  local cause="$1"
+  local found; found="$(find_volume 2>/dev/null)"
+  if [ -z "$found" ]; then
+    journal_line "$(now_iso)  burst-lane  up  volume-create-unwound  (name=$BURST_VOLUME_NAME id=unknown cause=$cause)"
+    return 0
+  fi
+  local vid vsize vserver vdevice vcreated
+  IFS='|' read -r vid vsize vserver vdevice vcreated <<<"$found"
+  "$HCLOUD" volume delete "$vid" >/dev/null 2>&1
+  journal_line "$(now_iso)  burst-lane  up  volume-create-unwound  (name=$BURST_VOLUME_NAME id=$vid cause=$cause)"
 }
 
 volume_ensure() {  # $1=ip $2=server_id
@@ -908,26 +945,61 @@ volume_ensure() {  # $1=ip $2=server_id
     return 0
   fi
 
-  local vid vsize vserver vdevice
+  local vid vsize vserver vdevice vcreated
   local found; found="$(find_volume)"
   if [ -n "$found" ]; then
-    IFS='|' read -r vid vsize vserver vdevice <<<"$found"
-  else
-    local create_out
-    if ! create_out="$("$HCLOUD" volume create --name "$BURST_VOLUME_NAME" --size "$BURST_VOLUME_GB" --location "$LOCATION" -o json 2>&1)"; then
-      journal_line "$(now_iso)  burst-lane  up  volume-create-failed  (name=$BURST_VOLUME_NAME err=\"$(tr '\n' ' ' <<<"$create_out")\" — booting on root disk)"
+    IFS='|' read -r vid vsize vserver vdevice vcreated <<<"$found"
+  fi
+
+  # PRD-build-burst-volume-id-parse P0 startup guard: `up` never stacks a
+  # second volume on top of an unattached one left behind by a prior run.
+  # An unattached volume found here (vserver empty) is adopted when its
+  # size already matches what this run wants, or replaced (deleted, then
+  # fall through to the create path below) when it doesn't — either way
+  # exactly one volume exists once this function returns, and the journal
+  # names which happened. A volume already attached to a server (this one
+  # or another) skips the guard entirely; the busy/attach logic further
+  # down is unchanged.
+  if [ -n "$found" ] && [ -z "$vserver" ]; then
+    if [ "$vsize" = "$BURST_VOLUME_GB" ]; then
+      journal_line "$(now_iso)  burst-lane  up  volume  adopted  (id=$vid name=$BURST_VOLUME_NAME size=${vsize}G cause=unattached-at-startup)"
+    else
+      if "$HCLOUD" volume delete "$vid" >/dev/null 2>&1; then
+        journal_line "$(now_iso)  burst-lane  up  volume-guard-replaced  (id=$vid name=$BURST_VOLUME_NAME old_size=${vsize}G target_size=${BURST_VOLUME_GB}G cause=size-mismatch)"
+      else
+        journal_line "$(now_iso)  burst-lane  up  volume-guard-delete-failed  (id=$vid name=$BURST_VOLUME_NAME size=${vsize}G — booting on root disk)"
+        volume_state_write "volume_mounted=false"
+        return 0
+      fi
+      found=""
+    fi
+  fi
+
+  if [ -z "$found" ]; then
+    # P0 correct parse: stdout and stderr captured separately (--quiet on
+    # top, so only real errors ever reach stderr) — the id is parsed from
+    # stdout alone, never a string that might carry hcloud's own action-
+    # progress text. Mirrors cmd_up's own server-create convention above.
+    local create_out create_err; create_err="$(mktemp)"
+    local create_rc=0
+    create_out="$("$HCLOUD" volume create --name "$BURST_VOLUME_NAME" --size "$BURST_VOLUME_GB" --location "$LOCATION" --quiet -o json 2>"$create_err")" || create_rc=$?
+    if [ "$create_rc" -ne 0 ]; then
+      # P0 honest journal grammar: the ONLY branch that journals
+      # volume-create-failed — the create itself exited non-zero, so
+      # nothing was made and nothing needs unwinding.
+      local emsg; emsg="$(tail -3 "$create_err" 2>/dev/null | tr '\n' ' ')"; rm -f "$create_err"
+      journal_line "$(now_iso)  burst-lane  up  volume-create-failed  (name=$BURST_VOLUME_NAME err=\"$emsg\" — booting on root disk)"
       volume_state_write "volume_mounted=false"
       return 0
     fi
-    IFS='|' read -r vid vsize vserver vdevice <<<"$(python3 -c '
-import json, sys
-d = json.loads(sys.stdin.read())
-d = d.get("volume", d)
-sid = d.get("server")
-print("%s|%s|%s|%s" % (d.get("id",""), d.get("size",""), sid if sid is not None else "", d.get("linux_device","")))
-' <<<"$create_out" 2>/dev/null)"
+    rm -f "$create_err"
+    local parsed; parsed="$(volume_json_parse <<<"$create_out")"
+    IFS='|' read -r vid vsize vserver vdevice vcreated <<<"$parsed"
     if [ -z "$vid" ]; then
-      journal_line "$(now_iso)  burst-lane  up  volume-create-failed  (name=$BURST_VOLUME_NAME cause=could-not-parse-id — booting on root disk)"
+      # P0 create is transactional: the create exited 0 (it really happened
+      # server-side) but this id could not be read back — unwind rather
+      # than abandon. Never journals volume-create-failed for this case.
+      volume_unwind_untracked "could-not-parse-id"
       volume_state_write "volume_mounted=false"
       return 0
     fi
@@ -5086,19 +5158,27 @@ reap_volumes() {  # -> stdout "volumes-reaped=N"
     echo "volumes-reaped=0"
     return 0
   fi
-  local vid vsize vserver vdevice
-  IFS='|' read -r vid vsize vserver vdevice <<<"$found"
+  local vid vsize vserver vdevice vcreated
+  IFS='|' read -r vid vsize vserver vdevice vcreated <<<"$found"
   if [ -n "$vserver" ] && server_alive "$vserver"; then
     echo "volumes-reaped=0"
     return 0
   fi
   local used_pct; used_pct="$(volume_state_read volume_used_pct)"; used_pct="${used_pct:-unknown}"
+  # PRD-build-burst-volume-id-parse AC6: age in hours from hcloud's own
+  # "created" timestamp (never from local state — this sweep's whole point
+  # is finding volumes with no session pointer at all).
+  local age_h="unknown"
+  if [ -n "$vcreated" ]; then
+    local created_epoch; created_epoch="$(date -u -d "$vcreated" +%s 2>/dev/null || echo "")"
+    [ -n "$created_epoch" ] && age_h=$(( ( $(now_epoch) - created_epoch ) / 3600 ))
+  fi
   if "$HCLOUD" volume delete "$vid" >/dev/null 2>&1; then
-    journal_line "$(now_iso)  burst-lane  reap  volume-deleted  (id=$vid used_pct=$used_pct cause=orphaned-no-session-pointer)"
+    journal_line "$(now_iso)  burst-lane  reap  volume-deleted  (id=$vid used_pct=$used_pct size=${vsize:-unknown}G age_h=$age_h cause=orphaned-no-session-pointer)"
     rm -f "$VOLUME_STATE_FILE"
     echo "volumes-reaped=1"
   else
-    journal_line "$(now_iso)  burst-lane  reap  volume-delete-failed  (id=$vid used_pct=$used_pct)"
+    journal_line "$(now_iso)  burst-lane  reap  volume-delete-failed  (id=$vid used_pct=$used_pct size=${vsize:-unknown}G age_h=$age_h)"
     echo "volumes-reaped=0"
   fi
 }
