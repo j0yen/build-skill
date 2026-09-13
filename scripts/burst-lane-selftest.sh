@@ -281,6 +281,11 @@ fresh_env() {
   # server create-image` / `hcloud image describe` state, scoped under $T
   # like every other fake-hcloud state file above.
   export FAKE_HCLOUD_IMAGE_STATE="$T/hcloud-image.state"
+  # requirement 4/6: this host's REAL ~/.config/systemd/user tree must
+  # never be touched by this suite — every enable/disable/status case
+  # scopes the drop-in under $T, and it does not exist by default (a fresh
+  # session reads enabled:false until a case explicitly creates it).
+  export BURST_LANE_SYSTEMD_DROPIN="$T/systemd-user/claude-build.service.d/burst.conf"
   export FAKE_RSYNC_STATS_DIR="$T/rsync-stats"; mkdir -p "$FAKE_RSYNC_STATS_DIR"
   export BURST_LANE_COST_LEDGER="$T/cost.jsonl"
   # Three-state retrofit (PRD-build-three-state-probes): sandbox the shared
@@ -4448,6 +4453,67 @@ r4b_install_line="$(grep -n 'burst-lane  gate-tools  install-start  (tool=jq)' "
 expect "reenable AC4b: bake-stale precedes install-start" \
   "[ -n \"$r4b_bakestale_line\" ] && [ -n \"$r4b_install_line\" ] && [ \"$r4b_bakestale_line\" -lt \"$r4b_install_line\" ]"
 unset FAKE_SSH_GATE_TOOLS_MISSING
+
+# ---- reenable AC12: status (text and --json) reports image_id,
+# image_source, bake_age_h, proof_age_h, proof_routed, enabled — session-
+# independent, so this holds with no active session too.
+# Case a: nothing baked/proved/enabled yet.
+fresh_env
+r12a_json="$("$BL" status --json)"
+expect "reenable AC12a: status --json reports image_source=env with no snapshot.json" \
+  "python3 -c \"import json,sys; d=json.loads(sys.argv[1]); assert d['image_source']=='env', d\" '$r12a_json'"
+expect "reenable AC12a: bake_age_h is null (never baked)" \
+  "python3 -c \"import json,sys; d=json.loads(sys.argv[1]); assert d['bake_age_h'] is None, d\" '$r12a_json'"
+expect "reenable AC12a: proof_age_h/proof_routed are null (never proved)" \
+  "python3 -c \"import json,sys; d=json.loads(sys.argv[1]); assert d['proof_age_h'] is None and d['proof_routed'] is None, d\" '$r12a_json'"
+expect "reenable AC12a: enabled is false (no drop-in)" \
+  "python3 -c \"import json,sys; d=json.loads(sys.argv[1]); assert d['enabled'] is False, d\" '$r12a_json'"
+expect "reenable AC12a: status --json uses compact separators (cmd_route_check's *'active':true* substring match must still fire)" \
+  "python3 -c \"import sys; assert '\\\"active\\\":false' in sys.argv[1], sys.argv[1]\" '$r12a_json'"
+
+# Case b: a snapshot.json exists (baked) -> image_source=baked, bake_age_h
+# numeric.
+fresh_env
+mkdir -p "$BURST_LANE_STATE_DIR"
+cat > "$BURST_LANE_STATE_DIR/snapshot.json" <<'JSON'
+{"image_id": "999891", "created": "2026-09-13T00:00:00Z", "base_image_id": "427125061", "build_skill_sha": "abc123", "gate_tool_versions": {}, "baked_history": ["999891"]}
+JSON
+r12b_json="$("$BL" status --json)"
+expect "reenable AC12b: image_source=baked" \
+  "python3 -c \"import json,sys; d=json.loads(sys.argv[1]); assert d['image_source']=='baked' and d['image_id']=='999891', d\" '$r12b_json'"
+expect "reenable AC12b: bake_age_h is a non-negative number" \
+  "python3 -c \"import json,sys; d=json.loads(sys.argv[1]); assert isinstance(d['bake_age_h'], (int,float)) and d['bake_age_h']>=0, d\" '$r12b_json'"
+
+# Case c: a proof.json exists with routed=true -> proof_routed=true,
+# proof_age_h numeric.
+fresh_env
+mkdir -p "$BURST_LANE_STATE_DIR"
+cat > "$BURST_LANE_STATE_DIR/proof.json" <<'JSON'
+{"ts": "2026-09-13T00:00:00Z", "image_id": "999891", "server_id": "1", "worktree": "/tmp/x", "sha": "deadbeef", "routed": true, "bytes": 100, "secs_remote": 5, "cause": ""}
+JSON
+r12c_json="$("$BL" status --json)"
+expect "reenable AC12c: proof_routed is true" \
+  "python3 -c \"import json,sys; d=json.loads(sys.argv[1]); assert d['proof_routed'] is True, d\" '$r12c_json'"
+expect "reenable AC12c: proof_age_h is a non-negative number" \
+  "python3 -c \"import json,sys; d=json.loads(sys.argv[1]); assert isinstance(d['proof_age_h'], (int,float)) and d['proof_age_h']>=0, d\" '$r12c_json'"
+
+# Case d: the systemd drop-in exists -> enabled=true.
+fresh_env
+mkdir -p "$(dirname "$BURST_LANE_SYSTEMD_DROPIN")"
+echo "[Service]" > "$BURST_LANE_SYSTEMD_DROPIN"
+r12d_json="$("$BL" status --json)"
+expect "reenable AC12d: enabled is true when the drop-in file exists" \
+  "python3 -c \"import json,sys; d=json.loads(sys.argv[1]); assert d['enabled'] is True, d\" '$r12d_json'"
+
+# Case e: text-mode "no active session" stays byte-exact and single-line —
+# the cargo/uv shims (burst-lane-bin/{cargo,uv}) both do a WHOLE-OUTPUT
+# `[ "$status_out" != "no active session" ]` comparison, so requirement 6's
+# extras are --json-only for now (see burst-lane.sh's own comment at that
+# call site); this case is the regression guard for that.
+fresh_env
+r12e_text="$("$BL" status)"
+expect "reenable AC12e: text-mode 'no active session' is unchanged, byte-exact, single-line" \
+  "[ \"$r12e_text\" = 'no active session' ]"
 
 expect_block_green "reenable" "reenable: every reenable case above ran green"
 

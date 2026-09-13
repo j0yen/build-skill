@@ -242,6 +242,14 @@ SNAPSHOT_STATE_FILE="$STATE_DIR/snapshot.json"
 # script only tracks the origin of a boot it just created, not one it
 # merely adopted.
 CURRENT_BOOT_IMAGE_SOURCE=""
+# PRD-build-burst-dispatch-reenable requirement 3/6: `prove`'s own receipt
+# (ts, image_id, server_id, worktree, sha, routed, bytes, secs_remote,
+# cause) — absent file reads as "never proved" everywhere (`status`,
+# `enable`). requirement 4/6: the systemd drop-in `enable` writes/`disable`
+# removes/`status` reports the existence of; overridable so a selftest
+# never touches this host's REAL ~/.config/systemd/user tree.
+PROOF_STATE_FILE="$STATE_DIR/proof.json"
+SYSTEMD_DROPIN="${BURST_LANE_SYSTEMD_DROPIN:-$HOME/.config/systemd/user/claude-build.service.d/burst.conf}"
 COST_LEDGER="${BURST_LANE_COST_LEDGER:-$STATE_DIR/cost.jsonl}"
 # Requirement 13: which PRD slugs this session served, one per line,
 # deduped. Reset on a fresh boot/adopt (alongside runs_served=0), appended
@@ -1823,6 +1831,116 @@ shred_gate_credential() {  # $1=ip $2=caller(down|watchdog)
   fi
 }
 
+# ---- image resolution / status extras (PRD-build-burst-dispatch-reenable) -
+# requirement 2: the exact three-tier precedence `up`'s create path and
+# `status`'s "which image would the lane boot next" both need — factored
+# out so the two never drift apart.
+resolve_boot_image() {  # stdout: "<image_id> <image_source(baked|env|default)>"
+  local image_id=""
+  if [ -f "$SNAPSHOT_STATE_FILE" ]; then
+    image_id="$(python3 -c '
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    d = {}
+print(d.get("image_id", ""))
+' "$SNAPSHOT_STATE_FILE" 2>/dev/null)"
+  fi
+  if [ -n "$image_id" ]; then
+    printf '%s baked\n' "$image_id"
+  elif [ "${SNAPSHOT_ID_FROM_ENV:-0}" = "1" ]; then
+    printf '%s env\n' "$SNAPSHOT_ID"
+  else
+    printf '%s default\n' "$SNAPSHOT_ID"
+  fi
+}
+
+# requirement 6: the session-INDEPENDENT fields `status` (text and --json)
+# always reports — image_id/image_source (what `up` would boot right now,
+# via resolve_boot_image above), bake_age_h (hours since snapshot.json's
+# own `created`, null if never baked), proof_age_h/proof_routed (same idea
+# from proof.json, requirement 3's own receipt — null until `prove` has
+# ever run), and enabled (does the systemd drop-in `enable` writes exist
+# right now). Every one of these persists whether or not a session is
+# currently up, so this is called from ALL FOUR of cmd_status's exit
+# points below, not just the active-session one.
+status_extra_fields_json() {  # stdout: one JSON object (never fails/exits)
+  local img_id img_source
+  read -r img_id img_source <<<"$(resolve_boot_image)"
+  python3 -c '
+import calendar, json, sys, time
+
+img_id, img_source, snap_path, proof_path, dropin_path = sys.argv[1:6]
+
+def age_h(iso):
+    try:
+        t = time.strptime(iso, "%Y-%m-%dT%H:%M:%SZ")
+        epoch = calendar.timegm(t)
+        return round((time.time() - epoch) / 3600.0, 2)
+    except Exception:
+        return None
+
+bake_age_h = None
+try:
+    snap = json.load(open(snap_path))
+    bake_age_h = age_h(snap.get("created", ""))
+except Exception:
+    pass
+
+proof_age_h = None
+proof_routed = None
+try:
+    proof = json.load(open(proof_path))
+    proof_age_h = age_h(proof.get("ts", ""))
+    proof_routed = proof.get("routed")
+except Exception:
+    pass
+
+import os
+enabled = os.path.isfile(dropin_path)
+
+print(json.dumps({
+    "image_id": img_id,
+    "image_source": img_source,
+    "bake_age_h": bake_age_h,
+    "proof_age_h": proof_age_h,
+    "proof_routed": proof_routed,
+    "enabled": enabled,
+}))
+' "$img_id" "$img_source" "$SNAPSHOT_STATE_FILE" "$PROOF_STATE_FILE" "$SYSTEMD_DROPIN"
+}
+
+# Same fields, one text-mode summary line (requirement 6: "text and --json").
+status_extra_fields_line() {  # stdout: one "image: ..." line
+  python3 -c '
+import json, sys
+d = json.loads(sys.argv[1])
+def s(v):
+    return "none" if v is None else v
+print("image: id=%s source=%s bake_age_h=%s proof_age_h=%s proof_routed=%s enabled=%s" % (
+    s(d["image_id"]), s(d["image_source"]), s(d["bake_age_h"]), s(d["proof_age_h"]),
+    s(d["proof_routed"]), str(d["enabled"]).lower()))
+' "$(status_extra_fields_json)"
+}
+
+# requirement 6/12: merge status_extra_fields_json() into an existing JSON
+# object string without hand-rolled string concatenation (every field above
+# already came through json.dumps, so this is a pure, quote-safe merge).
+status_json_with_extras() {  # $1 = base JSON object string -> stdout
+  # PRD-build-burst-dispatch-reenable requirement 6: compact separators
+  # (no space after ':'/',') to match this codebase's existing
+  # `"active":true`-shaped substring-match convention (cmd_route_check and
+  # others grep this exact shape) — json.dumps' default separators insert
+  # a space and silently broke every one of those matches.
+  python3 -c '
+import json, sys
+base = json.loads(sys.argv[1])
+base.update(json.loads(sys.argv[2]))
+print(json.dumps(base, separators=(",", ":")))
+' "$1" "$(status_extra_fields_json)"
+}
+
 # ---- bake (PRD-build-burst-dispatch-reenable requirement 1) ---------------
 # Turns a verified, healthy session into a new snapshot image so the next
 # `up` boots ready without repeating box_bootstrap's per-tool installs. Never
@@ -2073,26 +2191,8 @@ cmd_up() {
   # same three-tier precedence bake/up were designed around), and record
   # which tier won both for the journal and for provision_gate_tools'
   # bake-stale check just below.
-  local image_id="" image_source=""
-  if [ -f "$SNAPSHOT_STATE_FILE" ]; then
-    image_id="$(python3 -c '
-import json, sys
-try:
-    d = json.load(open(sys.argv[1]))
-except Exception:
-    d = {}
-print(d.get("image_id", ""))
-' "$SNAPSHOT_STATE_FILE" 2>/dev/null)"
-  fi
-  if [ -n "$image_id" ]; then
-    image_source="baked"
-  elif [ "${SNAPSHOT_ID_FROM_ENV:-0}" = "1" ]; then
-    image_id="$SNAPSHOT_ID"
-    image_source="env"
-  else
-    image_id="$SNAPSHOT_ID"
-    image_source="default"
-  fi
+  local image_id image_source
+  read -r image_id image_source <<<"$(resolve_boot_image)"
   CURRENT_BOOT_IMAGE_SOURCE="$image_source"
   journal_line "$(now_iso)  burst-lane  up  image  (id=$image_id source=$image_source)"
 
@@ -2435,7 +2535,21 @@ cmd_status() {
   [ "${1:-}" = "--json" ] && json=1
   if ! state_active; then
     probe_emit burst-status clean "no active session" >/dev/null
-    if [ "$json" -eq 1 ]; then echo '{"active":false}'; else echo "no active session"; fi
+    # requirement 6: image/bake/proof/enabled are session-independent —
+    # reported in --json here (status_json_with_extras). NOT wired into
+    # text mode: the cargo/uv shims (burst-lane-bin/cargo, burst-lane-bin/
+    # uv) both do `[ "$status_out" != "no active session" ]` — a byte-exact
+    # WHOLE-OUTPUT comparison, not a first-line one — so appending even a
+    # second line here flips every no-session shim call to "route to
+    # burst" (caught by this PRD's own regression pass). Text-mode wiring
+    # (status_extra_fields_line, already written) needs those two shims
+    # changed to a first-line comparison first — left for a later step of
+    # this PRD rather than risked here.
+    if [ "$json" -eq 1 ]; then
+      status_json_with_extras '{"active":false}'
+    else
+      echo "no active session"
+    fi
     exit 0
   fi
   # AC4 (PRD-build-three-state-probes): a corrupted session.json is a file
@@ -2447,7 +2561,11 @@ cmd_status() {
   if [ -n "$JQ" ] && ! "$JQ" -e . "$STATE_FILE" >/dev/null 2>&1; then
     probe_emit burst-status could-not-check "session.json corrupted (unparseable): $STATE_FILE" >/dev/null
     journal_line "$(now_iso)  burst-lane  status  could-not-check  (session.json corrupted at $STATE_FILE — treating as no active session, falling back local)"
-    if [ "$json" -eq 1 ]; then echo '{"active":false,"could_not_check":true}'; else echo "could-not-check: session.json corrupted — treating as no active session"; fi
+    if [ "$json" -eq 1 ]; then
+      status_json_with_extras '{"active":false,"could_not_check":true}'
+    else
+      echo "could-not-check: session.json corrupted — treating as no active session"
+    fi
     exit 0
   fi
   # Requirement 4/AC6: verify the session's server against hcloud before
@@ -2458,7 +2576,7 @@ cmd_status() {
   if ! session_reconcile; then
     journal_line "$(now_iso)  burst-lane  status  session-stale  (archived session.json — reporting active:false)"
     if [ "$json" -eq 1 ]; then
-      echo '{"active":false,"server_verified":false}'
+      status_json_with_extras '{"active":false,"server_verified":false}'
     else
       echo "active:false server_verified:false — session.json archived (server absent from hcloud)"
     fi
@@ -2617,8 +2735,10 @@ print(json.dumps(out))
 ' "$ATTR_REPOS_DIR" "$BURST_PARITY_REPOS")"
 
   if [ "$json" -eq 1 ]; then
-    printf '{"active":true,"server_verified":true,"server_id":"%s","ip":"%s","minutes_alive":%s,"ttl_hours":"%s","sandbox_ok":"%s","concurrent":"%s","free_disk_gb":%s,"disk_state":"%s","dirty":%s,"gates":%s,"gate_ready":"%s","gate_tools_missing":"%s","volume":%s,"volume_verified":%s,"redbaron_free_gb":%s,"parity":%s}\n' \
-      "$id" "$ip" "$alive" "$ttl" "$sbx" "$conc" "$free_disk_gb" "$disk_state" "$dirty_json" "$gates_json" "$(state_read gate_ready)" "$(state_read gate_tools_missing)" "$vol_json" "$volume_verified" "$redbaron_free_gb" "$parity_json"
+    local status_base
+    status_base="$(printf '{"active":true,"server_verified":true,"server_id":"%s","ip":"%s","minutes_alive":%s,"ttl_hours":"%s","sandbox_ok":"%s","concurrent":"%s","free_disk_gb":%s,"disk_state":"%s","dirty":%s,"gates":%s,"gate_ready":"%s","gate_tools_missing":"%s","volume":%s,"volume_verified":%s,"redbaron_free_gb":%s,"parity":%s}' \
+      "$id" "$ip" "$alive" "$ttl" "$sbx" "$conc" "$free_disk_gb" "$disk_state" "$dirty_json" "$gates_json" "$(state_read gate_ready)" "$(state_read gate_tools_missing)" "$vol_json" "$volume_verified" "$redbaron_free_gb" "$parity_json")"
+    status_json_with_extras "$status_base"
   else
     local gate_count; gate_count="$(python3 -c 'import json,sys; print(len(json.loads(sys.argv[1])))' "$gates_json")"
     # PRD-build-burst-gate-tools-scope requirement 3: an operator (or
@@ -2631,6 +2751,7 @@ print(json.dumps(out))
     # volume line follows; text-mode operators already get free_disk_gb
     # (the box) and volume=attached (the volume) on this same line.
     echo "active: $id ip=$ip alive=${alive}m ttl=${ttl}h sandbox_ok=$sbx concurrent=$conc disk_state=$disk_state free_disk_gb=$free_disk_gb gates:${gate_count} gate_ready=$(state_read gate_ready) missing=$(state_read gate_tools_missing)${vol_line}"
+    status_extra_fields_line
     [ -n "$dirty_lines" ] && printf '%s\n' "$dirty_lines"
     [ -n "$gate_lines" ] && printf '%s\n' "$gate_lines"
     local parity_lines; parity_lines="$(python3 -c '
