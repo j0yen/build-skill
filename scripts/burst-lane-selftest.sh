@@ -4598,6 +4598,79 @@ expect "reenable AC4b: bake-stale precedes install-start" \
   "[ -n \"$r4b_bakestale_line\" ] && [ -n \"$r4b_install_line\" ] && [ \"$r4b_bakestale_line\" -lt \"$r4b_install_line\" ]"
 unset FAKE_SSH_GATE_TOOLS_MISSING
 
+# ---- reenable AC5/AC6 (PRD-build-burst-dispatch-reenable requirement 3):
+# `prove` independently re-derives every assertion (never trusts `run`'s own
+# journal line alone — the 2026-09-09 lesson) and writes proof.json
+# accordingly. A fake `cargo` on PATH stands in for the box's real cargo
+# (mirroring the existing fake-uv WT_PY pattern above): it writes a fresh
+# target/ file and exits 0, so `run`'s remote exec, the explicit `pull`,
+# and the on-disk freshness check all succeed identically in both cases —
+# the ONLY thing that differs between AC5 and AC6 is the fake ssh's answer
+# to the literal remote `hostname` call this PRD's cmd_prove makes.
+REEN_PROVE_CARGO="$T/fakebin-prove-cargo"; mkdir -p "$REEN_PROVE_CARGO"
+cat > "$REEN_PROVE_CARGO/cargo" <<'EOF'
+#!/usr/bin/env bash
+# cmd_verify's own remote-cargo probe calls `cargo --version` before any
+# real work routes here — answer that the same way the real cargo would, or
+# verify FAILs and every run falls back local before prove ever gets a
+# chance to run.
+if [ "${1:-}" = "--version" ]; then
+  echo "cargo 1.85.0-fake"
+  exit 0
+fi
+mkdir -p target
+echo built > target/out.txt
+exit 0
+EOF
+chmod +x "$REEN_PROVE_CARGO/cargo"
+
+# `cmd_run` refuses to route until `verify` passes, and `verify`'s
+# gate-tools check compares the LOCAL autobuilder's version against the
+# fake remote's — same fake-local-autobuilder trick as reenable AC4 above
+# (BURST_LANE_AUTOBUILDER_BIN), so this machine's real (mismatched) local
+# autobuilder never trips a spurious gate-tools-missing/version-drift verify
+# failure that would fall this run back local before `prove` ever gets to
+# its own host-attribution check.
+REEN_PROVE_AB_SRC="$T/fake-autobuilder-src-prove"; mkdir -p "$REEN_PROVE_AB_SRC"
+cat > "$REEN_PROVE_AB_SRC/autobuilder" <<'EOF'
+#!/usr/bin/env bash
+echo "autobuilder 9.9.9"
+EOF
+chmod +x "$REEN_PROVE_AB_SRC/autobuilder"
+export BURST_LANE_AUTOBUILDER_BIN="$REEN_PROVE_AB_SRC/autobuilder"
+
+# Case AC5: the box's `hostname` answers something OTHER than this
+# machine's own — prove treats that as proof the run actually left this
+# caller, exactly as the box hostname != caller check is meant to catch a
+# same-host passthrough.
+fresh_env
+export BURST_LANE_AUTOBUILDER_BIN="$REEN_PROVE_AB_SRC/autobuilder"
+WT_PROVE5="$T/prove-ac5-mcphost"; mkdir -p "$WT_PROVE5"
+r5_out="$(PATH="$REEN_PROVE_CARGO:$PATH" FAKE_SSH_HOSTNAME=wm-burst-lane-fake-box "$BL" prove --worktree "$WT_PROVE5" 2>&1)"; r5_rc=$?
+expect "reenable AC5: prove exits 0 when run+pull+freshness+host all check out" "[ $r5_rc -eq 0 ]"
+expect "reenable AC5: proof.json has routed=true and bytes>0" \
+  "python3 -c \"import json; d=json.load(open('$BURST_LANE_STATE_DIR/proof.json')); assert d['routed'] is True and d['bytes'] > 0, d\""
+expect "reenable AC5: journal has prove done" \
+  "grep -q 'burst-lane  prove  done  (routed=true' \"$BURST_LANE_JOURNAL\""
+expect "reenable AC5: down ran at the end of prove (a decision line was journaled)" \
+  "grep -q 'burst-lane  down  decision=' \"$BURST_LANE_JOURNAL\""
+
+# Case AC6: the box's `hostname` answers the SAME as this caller's own (the
+# fake ssh's default — indistinguishable from a local passthrough) — first
+# failing check is host-mismatch, everything upstream of it (run, pull,
+# freshness) still having succeeded.
+fresh_env
+export BURST_LANE_AUTOBUILDER_BIN="$REEN_PROVE_AB_SRC/autobuilder"
+WT_PROVE6="$T/prove-ac6-mcphost"; mkdir -p "$WT_PROVE6"
+r6_out="$(PATH="$REEN_PROVE_CARGO:$PATH" "$BL" prove --worktree "$WT_PROVE6" 2>&1)"; r6_rc=$?
+expect "reenable AC6: prove exits 1 when the box's hostname matches the caller's" "[ $r6_rc -eq 1 ]"
+expect "reenable AC6: proof.json has routed=false with cause=host-mismatch" \
+  "python3 -c \"import json; d=json.load(open('$BURST_LANE_STATE_DIR/proof.json')); assert d['routed'] is False and d['cause'] == 'host-mismatch', d\""
+expect "reenable AC6: journal has prove failed (cause=host-mismatch)" \
+  "grep -q 'burst-lane  prove  failed  (cause=host-mismatch' \"$BURST_LANE_JOURNAL\""
+expect "reenable AC6: down still ran even though the proof failed" \
+  "grep -q 'burst-lane  down  decision=' \"$BURST_LANE_JOURNAL\""
+
 # ---- reenable AC7: `enable` writes the systemd drop-in only when
 # proof.json is routed=true, younger than 7 days, and names the image `up`
 # would boot now; otherwise it refuses (rc 3, no drop-in). `disable` always

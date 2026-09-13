@@ -330,6 +330,17 @@ case "$cmd" in
     [ "${FAKE_SSH_NEXTEST_PRESENT:-0}" = "1" ] && exit 0
     exit 1
     ;;
+  hostname)
+    # PRD-build-burst-dispatch-reenable requirement 3 (prove): the box's own
+    # identity, asked independently of anything cmd_run's journal claims
+    # (the 2026-09-09 lesson — never trust the journal alone). Defaults to
+    # THIS machine's own real hostname — i.e. indistinguishable from the
+    # caller, the natural "host-mismatch" shape offline — so a test wanting
+    # the success path must explicitly set FAKE_SSH_HOSTNAME to a distinct
+    # value.
+    echo "${FAKE_SSH_HOSTNAME:-$(hostname 2>/dev/null || echo unknown)}"
+    exit 0
+    ;;
 esac
 if [ "${FAKE_SSH_REMOTE_FAIL:-0}" != "0" ]; then exit "${FAKE_SSH_REMOTE_FAIL}"; fi
 eval "$cmd"

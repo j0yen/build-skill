@@ -2112,6 +2112,144 @@ json.dump(d, open(out_path, "w"), indent=2, sort_keys=True)
   exit 0
 }
 
+# ---- prove (PRD-build-burst-dispatch-reenable requirement 3) --------------
+# The one thing `bake`/`enable` alone never establish: that a box can carry
+# a REAL cargo run and hand real artifacts back — the 2026-09-09 lesson was
+# fourteen runs that looked routed in the journal and were not, so this
+# never trusts cmd_run's own journal line alone. It independently re-derives
+# each assertion (run's own exit code, the pull's own reported bytes, a
+# fresh file on disk, and a remote `hostname` call distinct from this
+# caller's own) and stops at the FIRST failing one. BUILD_BURST_ENABLED is
+# forced on for this function's own call chain only (a `local -x`, gone the
+# moment this function returns) — proving must work precisely when the lane
+# is NOT yet opted in, since a proof is `enable`'s own prerequisite.
+# Default worktree (Joe, 2026-09-13, decided in Open questions): a
+# disposable `git worktree` of ~/wintermute/mcphost at its current HEAD, no
+# PRD claimed — 11 of 21 queued PRDs are mcphost rust-extend, so this
+# exercises more of the real path than any smaller crate would.
+# `prove` always ends with `down` under the existing cost-safe rules
+# (requirement 3's own text), success or failure alike.
+cmd_prove() {
+  local -x BUILD_BURST_ENABLED=1
+  local worktree="" disposable_repo="" cleanup_worktree=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --worktree) worktree="${2:?prove: --worktree needs a value}"; shift 2 ;;
+      *) echo "usage: burst-lane.sh prove [--worktree <path>]" >&2; exit 2 ;;
+    esac
+  done
+
+  local start_epoch; start_epoch="$(now_epoch)"
+
+  if [ -z "$worktree" ]; then
+    disposable_repo="${BURST_PROVE_MCPHOST_REPO:-$HOME/wintermute/mcphost}"
+    if [ ! -d "$disposable_repo/.git" ] && ! git -C "$disposable_repo" rev-parse --git-dir >/dev/null 2>&1; then
+      journal_line "$(now_iso)  burst-lane  prove  failed  (cause=mcphost-repo-missing)"
+      echo "prove failed (cause=mcphost-repo-missing)" >&2
+      exit 1
+    fi
+    worktree="$(mktemp -u "${TMPDIR:-/tmp}/burst-prove-mcphost.XXXXXX")"
+    if ! git -C "$disposable_repo" worktree add --detach "$worktree" HEAD >/dev/null 2>&1; then
+      journal_line "$(now_iso)  burst-lane  prove  failed  (cause=worktree-add-failed)"
+      echo "prove failed (cause=worktree-add-failed)" >&2
+      exit 1
+    fi
+    cleanup_worktree="$worktree"
+  fi
+  [ -d "$worktree" ] || { echo "prove failed (cause=no-such-worktree)" >&2; exit 1; }
+
+  local sha; sha="$(git -C "$worktree" rev-parse HEAD 2>/dev/null || echo unknown)"
+  local fresh_marker; fresh_marker="$(mktemp "${TMPDIR:-/tmp}/burst-prove-marker.XXXXXX")"
+  touch -d "@$start_epoch" "$fresh_marker" 2>/dev/null || true
+
+  local routed=false bytes=0 cause="" id="" secs_remote=0
+
+  local up_out up_rc; up_out="$(cmd_up 2>&1)"; up_rc=$?
+  if [ "$up_rc" -ne 0 ]; then
+    cause="up-failed"
+  else
+    id="$(state_read server_id)"
+
+    local run_out run_rc
+    run_out="$(cmd_run "$worktree" -- cargo test --workspace 2>&1)"; run_rc=$?
+    local run_line; run_line="$(grep "burst-lane  run  routed  (server_id=$id worktree=$worktree " "$JOURNAL" 2>/dev/null | tail -n1)"
+    if [ "$run_rc" -ne 0 ] || [ -z "$run_line" ] || ! grep -q "exit=0" <<<"$run_line"; then
+      cause="run-failed"
+    else
+      local pull_out pull_rc
+      pull_out="$(cmd_pull "$worktree" 2>&1)"; pull_rc=$?
+      if [ "$pull_rc" -ne 0 ] || [ "$pull_out" != "pulled" ]; then
+        cause="pull-failed"
+      else
+        local pull_line; pull_line="$(grep "burst-lane  pull  ok  (worktree=$worktree " "$JOURNAL" 2>/dev/null | tail -n1)"
+        bytes="$(sed -n 's/.*bytes=\([0-9][0-9]*\).*/\1/p' <<<"$pull_line" | tail -n1)"
+        case "$bytes" in ''|*[!0-9]*) bytes=0 ;; esac
+        if [ "$bytes" -le 0 ]; then
+          cause="pull-zero-bytes"
+        else
+          local override local_target
+          override="$(cargo_target_dir_for "$worktree")"
+          local_target="${override:-$worktree/target}"
+          if ! find "$local_target" -type f -newer "$fresh_marker" 2>/dev/null | grep -q .; then
+            cause="no-fresh-artifact"
+          else
+            local ip local_hostname box_hostname
+            ip="$(state_read ip)"
+            local_hostname="$(hostname 2>/dev/null || echo unknown)"
+            box_hostname="$("$SSH_BIN" -o BatchMode=yes -o ConnectTimeout=5 $(ssh_kh_args) \
+                -i "$SSH_KEY" "$REMOTE_USER@$ip" hostname 2>/dev/null || true)"
+            if [ -z "$box_hostname" ]; then
+              cause="host-unreachable"
+            elif [ "$box_hostname" = "$local_hostname" ]; then
+              cause="host-mismatch"
+            else
+              routed=true
+            fi
+          fi
+        fi
+      fi
+    fi
+  fi
+
+  rm -f "$fresh_marker" 2>/dev/null || true
+  secs_remote=$(( $(now_epoch) - start_epoch ))
+
+  local image_id; image_id="$(resolve_boot_image | awk '{print $1}')"
+  python3 -c '
+import json, sys
+image_id, server_id, worktree, sha, routed, bytes_n, secs, cause, out_path = sys.argv[1:10]
+d = {
+    "ts": sys.argv[10],
+    "image_id": image_id,
+    "server_id": server_id,
+    "worktree": worktree,
+    "sha": sha,
+    "routed": routed == "true",
+    "bytes": int(bytes_n),
+    "secs_remote": int(secs),
+    "cause": cause,
+}
+json.dump(d, open(out_path, "w"), indent=2, sort_keys=True)
+' "$image_id" "${id:-}" "$worktree" "$sha" "$routed" "$bytes" "$secs_remote" "$cause" "$PROOF_STATE_FILE" "$(now_iso)"
+
+  # `prove` always ends with `down`, success or failure — never leaves a
+  # box up just because the proof itself failed a check.
+  ( cmd_down >/dev/null 2>&1 ) || true
+
+  if [ -n "$cleanup_worktree" ]; then
+    git -C "$disposable_repo" worktree remove --force "$cleanup_worktree" >/dev/null 2>&1 || rm -rf "$cleanup_worktree"
+  fi
+
+  if [ "$routed" = true ]; then
+    journal_line "$(now_iso)  burst-lane  prove  done  (routed=true image_id=$image_id server_id=$id bytes=$bytes secs=$secs_remote)"
+    echo "prove done: routed=true image_id=$image_id bytes=$bytes"
+    exit 0
+  fi
+  journal_line "$(now_iso)  burst-lane  prove  failed  (cause=$cause image_id=$image_id server_id=${id:-none})"
+  echo "prove failed (cause=$cause)" >&2
+  exit 1
+}
+
 # ---- enable / disable (PRD-build-burst-dispatch-reenable requirement 4) --
 # The tick's ONLY opt-in surface. `enable` never edits
 # ~/.config/wm-burst/.env (that file also carries HCLOUD_TOKEN and
@@ -6683,6 +6821,7 @@ main() {
     parity)    cmd_parity "$@" ;;
     gate)      cmd_gate "$@" ;;
     bake)      cmd_bake "$@" ;;
+    prove)     cmd_prove "$@" ;;
     enable)    cmd_enable "$@" ;;
     disable)   cmd_disable "$@" ;;
     # Undocumented/hidden — PRD-build-burst-unprivileged-user requirement 1:
