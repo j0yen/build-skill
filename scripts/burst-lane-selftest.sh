@@ -48,6 +48,16 @@ ALL_TMPDIRS=()
 cleanup() { for d in "${ALL_TMPDIRS[@]:-}"; do rm -rf "$d"; done; }
 trap cleanup EXIT
 
+# PRD-build-burst-pull-back-restore AC11: a durable, re-derivable ledger of
+# every "pullback"-labeled case's outcome from THIS run (see block_start
+# "pullback" below and expect()'s own PULLBACK_FAILURE_CAUSES append) —
+# written to the REAL repo state dir, never $BURST_LANE_STATE_DIR (this
+# run's own sandboxed tmpdir, gone the moment fresh_env's next call or this
+# process's own cleanup trap fires). One line appended per run; see the
+# write site near the bottom of this file.
+PULLBACK_ITER_LOG="$HOME/.claude/skills/build/state/pullback-transfer-log.jsonl"
+PULLBACK_FAILURE_CAUSES=()
+
 # ---- Live audit (PRD-build-burst-selftest-isolation requirement 3) --------
 # audit_snapshot: sha256sum of every file under a state dir + the last 200
 # lines of a journal, as one comparable text blob. Generic over its paths
@@ -112,6 +122,11 @@ expect() {
     echo "FAIL $label" >&2
     fail=1
     [ -n "${BLOCK_OPENED[$blk]:-}" ] && BLOCK_FAIL[$blk]=$(( ${BLOCK_FAIL[$blk]} + 1 ))
+    # PRD-build-burst-pull-back-restore AC11: every failing case in the
+    # "pullback" block (this PRD's own AC3/AC5/AC12 fixtures) is recorded by
+    # label so the end-of-run ledger names the cause of each, not just a
+    # bare count.
+    [ "$blk" = "pullback" ] && PULLBACK_FAILURE_CAUSES+=("$label")
   fi
 }
 
@@ -251,6 +266,13 @@ case "$_pullback_wt_free_gb" in
 esac
 unset _pullback_wt_base _pullback_wt_fs _pullback_wt_free_gb
 
+# PRD-build-burst-pull-back-restore AC11: open the "pullback" block now, so
+# every "pullback AC<n>: ..." case anywhere below this point (AC3/AC5/AC12)
+# is counted into BLOCK_TOTAL/BLOCK_FAIL["pullback"] via expect()'s own
+# block_of() attribution — the ledger written near the bottom of this file
+# reads those two counters plus PULLBACK_FAILURE_CAUSES.
+block_start "pullback"
+
 # PRD-build-burst-parity-cadence: every hand-crafted box-parity.json fixture
 # in this suite must carry the ACTIVE session's session_id + toolchain_fp
 # (matching what a real `parity` run would write) so cmd_gate's session/
@@ -387,7 +409,8 @@ fresh_env() {
         FAKE_HCLOUD_VOLUME_CREATE_STDERR_NOISE FAKE_HCLOUD_VOLUME_CREATE_GARBLED \
         FAKE_SSH_VOLUME_LABEL_PRESENT FAKE_SSH_VOLUME_MOUNT_FAIL FAKE_SSH_VOLUME_USED_GB FAKE_SSH_VOLUME_SIZE_GB FAKE_SSH_VOLUME_USED_PCT \
         FAKE_SSH_VOLUME_FSCK_CALLLOG \
-        FAKE_HCLOUD_CREATE_IMAGE_FAIL FAKE_HCLOUD_CREATE_IMAGE_PENDING
+        FAKE_HCLOUD_CREATE_IMAGE_FAIL FAKE_HCLOUD_CREATE_IMAGE_PENDING \
+        FAKE_SSH_PULL_PROBE_BYTES FAKE_SSH_PULL_PROBE_FAIL FAKE_SSH_PULL_PROBE_HANG BURST_PULL_PROBE_TIMEOUT_S
 }
 
 # ---- AC1: single-box refusal + adoption ------------------------------------
@@ -3314,7 +3337,14 @@ mkdir -p "$BURST_LANE_STATE_DIR/pull-sizes"
 # 2026-09-11 incident evidence (an 87 GB single gate pull).
 printf '%s\n' "$((87 * 1073741824))" > "$BURST_LANE_STATE_DIR/pull-sizes/$bv9_wkey"
 export BURST_LANE_LOCAL_FREE_GB=20
-bv9_pull_out="$("$BL" pull "$WT_BV9" 2>&1)"; bv9_pull_rc=$?
+# PRD-build-burst-pull-back-restore AC12: this fixture is deliberately
+# testing the STATIC floor/last-observed-size rule in isolation (an
+# 87 GB fabricated history, no real remote payload to speak of) — force
+# the new payload probe unavailable so it stays exactly what it always
+# tested rather than being superseded by a probe reading this worktree's
+# actual (tiny) fake-remote content. The probe's own success path gets
+# its own dedicated coverage in the "pullback AC12" cases below.
+bv9_pull_out="$(FAKE_SSH_PULL_PROBE_FAIL=1 "$BL" pull "$WT_BV9" 2>&1)"; bv9_pull_rc=$?
 unset BURST_LANE_LOCAL_FREE_GB
 expect "burstvol AC9: pull exits 0 (deferred, not an error)" "[ $bv9_pull_rc -eq 0 ]"
 expect "burstvol AC9: journal records pull deferred cause=local-disk free_gb=20 need_gb=87" \
@@ -3339,6 +3369,63 @@ expect "pullback AC3: retry after the floor is restored exits 0 and prints pulle
   "[ $bv9_retry_rc -eq 0 ] && [ \"$bv9_retry_out\" = pulled ]"
 expect "pullback AC3: retry fetched target/ back" "[ -f \"$WT_BV9/target/out.txt\" ]"
 expect "pullback AC3: retry cleared the dirty marker" "! dirty_has \"$WT_BV9\""
+
+# ---- pullback AC5 (PRD-build-burst-pull-back-restore): an explicit pull's
+# underlying rsync-down genuinely fails (box up, remote dir exists,
+# do_marker_pull's own real-failure branch — described in its header
+# comment but never fixture-proven before this PRD; see
+# tests/pullback_ac5_rsync_failure_exit.sh's own documented gap). Distinct
+# from every deferred/cold outcome above (all pinned exit 0 by design): a
+# real transfer failure must leave the marker dirty for a later retry,
+# exit non-zero, and journal the cause.
+fresh_env
+"$BL" up >/dev/null
+WT_AC5PULL="$T/worktree-pullback-ac5"; mkdir -p "$WT_AC5PULL"
+echo 'mkdir -p target && echo built > target/out.txt; exit 0' > "$WT_AC5PULL/build.sh"
+"$BL" run "$WT_AC5PULL" -- bash build.sh >/dev/null 2>&1
+expect "pullback AC5 setup: run left the worktree dirty" "dirty_has \"$WT_AC5PULL\""
+ac5pull_out="$(FAKE_RSYNC_FAIL=1 FAKE_RSYNC_FAIL_RC=11 FAKE_RSYNC_FAIL_MSG='rsync: fake pull-down failure' \
+  "$BL" pull "$WT_AC5PULL" 2>&1)"; ac5pull_rc=$?
+expect "pullback AC5: pull exits non-zero on a real rsync-down failure" "[ $ac5pull_rc -ne 0 ]"
+expect "pullback AC5: stdout reports the fallback, never claims 'pulled'" \
+  "[ \"$ac5pull_out\" = 'fallback: pull failed' ]"
+expect "pullback AC5: the marker is left dirty for a later retry" "dirty_has \"$WT_AC5PULL\""
+expect "pullback AC5: journal names the rsync failure cause" \
+  "grep -q 'burst-lane  pull  fallback  (cause=rsync-failed worktree=$WT_AC5PULL trigger=explicit' \"$BURST_LANE_JOURNAL\""
+
+# ---- pullback AC12 (PRD-build-burst-pull-back-restore, Joe's 2026-09-13
+# decision): need_gb follows a bounded remote payload probe when it
+# succeeds, and falls back to the existing floor/last-observed rule,
+# UNCHANGED, when the probe fails or times out. Both cases run against the
+# SAME 60 GB floor (overridden inline from this suite's own default of 2)
+# with free space pinned low enough that a deferral — and the need_gb/rule
+# fields on its journal line — always fires, so the computed value itself
+# is proven, not just its side effect.
+fresh_env
+"$BL" up >/dev/null
+WT_AC12A="$T/worktree-pullback-ac12a"; mkdir -p "$WT_AC12A"
+echo 'mkdir -p target && echo built > target/out.txt; exit 0' > "$WT_AC12A/build.sh"
+"$BL" run "$WT_AC12A" -- bash build.sh >/dev/null 2>&1
+# 3 GB payload, probe succeeds -> need_gb = 2*3 = 6 (well under the 60 GB
+# floor); free space pinned at 5 GB (< 6) so the deferral fires on the
+# PAYLOAD number, not the floor.
+ac12a_out="$(FAKE_SSH_PULL_PROBE_BYTES=$((3 * 1073741824)) BURST_LANE_LOCAL_FREE_GB=5 BURST_LOCAL_DISK_FLOOR_GB=60 \
+  "$BL" pull "$WT_AC12A" 2>&1)"; ac12a_rc=$?
+expect "pullback AC12: probe-succeeding pull exits 0 (deferred, not an error)" "[ $ac12a_rc -eq 0 ]"
+expect "pullback AC12: a 3 GB payload probe sets need_gb=6, naming the payload rule" \
+  "grep -qF 'burst-lane  pull  deferred  (worktree=$WT_AC12A trigger=explicit cause=local-disk free_gb=5 need_gb=6 rule=payload)' \"$BURST_LANE_JOURNAL\""
+
+WT_AC12B="$T/worktree-pullback-ac12b"; mkdir -p "$WT_AC12B"
+echo 'mkdir -p target && echo built > target/out.txt; exit 0' > "$WT_AC12B/build.sh"
+"$BL" run "$WT_AC12B" -- bash build.sh >/dev/null 2>&1
+# Probe times out (the fake sleeps 30s; this fixture's own bound is 1s) ->
+# need_gb stays the unchanged 60 GB floor; free space pinned at 10 GB
+# (< 60) so the same deferral path fires on the FLOOR number instead.
+ac12b_out="$(FAKE_SSH_PULL_PROBE_HANG=1 BURST_PULL_PROBE_TIMEOUT_S=1 BURST_LANE_LOCAL_FREE_GB=10 BURST_LOCAL_DISK_FLOOR_GB=60 \
+  "$BL" pull "$WT_AC12B" 2>&1)"; ac12b_rc=$?
+expect "pullback AC12: probe-timeout pull exits 0 (deferred, not an error)" "[ $ac12b_rc -eq 0 ]"
+expect "pullback AC12: a timed-out probe leaves need_gb=60, naming the floor rule" \
+  "grep -qF 'burst-lane  pull  deferred  (worktree=$WT_AC12B trigger=explicit cause=local-disk free_gb=10 need_gb=60 rule=floor)' \"$BURST_LANE_JOURNAL\""
 
 # ---- burstvol AC10: a dirty marker under a moved root (byte-identical to --
 # the 2026-09-11 user-migration evidence: a marker still naming /root/build
@@ -4654,6 +4741,33 @@ expect "reenable AC12e: text-mode 'no active session' is unchanged, byte-exact, 
   "[ \"$r12e_text\" = 'no active session' ]"
 
 expect_block_green "reenable" "reenable: every reenable case above ran green"
+
+# ---- pullback AC11 (PRD-build-burst-pull-back-restore): record, on every
+# run, how many transfer-layer failures remain among this PRD's own
+# "pullback"-block fixtures (AC3/AC5/AC12 above) and the cause of each, to
+# a durable, re-derivable ledger — not a one-time commit message (see
+# tests/pullback_ac11_iteration_log.sh's own former documented gap, now
+# closed). Written to the REAL repo state dir, never $BURST_LANE_STATE_DIR
+# (this run's own sandboxed tmpdir, cleaned up by this process's own EXIT
+# trap the moment it returns).
+pullback_total="${BLOCK_TOTAL[pullback]:-0}"
+pullback_failed="${BLOCK_FAIL[pullback]:-0}"
+pullback_causes="none"
+if [ "${#PULLBACK_FAILURE_CAUSES[@]}" -gt 0 ]; then
+  pullback_causes="$(printf '%s; ' "${PULLBACK_FAILURE_CAUSES[@]}")"
+  pullback_causes="${pullback_causes%; }"
+fi
+mkdir -p "$(dirname "$PULLBACK_ITER_LOG")" 2>/dev/null || true
+python3 -c '
+import json, sys
+rec = {"ts": sys.argv[1], "total": int(sys.argv[2]), "failed": int(sys.argv[3]), "causes": sys.argv[4]}
+with open(sys.argv[5], "a") as f:
+    f.write(json.dumps(rec) + "\n")
+' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$pullback_total" "$pullback_failed" "$pullback_causes" "$PULLBACK_ITER_LOG" 2>/dev/null \
+  && echo "pullback-iteration-log: total=$pullback_total failed=$pullback_failed causes=\"$pullback_causes\" -> $PULLBACK_ITER_LOG" \
+  || echo "pullback-iteration-log: WARNING — failed to write $PULLBACK_ITER_LOG" >&2
+expect "pullback AC11: the iteration ledger recorded this run" \
+  "[ -s \"$PULLBACK_ITER_LOG\" ] && tail -1 \"$PULLBACK_ITER_LOG\" | python3 -c 'import json,sys; json.loads(sys.stdin.read())'"
 
 echo "=== $([ $fail -eq 0 ] && echo PASS || echo FAIL) ==="
 exit $fail

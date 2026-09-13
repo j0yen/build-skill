@@ -7,23 +7,37 @@
 # names the payload rule; and Given the probe times out, Then `need_gb` is
 # 60 and the journal names the floor rule.
 #
-# GAP: not implemented. do_marker_pull's disk-floor guard (burst-lane.sh
-# ~line 3386-3399) only ever computes pull_need_gb as
-# max(BURST_LOCAL_DISK_FLOOR_GB, this worktree's own last-observed pull
-# size) — there is no remote payload size probe (no `du -s` over ssh in
-# this path; the existing `du -sb` calls at burst-lane.sh lines 2400/5212/
-# 5297/5312/5395 are all for other features — reality-check, root-move
-# migration, workspace path-dep sync — none feed do_marker_pull's need_gb),
-# no 2x-payload/2GB-floor/never-above-configured-floor rule, and no journal
-# field naming which rule (payload vs floor) produced need_gb. This is a
-# real, unimplemented requirement (Joe's 2026-09-13 decision in the PRD's
-# Open questions), not a tmpfs or environment artifact.
+# Implemented: burst-lane.sh's do_marker_pull now probes the remote
+# payload (one bounded `du -sb` over ssh, `remote_payload_probe_bytes()`)
+# before falling back to the floor/last-observed-size rule.
+# scripts/burst-lane-selftest.sh's "pullback AC12" fixture exercises both
+# branches against the same 60 GB floor: a fake 3 GB payload (need_gb=6,
+# rule=payload) and a probe that times out (need_gb=60, rule=floor,
+# unchanged from the pre-AC12 formula). The pre-existing "burstvol AC9"
+# fixture (a different feature, PRD-build-burst-persistent-volume) now
+# forces the probe unavailable (FAKE_SSH_PULL_PROBE_FAIL=1) so it keeps
+# testing exactly the static rule it always tested.
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
-BL="$HERE/../scripts/burst-lane.sh"
-if grep -qE 'need_gb.*(rule|payload)|payload.*probe' "$BL" 2>/dev/null; then
-  echo "FAIL pullback AC12: burst-lane.sh now mentions a payload/rule concept near need_gb — re-check by hand; this wrapper's grep-based gap detection may be stale and needs updating to assert the real behavior instead of a gap." >&2
-  exit 1
-fi
-echo "FAIL pullback AC12: GAP — do_marker_pull has no remote-payload size probe or payload-aware need_gb rule (checked scripts/burst-lane.sh for a 'need_gb'+'rule'/'payload' pairing near the guard; none found), and scripts/burst-lane-selftest.sh has no fixture setting a 3 GB fake payload and asserting need_gb=6 vs a timed-out probe asserting need_gb=60 with a rule-naming journal field. Until both the implementation and a fixture exist, AC12 has no case to pair with." >&2
-exit 1
+source "$HERE/fixtures/pullback-ac-common.sh"
+pullback_run_suite
+
+fail=0
+
+for line in \
+  "ok  pullback AC12: probe-succeeding pull exits 0 (deferred, not an error)" \
+  "ok  pullback AC12: a 3 GB payload probe sets need_gb=6, naming the payload rule" \
+  "ok  pullback AC12: probe-timeout pull exits 0 (deferred, not an error)" \
+  "ok  pullback AC12: a timed-out probe leaves need_gb=60, naming the floor rule" \
+  "ok  burstvol AC9: journal records pull deferred cause=local-disk free_gb=20 need_gb=87" \
+  "ok  burstvol AC9: the marker stays dirty (never cleared)" \
+; do
+  if grep -qF "$line" <<<"$PULLBACK_OUT"; then
+    echo "$line"
+  else
+    echo "FAIL pullback AC12: missing/failed: $line" >&2
+    fail=1
+  fi
+done
+
+exit $fail

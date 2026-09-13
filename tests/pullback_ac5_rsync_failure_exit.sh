@@ -5,14 +5,32 @@
 # Given a transfer whose underlying rsync fails, When `pull` runs, Then
 # `pull` exits non-zero and journals the failure cause.
 #
-# GAP: scripts/burst-lane-selftest.sh's FAKE_RSYNC_FAIL knob is exercised
-# twice — "burstdisk AC3" (~line 928) for `run`'s rsync-UP, and "gatebox
-# AC5" (~line 1739) for `gate`'s rsync-up — but never against an explicit
-# `pull`'s rsync-DOWN. do_marker_pull's own real-failure branch (rsync ran,
-# box/dir exist, transfer itself failed -> marker left dirty, rc1,
-# journaled) is described in burst-lane.sh's own header comment above
-# do_marker_pull but has no fixture proving it. This is a real,
-# unimplemented coverage gap, not a tmpfs or environment artifact.
+# Implemented: scripts/burst-lane-selftest.sh's "pullback AC5" fixture
+# marks a worktree dirty via a real `run`, then forces FAKE_RSYNC_FAIL=1
+# on an explicit `pull` — do_marker_pull's own real-failure branch (rsync
+# ran, box/dir exist, transfer itself failed -> marker left dirty, rc1,
+# journaled cause=rsync-failed) now has a fixture proving it, distinct
+# from every deferred/cold outcome (pinned exit 0) elsewhere in the suite.
 set -uo pipefail
-echo "FAIL pullback AC5: GAP — no fixture in scripts/burst-lane-selftest.sh sets FAKE_RSYNC_FAIL for an explicit \`pull\` (rsync-down). The two existing FAKE_RSYNC_FAIL cases (burstdisk AC3 ~line 928, gatebox AC5 ~line 1739) both fail rsync-UP paths (run/gate), never pull's rsync-down. Until such a fixture exists (dirty marker + real session + FAKE_RSYNC_FAIL=1 pull -> assert rc!=0, marker still dirty, journal names the rsync failure cause), AC5 has no case to pair with." >&2
-exit 1
+HERE="$(cd "$(dirname "$0")" && pwd)"
+source "$HERE/fixtures/pullback-ac-common.sh"
+pullback_run_suite
+
+fail=0
+
+for line in \
+  "ok  pullback AC5 setup: run left the worktree dirty" \
+  "ok  pullback AC5: pull exits non-zero on a real rsync-down failure" \
+  "ok  pullback AC5: stdout reports the fallback, never claims 'pulled'" \
+  "ok  pullback AC5: the marker is left dirty for a later retry" \
+  "ok  pullback AC5: journal names the rsync failure cause" \
+; do
+  if grep -qF "$line" <<<"$PULLBACK_OUT"; then
+    echo "$line"
+  else
+    echo "FAIL pullback AC5: missing/failed: $line" >&2
+    fail=1
+  fi
+done
+
+exit $fail

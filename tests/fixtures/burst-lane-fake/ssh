@@ -292,6 +292,33 @@ case "$cmd" in
     eval "$cmd"
     exit $?
     ;;
+  *'# pull-payload-probe'*)
+    # PRD-build-burst-pull-back-restore AC12: do_marker_pull's remote
+    # payload-size probe (`du -sb ... # pull-payload-probe`). Three
+    # independent knobs, same deterministic-fake doctrine as the
+    # gate-tools-probe case above:
+    #   FAKE_SSH_PULL_PROBE_BYTES=<n>  probe succeeds, reports exactly n
+    #                                  bytes (AC12's own case: a 3 GB
+    #                                  payload is 3*1024^3).
+    #   FAKE_SSH_PULL_PROBE_FAIL=1     the ssh call itself fails (rc 1, no
+    #                                  output) — a real connectivity
+    #                                  failure looks the same to the caller.
+    #   FAKE_SSH_PULL_PROBE_HANG=1     never returns inside any bound this
+    #                                  suite would set — proves the
+    #                                  caller's own `timeout` wins the race
+    #                                  rather than assuming it would.
+    # None set: falls through to the real `eval "$cmd"`, which `du`s this
+    # fixture's own real (fake-remote) target dir — exactly what
+    # production does against a real box.
+    [ "${FAKE_SSH_PULL_PROBE_FAIL:-0}" = "1" ] && exit 1
+    if [ "${FAKE_SSH_PULL_PROBE_HANG:-0}" = "1" ]; then sleep 30; exit 0; fi
+    if [ -n "${FAKE_SSH_PULL_PROBE_BYTES:-}" ]; then
+      echo "$FAKE_SSH_PULL_PROBE_BYTES"
+      exit 0
+    fi
+    eval "$cmd"
+    exit $?
+    ;;
   *'command -v cargo-nextest'*)
     # PRD-build-burst-parity-robust requirement 1: box-side nextest
     # presence check. Answered explicitly (never `eval`'d against this

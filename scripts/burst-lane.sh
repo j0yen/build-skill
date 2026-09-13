@@ -3422,6 +3422,27 @@ remote_dir_exists() {  # $1=ip $2=remote_path -> rc0 exists
     "$REMOTE_USER@$1" "[ -d '$2' ]" 2>/dev/null
 }
 
+# PRD-build-burst-pull-back-restore AC12 (Joe's 2026-09-13 decision): a
+# bounded remote payload probe for do_marker_pull's disk-floor guard. One
+# `du -sb` over ssh, wrapped in `timeout` so a hung/unreachable box can
+# never stall the guard past BURST_PULL_PROBE_TIMEOUT_S — a probe that
+# doesn't return a clean non-negative integer byte count (timeout, ssh
+# failure, empty/garbled stdout) is "unavailable", not "zero", so the
+# caller falls back to the existing floor/last-observed-size rule
+# unchanged rather than treating a probe hiccup as evidence of a tiny
+# payload. The `# pull-payload-probe` trailing comment is a no-op on a
+# real box (a plain shell comment) and exists only so the offline fake ssh
+# fixture can special-case this exact probe call deterministically.
+remote_payload_probe_bytes() {  # $1=ip $2=remote_target_dir -> stdout bytes; rc1 unavailable
+  local ip="$1" target="$2" out
+  out="$(timeout "${BURST_PULL_PROBE_TIMEOUT_S:-10}" "$SSH_BIN" $(ssh_kh_args) -o ConnectTimeout=8 -i "$SSH_KEY" \
+    "$REMOTE_USER@$ip" "du -sb '$target' 2>/dev/null | cut -f1  # pull-payload-probe" 2>/dev/null)"
+  case "$out" in
+    ''|*[!0-9]*) return 1 ;;
+    *) printf '%s\n' "$out"; return 0 ;;
+  esac
+}
+
 # Shared body for actually executing a lazy pull against one dirty marker.
 # Does NOT itself lock — callers hold (or non-blockingly probe) the
 # worktree's own flock as their race-safety strategy differs (see cmd_pull,
@@ -3459,21 +3480,54 @@ do_marker_pull() {  # $1=worktree $2=trigger(local-read|explicit|teardown) -> rc
   # than being reclassified "cold" (which permanently drops the artifact)
   # or attempted and left to fail mid-transfer, one gate pull after another,
   # the way four straight 87/49/87/19 GB pulls actually took RedBaron's
-  # root to 0 bytes free on 2026-09-11. need_gb is the larger of the
-  # configured floor and this worktree's own last-observed pull size (the
-  # best evidence of what THIS pull is about to cost) — fails OPEN (proceeds)
-  # on an unreadable probe, never blocking a pull the real disk has room for.
+  # root to 0 bytes free on 2026-09-11. need_gb defaults to the larger of
+  # the configured floor and this worktree's own last-observed pull size
+  # (the best static evidence of what THIS pull is about to cost) — fails
+  # OPEN (proceeds) on an unreadable probe, never blocking a pull the real
+  # disk has room for.
   local pull_free_gb; pull_free_gb="$(local_disk_free_gb "$worktree")"
   case "$pull_free_gb" in
     ''|*[!0-9]*) : ;;
     *)
-      local pull_last_bytes pull_last_gb pull_need_gb
+      local pull_last_bytes pull_last_gb pull_need_gb pull_need_rule
       pull_last_bytes="$(last_pull_size "$worktree")"
       pull_last_gb="$(awk -v b="${pull_last_bytes:-0}" 'BEGIN{printf "%.0f", b/1073741824}')"
       pull_need_gb="$BURST_LOCAL_DISK_FLOOR_GB"
+      pull_need_rule="floor"
       [ "${pull_last_gb:-0}" -gt "$pull_need_gb" ] 2>/dev/null && pull_need_gb="$pull_last_gb"
+
+      # PRD-build-burst-pull-back-restore AC12 (Joe's 2026-09-13 decision):
+      # when a live session exists, a bounded remote payload probe
+      # supersedes the static floor/last-observed rule above — need_gb
+      # becomes 2x the payload (rounded up to a whole GB), floored at 2 GB,
+      # and capped at BURST_LOCAL_DISK_FLOOR_GB (a probe can only ever
+      # LOWER the demand versus the floor, never raise it past what the
+      # floor already protects against). A failed or timed-out probe (no
+      # active session, no ip, ssh/timeout failure, garbled output) leaves
+      # the rule above completely unchanged, per the PRD's own text ("the
+      # floor applies unchanged").
+      if state_active; then
+        local pull_probe_ip pull_probe_target pull_probe_bytes pull_probe_gb
+        pull_probe_ip="$(state_read ip)"
+        if [ -n "$pull_probe_ip" ]; then
+          if [ "$kind" = "pybuilder" ]; then
+            pull_probe_target="$remote_path/.pybuilder"
+          else
+            pull_probe_target="$remote_path/target"
+          fi
+          if pull_probe_bytes="$(remote_payload_probe_bytes "$pull_probe_ip" "$pull_probe_target")"; then
+            pull_probe_gb="$(awk -v b="$pull_probe_bytes" \
+              'BEGIN{g=b/1073741824; gi=int(g); if (g>gi) gi+=1; if (gi<1) gi=1; printf "%d", gi}')"
+            pull_need_gb=$((pull_probe_gb * 2))
+            [ "$pull_need_gb" -lt 2 ] && pull_need_gb=2
+            [ "$pull_need_gb" -gt "$BURST_LOCAL_DISK_FLOOR_GB" ] && pull_need_gb="$BURST_LOCAL_DISK_FLOOR_GB"
+            pull_need_rule="payload"
+          fi
+        fi
+      fi
+
       if [ "$pull_free_gb" -lt "$pull_need_gb" ]; then
-        journal_line "$(now_iso)  burst-lane  pull  deferred  (worktree=$worktree trigger=$trigger cause=local-disk free_gb=$pull_free_gb need_gb=$pull_need_gb)"
+        journal_line "$(now_iso)  burst-lane  pull  deferred  (worktree=$worktree trigger=$trigger cause=local-disk free_gb=$pull_free_gb need_gb=$pull_need_gb rule=$pull_need_rule)"
         PULL_OUTCOME="deferred"
         return 0
       fi
