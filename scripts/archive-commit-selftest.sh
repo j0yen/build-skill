@@ -548,5 +548,5 @@ expect "ARCHVERIFY AC3: ordering never patches status:shipped on a non-zero arch
   "grep -q '\"status\": *\"in_progress\"' '$D14/orch_manifest.json'"
 
 echo "----"
-echo "archive-commit-selftest: pass=$PASS fail=$FAIL"
+echo "archive-commit-selftest: $PASS/$((PASS+FAIL)) ok, $FAIL FAIL"
 [ "$FAIL" -eq 0 ]
