@@ -1422,13 +1422,64 @@ substrate-naming AC the plan could derive a command for), run
 `scripts/reality-check.sh run <archived-prd-path>`:
 - Reachability is probed per AC kind (`burst-lane.sh status --json` for a
   box, `curl -m 8` for an endpoint, `systemctl --user is-active` for a
-  unit) before anything real runs; an unreachable substrate records
-  `reality: unreachable` and drafts nothing — it is not a failure to find
-  the box asleep, only to ship believing it was awake.
-- A reachable AC's command actually runs; the archived PRD's own
-  frontmatter gains `reality: ok|failed|unreachable` and
-  `reality_receipt: <path under ~/brain/journal/build/receipts/>`, and the
-  journal gains `reality  <slug>  ok|failed|unreachable  (...)`.
+  unit) before anything real runs. For `endpoint`/`unit` kind ACs an
+  unreachable substrate records `reality: unreachable` and drafts nothing —
+  it is not a failure to find the box asleep, only to ship believing it was
+  awake. `box` kind ACs (requirement 3, 2026-09-12 revision — container
+  tier immediate, box-only event-driven, added after four operator
+  interventions in the first 24h post-ship showed a bare `unreachable`
+  verdict was itself hiding the same fixture-not-reality gap this whole
+  step exists to close) never settle for a bare `unreachable`:
+  - `plan` tags every `box` AC **container-coverable** (default) or
+    **box-only** (`BOX_ONLY_RE`: `hcloud`/`snapshot`/`cloud-init`/`disk
+    siz*`/`provision*`/`parity` — `parity` is named explicitly because it
+    diffs against the real box's own disk state, which an empty container
+    has none of to compare). The tag lands in the plan JSON and the
+    receipt.
+  - **container-coverable**, unreachable → runs THIS SAME TICK in a fresh,
+    empty, non-root sandbox on this host (`run_in_container`: `bwrap
+    --unshare-all --uid 65534` over a tmpfs rootfs with only `busybox`
+    bound in — no `/usr/bin`, no `~/.cargo/bin`, no gate tools reachable on
+    PATH, never RedBaron's own environment). Real pass/fail, `tier:
+    container` in the receipt. This is what catches the 09-10/11 failure
+    classes (no-op installs, wrong toolchain, uid-0 refusal) without
+    waiting on the actual box.
+  - **box-only**, unreachable on a first probe → a second, spaced probe
+    (`$REALITY_CHECK_PROBE_SPACING`, default 5s) before it's trusted as
+    genuinely down (a single probe cannot brand a box asleep). Still
+    reachable on either probe → runs live. Unreachable on both →
+    **registers pending**: `state/reality-pending/<slug>-ac<n>.json`
+    (dir overridable via `$REALITY_CHECK_PENDING_DIR` for selftests), the
+    parent PRD's frontmatter gains `reality: pending` +
+    `reality_pending_since: <ts>`, and the journal gets two `reality
+    probe probe-1|probe-2` lines. Never a false `unreachable` masking a
+    check that's actually just waiting its turn.
+  - `scripts/reality-check.sh pending-run <target>` runs every registered
+    box-only check against a box the lane just booted for ANY reason,
+    before its ordinary work — writes the verdict (`tier: box`) back onto
+    the ORIGINAL parent PRD and removes the consumed registration so a
+    later boot doesn't repeat it. No dedicated box is ever booted solely
+    for this. **Wiring the actual call site into `burst-lane.sh`'s `up`**
+    (so this runs automatically rather than needing an explicit invocation)
+    is left as a follow-up — deliberately kept out of this PRD's own
+    engineering target (archive step/receipts/post-ship tick phase, not
+    burst-lane's boot sequence) to avoid destabilizing burst-lane's own
+    heavily-gated provisioning path; `pending-run` itself is fully
+    implemented and selftested, only the automatic trigger is pending.
+  - `scripts/reality-check.sh alarm-check` fires exactly one alarm
+    (journal line + stderr) for a pending registration ≥6h old with no
+    boot window (`$REALITY_CHECK_ALARM_SECONDS`, default 21600), then
+    marks itself alarmed so it never repeats for the same pending state.
+    Never boots a box. Meant to run on an existing periodic cadence (e.g.
+    quota-watch); a dedicated timer for it is a follow-up, same
+    interim-surface posture as requirement 8's `open` below.
+- A reachable/answered AC's command actually runs; the archived PRD's own
+  frontmatter gains `reality: ok|failed|pending|unreachable|fixture-only`
+  and `reality_receipt: <path under ~/brain/journal/build/receipts/>`, and
+  the journal gains `reality  <slug>  ok|failed|pending|unreachable  (...)`.
+  A PRD with no substrate-naming AC at all gets `reality: fixture-only`
+  with a receipt saying so — never a silent skip that could be mistaken
+  for a false `pending`.
 - On `failed`, `reality-check.sh` also drafts
   `build-queue/PRD-<slug>-reality-<n>.md` (high priority, same
   `build_into`/`build_target`/`Vision` as the parent) containing the

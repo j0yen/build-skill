@@ -46,6 +46,29 @@
 #            "reachable", since the point is "the unit exists to probe",
 #            not "the unit happens to be running".
 #
+#   reality-check.sh pending-run <target>
+#       Requirement 3/AC10: runs every registered box-only pending check
+#       (state/reality-pending/*.json) against a box the lane just booted
+#       for any reason — <target> (ip/hostname) is recorded on the receipt
+#       only, this command trusts the caller that the box is up. Writes
+#       reality=ok|failed + reality_receipt back onto the ORIGINAL parent
+#       PRD (tier=box in the receipt), journals `reality <slug> ok|failed
+#       (... tier=box ...)`, and removes the consumed registration so a
+#       later boot doesn't re-run it. No dedicated box is ever booted for
+#       this alone — see burst-lane.sh's `up` for where a lane would call
+#       this opportunistically (wiring that call site is a follow-up, kept
+#       out of this PRD's own engineering target of archive-step/receipts/
+#       post-ship-tick to avoid destabilizing burst-lane's own gate).
+#
+#   reality-check.sh alarm-check
+#       Requirement 4/AC11: any pending registration ≥6h old
+#       ($REALITY_CHECK_ALARM_SECONDS, default 21600) with no boot window
+#       fires exactly one alarm (journal line + stderr), then marks itself
+#       alarmed so it never repeats for the same pending state. Never
+#       boots a box. Meant to be invoked periodically by an existing
+#       cadence (e.g. quota-watch); a dedicated timer is a follow-up, same
+#       interim-surface posture as requirement 8's `open` below.
+#
 #   reality-check.sh open [--prd-dir <dir>] [--format json|text]
 #       Requirement 8 (P1, visibility — no dedicated numbered AC, matching
 #       gate-debt.sh's `open` precedent, so this subcommand doesn't gate
@@ -91,7 +114,7 @@ die() { printf 'reality-check: %s\n' "$*" >&2; exit "${2:-2}"; }
 now_iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
 usage() {
-  sed -n '2,76p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '2,100p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
   exit 2
 }
 
@@ -172,6 +195,27 @@ STRONG_RE = re.compile(
     r"\blive lane\b|\breal box\b|\bon casper\b|\bagainst the redbaron endpoint\b", re.I)
 WEAK_HOST_RE = re.compile(
     r"\b(" + "|".join(re.escape(h) for h in FLEET_HOSTS) + r")\b", re.I)
+# Requirement 3 (P0, PRD-build-post-ship-reality-check, 2026-09-12): every
+# "box" kind AC is further tagged container-coverable (default — a fresh,
+# empty, non-root container on RedBaron can stand in for the real box; the
+# 09-10/11 failure classes named in this PRD — no-op installs, wrong
+# toolchain, uid-0 refusal — are all about behavior in an empty environment,
+# not about the box's own cloud specifics) or box-only (needs hcloud API /
+# snapshots / cloud-init / real disk sizing — a container cannot fake these,
+# only a real boot can exercise them). Narrow keyword match, same posture as
+# STRONG_RE/WEAK_HOST_RE above: false-negative (missed box-only, treated as
+# container-coverable) is safe because run() still records a real pass/fail
+# either way; false-positive box-only would just mean an AC that could have
+# run this tick instead waits for the lane's next boot, also safe, never
+# silent.
+BOX_ONLY_RE = re.compile(
+    r"\bhcloud\b|\bsnapshot\b|\bcloud-init\b|\bdisk siz|\bprovision|\bparity\b", re.I)
+# `parity` (burst-lane.sh's own remote-vs-local tree diff, cmd_parity) is
+# named explicitly: it inherently compares against the REAL box's actual
+# disk state, which a fresh empty container has none of to compare —
+# classifying it container-coverable would make an unreachable box's parity
+# check spuriously "fail" on a missing binary instead of correctly waiting
+# for the box, the wrong failure for the wrong reason.
 URL_RE = re.compile(r"https?://[^\s`)]+[^\s`),.]")
 BACKTICK_CMD_RE = re.compile(r"`([^`]+)`")
 SYSTEMCTL_CMD_RE = re.compile(r"systemctl\s+--user\s+[^\s`]+(?:\s+[^\s`]+)?")
@@ -247,9 +291,10 @@ for it in items:
         if literal_cmds:
             # A strong substrate phrase plus a literal backtick command —
             # run the command against the box (the common shape: "run
-            # `<cmd>` against the live lane").
+            # `<cmd>` against the live lane"). Tag its tier (requirement 3).
+            tier = "box-only" if BOX_ONLY_RE.search(text) else "container-coverable"
             plan.append({"ac": n, "kind": "box", "command": literal_cmds[0],
-                          "text": text, "reason": None})
+                          "text": text, "reason": None, "tier": tier})
             continue
         # Strong phrase, no derivable command — manual, never dropped.
         plan.append({"ac": n, "kind": "manual", "command": None, "text": text,
@@ -378,6 +423,70 @@ journal_line() {
   printf '%s\n' "$1" >>"$JOURNAL_DIR/$(date -u +%F).md"
 }
 
+# ---- container tier (requirement 3, P0, container-coverable ACs) ---------
+# Runs `cmd` in a fresh, empty, non-root sandbox on THIS host (RedBaron) via
+# bwrap — never RedBaron's own environment, which would hide every missing-
+# tool/toolchain/uid failure class the PRD is named for (the 09-10/11
+# no-op-install / wrong-toolchain / uid-0-refusal defects). The rootfs is an
+# empty tmpfs with only busybox (+ its dynamic-linker deps) bound in — no
+# `/usr/bin`, no `~/.cargo/bin`, no gate tools reachable via PATH — and the
+# process runs as uid/gid 65534 (nobody), never root. Overridable for
+# selftests so a fake/broken bwrap can be exercised without touching the
+# real sandbox.
+PENDING_DIR="${REALITY_CHECK_PENDING_DIR:-$SKILL_DIR/state/reality-pending}"
+run_in_container() {
+  local cmd="$1"
+  local bwrap_bin="${REALITY_CHECK_BWRAP:-bwrap}"
+  local bb="${REALITY_CHECK_BUSYBOX:-/usr/bin/busybox}"
+  if ! command -v "$bwrap_bin" >/dev/null 2>&1; then
+    printf 'container tier unavailable: %s not found\n' "$bwrap_bin"
+    return 127
+  fi
+  if [ ! -x "$bb" ]; then
+    printf 'container tier unavailable: busybox not found at %s\n' "$bb"
+    return 127
+  fi
+  local -a args=(
+    --unshare-all --die-with-parent
+    --uid 65534 --gid 65534
+    --tmpfs / --dir /tmp --dir /bin
+    --ro-bind "$bb" /bin/busybox
+    --ro-bind /lib /lib
+    --ro-bind /usr/lib /usr/lib
+    --proc /proc --dev /dev
+    --setenv HOME /tmp --setenv PATH /bin
+    --chdir /tmp
+  )
+  [ -d /lib64 ] && args+=(--ro-bind /lib64 /lib64)
+  "$bwrap_bin" "${args[@]}" /bin/busybox sh -c "$cmd" 2>&1
+}
+
+# ---- box-only pending registration (requirement 3/AC2/AC10) --------------
+# A box-only AC whose real substrate is down on BOTH of two spaced probes
+# registers here instead of just recording `unreachable` — the lane's next
+# boot (for any reason) runs it first via `pending-run` before its ordinary
+# work, per AC10. One file per (slug, AC) under state/reality-pending/, so a
+# second `run` re-registering the same AC overwrites cleanly (idempotent).
+register_pending() {
+  local prd="$1" slug="$2" ac="$3" cmd="$4" reg_ts="$5" ev1="$6" ev2="$7"
+  mkdir -p "$PENDING_DIR"
+  local f="$PENDING_DIR/${slug}-ac${ac}.json"
+  python3 - "$f" "$prd" "$slug" "$ac" "$cmd" "$reg_ts" "$ev1" "$ev2" <<'PY'
+import json, sys
+f, prd, slug, ac, cmd, reg_ts, ev1, ev2 = sys.argv[1:9]
+data = {
+    "prd": prd, "slug": slug, "ac": int(ac), "command": cmd,
+    "registered_at": reg_ts,
+    "probes": [{"ts": reg_ts, "reach": "unreachable", "evidence": ev1},
+               {"ts": reg_ts, "reach": "unreachable", "evidence": ev2}],
+    "alarmed": False,
+}
+with open(f, "w") as fh:
+    json.dump(data, fh, indent=2)
+PY
+  journal_line "$(now_iso)  reality  pending  registered  (lane=$(hostname) slug=$slug ac=$ac file=$f)"
+}
+
 # ---- follow-up PRD drafting (requirement 5) -------------------------------
 # Drafts build-queue/PRD-<slug>-reality-<n>.md, lints it with prd-lint.sh
 # before it is written to the real queue, and never writes a PRD that
@@ -495,7 +604,20 @@ do_run() {
   local plan_json; plan_json="$(do_plan "$prd")" || die "plan extraction failed for $prd"
   local n_runnable; n_runnable="$("$JQ" '[.[] | select(.kind != "manual")] | length' <<<"$plan_json")"
   if [ "${n_runnable:-0}" -eq 0 ]; then
-    log "no non-manual substrate ACs for $slug — nothing to run"
+    # AC7: a pure-fixture ship still gets a receipt saying so — never a
+    # silently-skipped run that could be mistaken for a false pending.
+    local receipt; mkdir -p "$RECEIPTS_DIR"
+    receipt="$RECEIPTS_DIR/$(date -u +%F)-${slug}-reality.txt"
+    {
+      printf 'reality-check receipt for %s\n' "$slug"
+      printf 'started-at: %s\n' "$(now_iso)"
+      printf 'hostname: %s\n\n' "$(hostname)"
+      printf 'result: fixture-only (no substrate-naming AC with a runnable command)\n'
+    } >"$receipt"
+    write_frontmatter_keys "$prd" "reality=fixture-only" "reality_receipt=$receipt"
+    commit_and_push "$prd" "$slug: reality-check fixture-only (post-ship)" "$no_push"
+    journal_line "$(now_iso)  reality  $slug  fixture-only  (lane=$(hostname) receipt=$receipt)"
+    log "no non-manual substrate ACs for $slug — fixture-only, receipt recorded at $receipt"
     exit 0
   fi
 
@@ -508,20 +630,101 @@ do_run() {
     printf 'hostname: %s\n\n' "$(hostname)"
   } >"$receipt"
 
+  # Rank-ordered overall verdict: failed beats pending beats ok beats
+  # unreachable, so one bad AC among several never gets masked by the
+  # others' success, and a pending AC is never silently swallowed by an ok
+  # one that happened to run first.
   local overall=unreachable
+  declare -A REALITY_RANK=([unreachable]=0 [ok]=1 [pending]=2 [failed]=3)
+  bump_overall() {
+    local new="$1"
+    if [ "${REALITY_RANK[$new]}" -gt "${REALITY_RANK[$overall]}" ]; then overall="$new"; fi
+  }
+
   local -a failing_items=()
   local i count; count="$("$JQ" 'length' <<<"$plan_json")"
   for ((i=0; i<count; i++)); do
-    local item kind cmd ac
+    local item kind cmd ac tier
     item="$("$JQ" -c ".[$i]" <<<"$plan_json")"
     kind="$("$JQ" -r '.kind' <<<"$item")"
     [ "$kind" = manual ] && continue
     cmd="$("$JQ" -r '.command' <<<"$item")"
     ac="$("$JQ" -r '.ac' <<<"$item")"
+    tier="$("$JQ" -r '.tier // "n/a"' <<<"$item")"
+
+    if [ "$kind" = box ]; then
+      # Requirement 3 (P0): box kind gets the tier-aware path — reachable
+      # runs live as before; unreachable + container-coverable runs in a
+      # fresh RedBaron container THIS SAME TICK (AC9); unreachable +
+      # box-only needs a second spaced probe before it's trusted as
+      # genuinely down, then registers pending for the lane's next boot
+      # (AC2/AC10) instead of a bare `unreachable`.
+      local reach1 ev1
+      IFS=$'\t' read -r reach1 ev1 < <(probe_box)
+      {
+        printf -- '--- AC%s (box, tier=%s) ---\n' "$ac" "$tier"
+        printf 'command: %s\n' "$cmd"
+        printf 'probe-1: %s (%s)\n' "$reach1" "$ev1"
+      } >>"$receipt"
+
+      if [ "$reach1" = reachable ]; then
+        local out rc
+        out="$(eval "$cmd" 2>&1)"; rc=$?
+        printf 'ran: live (tier=live), exit=%s\n' "$rc" >>"$receipt"
+        printf 'output (tail 20 lines):\n%s\n\n' "$(printf '%s' "$out" | tail -n 20)" >>"$receipt"
+        if [ "$rc" -eq 0 ]; then
+          printf 'result: ok (tier=live)\n\n' >>"$receipt"; bump_overall ok
+        else
+          printf 'result: failed (tier=live)\n\n' >>"$receipt"; bump_overall failed
+          failing_items+=("$("$JQ" -c --arg cmd "$cmd" --arg out "$out" --arg tier live '. + {command:$cmd, output_tail:$out, tier:$tier}' <<<"$item")")
+        fi
+        continue
+      fi
+
+      if [ "$tier" = container-coverable ]; then
+        local cout crc
+        cout="$(run_in_container "$cmd")"; crc=$?
+        printf 'ran: container (tier=container), exit=%s\n' "$crc" >>"$receipt"
+        printf 'output (tail 20 lines):\n%s\n\n' "$(printf '%s' "$cout" | tail -n 20)" >>"$receipt"
+        if [ "$crc" -eq 0 ]; then
+          printf 'result: ok (tier=container)\n\n' >>"$receipt"; bump_overall ok
+        else
+          printf 'result: failed (tier=container)\n\n' >>"$receipt"; bump_overall failed
+          failing_items+=("$("$JQ" -c --arg cmd "$cmd" --arg out "$cout" --arg tier container '. + {command:$cmd, output_tail:$out, tier:$tier}' <<<"$item")")
+        fi
+        continue
+      fi
+
+      # box-only: second spaced probe before trusting "genuinely down".
+      sleep "${REALITY_CHECK_PROBE_SPACING:-5}"
+      local reach2 ev2
+      IFS=$'\t' read -r reach2 ev2 < <(probe_box)
+      printf 'probe-2: %s (%s)\n' "$reach2" "$ev2" >>"$receipt"
+      journal_line "$(now_iso)  reality  probe  probe-1  (lane=$(hostname) slug=$slug ac=$ac reach=$reach1 evidence=$ev1)"
+      journal_line "$(now_iso)  reality  probe  probe-2  (lane=$(hostname) slug=$slug ac=$ac reach=$reach2 evidence=$ev2)"
+      if [ "$reach2" = reachable ]; then
+        # Came back up between probes — run it live after all.
+        local out rc
+        out="$(eval "$cmd" 2>&1)"; rc=$?
+        printf 'ran: live-after-second-probe (tier=live), exit=%s\n' "$rc" >>"$receipt"
+        printf 'output (tail 20 lines):\n%s\n\n' "$(printf '%s' "$out" | tail -n 20)" >>"$receipt"
+        if [ "$rc" -eq 0 ]; then
+          printf 'result: ok (tier=live)\n\n' >>"$receipt"; bump_overall ok
+        else
+          printf 'result: failed (tier=live)\n\n' >>"$receipt"; bump_overall failed
+          failing_items+=("$("$JQ" -c --arg cmd "$cmd" --arg out "$out" --arg tier live '. + {command:$cmd, output_tail:$out, tier:$tier}' <<<"$item")")
+        fi
+        continue
+      fi
+      local reg_ts; reg_ts="$(now_iso)"
+      register_pending "$prd" "$slug" "$ac" "$cmd" "$reg_ts" "$ev1" "$ev2"
+      printf 'result: pending (tier=box, registered=%s)\n\n' "$reg_ts" >>"$receipt"
+      bump_overall pending
+      continue
+    fi
 
     local reach evidence
     case "$kind" in
-      box) IFS=$'\t' read -r reach evidence < <(probe_box) ;;
       endpoint) IFS=$'\t' read -r reach evidence < <(probe_endpoint "$cmd") ;;
       unit) IFS=$'\t' read -r reach evidence < <(probe_unit "${cmd##* }") ;;
       *) reach=unreachable; evidence="unknown kind $kind" ;;
@@ -544,15 +747,18 @@ do_run() {
     printf 'output (tail 20 lines):\n%s\n\n' "$(printf '%s' "$out" | tail -n 20)" >>"$receipt"
     if [ "$rc" -eq 0 ]; then
       printf 'result: ok\n\n' >>"$receipt"
-      [ "$overall" = unreachable ] && overall=ok
+      bump_overall ok
     else
       printf 'result: failed\n\n' >>"$receipt"
-      overall=failed
+      bump_overall failed
       failing_items+=("$("$JQ" -c --arg cmd "$cmd" --arg out "$out" '. + {command:$cmd, output_tail:$out}' <<<"$item")")
     fi
   done
 
   write_frontmatter_keys "$prd" "reality=$overall" "reality_receipt=$receipt"
+  if [ "$overall" = pending ]; then
+    write_frontmatter_keys "$prd" "reality_pending_since=$(now_iso)"
+  fi
   local commit_msg="$slug: reality-check $overall (post-ship)"
   local followup=""
   if [ "$overall" = failed ]; then
@@ -613,10 +819,99 @@ print(json.dumps({"reality_open": rows}))
   fi
 }
 
+# ---- pending-run: execute every registered box-only pending AC against a
+# just-booted box (requirement 3/AC10 — "the next box the lane boots for
+# ANY reason runs the pending checks first, before its ordinary work"). The
+# caller (a lane's own boot sequence) passes the box identity through for
+# the receipt only; this command doesn't itself decide reachability — if
+# the box just came up, the caller already knows it's up. One receipt per
+# consumed registration, written back onto the ORIGINAL PRD's frontmatter
+# (tier=box), then the registration file is removed so a second boot
+# doesn't re-run the same check. No dedicated box is ever booted for this —
+# it only runs opportunistically inside an existing boot.
+do_pending_run() {
+  local target=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      *) target="$1"; shift ;;
+    esac
+  done
+  [ -n "$target" ] || die "pending-run requires a target (ip/hostname) argument"
+  [ -d "$PENDING_DIR" ] || { log "no pending dir — nothing to run"; exit 0; }
+  local f found=false
+  for f in "$PENDING_DIR"/*.json; do
+    [ -f "$f" ] || continue
+    found=true
+    local slug ac cmd prd
+    slug="$("$JQ" -r '.slug' "$f")"
+    ac="$("$JQ" -r '.ac' "$f")"
+    cmd="$("$JQ" -r '.command' "$f")"
+    prd="$("$JQ" -r '.prd' "$f")"
+
+    local out rc
+    out="$(eval "$cmd" 2>&1)"; rc=$?
+    local receipt; mkdir -p "$RECEIPTS_DIR"
+    receipt="$RECEIPTS_DIR/$(date -u +%F)-${slug}-ac${ac}-reality-boxrun.txt"
+    {
+      printf 'pending box-only reality check for %s AC%s\n' "$slug" "$ac"
+      printf 'run-at: %s\n' "$(now_iso)"
+      printf 'target: %s\n' "$target"
+      printf 'command: %s\n' "$cmd"
+      printf 'exit: %s\n' "$rc"
+      printf 'output (tail 20 lines):\n%s\n' "$(printf '%s' "$out" | tail -n 20)"
+    } >"$receipt"
+    local verdict; if [ "$rc" -eq 0 ]; then verdict=ok; else verdict=failed; fi
+
+    if [ -f "$prd" ]; then
+      write_frontmatter_keys "$prd" "reality=$verdict" "reality_receipt=$receipt"
+      commit_and_push "$prd" "$slug: reality-check $verdict (box-only pending run on $target, tier=box)" false
+    else
+      log "pending-run: parent PRD $prd no longer exists — receipt still recorded at $receipt"
+    fi
+    journal_line "$(now_iso)  reality  $slug  $verdict  (lane=$(hostname) receipt=$receipt tier=box ac=$ac target=$target)"
+    rm -f "$f"
+  done
+  [ "$found" = true ] || log "no pending box-only checks registered — nothing to run"
+  exit 0
+}
+
+# ---- alarm-check: exactly one alarm per pending registration once it has
+# sat 6h with no boot window (requirement 4/AC11). Idempotent — a fired
+# registration is marked alarmed=true so re-running this (meant to be
+# invoked periodically, e.g. from the existing quota-watch timer cadence;
+# wiring a dedicated timer is left as a follow-up, same interim-surface
+# posture as requirement 8's `open`) never re-alarms the same pending
+# state. The loop never boots a paid box solely for a reality check — this
+# command only ever journals + prints, it never calls burst-lane.sh.
+do_alarm_check() {
+  [ -d "$PENDING_DIR" ] || exit 0
+  local now_epoch; now_epoch="$(date -u +%s)"
+  local f
+  for f in "$PENDING_DIR"/*.json; do
+    [ -f "$f" ] || continue
+    local alarmed reg_ts reg_epoch slug ac age
+    alarmed="$("$JQ" -r '.alarmed // false' "$f")"
+    [ "$alarmed" = true ] && continue
+    reg_ts="$("$JQ" -r '.registered_at' "$f")"
+    reg_epoch="$(date -u -d "$reg_ts" +%s 2>/dev/null || echo "$now_epoch")"
+    slug="$("$JQ" -r '.slug' "$f")"
+    ac="$("$JQ" -r '.ac' "$f")"
+    age=$(( now_epoch - reg_epoch ))
+    if [ "$age" -ge "${REALITY_CHECK_ALARM_SECONDS:-21600}" ]; then
+      journal_line "$(now_iso)  reality  alarm  pending-6h  (lane=$(hostname) slug=$slug ac=$ac age_s=$age file=$f)"
+      printf '[reality-alarm] %s AC%s pending %ss with no boot window\n' "$slug" "$ac" "$age" >&2
+      local tmp; tmp="$("$JQ" '.alarmed = true' "$f")" && printf '%s\n' "$tmp" >"$f"
+    fi
+  done
+  exit 0
+}
+
 case "$cmd" in
-  plan) do_plan "$@" ;;
-  run)  do_run "$@" ;;
-  open) do_open "$@" ;;
+  plan)         do_plan "$@" ;;
+  run)          do_run "$@" ;;
+  open)         do_open "$@" ;;
+  pending-run)  do_pending_run "$@" ;;
+  alarm-check)  do_alarm_check "$@" ;;
   -h|--help) usage ;;
   *) usage ;;
 esac

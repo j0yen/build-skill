@@ -2378,14 +2378,26 @@ expect "reality AC2: reality_receipt frontmatter present and file exists" \
 expect "reality AC2: journal has 'reality  realityfix  ok'" \
   "grep -q 'reality  realityfix  ok' \"$RT/journal/$(date -u +%F).md\""
 
-# reality AC3 (PRD AC3): no session -> frontmatter reads unreachable, no follow-up.
+# reality AC3 (PRD AC2/AC10, 2026-09-12 revision — supersedes the
+# pre-revision "unreachable, no follow-up" outcome this case originally
+# asserted): AC1's `parity ~/wintermute/mcphost` is tagged box-only (it
+# inherently diffs against the real box's own disk state — a container has
+# none to compare, see reality-check.sh's BOX_ONLY_RE comment), so a lane
+# reporting inactive on BOTH of two spaced probes registers it pending
+# instead of a bare unreachable, and still drafts no follow-up (pending is
+# not a failure).
 cp "$RT/built-prds/PRD-realityfix.md.orig" "$RT/built-prds/PRD-realityfix.md"
-rm -rf "$RT/journal"
-PATH="$RT/fake-bin:$PATH" REALITY_CHECK_BURST_LANE="$RT/fake-bin/fake-lane-inactive.sh" \
-  BUILD_JOURNAL_DIR="$RT/journal" BUILD_RECEIPTS_DIR="$RT/journal/receipts" \
+rm -rf "$RT/journal" "$RT/reality-pending"; mkdir -p "$RT/reality-pending"
+PATH="$RT/fake-bin:$PATH" REALITY_CHECK_BURST_LANE="$RT/fake-bin/fake-lane-inactive.sh" REALITY_CHECK_PROBE_SPACING=0 \
+  BUILD_JOURNAL_DIR="$RT/journal" BUILD_RECEIPTS_DIR="$RT/journal/receipts" REALITY_CHECK_PENDING_DIR="$RT/reality-pending" \
   "$RC" run "$RT/built-prds/PRD-realityfix.md" --no-push >/dev/null 2>&1
-expect "reality AC3: unreachable lane -> reality: unreachable" "grep -q '^- reality: unreachable' \"$RT/built-prds/PRD-realityfix.md\""
-expect "reality AC3: no follow-up drafted when unreachable" "[ ! -e \"$RT/build-queue/PRD-realityfix-reality-1.md\" ]"
+expect "reality AC3: unreachable box-only lane on two probes -> reality: pending (not a bare unreachable)" \
+  "grep -q '^- reality: pending' \"$RT/built-prds/PRD-realityfix.md\""
+expect "reality AC3: registration timestamp recorded on the parent" \
+  "grep -qE '^- reality_pending_since: ' \"$RT/built-prds/PRD-realityfix.md\""
+expect "reality AC3: pending registration file exists" \
+  "[ -f \"$RT/reality-pending/realityfix-ac1.json\" ]"
+expect "reality AC3: no follow-up drafted when pending" "[ ! -e \"$RT/build-queue/PRD-realityfix-reality-1.md\" ]"
 
 # reality AC4 (PRD AC4): deferral-premise-false, naming the session id, when
 # a deferred AC's justification claims unreachability but the fake lane
