@@ -234,6 +234,12 @@ COST_LEDGER="${BURST_LANE_COST_LEDGER:-$STATE_DIR/cost.jsonl}"
 # to (deduped) by every routed `run`, read into the cost-ledger row at
 # teardown, then cleared with the rest of the session state.
 SERVED_FILE="$STATE_DIR/prds_served"
+# PRD-build-burst-teardown-lifecycle requirement 3: a scratch file, not a
+# shell variable — teardown_and_delete runs inside every caller's own
+# `$(...)` command substitution, which is a SUBSHELL; a plain variable set
+# there never reaches the parent shell that reads it back afterward. A file
+# survives that boundary the same way $SERVED_FILE etc. already do.
+TEARDOWN_CAUSE_FILE="$STATE_DIR/.last-teardown-cause"
 ENV_FILE="${BURST_LANE_ENV_FILE:-$HOME/.config/wm-burst/.env}"
 JOURNAL="${BURST_LANE_JOURNAL:-$HOME/brain/journal/build/burst-lane.log}"
 PRD_DIR="${BURST_LANE_PRD_DIR:-$HOME/Documents/PRDs}"
@@ -461,8 +467,21 @@ BURST_LOCAL_DISK_FLOOR_GB="${BURST_LOCAL_DISK_FLOOR_GB:-60}"
 # state_write's.
 VOLUME_STATE_FILE="$STATE_DIR/volume.json"
 
+# ---- setup-grace + cold-volume policy (PRD-build-burst-teardown-lifecycle) --
+# BURST_SETUP_GRACE_MIN: minutes an autonomous teardown caller (anything
+# other than the "down" tag — see teardown_and_delete) must wait past `up`
+# before it may delete a session still in phase=setup. Protects the exact
+# 2026-09-13 window a provision-failed box and a genuinely-still-setting-up
+# one are indistinguishable by gate_ready/runs_served alone.
+BURST_SETUP_GRACE_MIN="${BURST_SETUP_GRACE_MIN:-30}"
+# BURST_VOLUME_KEEP_MIN_PCT: a volume below this used-pct (or one that has
+# never served a build at all) is deleted, not kept, on the teardown that
+# ends the lane's activity — a cold 500GB volume bills ~€38/mo for nothing;
+# recreating it on the next `up` is cheaper than that idle rent.
+BURST_VOLUME_KEEP_MIN_PCT="${BURST_VOLUME_KEEP_MIN_PCT:-5}"
+
 die() { echo "burst-lane: $*" >&2; exit "${2:-1}"; }
-usage() { echo "usage: burst-lane.sh {up|status|run|sync-back|pull|ensure-fresh|down|watchdog|cost|sub-cap|verify|provision|reap|box-isolation-check|route-check|parity|gate} ..." >&2; exit 2; }
+usage() { echo "usage: burst-lane.sh {up|status|run|sync-back|pull|ensure-fresh|down|watchdog|idle-guard|cost|sub-cap|verify|provision|reap|box-isolation-check|route-check|parity|gate} ..." >&2; exit 2; }
 
 now_epoch() { echo "${BURST_LANE_NOW:-$(date -u +%s)}"; }
 now_iso()   { date -u -d "@$(now_epoch)" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ; }
@@ -624,6 +643,15 @@ state_write() {  # $1..$N = key=value pairs
 state_clear() { rm -f "$STATE_FILE" "$SERVED_FILE"; }
 state_active() { [ -f "$STATE_FILE" ]; }
 
+# Migration/compatibility: a session.json written before this PRD has no
+# "phase" key at all — that reads as phase=provisioned (existing behavior,
+# no grace), never as phase=setup. Every state_write call site that isn't
+# itself transitioning phase should preserve the CURRENT value via this
+# reader (never hardcode "provisioned" directly), so a genuinely-still-
+# "setup" session mid-boot doesn't get silently promoted out of its own
+# grace window by an unrelated field update (e.g. cmd_run's runs_served++).
+state_read_phase() { local p; p="$(state_read phase)"; printf '%s\n' "${p:-provisioned}"; }
+
 # ---- persistent-volume state (PRD-build-burst-persistent-volume) ----------
 # Deliberately a SEPARATE file from $STATE_FILE: the volume (and a failed-
 # detach's dirty flag) outlive the session/server that state_clear wipes at
@@ -646,7 +674,13 @@ volume_state_write() {  # $1..$N = key=value pairs, merged onto whatever's
   local tmp="$VOLUME_STATE_FILE.tmp.$$"
   local -A merged
   local k
-  for k in volume_id volume_mounted volume_dirty volume_size_gb volume_used_pct; do
+  # PRD-build-burst-teardown-lifecycle requirement 5: volume_runs_served
+  # joins this preserve-list — like every field here, a partial call (e.g.
+  # volume_teardown's own "volume_used_pct=$used_pct" refresh) must never
+  # silently drop it; it is this volume's own lifetime "has it ever served
+  # a build" signal and has to survive every write that doesn't explicitly
+  # touch it, exactly like volume_dirty already does across sessions.
+  for k in volume_id volume_mounted volume_dirty volume_size_gb volume_used_pct volume_runs_served; do
     merged["$k"]="$(volume_state_read "$k")"
   done
   local kv v
@@ -959,11 +993,28 @@ echo MOUNTED
 # detach failure here NEVER blocks the server delete that follows it (fail
 # open on the teardown, same doctrine as volume_ensure on the way up) — it
 # only marks volume_dirty=true so the NEXT up's mount runs fsck first.
-volume_teardown() {  # $1=ip $2=caller(down|watchdog)
+volume_teardown() {  # $1=ip $2=caller(down|watchdog|idle-guard)
   local ip="$1" caller="$2"
   [ "$(volume_state_read volume_mounted)" = "true" ] || return 0
   local vid; vid="$(volume_state_read volume_id)"
   [ -n "$vid" ] || return 0
+
+  # PRD-build-burst-teardown-lifecycle requirement 5/Technical
+  # considerations: refresh volume_used_pct from a LIVE df probe before
+  # unmounting — trusting whatever volume_ensure stamped at `up` time would
+  # let a volume that filled up mid-session still read as cold. Reuses the
+  # exact "# volume-df" remote command volume_status_probe already uses (and
+  # the fake ssh fixture already answers), so this is the same live number
+  # `status --json` would show right now, not a second, independently-wired
+  # probe. Falls back to the last-stored reading if the probe fails (box
+  # already unreachable) — never treated as a hard failure of teardown.
+  local dfout used_pct
+  dfout="$("$SSH_BIN" $(ssh_kh_args) -o ConnectTimeout=8 -i "$SSH_KEY" "$REMOTE_USER@$ip" \
+    "df -BG --output=used,size,pcent '$REMOTE_ROOT' 2>/dev/null | tail -n1 # volume-df" 2>/dev/null)"
+  used_pct="$(awk '{print $3}' <<<"$dfout" | tr -dc '0-9')"
+  used_pct="${used_pct:-$(volume_state_read volume_used_pct)}"
+  case "$used_pct" in ''|*[!0-9]*) used_pct=0 ;; esac
+  volume_state_write "volume_used_pct=$used_pct"
 
   "$SSH_BIN" $(ssh_kh_args) -o ConnectTimeout=8 -i "$SSH_KEY" "$REMOTE_USER@$ip" \
     "sync # volume-sync" >/dev/null 2>&1 || true
@@ -988,6 +1039,31 @@ volume_teardown() {  # $1=ip $2=caller(down|watchdog)
   fi
   volume_state_write "volume_mounted=false" "volume_dirty=false"
   journal_line "$(now_iso)  burst-lane  $caller  volume  detached  (id=$vid)"
+
+  # Requirement 5: cold-volume policy. This lane runs exactly one session at
+  # a time (SERVER_NAME is singular), so a teardown that reaches this point
+  # — the box already destroy_verify-bound right after this call returns —
+  # is BY CONSTRUCTION the teardown that ends the lane's activity; there is
+  # no "another session still using this volume" case to check for. A
+  # volume below BURST_VOLUME_KEEP_MIN_PCT used, or one that has never
+  # served a single build across its whole life (volume_runs_served, set by
+  # cmd_run — independent of used_pct, so a probe hiccup that reads 0% on a
+  # genuinely-used volume still doesn't wrongly delete it if a real run is
+  # on record), is deleted rather than left billing ~€38/mo idle; `up`
+  # recreates one on demand, cheaper than the idle rent.
+  local keep_min="${BURST_VOLUME_KEEP_MIN_PCT:-5}"
+  local vruns; vruns="$(volume_state_read volume_runs_served)"
+  case "$vruns" in ''|*[!0-9]*) vruns=0 ;; esac
+  if [ "$used_pct" -lt "$keep_min" ] || [ "$vruns" -eq 0 ]; then
+    if "$HCLOUD" volume delete "$vid" >/dev/null 2>&1; then
+      journal_line "$(now_iso)  burst-lane  $caller  volume  deleted  (id=$vid used_pct=$used_pct runs_served=$vruns cause=cold-volume — recreate-on-next-up cheaper than idle ${BURST_VOLUME_GB}GB)"
+      rm -f "$VOLUME_STATE_FILE"
+    else
+      journal_line "$(now_iso)  burst-lane  $caller  volume  delete-failed  (id=$vid used_pct=$used_pct)"
+    fi
+  else
+    journal_line "$(now_iso)  burst-lane  $caller  volume-kept  (used_pct=$used_pct)"
+  fi
 }
 
 # `status --json`/`status` want a LIVE reading (not whatever volume_ensure
@@ -1540,7 +1616,8 @@ cmd_up() {
       "boot_ts=$(now_iso)" "boot_epoch=$(now_epoch)" "ttl_hours=$DEFAULT_TTL_HOURS" \
       "hard_ttl_hours=$HARD_TTL_HOURS" "runs_served=0" "sandbox_ok=$sbx" \
       "teardown_scheduled=false" "teardown_epoch=" "remote_user=$REMOTE_USER" \
-      "gate_ready=$GATE_READY" "gate_tools_missing=$GATE_TOOLS_MISSING"
+      "gate_ready=$GATE_READY" "gate_tools_missing=$GATE_TOOLS_MISSING" \
+      "phase=setup" "phase_epoch=$(now_epoch)"
     journal_line "$(now_iso)  burst-lane  up  adopted  (server_id=$aid ip=$aip sandbox_ok=$sbx gate_ready=$GATE_READY)"
     ( cmd_verify >/dev/null 2>&1 ) || journal_line "$(now_iso)  burst-lane  up  verify-failed-after-adopt  (lane unverified — run falls back local)"
     schedule_session_parity "$aid"
@@ -1616,7 +1693,8 @@ print(d.get("id",""), d.get("public_net",{}).get("ipv4",{}).get("ip",""))
     "boot_ts=$(now_iso)" "boot_epoch=$(now_epoch)" "ttl_hours=$DEFAULT_TTL_HOURS" \
     "hard_ttl_hours=$HARD_TTL_HOURS" "runs_served=0" "sandbox_ok=$sbx" \
     "teardown_scheduled=false" "teardown_epoch=" "remote_user=$REMOTE_USER" \
-    "gate_ready=$GATE_READY" "gate_tools_missing=$GATE_TOOLS_MISSING"
+    "gate_ready=$GATE_READY" "gate_tools_missing=$GATE_TOOLS_MISSING" \
+    "phase=setup" "phase_epoch=$(now_epoch)"
   journal_line "$(now_iso)  burst-lane  up  booted  (server_id=$id ip=$ip type=$SERVER_TYPE sandbox_ok=$sbx gate_ready=$GATE_READY remote_user=$REMOTE_USER)"
   ( cmd_verify >/dev/null 2>&1 ) || journal_line "$(now_iso)  burst-lane  up  verify-failed-after-boot  (lane unverified — run falls back local)"
   if [ "$sbx" = false ]; then
@@ -1727,7 +1805,7 @@ cmd_verify() {
     "teardown_scheduled=$(state_read teardown_scheduled)" "teardown_epoch=$(state_read teardown_epoch)" \
     "remote_user=$(state_read remote_user)" \
     "gate_ready=$gt_ready" "gate_tools_missing=$gt_missing" \
-    "verified=true"
+    "verified=true" "phase=$(state_read_phase)" "phase_epoch=$(state_read phase_epoch)"
   probe_emit burst-verify clean "rsync+cargo+uv+python3+sandbox all real" >/dev/null
   journal_line "$(now_iso)  burst-lane  verify  ok  (rsync+cargo+uv+python3+sandbox all real)"
   echo "verify: ok"
@@ -1858,14 +1936,24 @@ cmd_provision() {
   fi
 
   provision_gate_tools "$ip"
+  # Requirement 1: provision is the ONLY place a session leaves phase=setup
+  # under its own steam — success moves it to phase=provisioned (grace no
+  # longer applies, same as always having been provisioned), failure moves
+  # it to phase=failed (also grace-exempt: a box that just failed to
+  # provision is immediately eligible for autonomous teardown, never made
+  # to wait out the rest of a setup window it has already proven it won't
+  # use). A session already past "setup" (a re-provision retrying missing
+  # gate tools) just re-stamps the same outcome — never re-enters setup.
+  local new_phase; [ "$GATE_READY" = "true" ] && new_phase="provisioned" || new_phase="failed"
   state_write "server_id=$(state_read server_id)" "ip=$ip" "server_type=$(state_read server_type)" \
     "boot_ts=$(state_read boot_ts)" "boot_epoch=$(state_read boot_epoch)" \
     "ttl_hours=$(state_read ttl_hours)" "hard_ttl_hours=$(state_read hard_ttl_hours)" \
     "runs_served=$(state_read runs_served)" "sandbox_ok=$(state_read sandbox_ok)" \
     "teardown_scheduled=$(state_read teardown_scheduled)" "teardown_epoch=$(state_read teardown_epoch)" \
     "verified=$(state_read verified)" "remote_user=$REMOTE_USER" \
-    "gate_ready=$GATE_READY" "gate_tools_missing=$GATE_TOOLS_MISSING"
-  journal_line "$(now_iso)  burst-lane  provision  done  (server_id=$(state_read server_id) gate_ready=$GATE_READY gate_tools_missing=${GATE_TOOLS_MISSING:-none} remote_user=$REMOTE_USER per_tool_rc=\"${GATE_TOOLS_RC_SUMMARY:-}\")"
+    "gate_ready=$GATE_READY" "gate_tools_missing=$GATE_TOOLS_MISSING" \
+    "phase=$new_phase" "phase_epoch=$(now_epoch)"
+  journal_line "$(now_iso)  burst-lane  provision  done  (server_id=$(state_read server_id) gate_ready=$GATE_READY gate_tools_missing=${GATE_TOOLS_MISSING:-none} remote_user=$REMOTE_USER per_tool_rc=\"${GATE_TOOLS_RC_SUMMARY:-}\" phase=$new_phase)"
   echo "provision: gate_ready=$GATE_READY missing=${GATE_TOOLS_MISSING:-} per_tool_rc=\"${GATE_TOOLS_RC_SUMMARY:-}\""
   [ "$GATE_READY" = "true" ] && exit 0
   exit 1
@@ -3195,7 +3283,20 @@ cmd_run() {
     "runs_served=$runs" "sandbox_ok=$(state_read sandbox_ok)" \
     "teardown_scheduled=$(state_read teardown_scheduled)" "teardown_epoch=$(state_read teardown_epoch)" "verified=$(state_read verified)" \
     "remote_user=$(state_read remote_user)" \
-    "gate_ready=$(state_read gate_ready)" "gate_tools_missing=$(state_read gate_tools_missing)"
+    "gate_ready=$(state_read gate_ready)" "gate_tools_missing=$(state_read gate_tools_missing)" \
+    "phase=$(state_read_phase)" "phase_epoch=$(state_read phase_epoch)"
+
+  # PRD-build-burst-teardown-lifecycle requirement 5: a run that actually
+  # reached the box, while a persistent volume is mounted, is this volume's
+  # (not just this session's) proof that its cache has served a build —
+  # tracked in volume.json (outlives this session, like volume_dirty) so a
+  # later teardown's cold-volume decision has a signal independent of
+  # whatever used_pct a df probe happens to read.
+  if [ "$(volume_state_read volume_mounted)" = "true" ]; then
+    local vruns; vruns="$(volume_state_read volume_runs_served)"
+    case "$vruns" in ''|*[!0-9]*) vruns=0 ;; esac
+    volume_state_write "volume_runs_served=$((vruns + 1))"
+  fi
 
   # Requirement 13: attribute this run to a PRD slug for the cost ledger.
   # Callers that know their own slug (branch/gate dispatch) should export
@@ -4752,10 +4853,52 @@ reap_orphan_processes() {
 }
 
 cmd_reap() {
+  if [ "${1:-}" = "--volumes" ]; then
+    reap_volumes
+    exit 0
+  fi
   local proc_out; proc_out="$(reap_orphan_processes)"
   local out; out="$(reap_orphans)"
   printf '%s\n%s\n' "$proc_out" "$out"
   exit 0
+}
+
+# ---- orphan volume sweep (PRD-build-burst-teardown-lifecycle requirement 6) -
+# Locates a burst-owned volume by NAME (find_volume(), the same by-name
+# hcloud lookup `up`/volume_reconcile already use), never by session.json's
+# volume_id pointer — a server deleted out-of-band (by hand, or by a caller
+# that skipped this script entirely) leaves exactly this shape: the volume
+# still exists in hcloud, but this lane's own state files may be stale,
+# archived, or gone. A volume still attached to a server hcloud confirms is
+# alive is left alone (genuinely in use, not orphaned); anything else —
+# unattached, or attached to an id that's no longer alive — is deleted
+# unconditionally (no used_pct keep-check here: a stranded volume with no
+# session pointer at all has nobody left to decide "keep it for the next
+# run", so `reap --volumes` and `down --force` (which calls this too) both
+# just remove it rather than let it bill forever undiscovered) and
+# journaled with its id and whatever used_pct is on record.
+reap_volumes() {  # -> stdout "volumes-reaped=N"
+  [ -n "$BURST_VOLUME_NAME" ] || { echo "volumes-reaped=0"; return 0; }
+  local found; found="$(find_volume 2>/dev/null)"
+  if [ -z "$found" ]; then
+    echo "volumes-reaped=0"
+    return 0
+  fi
+  local vid vsize vserver vdevice
+  IFS='|' read -r vid vsize vserver vdevice <<<"$found"
+  if [ -n "$vserver" ] && server_alive "$vserver"; then
+    echo "volumes-reaped=0"
+    return 0
+  fi
+  local used_pct; used_pct="$(volume_state_read volume_used_pct)"; used_pct="${used_pct:-unknown}"
+  if "$HCLOUD" volume delete "$vid" >/dev/null 2>&1; then
+    journal_line "$(now_iso)  burst-lane  reap  volume-deleted  (id=$vid used_pct=$used_pct cause=orphaned-no-session-pointer)"
+    rm -f "$VOLUME_STATE_FILE"
+    echo "volumes-reaped=1"
+  else
+    journal_line "$(now_iso)  burst-lane  reap  volume-delete-failed  (id=$vid used_pct=$used_pct)"
+    echo "volumes-reaped=0"
+  fi
 }
 
 # ---- box isolation check (PRD-build-burst-selftest-isolation req 3) --------
@@ -5191,9 +5334,48 @@ print(sum(1 for v in first_warm.values() if v))
 # Prints "hrs|eur|served|alive" on stdout and returns 0 on a confirmed
 # destroy; prints nothing and returns 1 on a LEAK-FLAG (still present after
 # destroy_verify's 3 retries) — caller owns the decision/journal line.
-teardown_and_delete() {  # $1=id $2=caller_tag(down|watchdog)
+teardown_and_delete() {  # $1=id $2=caller_tag(down|watchdog|idle-guard)
   local id="$1" caller="$2" ip alive
   ip="$(state_read ip)"; alive="$(minutes_alive)"
+
+  # PRD-build-burst-teardown-lifecycle requirements 1-3: setup-grace check.
+  # "down" is the one caller tag reserved for an explicit operator call
+  # (cmd_down/cmd_down_force) and always bypasses this, matching requirement
+  # 2 — every other tag (watchdog, idle-guard; parity no longer reaches this
+  # function at all, requirement 4) is autonomous and must never delete a
+  # box still inside its post-`up` setup window: an unprovisioned box reads
+  # identically to a genuinely failed one (gate_ready=false, runs_served=0)
+  # by the prior PRD's own cost-safe rule, which is exactly the 2026-09-13
+  # incident this PRD fixes. $TEARDOWN_CAUSE_FILE is cleared every call and
+  # written with "setup-grace-expired" only when the grace window has run
+  # out with the session still (never provisioned/failed) in phase=setup —
+  # callers that want the more specific cause in their own journal line read
+  # it right after a successful (rc=0) return; it is deliberately not folded
+  # into this function's own stdout tuple (hrs|eur|served|alive), which
+  # every existing caller already parses positionally.
+  rm -f "$TEARDOWN_CAUSE_FILE"
+  if [ "$caller" != "down" ]; then
+    local phase; phase="$(state_read_phase)"
+    if [ "$phase" = "setup" ]; then
+      local phase_epoch grace_min grace_secs now elapsed
+      phase_epoch="$(state_read phase_epoch)"; phase_epoch="${phase_epoch:-$(state_read boot_epoch)}"
+      grace_min="${BURST_SETUP_GRACE_MIN:-30}"
+      grace_secs=$(( grace_min * 60 ))
+      now="$(now_epoch)"
+      elapsed=$(( now - ${phase_epoch:-$now} ))
+      if [ "$elapsed" -lt "$grace_secs" ]; then
+        local remaining=$(( grace_secs - elapsed ))
+        journal_line "$(now_iso)  burst-lane  $caller  teardown-deferred  (cause=setup-grace remaining=${remaining}s server_id=$id)"
+        return 2
+      fi
+      # Grace expired with nobody ever having provisioned this session —
+      # deleted below same as any other autonomous decision, but tagged so
+      # a forgotten box's cause is distinguishable in the ledger/journal
+      # (requirement 3).
+      printf '%s' "setup-grace-expired" > "$TEARDOWN_CAUSE_FILE"
+    fi
+  fi
+
   sweep_dirty_worktrees "$caller"
   gate_wait_for_inflight "$caller"
   shred_gate_credential "$ip" "$caller"
@@ -5238,6 +5420,10 @@ cmd_down_force() {
   fi
   session_known_hosts_remove
   rm -f "$STATE_FILE" "$SERVED_FILE"
+  # Requirement 6: `down --force` sweeps for a stranded volume too, same as
+  # `reap --volumes` — bypassing every keep rule (this function's whole
+  # point) includes the volume's used_pct keep-check, not just the box.
+  reap_volumes >/dev/null 2>&1 || true
   echo "decision=force-deleted"
   exit 0
 }
@@ -5291,7 +5477,8 @@ cmd_down() {
           "hard_ttl_hours=$(state_read hard_ttl_hours)" "runs_served=$(state_read runs_served)" \
           "sandbox_ok=$(state_read sandbox_ok)" "teardown_scheduled=false" "teardown_epoch=" "verified=$(state_read verified)" \
           "remote_user=$(state_read remote_user)" \
-          "gate_ready=$(state_read gate_ready)" "gate_tools_missing=$(state_read gate_tools_missing)"
+          "gate_ready=$(state_read gate_ready)" "gate_tools_missing=$(state_read gate_tools_missing)" \
+          "phase=$(state_read_phase)" "phase_epoch=$(state_read phase_epoch)"
         journal_line "$(now_iso)  burst-lane  down  decision=keep  (server_id=$id cause=rust-work-arrived, schedule cancelled)"
       else
         journal_line "$(now_iso)  burst-lane  down  decision=keep  (server_id=$id)"
@@ -5344,7 +5531,8 @@ cmd_down() {
     "hard_ttl_hours=$(state_read hard_ttl_hours)" "runs_served=$(state_read runs_served)" \
     "sandbox_ok=$(state_read sandbox_ok)" "teardown_scheduled=true" "teardown_epoch=$window_start" "verified=$(state_read verified)" \
     "remote_user=$(state_read remote_user)" \
-    "gate_ready=$(state_read gate_ready)" "gate_tools_missing=$(state_read gate_tools_missing)"
+    "gate_ready=$(state_read gate_ready)" "gate_tools_missing=$(state_read gate_tools_missing)" \
+    "phase=$(state_read_phase)" "phase_epoch=$(state_read phase_epoch)"
   journal_line "$(now_iso)  burst-lane  down  decision=scheduled  (server_id=$id teardown_at=$(date -u -d "@$window_start" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "$window_start"))"
   echo "decision=scheduled"
   exit 0
@@ -5387,16 +5575,82 @@ cmd_watchdog() {
   # The watchdog is a teardown path too — same hygiene (dirty sweep, gate
   # wait, credential shred, volume detach) as `down`'s delete path, via the
   # shared teardown_and_delete helper (PRD-build-burst-session-hygiene).
-  local result hrs eur served alive
-  if result="$(teardown_and_delete "$id" watchdog)"; then
+  # PRD-build-burst-teardown-lifecycle: watchdog is an autonomous caller, so
+  # teardown_and_delete may return 2 (setup-grace still open, nothing
+  # deleted, its own "teardown-deferred" line already journaled) — that is
+  # neither a successful teardown nor a LEAK-FLAG, and must not be reported
+  # as either.
+  local result rc hrs eur served alive teardown_cause
+  result="$(teardown_and_delete "$id" watchdog)"; rc=$?
+  if [ "$rc" -eq 0 ]; then
     IFS='|' read -r hrs eur served alive <<<"$result"
-    journal_line "$(now_iso)  burst-lane  watchdog  teardown  (server_id=$id uptime=${alive}m cost_eur=$eur prds=$served)"
+    teardown_cause="$(cat "$TEARDOWN_CAUSE_FILE" 2>/dev/null || true)"
+    journal_line "$(now_iso)  burst-lane  watchdog  teardown  (server_id=$id uptime=${alive}m cost_eur=$eur prds=$served${teardown_cause:+ cause=$teardown_cause})"
     state_clear
     session_known_hosts_remove
     echo "watchdog teardown: $id (${alive}m)"
     exit 0
+  elif [ "$rc" -eq 2 ]; then
+    echo "watchdog: teardown deferred (setup-grace)"
+    exit 0
   fi
   journal_line "$(now_iso)  burst-lane  watchdog  LEAK-FLAG  (server_id=$id action=page-a-human — destroy failed after 3 retries)"
+  echo "LEAK-FLAG: server $id did not confirm destroyed after 3 retries"
+  exit 1
+}
+
+# ---- idle-guard (PRD-build-burst-teardown-lifecycle requirement 1/4) --------
+# A third autonomous teardown caller, alongside watchdog: a box that has
+# never served a single run and is already comfortably past a boot grace is
+# dead weight regardless of TTL. This is the in-repo home for that decision
+# — the exact idle-detection heuristic a standalone, out-of-tree 5-minute
+# timer previously reimplemented against a raw `hcloud server delete`, with
+# no notion of setup-grace at all (the real-world twin of this PRD's own
+# incident: an idle-looking box that was actually still mid-setup). Routing
+# the decision through the SAME teardown_and_delete() used by down/watchdog
+# means idle-guard inherits the grace check, the volume cold-teardown
+# policy, and every other teardown-hygiene step for free, instead of a
+# second, independently-drifting deletion path. Wiring an external timer at
+# `burst-lane.sh idle-guard` instead of a raw hcloud call is a follow-on
+# step outside this repo (the existing timer's unit files live under
+# ~/dotfiles, a separate repo this PRD's build_into does not cover).
+cmd_idle_guard() {
+  if ! state_active; then
+    echo "no-active-session"
+    exit 0
+  fi
+  reap_orphans >/dev/null 2>&1 || true
+
+  local id runs_served boot_epoch now age
+  id="$(state_read server_id)"; runs_served="$(state_read runs_served)"
+  case "$runs_served" in ''|*[!0-9]*) runs_served=0 ;; esac
+  boot_epoch="$(state_read boot_epoch)"; now="$(now_epoch)"; age=$(( now - boot_epoch ))
+
+  local due=0
+  local zero_runs_age_s="${BURST_IDLE_GUARD_ZERO_RUNS_AGE_S:-900}"
+  if [ "$runs_served" -eq 0 ] && [ "$age" -ge "$zero_runs_age_s" ]; then
+    due=1
+  fi
+  if [ "$due" -eq 0 ]; then
+    echo "ok: idle-guard sees no idle condition (runs_served=$runs_served age=${age}s)"
+    exit 0
+  fi
+
+  local result rc hrs eur served alive teardown_cause
+  result="$(teardown_and_delete "$id" idle-guard)"; rc=$?
+  if [ "$rc" -eq 0 ]; then
+    IFS='|' read -r hrs eur served alive <<<"$result"
+    teardown_cause="$(cat "$TEARDOWN_CAUSE_FILE" 2>/dev/null || true)"
+    journal_line "$(now_iso)  burst-lane  down  decision=deleted  (server_id=$id cause=${teardown_cause:-idle-guard:zero-runs-lifetime} minutes=$alive cost_eur=$eur prds=$served)"
+    state_clear
+    session_known_hosts_remove
+    echo "idle-guard teardown: $id (${alive}m)"
+    exit 0
+  elif [ "$rc" -eq 2 ]; then
+    echo "idle-guard: teardown deferred (setup-grace)"
+    exit 0
+  fi
+  journal_line "$(now_iso)  burst-lane  idle-guard  LEAK-FLAG  (server_id=$id action=page-a-human — destroy failed after 3 retries)"
   echo "LEAK-FLAG: server $id did not confirm destroyed after 3 retries"
   exit 1
 }
@@ -5650,6 +5904,7 @@ main() {
     ensure-fresh) cmd_ensure_fresh "$@" ;;
     down)      cmd_down "$@" ;;
     watchdog)  cmd_watchdog "$@" ;;
+    idle-guard) cmd_idle_guard "$@" ;;
     cost)      cmd_cost "$@" ;;
     sub-cap)   cmd_sub_cap "$@" ;;
     verify)    cmd_verify "$@" ;;

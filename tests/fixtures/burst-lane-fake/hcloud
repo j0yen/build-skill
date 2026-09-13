@@ -141,6 +141,17 @@ case "${1:-}" in
         mv "$VOLSTATE.tmp" "$VOLSTATE"
         exit 0
         ;;
+      delete)
+        # PRD-build-burst-teardown-lifecycle requirement 5/6: cold-volume
+        # teardown and reap --volumes/down --force's orphan sweep both call
+        # `hcloud volume delete <id>` for real — mirrors `server delete`'s
+        # own convention (match by id OR name, drop the line, rc0 even if
+        # already gone). FAKE_HCLOUD_VOLUME_DELETE_FAIL injects a failure.
+        [ "${FAKE_HCLOUD_VOLUME_DELETE_FAIL:-0}" = "1" ] && { echo "volume delete failed" >&2; exit 1; }
+        key="$3"
+        awk -F'|' -v k="$key" '$1!=k && $2!=k' "$VOLSTATE" > "$VOLSTATE.tmp" 2>/dev/null && mv "$VOLSTATE.tmp" "$VOLSTATE"
+        exit 0
+        ;;
       *) exit 2 ;;
     esac
     ;;

@@ -3750,5 +3750,255 @@ expect "bursthyg AC7: up (already-up fast path) also archives a volume.json whos
 # deferred_acs/mock_justifications frontmatter.
 expect "bursthyg: every bursthyg case above ran green" "[ $fail -eq 0 ]"
 
+# ==============================================================================
+# ---- bursttdl: PRD-build-burst-teardown-lifecycle ---------------------------
+# ==============================================================================
+# The 2026-09-13 real-box run: `up` scheduled a backgrounded parity check,
+# something called `down` 8 minutes after boot (before `provision` even
+# started), and the prior PRD's own cost-safe unproven-box rule ("unproven"
+# reads identically whether a box failed or is simply still mid-setup)
+# deleted it. This block proves the fix: a `phase=setup` session is
+# protected from every AUTONOMOUS teardown caller (watchdog, idle-guard)
+# until BURST_SETUP_GRACE_MIN minutes pass or `provision` moves it out of
+# setup one way or the other; an explicit `down` still bypasses the grace
+# unconditionally (never against a human choosing to stop spending); and a
+# cold, never-used persistent volume no longer survives a teardown that
+# ends the lane's activity. AC8 (a real Hetzner box proving `up` survives to
+# serve a `provision` 5+ minutes later) is deferred — see this PRD's own
+# frontmatter; no real box is authorized at build time.
+
+# ---- bursttdl AC1: setup-grace blocks watchdog + idle-guard ----------------
+fresh_env
+"$BL" up >/dev/null 2>&1
+btdl1_sid="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+btdl1_boot="$(grep -oE '"boot_epoch":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+expect "bursttdl AC1 setup: a fresh session starts phase=setup" \
+  "grep -q '\"phase\":\"setup\"' \"$BURST_LANE_STATE_DIR/session.json\""
+
+# Force watchdog's OWN due-check to fire immediately (ttl_hours=0) while
+# staying well inside the default 30-minute setup-grace window (5 minutes
+# in) — isolates "would watchdog otherwise delete this" from "does grace
+# block it".
+sed -i 's/"ttl_hours":[0-9]*/"ttl_hours":0/' "$BURST_LANE_STATE_DIR/session.json"
+export BURST_LANE_NOW=$((btdl1_boot + 300))
+btdl1_wd_rc=0; "$BL" watchdog >/dev/null 2>&1 || btdl1_wd_rc=$?
+expect "bursttdl AC1: watchdog exits 0 on a deferred (not deleted, not leaked) teardown" "[ $btdl1_wd_rc -eq 0 ]"
+expect "bursttdl AC1: watchdog does not delete a phase=setup box inside its grace window" \
+  "hcloud server describe \"$btdl1_sid\" -o json >/dev/null 2>&1"
+expect "bursttdl AC1: watchdog journals teardown-deferred with cause=setup-grace and a remaining= countdown" \
+  "grep -qE 'burst-lane  watchdog  teardown-deferred  \\(cause=setup-grace remaining=[0-9]+s server_id='\"$btdl1_sid\"'\\)' \"$BURST_LANE_JOURNAL\""
+
+# idle-guard: runs_served=0 by construction (no run yet), so its own
+# zero-runs threshold (900s default) has passed at +1000s, but grace
+# (1800s default) has not.
+export BURST_LANE_NOW=$((btdl1_boot + 1000))
+btdl1_ig_rc=0; "$BL" idle-guard >/dev/null 2>&1 || btdl1_ig_rc=$?
+expect "bursttdl AC1: idle-guard exits 0 on a deferred teardown" "[ $btdl1_ig_rc -eq 0 ]"
+expect "bursttdl AC1: idle-guard does not delete a phase=setup box inside its grace window" \
+  "hcloud server describe \"$btdl1_sid\" -o json >/dev/null 2>&1"
+expect "bursttdl AC1: idle-guard journals teardown-deferred with cause=setup-grace" \
+  "grep -qE 'burst-lane  idle-guard  teardown-deferred  \\(cause=setup-grace remaining=[0-9]+s server_id='\"$btdl1_sid\"'\\)' \"$BURST_LANE_JOURNAL\""
+unset BURST_LANE_NOW
+
+# Migration/compatibility: a session.json with no "phase" key at all (a
+# session started before this PRD shipped) reads as phase=provisioned —
+# no grace, existing behavior unaffected.
+python3 -c '
+import json, sys
+path = sys.argv[1]
+d = json.load(open(path))
+d.pop("phase", None)
+d.pop("phase_epoch", None)
+json.dump(d, open(path, "w"))
+' "$BURST_LANE_STATE_DIR/session.json"
+expect "bursttdl AC1 migration setup: the session file now has no phase field at all" \
+  "! grep -q '\"phase\"' \"$BURST_LANE_STATE_DIR/session.json\""
+export BURST_LANE_NOW=$((btdl1_boot + 60))   # 1 minute in — deep inside any grace window
+btdl1_legacy_rc=0; "$BL" watchdog >/dev/null 2>&1 || btdl1_legacy_rc=$?
+expect "bursttdl AC1 migration: a legacy session with no phase field is NOT grace-protected (reads as already-provisioned)" \
+  "! hcloud server describe \"$btdl1_sid\" -o json >/dev/null 2>&1"
+unset BURST_LANE_NOW
+
+# ---- bursttdl AC2: an explicit `down` bypasses grace unconditionally ------
+fresh_env
+"$BL" up >/dev/null 2>&1
+btdl2_sid="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+expect "bursttdl AC2 setup: the session is phase=setup, well inside the grace window" \
+  "grep -q '\"phase\":\"setup\"' \"$BURST_LANE_STATE_DIR/session.json\""
+# Route `down` through the SAME immediate-delete path bursthyg AC4 already
+# proves (a queued rust PRD -> rust-work-remains -> the unproven-box check,
+# gate_ready=false/runs_served=0 by construction on a box this fresh) —
+# this is "down" the caller tag, which must ignore phase=setup entirely.
+cat > "$BURST_LANE_PRD_DIR/build-queue/PRD-fake-rust-tdl.md" <<'EOF'
+# PRD — fake-rust-tdl
+
+- Status: queued
+- build_target: rust-extend
+EOF
+btdl2_out="$("$BL" down)"
+expect "bursttdl AC2: an operator's down deletes a phase=setup box immediately" "[ \"$btdl2_out\" = 'decision=deleted' ]"
+expect "bursttdl AC2: the fake hcloud confirms the server is actually gone" "! hcloud server describe \"$btdl2_sid\" -o json >/dev/null 2>&1"
+expect "bursttdl AC2: no teardown-deferred line was ever journaled for this session" \
+  "! grep -q \"teardown-deferred.*server_id=$btdl2_sid\" \"$BURST_LANE_JOURNAL\""
+rm -f "$BURST_LANE_PRD_DIR/build-queue/PRD-fake-rust-tdl.md"
+
+# ---- bursttdl AC3: grace expiry is not a leak ------------------------------
+fresh_env
+"$BL" up >/dev/null 2>&1
+btdl3_sid="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+btdl3_boot="$(grep -oE '"boot_epoch":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+sed -i 's/"ttl_hours":[0-9]*/"ttl_hours":0/' "$BURST_LANE_STATE_DIR/session.json"
+export BURST_LANE_NOW=$((btdl3_boot + 1801))   # one second past the default 30-minute grace
+"$BL" watchdog >/dev/null 2>&1
+expect "bursttdl AC3: an autonomous caller deletes once grace has expired" \
+  "! hcloud server describe \"$btdl3_sid\" -o json >/dev/null 2>&1"
+expect "bursttdl AC3: the deletion is journaled with cause=setup-grace-expired" \
+  "grep -q 'burst-lane  watchdog  teardown.*cause=setup-grace-expired' \"$BURST_LANE_JOURNAL\""
+unset BURST_LANE_NOW
+
+# ---- bursttdl AC4: provision moves the session out of phase=setup ---------
+fresh_env
+"$BL" up >/dev/null 2>&1
+btdl4a_sid="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+"$BL" provision >/dev/null 2>&1   # default fixture: gate tools all present -> success
+expect "bursttdl AC4: a successful provision moves phase to provisioned" \
+  "grep -q '\"phase\":\"provisioned\"' \"$BURST_LANE_STATE_DIR/session.json\""
+
+fresh_env
+# Same deterministic gate_ready=false setup gatetools AC2/AC3 use: missing +
+# install-fail together, so no self-heal retry inside `provision` can
+# accidentally turn this into a success (a bare FAKE_SSH_GATE_TOOLS_MISSING
+# alone is a transient, retry-recoverable defect — provision_gate_tools()
+# retrying the install is exactly its own documented job).
+export FAKE_SSH_GATE_TOOLS_MISSING="autobuilder"
+export FAKE_SSH_GATE_TOOLS_INSTALL_FAIL=1
+"$BL" up >/dev/null 2>&1
+btdl4b_sid="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+btdl4b_boot="$(grep -oE '"boot_epoch":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+btdl4b_prov_rc=0; "$BL" provision >/dev/null 2>&1 || btdl4b_prov_rc=$?
+unset FAKE_SSH_GATE_TOOLS_MISSING FAKE_SSH_GATE_TOOLS_INSTALL_FAIL
+expect "bursttdl AC4: a failed provision exits non-zero" "[ $btdl4b_prov_rc -ne 0 ]"
+expect "bursttdl AC4: a failed provision moves phase to failed" \
+  "grep -q '\"phase\":\"failed\"' \"$BURST_LANE_STATE_DIR/session.json\""
+sed -i 's/"ttl_hours":[0-9]*/"ttl_hours":0/' "$BURST_LANE_STATE_DIR/session.json"
+export BURST_LANE_NOW=$((btdl4b_boot + 60))   # 1 minute in — deep inside any grace window
+"$BL" watchdog >/dev/null 2>&1
+expect "bursttdl AC4: a phase=failed box is deleted by the very next autonomous caller, without waiting out any grace" \
+  "! hcloud server describe \"$btdl4b_sid\" -o json >/dev/null 2>&1"
+unset BURST_LANE_NOW
+
+# ---- bursttdl AC5: parity reports its diff and never tears down -----------
+# Requirement 4: `cmd_up`'s backgrounded parity call (`schedule_session_parity`)
+# must only ever report a diff — teardown decisions belong to down/watchdog/
+# idle-guard alone. A real (empty, single-commit) git repo under
+# BURST_PARITY_REPOS' default name ("mcphost") makes `up` actually schedule
+# and run cmd_parity end-to-end against the fake ssh/rsync, instead of the
+# "not-a-repo" schedule-skip every other case in this file exercises.
+fresh_env
+mkdir -p "$BURST_LANE_REPOS_DIR/mcphost"
+( cd "$BURST_LANE_REPOS_DIR/mcphost" && git init -q && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init )
+"$BL" up >/dev/null 2>&1
+btdl5_sid="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+# The parity call was backgrounded (disowned) by `up` — poll its own journal
+# for a terminal line rather than assuming any fixed sleep is long enough.
+btdl5_seen=0
+for _ in $(seq 1 40); do
+  grep -qE 'burst-lane  parity  (ok|diff|fallback)' "$BURST_LANE_JOURNAL" 2>/dev/null && { btdl5_seen=1; break; }
+  sleep 0.5
+done
+expect "bursttdl AC5 setup: the backgrounded parity call actually ran to a terminal outcome" "[ $btdl5_seen -eq 1 ]"
+expect "bursttdl AC5: parity reports its diff (ok/diff/fallback), never a deletion, from the up-scheduled path" \
+  "grep -qE 'burst-lane  parity  (ok|diff|fallback)' \"$BURST_LANE_JOURNAL\""
+expect "bursttdl AC5: no decision=deleted line was ever journaled for this session" \
+  "! grep -q \"decision=deleted.*server_id=$btdl5_sid\" \"$BURST_LANE_JOURNAL\""
+expect "bursttdl AC5: the box is still alive after its own scheduled parity check completed" \
+  "hcloud server describe \"$btdl5_sid\" -o json >/dev/null 2>&1"
+expect "bursttdl AC5 (negative-case guard): cmd_parity's own source contains no teardown_and_delete/cmd_down call at all" \
+  "! sed -n '/^cmd_parity()/,/^gate_inflight_marker_file()/p' \"$BL\" | grep -qE 'teardown_and_delete|cmd_down\\b'"
+
+# ---- bursttdl AC6: cold-volume policy on the teardown that ends the lane ---
+# No rust work is queued here at all, so `down`'s decision routes through
+# its own deterministic "no rust work -> last two minutes of the billed
+# hour" scheduled-window path (same BURST_LANE_NOW-at-window_start technique
+# bursthyg/burst-lane-lane-ccx53's own AC8 tests already use) rather than the
+# gate_ready-dependent unproven-box branch — gate_ready's own value here
+# depends on comparing this dev machine's REAL locally-installed
+# `autobuilder` against the fixture's stubbed remote version, which is not
+# something this block should have to pin down just to prove what
+# volume_teardown() does once a box is actually going away.
+fresh_env
+export BURST_VOLUME_NAME="wm-burst-build-tdl6a"
+export FAKE_SSH_VOLUME_USED_PCT=1
+"$BL" up >/dev/null 2>&1
+btdl6a_boot="$(grep -oE '"boot_epoch":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+btdl6a_vid="$(grep -oE '"volume_id":"?[0-9]+"?' "$BURST_LANE_STATE_DIR/volume.json" | grep -oE '[0-9]+')"
+export BURST_LANE_NOW=$((btdl6a_boot + 3600 - 60))
+"$BL" down >/dev/null 2>&1
+unset BURST_LANE_NOW
+expect "bursttdl AC6: a cold (1% used, never-served) volume is deleted at the lane-ending teardown" \
+  "! hcloud volume describe \"$btdl6a_vid\" -o json >/dev/null 2>&1"
+expect "bursttdl AC6: the deletion is journaled with the volume's id and used_pct" \
+  "grep -qE \"burst-lane  down  volume  deleted  \\(id=$btdl6a_vid used_pct=1\" \"$BURST_LANE_JOURNAL\""
+
+export BURST_VOLUME_NAME="wm-burst-build-tdl6b"
+export FAKE_SSH_VOLUME_USED_PCT=40
+"$BL" up >/dev/null 2>&1
+btdl6b_boot="$(grep -oE '"boot_epoch":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+btdl6b_vid="$(grep -oE '"volume_id":"?[0-9]+"?' "$BURST_LANE_STATE_DIR/volume.json" | grep -oE '[0-9]+')"
+BTDL6_WT="$T/tdl6-wt"; mkdir -p "$BTDL6_WT"; echo 'echo hi' > "$BTDL6_WT/build.sh"
+"$BL" run "$BTDL6_WT" -- bash build.sh >/dev/null 2>&1
+export BURST_LANE_NOW=$((btdl6b_boot + 3600 - 60))
+"$BL" down >/dev/null 2>&1
+unset BURST_LANE_NOW
+expect "bursttdl AC6: a warm (40% used, has served a build) volume is kept, not deleted" \
+  "hcloud volume describe \"$btdl6b_vid\" -o json >/dev/null 2>&1"
+expect "bursttdl AC6: the keep decision is journaled as volume-kept (used_pct=40)" \
+  "grep -q 'burst-lane  down  volume-kept  (used_pct=40)' \"$BURST_LANE_JOURNAL\""
+unset FAKE_SSH_VOLUME_USED_PCT
+
+# ---- bursttdl AC7: an orphan sweep finds a volume with no session pointer -
+# Simulates the out-of-band server delete from this PRD's own TL;DR: the
+# session pointer (session.json) is gone, but the volume is still real in
+# hcloud, findable only by name — never by a session/volume_id this suite
+# deliberately drops here.
+fresh_env
+export BURST_VOLUME_NAME="wm-burst-build-tdl7"
+export FAKE_SSH_VOLUME_USED_PCT=1
+"$BL" up >/dev/null 2>&1
+btdl7_sid="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+btdl7_vid="$(grep -oE '"volume_id":"?[0-9]+"?' "$BURST_LANE_STATE_DIR/volume.json" | grep -oE '[0-9]+')"
+hcloud server delete "$btdl7_sid" >/dev/null 2>&1
+rm -f "$BURST_LANE_STATE_DIR/session.json"
+expect "bursttdl AC7 setup: the volume is still real in hcloud after the out-of-band server delete" \
+  "hcloud volume describe \"$btdl7_vid\" -o json >/dev/null 2>&1"
+btdl7_out="$("$BL" reap --volumes)"
+expect "bursttdl AC7: reap --volumes reports one volume reaped" "[ \"$btdl7_out\" = 'volumes-reaped=1' ]"
+expect "bursttdl AC7: the volume is located by name and deleted despite no session pointer" \
+  "! hcloud volume describe \"$btdl7_vid\" -o json >/dev/null 2>&1"
+expect "bursttdl AC7: the deletion is journaled with id and used_pct" \
+  "grep -qE \"burst-lane  reap  volume-deleted  \\(id=$btdl7_vid used_pct=1\" \"$BURST_LANE_JOURNAL\""
+
+# `down --force` does the same sweep (requirement 6's other half).
+export BURST_VOLUME_NAME="wm-burst-build-tdl7b"
+export FAKE_SSH_VOLUME_USED_PCT=1
+"$BL" up >/dev/null 2>&1
+btdl7b_sid="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+btdl7b_vid="$(grep -oE '"volume_id":"?[0-9]+"?' "$BURST_LANE_STATE_DIR/volume.json" | grep -oE '[0-9]+')"
+hcloud server delete "$btdl7b_sid" >/dev/null 2>&1
+rm -f "$BURST_LANE_STATE_DIR/session.json"
+"$BL" down --force >/dev/null 2>&1
+expect "bursttdl AC7: down --force also locates and deletes a stranded volume with no session pointer" \
+  "! hcloud volume describe \"$btdl7b_vid\" -o json >/dev/null 2>&1"
+unset FAKE_SSH_VOLUME_USED_PCT
+
+# ---- bursttdl AC8 (P1, deferred — see this PRD's own frontmatter): no real
+# Hetzner box is authorized at build time to prove `up` survives to serve a
+# `provision` 5+ minutes later on real infrastructure.
+
+# ---- bursttdl AC9 (P1 style closer): this fixture set exits 0 and names
+# its own bursttdl cases — same in-band closing assertion every sibling
+# PRD's own block ends with (see bursthyg AC9 just above).
+expect "bursttdl: every bursttdl case above ran green" "[ $fail -eq 0 ]"
+
 echo "=== $([ $fail -eq 0 ] && echo PASS || echo FAIL) ==="
 exit $fail
