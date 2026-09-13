@@ -83,27 +83,97 @@ case "$cmd" in
     # every probe from then on — so a test can assert the up -> probe ->
     # install-missing -> re-probe round trip without any real apt-get/
     # curl/cargo-install ever running.
+    #
+    # PRD-build-burst-probe-visibility knobs (all opt-in; unset changes
+    # nothing about the above):
+    #   FAKE_SSH_GATE_TOOLS_PROBE_FAIL=1        ssh call itself "fails":
+    #                                            no output, nonzero exit —
+    #                                            AC6 (probe-unparseable).
+    #   FAKE_SSH_GATE_TOOLS_PROBE_OMIT="t1 t2"  these tools are left out of
+    #                                            the output entirely (never
+    #                                            printed at all) — AC1
+    #                                            (probe-absent).
+    #   FAKE_SSH_GATE_TOOLS_PROBE_TRUNCATE=N    stop after the Nth tool
+    #                                            line and never print the
+    #                                            sentinel — AC9
+    #                                            (probe-truncated).
+    #   FAKE_SSH_GATE_TOOLS_PROBE_CRLF=1        every value line gets a
+    #                                            trailing \r — AC7.
+    #   FAKE_SSH_GATE_TOOLS_PROBE_NO_SENTINEL=1 print every tool line but
+    #                                            withhold the sentinel —
+    #                                            distinct truncation shape
+    #                                            from _TRUNCATE (all tools
+    #                                            seen, sweep still marked
+    #                                            incomplete).
+    #   FAKE_SSH_GATE_TOOLS_PROBE_CALLCOUNT_FILE + FAKE_SSH_GATE_TOOLS_
+    #   MISSING_2ND="t1 t2"                     reproduces the exact
+    #                                            2026-09-13 instability: the
+    #                                            probe's answer changes
+    #                                            between two calls seconds
+    #                                            apart. Unset, every call
+    #                                            answers from
+    #                                            FAKE_SSH_GATE_TOOLS_MISSING
+    #                                            as before; set, the 2nd and
+    #                                            later call (counted in the
+    #                                            given file) answers from
+    #                                            FAKE_SSH_GATE_TOOLS_
+    #                                            MISSING_2ND instead — a
+    #                                            single provision calls the
+    #                                            probe exactly twice
+    #                                            (pre-install, final), so
+    #                                            this flips exactly between
+    #                                            them — AC5 (probe-
+    #                                            disagreement).
+    if [ "${FAKE_SSH_GATE_TOOLS_PROBE_FAIL:-0}" = "1" ]; then
+      exit "${FAKE_SSH_GATE_TOOLS_PROBE_FAIL_RC:-1}"
+    fi
     installed=""
     if [ -n "${FAKE_GATE_TOOLS_STATE:-}" ] && [ -f "$FAKE_GATE_TOOLS_STATE" ]; then
       installed="$(cat "$FAKE_GATE_TOOLS_STATE")"
     fi
+    _gt_call_missing="${FAKE_SSH_GATE_TOOLS_MISSING:-}"
+    if [ -n "${FAKE_SSH_GATE_TOOLS_PROBE_CALLCOUNT_FILE:-}" ]; then
+      _gt_call_n=0
+      [ -f "$FAKE_SSH_GATE_TOOLS_PROBE_CALLCOUNT_FILE" ] && _gt_call_n="$(cat "$FAKE_SSH_GATE_TOOLS_PROBE_CALLCOUNT_FILE")"
+      _gt_call_n=$((_gt_call_n + 1))
+      echo "$_gt_call_n" > "$FAKE_SSH_GATE_TOOLS_PROBE_CALLCOUNT_FILE"
+      if [ "$_gt_call_n" -ge 2 ] && [ -n "${FAKE_SSH_GATE_TOOLS_MISSING_2ND:-}" ]; then
+        _gt_call_missing="$FAKE_SSH_GATE_TOOLS_MISSING_2ND"
+      fi
+    fi
+    _gt_n=0
     for t in autobuilder jq gh mold cargo-deny cargo-nextest uv claude; do
+      _gt_omitted=0
+      for o in ${FAKE_SSH_GATE_TOOLS_PROBE_OMIT:-}; do [ "$o" = "$t" ] && _gt_omitted=1; done
+      [ "$_gt_omitted" = "1" ] && continue
+      _gt_n=$((_gt_n + 1))
+      if [ -n "${FAKE_SSH_GATE_TOOLS_PROBE_TRUNCATE:-}" ] && [ "$_gt_n" -gt "${FAKE_SSH_GATE_TOOLS_PROBE_TRUNCATE}" ]; then
+        break
+      fi
       missing=0
-      for m in ${FAKE_SSH_GATE_TOOLS_MISSING:-}; do [ "$m" = "$t" ] && missing=1; done
+      for m in ${_gt_call_missing:-}; do [ "$m" = "$t" ] && missing=1; done
       for i in $installed; do [ "$i" = "$t" ] && missing=0; done
       if [ "$missing" = "1" ]; then
-        printf '%s=MISSING\n' "$t"
+        _gt_line="$t=MISSING"
       elif [ "$t" = "autobuilder" ]; then
         # PRD-build-burst-gate-tools-scope requirement 1 (version-drift):
         # defaults to matching the standard fake local autobuilder used
         # across this selftest ("autobuilder 9.9.9", set once via
         # BURST_LANE_AUTOBUILDER_BIN) so no test trips version-drift by
         # accident; a dedicated test overrides this to something else.
-        printf '%s=%s\n' "$t" "${FAKE_SSH_AUTOBUILDER_VERSION:-autobuilder 9.9.9}"
+        _gt_line="$t=${FAKE_SSH_AUTOBUILDER_VERSION:-autobuilder 9.9.9}"
       else
-        printf '%s=%s-fakeversion\n' "$t" "$t"
+        _gt_line="$t=$t-fakeversion"
+      fi
+      if [ "${FAKE_SSH_GATE_TOOLS_PROBE_CRLF:-0}" = "1" ]; then
+        printf '%s\r\n' "$_gt_line"
+      else
+        printf '%s\n' "$_gt_line"
       fi
     done
+    if [ "${FAKE_SSH_GATE_TOOLS_PROBE_TRUNCATE:-}" = "" ] && [ "${FAKE_SSH_GATE_TOOLS_PROBE_NO_SENTINEL:-0}" != "1" ]; then
+      printf '%s\n' "__GATE_PROBE_DONE__"
+    fi
     exit 0
     ;;
   *'# gate-tools-apt-update'*)

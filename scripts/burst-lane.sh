@@ -312,6 +312,14 @@ GATE_TOOLS_STATE_FILE="$STATE_DIR/gate-tools.json"
 GATE_TOOLS_FAILED_LOG_DIR="$STATE_DIR/logs/failed"
 GATE_TOOLS_FAILED_SESSIONS_LOG="$STATE_DIR/logs/failed-sessions.log"
 GATE_TOOLS_FAILED_LOG_RETAIN_SESSIONS="${GATE_TOOLS_FAILED_LOG_RETAIN_SESSIONS:-5}"
+# PRD-build-burst-probe-visibility requirement 7: bounds each remote
+# `--version` call so one hanging binary can't truncate the whole sweep, and
+# names the sentinel line the probe emits after its last tool so the parser
+# can tell "sweep completed" from "output cut off mid-stream" (requirement
+# 7/AC9). Overridable so a selftest can shrink the timeout without waiting
+# out the real default.
+GATE_TOOLS_PROBE_TIMEOUT_S="${BURST_LANE_GATE_TOOLS_PROBE_TIMEOUT_S:-5}"
+GATE_TOOLS_PROBE_SENTINEL="__GATE_PROBE_DONE__"
 # In-flight tool name for the provision-loop abort trap (requirement 1) —
 # deliberately a plain global, not a function-local: an EXIT/signal trap
 # must read it regardless of exactly which stack frame was executing when
@@ -1101,7 +1109,17 @@ volume_status_probe() {  # $1=ip -> stdout "id size_gb used_pct"; empty if no vo
 # real box's bash actually needing to parse a comment (it doesn't; comments
 # are just inert there, the real install shell below the marker runs as
 # normal).
-gate_tools_probe() {  # $1=ip -> stdout: one "tool=version|MISSING" line per tool
+gate_tools_probe() {  # $1=ip -> stdout: one "tool=version|MISSING" line per
+  # tool, terminated by a $GATE_TOOLS_PROBE_SENTINEL line once the sweep
+  # actually finishes; returns the ssh call's own exit status (via `return`,
+  # not a global — this function is always invoked as `x="$(gate_tools_probe
+  # ...)"`, which runs it in a subshell, so a plain global assignment inside
+  # it would be lost the instant that subshell exits) so a caller can do
+  # `probe_out="$(gate_tools_probe "$ip")"; rc=$?` and tell "ssh itself
+  # failed" apart from "ssh succeeded but printed something unparseable"
+  # (PRD-build-burst-probe-visibility requirement 1: the raw result — rc
+  # included — must survive to be journaled, not just discarded like
+  # before).
   # PRD-build-burst-unprivileged-user requirement 2: probing needs no root —
   # reading a tool's own --version never writes anything — so this runs as
   # $REMOTE_USER like everything but the requirement-3 allow-list.
@@ -1116,7 +1134,8 @@ gate_tools_probe() {  # $1=ip -> stdout: one "tool=version|MISSING" line per too
   # $ROOT_CARGO_HOME/bin, so root's own probe still needs both listed.
   local gt_probe_extra=""
   [ "$REMOTE_USER" = "root" ] && gt_probe_extra=":$ROOT_CARGO_HOME/bin:/root/.local/bin"
-  "$SSH_BIN" $(ssh_kh_args) -o ConnectTimeout=8 -i "$SSH_KEY" "$REMOTE_USER@$1" "
+  local gt_out gt_rc=0
+  gt_out="$("$SSH_BIN" $(ssh_kh_args) -o ConnectTimeout=8 -i "$SSH_KEY" "$REMOTE_USER@$1" "
 # gate-tools-probe
 # PRD-build-burst-gate-tools-scope requirement 1: a non-login ssh shell's
 # PATH lacks the cargo-installed tools/uv/claude dirs, so a correctly-
@@ -1128,12 +1147,94 @@ gate_tools_probe() {  # $1=ip -> stdout: one "tool=version|MISSING" line per too
 export PATH=$GATE_TOOLS_REMOTE_BIN_DIR:\$PATH$gt_probe_extra
 for t in $GATE_TOOLS_LIST; do
   if command -v \"\$t\" >/dev/null 2>&1; then
-    v=\"\$(\"\$t\" --version 2>/dev/null | head -n1)\"
+    # PRD-build-burst-probe-visibility requirement 7: bound per-tool so one
+    # hanging binary can't stall (and truncate) the whole sweep.
+    v=\"\$(timeout $GATE_TOOLS_PROBE_TIMEOUT_S \"\$t\" --version 2>/dev/null | head -n1)\"
     printf '%s=%s\n' \"\$t\" \"\${v:-unknown}\"
   else
     printf '%s=MISSING\n' \"\$t\"
   fi
-done" 2>/dev/null
+done
+printf '%s\n' '$GATE_TOOLS_PROBE_SENTINEL'" 2>/dev/null)" || gt_rc=$?
+  printf '%s' "$gt_out"
+  return "$gt_rc"
+}
+
+# PRD-build-burst-probe-visibility requirement 1/7: parses one probe's raw
+# stdout (from gate_tools_probe) into a normalized tool->value lookup
+# (populated into the caller's associative array via nameref — bash has no
+# other clean way to hand back a map), journaling the raw record and any
+# anomaly found along the way. Never fatal — a totally empty/garbled probe
+# still returns (with an empty lookup), the anomaly itself IS the signal.
+#   $1 = phase ("pre" or "final")
+#   $2 = raw probe stdout (possibly empty)
+#   $3 = probe rc (ssh's own exit status, from _GT_PROBE_RC)
+#   $4 = name of caller's associative array to populate (cleared first)
+gate_tools_parse_probe() {
+  local phase="$1" raw="$2" rc="$3"
+  local -n _gt_map="$4"
+  _gt_map=()
+  local line name val seen_sentinel=0 tools_seen=0 tools_str=""
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line%$'\r'}"
+    [ -n "$line" ] || continue
+    if [ "$line" = "$GATE_TOOLS_PROBE_SENTINEL" ]; then
+      seen_sentinel=1
+      continue
+    fi
+    case "$line" in *=*) ;; *) continue ;; esac
+    name="${line%%=*}"
+    val="${line#*=}"
+    val="${val%$'\r'}"
+    _gt_map["$name"]="$val"
+    tools_seen=$((tools_seen + 1))
+    # requirement 1: "values containing whitespace are collapsed" in the
+    # journal record — the lookup above keeps the raw value, only the
+    # journaled string is normalized.
+    tools_str+="${tools_str:+ }$name=$(_gt_collapse_ws "$val")"
+  done <<<"$raw"
+
+  journal_line "$(now_iso)  burst-lane  gate-tools  probe  (phase=$phase user=$REMOTE_USER rc=$rc tools=\"$tools_str\")"
+
+  # requirement 6/AC6: a probe that failed outright (nonzero ssh rc) or came
+  # back with zero parseable tool= lines is "unparseable" — distinguishable
+  # from a genuinely-measured empty result, never silently read as one.
+  if [ "$rc" != "0" ] || [ "$tools_seen" -eq 0 ]; then
+    journal_line "$(now_iso)  burst-lane  gate-tools  probe-unparseable  (phase=$phase rc=$rc)"
+  fi
+
+  # requirement 7/AC9: no sentinel means the stream was cut off before the
+  # sweep finished — every tool NOT already in the map (unseen) must be
+  # treated as MISSING, never as present; the caller's lookup already does
+  # that for free (a tool absent from _gt_map reads MISSING via the
+  # probe-absent fail-safe), this just makes the truncation itself visible.
+  if [ "$seen_sentinel" != "1" ]; then
+    journal_line "$(now_iso)  burst-lane  gate-tools  probe-truncated  (phase=$phase tools_seen=$tools_seen expected=$(set -- $GATE_TOOLS_LIST; echo $#))"
+  fi
+}
+
+# requirement 1: collapses embedded whitespace/CR in a probe value down to
+# single spaces and trims the ends, so a multi-word `--version` reply (or
+# one padded with a stray tab/CR) never breaks the single-line probe record.
+_gt_collapse_ws() {  # $1=value -> stdout
+  local v="${1//$'\t'/ }"
+  v="${v//$'\r'/}"
+  # shellcheck disable=SC2086 — deliberate word-splitting collapse+trim
+  echo $v
+}
+
+# requirement 5/AC5: effective presence of a tool in a parsed probe map —
+# a tool the probe never reported reads as MISSING (same fail-safe the
+# install loop uses), so disagreement comparison never has to special-case
+# "absent" separately from "reported MISSING".
+_gt_effective_status() {  # $1=arrayname $2=tool -> stdout
+  local -n _gt_arr="$1"
+  local tool="$2"
+  if [ "${_gt_arr[$tool]+set}" = "set" ]; then
+    printf '%s' "${_gt_arr[$tool]}"
+  else
+    printf '%s' "MISSING"
+  fi
 }
 
 # Newest installed toolchain per `rustup toolchain list` (requirement 1) —
@@ -1253,16 +1354,26 @@ provision_gate_tools() {  # $1=ip
   mkdir -p "$STATE_DIR/logs" 2>/dev/null || true
 
   probe_out="$(gate_tools_probe "$ip")"
+  local pre_probe_rc=$?
+  # PRD-build-burst-probe-visibility requirement 1/2: journal the raw
+  # pre-install probe and parse it into a lookup the loop below consults —
+  # it no longer iterates the probe's own output (a tool the probe omits or
+  # misreports used to be skipped in total silence; see requirement 2).
+  local -A _gt_pre
+  gate_tools_parse_probe "pre" "$probe_out" "$pre_probe_rc" _gt_pre
 
   # requirement 3: apt-get update runs at most ONCE per provision, before
   # the first apt-based install, and gets its own journal record either
   # way — "ran=false" (no apt tool was missing) reads as deliberately
   # skipped, not silently forgotten, the same ambiguity requirement 2
-  # exists to kill for individual tool installs.
+  # exists to kill for individual tool installs. Driven from GATE_TOOLS_LIST
+  # (not the probe's own output) so a tool the probe omitted — fail-safe
+  # MISSING per requirement 2 — still counts toward this decision.
   local need_apt_update=0
-  while IFS='=' read -r name ver; do
-    [ -n "$name" ] && [ "$ver" = "MISSING" ] && gate_tools_is_apt "$name" && need_apt_update=1
-  done <<<"$probe_out"
+  for name in $GATE_TOOLS_LIST; do
+    ver="$(_gt_effective_status _gt_pre "$name")"
+    [ "$ver" = "MISSING" ] && gate_tools_is_apt "$name" && need_apt_update=1
+  done
   if [ "$need_apt_update" = "1" ]; then
     local apt_log="$STATE_DIR/logs/gate-tools-apt-update.$$.log" apt_rc=0
     # Requirement 3: apt-get is root's job, never build's — hardcoded root@,
@@ -1310,11 +1421,30 @@ provision_gate_tools() {  # $1=ip
   mkdir -p "$GATE_TOOLS_FAILED_LOG_DIR" 2>/dev/null || true
   local -A _gt_rc
   local t attempts_blob=""
-  for t in $GATE_TOOLS_LIST; do _gt_rc["$t"]=0; done
+  # requirement 4/AC4: "na" (never a numeric exit code) means "never
+  # attempted" — the pre-PRD seed of 0 here is exactly what made
+  # per_tool_rc="...=0" for six tools that never ran read as six clean
+  # successes on the real 2026-09-13 08:46Z run.
+  for t in $GATE_TOOLS_LIST; do _gt_rc["$t"]="na"; done
 
-  while IFS='=' read -r name ver; do
-    [ -n "$name" ] || continue
-    [ "$ver" = "MISSING" ] || continue
+  # requirement 2: iterate GATE_TOOLS_LIST itself, not the probe's own
+  # output — a tool the probe never reported is looked up as MISSING
+  # (fail-safe: attempt the install) rather than silently falling out of
+  # the loop the way `<<<"$probe_out"` used to.
+  for name in $GATE_TOOLS_LIST; do
+    if [ "${_gt_pre[$name]+set}" = "set" ]; then
+      ver="${_gt_pre[$name]}"
+    else
+      ver="MISSING"
+      journal_line "$(now_iso)  burst-lane  gate-tools  probe-absent  (tool=$name)"
+    fi
+    if [ "$ver" != "MISSING" ]; then
+      # requirement 3: an explicit terminal record for the "present,
+      # nothing to do" outcome — silence was never a valid outcome for a
+      # listed tool.
+      journal_line "$(now_iso)  burst-lane  gate-tools  install-skipped  (tool=$name reason=present version=\"$(_gt_collapse_ws "$ver")\")"
+      continue
+    fi
     local start_ts rc secs err_log err_line
     start_ts="$(now_epoch)"
     err_log="$STATE_DIR/logs/gate-tools-install.$$-$name.log"
@@ -1362,7 +1492,7 @@ provision_gate_tools() {  # $1=ip
     _gt_rc["$name"]="$rc"
     attempts_blob+="$name"$'\t'"$rc"$'\t'"$err_line"$'\n'
     _GT_CURRENT_TOOL=""
-  done <<<"$probe_out"
+  done
 
   # Loop finished normally — disarm the abort trap before any further code
   # in this function (or cmd_provision after it returns) can misattribute
@@ -1394,6 +1524,15 @@ provision_gate_tools() {  # $1=ip
   fi
 
   local final_out; final_out="$(gate_tools_probe "$ip")"
+  local final_probe_rc=$?
+  # requirement 1/6: journal the final probe's raw result the same way the
+  # pre-install one was, and parse it into a lookup for the disagreement
+  # check below — additive to (never replacing) the existing python
+  # tools/missing/gate_tool_versions state-file write just below, which
+  # keeps its own independent parse of $final_out on purpose (Migration/
+  # compatibility: no existing reader of that JSON shape changes shape).
+  local -A _gt_final
+  gate_tools_parse_probe "final" "$final_out" "$final_probe_rc" _gt_final
   mkdir -p "$STATE_DIR" 2>/dev/null || true
   local drift_json=""
   if [ -n "$final_out" ]; then
@@ -1437,6 +1576,28 @@ json.dump({"tools": {}, "missing": sys.argv[1].split(), "gate_tool_versions": {}
     journal_line "$(now_iso)  burst-lane  gate-tools  version-drift  (tool=autobuilder local=\"$dl\" remote=\"$dr\")"
   fi
   if [ -z "$GATE_TOOLS_MISSING" ]; then GATE_READY="true"; else GATE_READY="false"; fi
+
+  # requirement 5/AC5: the pre-install and final probes disagreeing on
+  # whether a tool is present is the exact contradiction observed on
+  # 2026-09-13 (six tools present pre-install, missing post-install) and
+  # must alarm rather than pass quietly. Excludes the one EXPECTED
+  # transition — a tool this run found MISSING and then installed
+  # successfully (rc=0) — since seeing that tool present at the final probe
+  # is the whole point of provisioning, not an anomaly.
+  for t in $GATE_TOOLS_LIST; do
+    local _gt_pre_eff _gt_final_eff
+    _gt_pre_eff="$(_gt_effective_status _gt_pre "$t")"
+    _gt_final_eff="$(_gt_effective_status _gt_final "$t")"
+    local _gt_pre_missing=0 _gt_final_missing=0
+    [ "$_gt_pre_eff" = "MISSING" ] && _gt_pre_missing=1
+    [ "$_gt_final_eff" = "MISSING" ] && _gt_final_missing=1
+    if [ "$_gt_pre_missing" != "$_gt_final_missing" ]; then
+      if [ "$_gt_pre_missing" = "1" ] && [ "${_gt_rc[$t]:-na}" = "0" ]; then
+        continue  # expected: was missing, we installed it, now present
+      fi
+      journal_line "$(now_iso)  burst-lane  gate-tools  probe-disagreement  (tool=$t pre=\"$(_gt_collapse_ws "$_gt_pre_eff")\" final=\"$(_gt_collapse_ws "$_gt_final_eff")\")"
+    fi
+  done
 
   # requirement 3: gate-tools.json records last_rc/last_err per attempted
   # tool. Merged in AFTER the tools/missing/gate_tool_versions write above
