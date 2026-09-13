@@ -2929,8 +2929,20 @@ remote_dir_exists() {  # $1=ip $2=remote_path -> rc0 exists
 #     next local build just recompiles), journaled, rc0.
 #   real failure (box up, dir exists, rsync itself failed): marker LEFT IN
 #     PLACE for a later retry, journaled, rc1.
+PULL_OUTCOME=""
 do_marker_pull() {  # $1=worktree $2=trigger(local-read|explicit|teardown) -> rc0 handled, rc1 real failure
+  # PRD-build-burst-pull-back-restore requirement 1/2: rc0 alone can't tell a
+  # caller WHICH handled outcome happened — not-dirty, disk-floor-deferred,
+  # cold (no session / moved root / remote dir gone), or an actual transfer
+  # all return 0 here, by design (a teardown sweep and ensure-fresh's
+  # local-read trigger both want "not a hard failure" collapsed to one rc).
+  # Only `cmd_pull` (the explicit operator path) needs the finer distinction,
+  # to stop rendering every rc0 as "pulled" — the exact defect this PRD
+  # fixes. PULL_OUTCOME is the SLOT_HELD-style side channel for that: set
+  # right before every return, read by cmd_pull immediately after the call,
+  # ignored by every other caller exactly as before.
   local worktree="$1" trigger="$2" sid remote_path kind
+  PULL_OUTCOME="not-dirty"
   is_dirty "$worktree" || return 0
   sid="$(dirty_field "$worktree" session_id)"
   remote_path="$(dirty_field "$worktree" remote_path)"
@@ -2958,6 +2970,7 @@ do_marker_pull() {  # $1=worktree $2=trigger(local-read|explicit|teardown) -> rc
       [ "${pull_last_gb:-0}" -gt "$pull_need_gb" ] 2>/dev/null && pull_need_gb="$pull_last_gb"
       if [ "$pull_free_gb" -lt "$pull_need_gb" ]; then
         journal_line "$(now_iso)  burst-lane  pull  deferred  (worktree=$worktree trigger=$trigger cause=local-disk free_gb=$pull_free_gb need_gb=$pull_need_gb)"
+        PULL_OUTCOME="deferred"
         return 0
       fi
       ;;
@@ -2966,6 +2979,7 @@ do_marker_pull() {  # $1=worktree $2=trigger(local-read|explicit|teardown) -> rc
   if ! state_active; then
     clear_dirty "$worktree"
     journal_line "$(now_iso)  burst-lane  pull  cold  (worktree=$worktree session_id=$sid trigger=$trigger cause=no-active-session — local target stale, next local build recompiles)"
+    PULL_OUTCOME="cold"
     return 0
   fi
   local ip; ip="$(state_read ip)"
@@ -2988,6 +3002,7 @@ do_marker_pull() {  # $1=worktree $2=trigger(local-read|explicit|teardown) -> rc
     *)
       clear_dirty "$worktree"
       journal_line "$(now_iso)  burst-lane  pull  cold  (worktree=$worktree session_id=$sid remote_path=$remote_path trigger=$trigger cause=remote-path-missing — local target stale, next local build recompiles)"
+      PULL_OUTCOME="cold"
       return 0
       ;;
   esac
@@ -2995,6 +3010,7 @@ do_marker_pull() {  # $1=worktree $2=trigger(local-read|explicit|teardown) -> rc
   if ! remote_dir_exists "$ip" "$remote_path"; then
     clear_dirty "$worktree"
     journal_line "$(now_iso)  burst-lane  pull  cold  (worktree=$worktree session_id=$sid remote_path=$remote_path trigger=$trigger cause=remote-dir-missing — local target stale, next local build recompiles)"
+    PULL_OUTCOME="cold"
     return 0
   fi
 
@@ -3012,6 +3028,7 @@ do_marker_pull() {  # $1=worktree $2=trigger(local-read|explicit|teardown) -> rc
   t1="$(now_fractional)"
   if [ "$prc" -ne 0 ]; then
     journal_line "$(now_iso)  burst-lane  pull  fallback  (cause=rsync-failed worktree=$worktree trigger=$trigger — marker left dirty for retry)"
+    PULL_OUTCOME="failed"
     return 1
   fi
 
@@ -3025,6 +3042,7 @@ do_marker_pull() {  # $1=worktree $2=trigger(local-read|explicit|teardown) -> rc
   if [ "$trigger" = "teardown" ]; then slug="teardown"; else slug="$(attribution_slug_for "$worktree")"; fi
   attribution_record "$slug" "$sid" 0 "$sync_s" "${bytes:-0}" "$worktree" pull 0 0 false "$trigger"
   journal_line "$(now_iso)  burst-lane  pull  ok  (worktree=$worktree trigger=$trigger bytes=${bytes:-0} slug=$slug)"
+  PULL_OUTCOME="transferred"
   return 0
 }
 
@@ -3558,9 +3576,32 @@ cmd_pull() {
     echo "clean: nothing to pull"
     exit 0
   fi
+  PULL_OUTCOME=""
   if do_marker_pull "$worktree" explicit; then
     flock -u 205
-    echo "pulled"
+    # PRD-build-burst-pull-back-restore requirement 2: success (rc0) alone
+    # no longer means "pulled" — only PULL_OUTCOME=transferred does. A
+    # deferred/cold outcome is a deliberate skip, not a failure (both stay
+    # exit 0, matching burstvol AC9/AC10's pinned rc), but it must never be
+    # rendered as though bytes moved.
+    case "$PULL_OUTCOME" in
+      transferred)
+        echo "pulled"
+        ;;
+      deferred)
+        echo "deferred: insufficient local disk, marker left dirty for retry"
+        ;;
+      cold)
+        echo "cold: remote artifacts gone, marker cleared"
+        ;;
+      *)
+        # Defensive: not-dirty (raced clean between the is_dirty check above
+        # and do_marker_pull's own) or any future outcome this case doesn't
+        # yet name — never default to claiming a transfer we can't show
+        # evidence for.
+        echo "clean: nothing to pull"
+        ;;
+    esac
     exit 0
   fi
   flock -u 205

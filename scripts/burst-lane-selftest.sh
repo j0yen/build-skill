@@ -3174,6 +3174,11 @@ expect "burstvol AC9: pull exits 0 (deferred, not an error)" "[ $bv9_pull_rc -eq
 expect "burstvol AC9: journal records pull deferred cause=local-disk free_gb=20 need_gb=87" \
   "grep -q 'burst-lane  pull  deferred  (worktree=$WT_BV9 .*cause=local-disk free_gb=20 need_gb=87' \"$BURST_LANE_JOURNAL\""
 expect "burstvol AC9: the marker stays dirty (never cleared)" "dirty_has \"$WT_BV9\""
+# PRD-build-burst-pull-back-restore requirement 2 / AC3c: a deferred pull
+# transferred nothing — the caller must never see the "pulled" string that
+# AC1's real-transfer case gets, even though (per the pinned rc==0 check
+# just above) the exit code stays 0 for this deliberately-skipped outcome.
+expect "burstpull AC3c: deferred pull's stdout never claims 'pulled'" "[ \"$bv9_pull_out\" != pulled ]"
 
 # ---- burstvol AC10: a dirty marker under a moved root (byte-identical to --
 # the 2026-09-11 user-migration evidence: a marker still naming /root/build
@@ -3198,6 +3203,34 @@ expect "burstvol AC10: journal records pull cold cause=remote-path-missing" \
 expect "burstvol AC10: never journaled as rsync-failed for this worktree" \
   "! grep -q \"burst-lane  pull  fallback  (cause=rsync-failed worktree=$WT_BV10\" \"$BURST_LANE_JOURNAL\""
 expect "burstvol AC10: the stale marker was cleared" "[ ! -e \"$BURST_LANE_STATE_DIR/dirty/$bv10_wkey.json\" ]"
+# PRD-build-burst-pull-back-restore requirement 2 / AC2: same distinction as
+# AC3c above — a cold outcome clears the marker and stays exit-0 (pinned
+# just above), but must never echo "pulled" alongside it.
+expect "burstpull AC2: cold pull's stdout never claims 'pulled'" "[ \"$bv10_pull_out\" != pulled ]"
+
+# ---- burstpull AC3b (PRD-build-burst-pull-back-restore): the OTHER cold
+# cause — no active session at all (session.json absent), as opposed to
+# AC10's live-session-but-moved-root cause=remote-path-missing above. Same
+# do_marker_pull branch family (state_active check, cause=no-active-session),
+# exercised directly via explicit `pull` with no `up` ever called, so there
+# is no session.json for state_active to find.
+fresh_env
+WT_BV3B="$T/no-session-wt"; mkdir -p "$WT_BV3B/target"
+bv3b_wkey="$(printf '%s' "$WT_BV3B" | sha1sum | cut -c1-8)"
+mkdir -p "$BURST_LANE_STATE_DIR/dirty"
+python3 -c "
+import json
+json.dump(
+    {'worktree': '$WT_BV3B', 'session_id': 'dead-session', 'kind': 'target',
+     'remote_path': '/root/build/no-session-wt-$bv3b_wkey', 'marked_ts': '2026-01-01T00:00:00Z'},
+    open('$BURST_LANE_STATE_DIR/dirty/$bv3b_wkey.json', 'w'))
+"
+bv3b_pull_out="$("$BL" pull "$WT_BV3B" 2>&1)"; bv3b_pull_rc=$?
+expect "burstpull AC3b: pull with no active session exits 0 (cold, not an error)" "[ $bv3b_pull_rc -eq 0 ]"
+expect "burstpull AC3b: pull's stdout never claims 'pulled' when nothing transferred" "[ \"$bv3b_pull_out\" != pulled ]"
+expect "burstpull AC3b: journal records pull cold cause=no-active-session" \
+  "grep -q 'burst-lane  pull  cold  (worktree=$WT_BV3B .*cause=no-active-session' \"$BURST_LANE_JOURNAL\""
+expect "burstpull AC3b: the stale marker was cleared" "[ ! -e \"$BURST_LANE_STATE_DIR/dirty/$bv3b_wkey.json\" ]"
 
 # ---- burstvol AC11: this fixture set exits 0 and names the burstvol cases -
 # (an explicit, in-band assertion, matching every sibling AC's own
