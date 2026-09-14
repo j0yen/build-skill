@@ -4494,6 +4494,14 @@ expect "reenable AC1: the credential shred is journaled before bake done (shred 
   "[ -n \"$r1_shred_line\" ] && [ -n \"$r1_done_line\" ] && [ \"$r1_shred_line\" -lt \"$r1_done_line\" ]"
 expect "reenable AC1: exactly one server create-image call happened" \
   "[ \"$(grep -c 'server create-image' "$FAKE_HCLOUD_CALLLOG")\" -eq 1 ]"
+# PRD-build-burst-prove-forensics AC12: the fake hcloud now unconditionally
+# rejects `-o`/`--output` on `create-image` with the real CLI's exact
+# flag-parse error (see tests/fixtures/burst-lane-fake/hcloud) — bake still
+# reaching `bake done` above already proves cmd_bake never sends one; assert
+# the call log directly too, so a future regression that re-adds `-o` here
+# fails this exact case instead of surfacing only against a real box.
+expect "reenable AC1 / AC12: the create-image call carries no -o/--output flag" \
+  "! grep 'server create-image' \"$FAKE_HCLOUD_CALLLOG\" | grep -qE -- '(^| )(-o|--output)( |$)'"
 unset BURST_GATE_REVIEWER BURST_CLAUDE_CRED_SRC
 
 # ---- reenable AC2a: no active session -> bake refused, exits 3, writes ----
@@ -4876,6 +4884,34 @@ fresh_env
 "$BL" status --json > "$T/pfx8b-status.json"
 expect "provefx AC8: status --json prove_last is null when prove has never run" \
   "python3 -c \"import json; d=json.load(open('$T/pfx8b-status.json')); assert d['prove_last'] is None, d['prove_last']\""
+
+# ---- provefx AC11 (requirement 9): cost and age count from server CREATION
+# (create_epoch), not from `up booted` (boot_epoch) — a session created at T
+# and booted 17 minutes later, torn down 2 minutes after boot (19 after
+# create), must show 19 billed minutes throughout, never 2 (boot to
+# teardown) — the exact gap that logged boxes 165737254/165738778 at 0.0h
+# each against a started billed hour.
+fresh_env
+"$BL" up >/dev/null 2>&1
+pfx11_create_epoch="$(grep -oE '"create_epoch":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+expect "provefx AC11 setup: up wrote a numeric create_epoch" "[ -n \"$pfx11_create_epoch\" ]"
+pfx11_boot_epoch=$((pfx11_create_epoch + 17 * 60))
+sed -i "s/\"boot_epoch\":[0-9]*/\"boot_epoch\":$pfx11_boot_epoch/" "$BURST_LANE_STATE_DIR/session.json"
+export BURST_LANE_NOW=$((pfx11_boot_epoch + 2 * 60))   # 19 minutes after create_epoch
+"$BL" status --json > "$T/pfx11-status.json"
+expect "provefx AC11: status --json minutes_alive reads 19 (from create_epoch, not boot_epoch's 2)" \
+  "python3 -c \"import json; d=json.load(open('$T/pfx11-status.json')); assert d['minutes_alive']==19, d\""
+pfx11_down_out="$("$BL" down --more-work-queued)"
+expect "provefx AC11: down deletes the unproven box (runs_served=0) immediately" \
+  "[ \"$pfx11_down_out\" = 'decision=deleted' ]"
+expect "provefx AC11: the deletion journal line reads minutes=19, not minutes=2" \
+  "grep -qE 'burst-lane  down  decision=deleted  \\(server_id=[^ ]+ cause=unproven-box .*minutes=19 ' \"$BURST_LANE_JOURNAL\""
+expect "provefx AC11: cost.jsonl's row reads hours=0.3167 (19/60), not 0.0333 (2/60)" \
+  "python3 -c \"
+import json
+rows = [json.loads(l) for l in open('$BURST_LANE_COST_LEDGER') if l.strip()]
+assert any(abs(r.get('hours', -1) - 19/60.0) < 0.0001 for r in rows), rows
+\""
 
 expect_block_green "provefx" "provefx: every provefx case above ran green"
 

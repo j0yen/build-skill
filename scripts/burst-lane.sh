@@ -2232,17 +2232,17 @@ prove_log_tail() {  # $1=step -> collapsed last 3 non-empty lines, <=240 chars
 
 # Requirement 5: prove's own `down` and cost line are always journaled by
 # prove itself, not left for a caller to infer from `down`'s line — must run
-# BEFORE `cmd_down`, while session state (server_id/boot_epoch) still
-# exists (a successful teardown clears it). Deliberately reuses the same
-# boot_epoch/COST_PER_HOUR_EUR math `minutes_alive`/`teardown_and_delete`
-# already use (requirement 9's create_epoch switch is separate, later
-# work) so this line never disagrees with the ledger row `down` writes.
+# BEFORE `cmd_down`, while session state (server_id/create_epoch/boot_epoch)
+# still exists (a successful teardown clears it). Reuses the same
+# create_epoch/COST_PER_HOUR_EUR math `minutes_alive`/`teardown_and_delete`
+# use (requirement 9) so this line never disagrees with the ledger row
+# `down` writes.
 prove_snapshot_cost() {
   PROVE_COST_ID="$(state_read server_id)"
-  local boot_epoch; boot_epoch="$(state_read boot_epoch)"
-  case "$boot_epoch" in
+  local base_epoch; base_epoch="$(session_create_epoch)"
+  case "$base_epoch" in
     ''|*[!0-9]*) PROVE_COST_MINUTES=0 ;;
-    *) PROVE_COST_MINUTES=$(( ($(now_epoch) - boot_epoch) / 60 )) ;;
+    *) PROVE_COST_MINUTES=$(( ($(now_epoch) - base_epoch) / 60 )) ;;
   esac
   PROVE_COST_EUR="$(awk -v m="$PROVE_COST_MINUTES" -v r="$COST_PER_HOUR_EUR" 'BEGIN{printf "%.4f", (m/60.0)*r}')"
 }
@@ -2683,6 +2683,13 @@ cmd_up() {
     provision_gate_tools "$aip"
     place_gate_credential "$aip"
     : > "$SERVED_FILE"
+    # Requirement 9: no `server create` happened on this path (the box
+    # already existed), so its true creation moment is unknown here — no
+    # create_epoch is written and session_create_epoch()'s own fallback to
+    # boot_epoch (set to "now", the adoption moment) applies, exactly as it
+    # does for a pre-this-PRD session. That undercounts an adopted box's
+    # true age, same as before this PRD; closing that gap needs an hcloud
+    # server describe round trip and is left for a follow-up.
     state_write "server_id=$aid" "ip=$aip" "server_type=$SERVER_TYPE" \
       "boot_ts=$(now_iso)" "boot_epoch=$(now_epoch)" "ttl_hours=$DEFAULT_TTL_HOURS" \
       "hard_ttl_hours=$HARD_TTL_HOURS" "runs_served=0" "sandbox_ok=$sbx" \
@@ -2744,6 +2751,14 @@ print(d.get("id",""), d.get("public_net",{}).get("ipv4",{}).get("ip",""))
     echo "fallback: could not parse server id from hcloud output"
     exit 3
   fi
+  # Requirement 9 (PRD-build-burst-prove-forensics): Hetzner starts billing
+  # the instant `server create` returns this id, not when `up` finishes
+  # setup and writes boot_epoch below — snapshot it now so every cost/age
+  # reader (minutes_alive, prove's cost line, watchdog/idle-guard, and the
+  # ssh-unreachable early-exit just below) counts from the true start of the
+  # billed hour. 2026-09-14: boxes 165737254/165738778 logged 0.0h each
+  # against a started hour because nothing captured this moment.
+  local create_epoch; create_epoch="$(now_epoch)"
   session_known_hosts_reset "$id"
 
   # Wait for ssh (bounded — never hang a tick forever). Hardcoded root@, not
@@ -2758,9 +2773,19 @@ print(d.get("id",""), d.get("public_net",{}).get("ipv4",{}).get("ip",""))
     tries=$((tries + 1)); sleep 1
   done
   if [ "$tries" -ge 30 ]; then
+    # Requirement 9: this box billed from create_epoch even though it never
+    # reached boot_epoch (no session.json was ever written) — journal the
+    # same "down ... minutes=... cost_eur=..." shape teardown_and_delete
+    # produces, and append the matching cost.jsonl row, so a provision that
+    # fails before boot is never a silent 0.0h/eur gap in the ledger.
+    local pf_minutes pf_eur
+    pf_minutes=$(( ($(now_epoch) - create_epoch) / 60 ))
+    pf_eur="$(awk -v m="$pf_minutes" -v r="$COST_PER_HOUR_EUR" 'BEGIN{printf "%.4f", (m/60.0)*r}')"
     journal_line "$(now_iso)  burst-lane  up  fallback  (cause=ssh-unreachable server_id=$id ip=$ip)"
-    echo "fallback: ssh never became reachable on $ip after 30s"
     "$HCLOUD" server delete "$id" >/dev/null 2>&1 || true
+    journal_line "$(now_iso)  burst-lane  down  decision=deleted  (server_id=$id cause=ssh-unreachable-before-boot minutes=$pf_minutes cost_eur=$pf_eur prds=none)"
+    ledger_append "$(awk -v m="$pf_minutes" 'BEGIN{printf "%.4f", m/60.0}')" "$pf_eur" "$id"
+    echo "fallback: ssh never became reachable on $ip after 30s"
     exit 3
   fi
 
@@ -2771,7 +2796,8 @@ print(d.get("id",""), d.get("public_net",{}).get("ipv4",{}).get("ip",""))
   place_gate_credential "$ip"
   : > "$SERVED_FILE"
   state_write "server_id=$id" "ip=$ip" "server_type=$SERVER_TYPE" \
-    "boot_ts=$(now_iso)" "boot_epoch=$(now_epoch)" "ttl_hours=$DEFAULT_TTL_HOURS" \
+    "boot_ts=$(now_iso)" "boot_epoch=$(now_epoch)" "create_epoch=$create_epoch" \
+    "ttl_hours=$DEFAULT_TTL_HOURS" \
     "hard_ttl_hours=$HARD_TTL_HOURS" "runs_served=0" "sandbox_ok=$sbx" \
     "teardown_scheduled=false" "teardown_epoch=" "remote_user=$REMOTE_USER" \
     "gate_ready=$GATE_READY" "gate_tools_missing=$GATE_TOOLS_MISSING" \
@@ -2881,6 +2907,7 @@ cmd_verify() {
   fi
   state_write "server_id=$(state_read server_id)" "ip=$ip" "server_type=$(state_read server_type)" \
     "boot_ts=$(state_read boot_ts)" "boot_epoch=$(state_read boot_epoch)" \
+    "create_epoch=$(state_read create_epoch)" \
     "ttl_hours=$(state_read ttl_hours)" "hard_ttl_hours=$(state_read hard_ttl_hours)" \
     "runs_served=$(state_read runs_served)" "sandbox_ok=$(state_read sandbox_ok)" \
     "teardown_scheduled=$(state_read teardown_scheduled)" "teardown_epoch=$(state_read teardown_epoch)" \
@@ -3028,6 +3055,7 @@ cmd_provision() {
   local new_phase; [ "$GATE_READY" = "true" ] && new_phase="provisioned" || new_phase="failed"
   state_write "server_id=$(state_read server_id)" "ip=$ip" "server_type=$(state_read server_type)" \
     "boot_ts=$(state_read boot_ts)" "boot_epoch=$(state_read boot_epoch)" \
+    "create_epoch=$(state_read create_epoch)" \
     "ttl_hours=$(state_read ttl_hours)" "hard_ttl_hours=$(state_read hard_ttl_hours)" \
     "runs_served=$(state_read runs_served)" "sandbox_ok=$(state_read sandbox_ok)" \
     "teardown_scheduled=$(state_read teardown_scheduled)" "teardown_epoch=$(state_read teardown_epoch)" \
@@ -3041,10 +3069,25 @@ cmd_provision() {
 }
 
 # ---- status -----------------------------------------------------------------
+# Requirement 9 (PRD-build-burst-prove-forensics): Hetzner bills from server
+# CREATION, not from `up booted` — a box that dies mid-setup (before
+# boot_epoch is ever written, or minutes before it) still owes the started
+# hour. Every cost/age reader below counts from create_epoch; sessions
+# written before this PRD (or adopted, where the true creation moment is
+# unknown to this lane) have no create_epoch and fall back to boot_epoch,
+# matching their pre-existing behavior exactly.
+session_create_epoch() {
+  local ce; ce="$(state_read create_epoch)"
+  case "$ce" in
+    ''|*[!0-9]*) state_read boot_epoch ;;
+    *) echo "$ce" ;;
+  esac
+}
+
 minutes_alive() {
-  local boot_epoch; boot_epoch="$(state_read boot_epoch)"
-  [ -n "$boot_epoch" ] || { echo 0; return; }
-  echo $(( ( $(now_epoch) - boot_epoch ) / 60 ))
+  local base_epoch; base_epoch="$(session_create_epoch)"
+  [ -n "$base_epoch" ] || { echo 0; return; }
+  echo $(( ( $(now_epoch) - base_epoch ) / 60 ))
 }
 
 cmd_status() {
@@ -4453,6 +4496,7 @@ cmd_run() {
   local runs; runs="$(state_read runs_served)"; runs=$((runs + 1))
   state_write "server_id=$id" "ip=$ip" "server_type=$(state_read server_type)" \
     "boot_ts=$(state_read boot_ts)" "boot_epoch=$(state_read boot_epoch)" \
+    "create_epoch=$(state_read create_epoch)" \
     "ttl_hours=$(state_read ttl_hours)" "hard_ttl_hours=$(state_read hard_ttl_hours)" \
     "runs_served=$runs" "sandbox_ok=$(state_read sandbox_ok)" \
     "teardown_scheduled=$(state_read teardown_scheduled)" "teardown_epoch=$(state_read teardown_epoch)" "verified=$(state_read verified)" \
@@ -6704,7 +6748,8 @@ cmd_down() {
     if [ "$gate_ready" = "true" ] && [ "$runs_served" -ge 1 ]; then
       if [ "$(state_read teardown_scheduled)" = "true" ]; then
         state_write "server_id=$id" "ip=$(state_read ip)" "server_type=$(state_read server_type)" \
-          "boot_ts=$(state_read boot_ts)" "boot_epoch=$boot_epoch" "ttl_hours=$(state_read ttl_hours)" \
+          "boot_ts=$(state_read boot_ts)" "boot_epoch=$boot_epoch" \
+          "create_epoch=$(state_read create_epoch)" "ttl_hours=$(state_read ttl_hours)" \
           "hard_ttl_hours=$(state_read hard_ttl_hours)" "runs_served=$(state_read runs_served)" \
           "sandbox_ok=$(state_read sandbox_ok)" "teardown_scheduled=false" "teardown_epoch=" "verified=$(state_read verified)" \
           "remote_user=$(state_read remote_user)" \
@@ -6758,7 +6803,8 @@ cmd_down() {
   fi
 
   state_write "server_id=$id" "ip=$(state_read ip)" "server_type=$(state_read server_type)" \
-    "boot_ts=$(state_read boot_ts)" "boot_epoch=$boot_epoch" "ttl_hours=$(state_read ttl_hours)" \
+    "boot_ts=$(state_read boot_ts)" "boot_epoch=$boot_epoch" \
+    "create_epoch=$(state_read create_epoch)" "ttl_hours=$(state_read ttl_hours)" \
     "hard_ttl_hours=$(state_read hard_ttl_hours)" "runs_served=$(state_read runs_served)" \
     "sandbox_ok=$(state_read sandbox_ok)" "teardown_scheduled=true" "teardown_epoch=$window_start" "verified=$(state_read verified)" \
     "remote_user=$(state_read remote_user)" \
@@ -6783,10 +6829,10 @@ cmd_watchdog() {
   # blocking it.
   reap_orphans >/dev/null 2>&1 || true
 
-  local id boot_epoch ttl_hours now age ttl_secs
-  id="$(state_read server_id)"; boot_epoch="$(state_read boot_epoch)"
+  local id create_epoch ttl_hours now age ttl_secs
+  id="$(state_read server_id)"; create_epoch="$(session_create_epoch)"
   ttl_hours="$(state_read ttl_hours)"; ttl_hours="${ttl_hours:-$DEFAULT_TTL_HOURS}"
-  now="$(now_epoch)"; age=$(( now - boot_epoch ))
+  now="$(now_epoch)"; age=$(( now - create_epoch ))
   ttl_secs=$(( ttl_hours * 3600 ))
 
   # Also honor a scheduled teardown whose window has arrived even if TTL
@@ -6852,10 +6898,10 @@ cmd_idle_guard() {
   fi
   reap_orphans >/dev/null 2>&1 || true
 
-  local id runs_served boot_epoch now age
+  local id runs_served create_epoch now age
   id="$(state_read server_id)"; runs_served="$(state_read runs_served)"
   case "$runs_served" in ''|*[!0-9]*) runs_served=0 ;; esac
-  boot_epoch="$(state_read boot_epoch)"; now="$(now_epoch)"; age=$(( now - boot_epoch ))
+  create_epoch="$(session_create_epoch)"; now="$(now_epoch)"; age=$(( now - create_epoch ))
 
   local due=0
   local zero_runs_age_s="${BURST_IDLE_GUARD_ZERO_RUNS_AGE_S:-900}"

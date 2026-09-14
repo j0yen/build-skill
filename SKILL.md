@@ -804,6 +804,41 @@ read it before assuming a step is "the last one this tick".
   already shows pending rust-extend gates) so a box never survives into a
   second billed hour idle.
 
+  **`prove` forensics (2026-09-14, PRD-build-burst-prove-forensics; gated
+  same as everything above on `burst_configured()`).** `burst-lane.sh
+  prove [--worktree <path>]` runs the real `up` → `run` → `pull` → down
+  cycle end to end and is the only command that spends a real, operator-
+  authorized billed hour to attest a burst box actually works. Its whole
+  body now runs under an `EXIT`/`ERR` trap: however it dies — a crashing
+  step, an unbound variable under `set -uo pipefail`, a `TERM` from
+  outside — it still writes `state/burst-lane/proof.json` with
+  `routed=false`, a `cause=<step>-aborted` naming the last step marker set
+  (`worktree`/`up`/`run`/`pull`/`assert`/`down`), `exit_code`, and `line`,
+  journals `prove aborted (step=… line=… rc=…)`, and still runs `down` so a
+  crashed `prove` never leaves a box for a human or the next tick to find
+  by hand. Every step's own captured output lands in
+  `state/burst-lane/logs/prove.<epoch>.<step>.log` (kept 14 days, pruned by
+  `reap`) and the last 3 non-empty lines ride into the failure/abort
+  journal line. `burst-lane.sh status --json` reports the newest one as
+  `prove_last: {ts, outcome, step, cause, line, log}`, so a tick or an
+  operator reads the last `prove` without opening the state dir. No lock
+  in `burst-lane.sh` can outlive the command that took it any more — every
+  backgrounded child (`schedule_session_parity` included) closes the lock
+  fds before it execs, so a disowned parity child can no longer hold
+  `up.lock` after its parent `up` returns (the 2026-09-13 incident: a dead
+  `prove`'s pid on `up.lock` refused every retry). A refused `up` now names
+  the lock's real, live holder (pid/comm/age/cmdline, read from
+  `/proc/locks` by the lock file's inode) or, if nothing actually holds it,
+  journals `up lock-reclaimed (stale_pid=…)` and proceeds — `up.pid` means
+  "live up", not "last successful up". Cost and age (`minutes_alive`, the
+  `down`/`prove` cost line, `cost.jsonl`'s `hours`, and the watchdog/idle-
+  guard TTL clock) all count from `create_epoch` — the moment `hcloud
+  server create` returns an id — not from `boot_epoch` (when `up` finishes
+  setup): boxes 165737254/165738778 logged 0.0h each while Hetzner billed
+  the started hour because nothing had captured server-creation time.
+  Sessions written before this PRD have no `create_epoch` and fall back to
+  `boot_epoch`, unchanged.
+
   **Ship rule (updated 2026-09-06, PRD-build-gate-delta-baseline): `pass`
   OR `delta-pass` ships — not just absolute `block=0`.** `extend-gate.sh`
   additionally diffs the blocking receipt set against a committed

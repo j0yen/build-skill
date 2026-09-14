@@ -104,6 +104,20 @@ case "${1:-}" in
         # a caller's poll loop (via `image describe`) is exercised — it
         # flips to "available" after FAKE_HCLOUD_CREATE_IMAGE_PENDING poll
         # calls.
+        # PRD-build-burst-prove-forensics AC12: `create-image` really has no
+        # `-o`/`--output` flag on the real CLI (1.67.0) — reject either
+        # spelling with the real CLI's exact flag-parse error, unconditionally
+        # (this is not opt-in fixture behavior; it models a permanent API
+        # constraint), BEFORE the FAKE_HCLOUD_CREATE_IMAGE_FAIL injection
+        # below, matching the real CLI's flag-parse-before-action ordering.
+        for _pfx_arg in "$@"; do
+          case "$_pfx_arg" in
+            -o|--output|-o=*|--output=*)
+              echo "unknown shorthand flag: 'o' in -o" >&2
+              exit 1
+              ;;
+          esac
+        done
         [ "${FAKE_HCLOUD_CREATE_IMAGE_FAIL:-0}" = "1" ] && { echo "create-image failed" >&2; exit 1; }
         img_desc=""
         shift 2
