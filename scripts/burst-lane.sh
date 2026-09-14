@@ -2145,6 +2145,136 @@ json.dump(d, open(out_path, "w"), indent=2, sort_keys=True)
 # exercises more of the real path than any smaller crate would.
 # `prove` always ends with `down` under the existing cost-safe rules
 # (requirement 3's own text), success or failure alike.
+#
+# ---- prove forensics (PRD-build-burst-prove-forensics) --------------------
+# On 2026-09-13 a real `prove` died silently between `up` returning and the
+# first `run` line: no journal entry, no proof.json, no stderr kept anywhere
+# (five-whys in visions/buildloop-operations.md). `cmd_prove` now runs its
+# whole body under an EXIT trap so ANY exit — a `set -u` unbound-variable
+# reference, an external signal, or an unguarded non-zero exit no `if`/`||`
+# was watching — still leaves a receipt naming the step. Two bash quirks
+# (verified by hand 2026-09-13/14) drove this shape:
+#   1. A `set -u` kill does NOT fire the ERR trap, only EXIT — so `line`
+#      (from ERR) is best-effort, honestly empty for that cause rather than
+#      guessed.
+#   2. bash unwinds a dying function's OWN `local` variables before an EXIT
+#      trap set inside that function runs, when the death is a `set -u`
+#      kill — a `local` read back from the trap comes back empty even
+#      though it was assigned moments earlier. Everything the trap needs is
+#      therefore a plain (non-local) `PROVE_*` global, updated as each step
+#      starts, never `local` inside cmd_prove.
+PROVE_STEP=""
+PROVE_START_EPOCH=""
+PROVE_WORKTREE=""
+PROVE_DISPOSABLE_REPO=""
+PROVE_CLEANUP_WORKTREE=""
+PROVE_SHA="unknown"
+PROVE_ID=""
+PROVE_FINISHED=false
+PROVE_ERR_LINE=""
+PROVE_FAIL_TAIL=""
+PROVE_COST_ID=""
+PROVE_COST_MINUTES=0
+PROVE_COST_EUR="0.0000"
+
+# Requirement 2: capture a step's raw output to a KEPT (never rm -f'd) log
+# file before its result is tested; `reap` prunes these after 14 days (see
+# reap_prove_logs). prove_log_tail hands back a whitespace-collapsed,
+# <=240-char rendering of the log's last 3 non-empty lines for a journal
+# line — same forensics for a clean step failure as for an abort.
+prove_step_log_path() {  # $1=step
+  printf '%s' "$STATE_DIR/logs/prove.${PROVE_START_EPOCH}.$1.log"
+}
+
+prove_write_step_log() {  # $1=step $2=content
+  mkdir -p "$STATE_DIR/logs" 2>/dev/null || true
+  printf '%s\n' "$2" > "$(prove_step_log_path "$1")" 2>/dev/null || true
+}
+
+prove_log_tail() {  # $1=step -> collapsed last 3 non-empty lines, <=240 chars
+  local f; f="$(prove_step_log_path "$1")"
+  [ -f "$f" ] || { printf ''; return 0; }
+  local t; t="$(grep -v '^[[:space:]]*$' "$f" 2>/dev/null | tail -n3 | tr '\n' ' ')"
+  t="$(printf '%s' "$t" | tr -s '[:space:]' ' ')"
+  t="${t# }"; t="${t% }"
+  printf '%s' "${t:0:240}"
+}
+
+# Requirement 5: prove's own `down` and cost line are always journaled by
+# prove itself, not left for a caller to infer from `down`'s line — must run
+# BEFORE `cmd_down`, while session state (server_id/boot_epoch) still
+# exists (a successful teardown clears it). Deliberately reuses the same
+# boot_epoch/COST_PER_HOUR_EUR math `minutes_alive`/`teardown_and_delete`
+# already use (requirement 9's create_epoch switch is separate, later
+# work) so this line never disagrees with the ledger row `down` writes.
+prove_snapshot_cost() {
+  PROVE_COST_ID="$(state_read server_id)"
+  local boot_epoch; boot_epoch="$(state_read boot_epoch)"
+  case "$boot_epoch" in
+    ''|*[!0-9]*) PROVE_COST_MINUTES=0 ;;
+    *) PROVE_COST_MINUTES=$(( ($(now_epoch) - boot_epoch) / 60 )) ;;
+  esac
+  PROVE_COST_EUR="$(awk -v m="$PROVE_COST_MINUTES" -v r="$COST_PER_HOUR_EUR" 'BEGIN{printf "%.4f", (m/60.0)*r}')"
+}
+
+prove_journal_cost() {  # $1=outcome (done|failed|aborted)
+  journal_line "$(now_iso)  burst-lane  prove  cost  (server_id=${PROVE_COST_ID:-none} eur=${PROVE_COST_EUR:-0.0000} minutes=${PROVE_COST_MINUTES:-0} outcome=$1)"
+}
+
+# Shared proof.json writer — the normal tail and the abort trap both call
+# this so the schema (now with exit_code/step/line — Migration note: existing
+# readers use only routed/ts and are unaffected) never drifts between paths.
+prove_write_proof_json() {  # image_id server_id worktree sha routed bytes secs cause exit_code step line
+  python3 -c '
+import json, sys
+image_id, server_id, worktree, sha, routed, bytes_n, secs, cause, exit_code, step, line, out_path, ts = sys.argv[1:14]
+d = {
+    "ts": ts,
+    "image_id": image_id,
+    "server_id": server_id,
+    "worktree": worktree,
+    "sha": sha,
+    "routed": routed == "true",
+    "bytes": int(bytes_n or 0),
+    "secs_remote": int(secs or 0),
+    "cause": cause,
+    "exit_code": int(exit_code) if exit_code != "" else None,
+    "step": step,
+    "line": int(line) if line.isdigit() else None,
+}
+json.dump(d, open(out_path, "w"), indent=2, sort_keys=True)
+' "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9" "${10}" "${11}" "$PROOF_STATE_FILE" "$(now_iso)"
+}
+
+# Requirement 1: the EXIT trap armed at the top of cmd_prove, for the whole
+# life of the process. The normal success/failure tails set
+# PROVE_FINISHED=true immediately before their own `exit` — this trap's
+# signal that proof.json and the journal are already written and it should
+# do nothing. Anything else reaching here is a premature exit.
+prove_exit_trap() {
+  local rc="$1"
+  [ "$PROVE_FINISHED" = true ] && exit "$rc"
+
+  local step="${PROVE_STEP:-unknown}"
+  local cause="${step}-aborted"
+  local tail; tail="$(prove_log_tail "$step")"
+
+  prove_write_proof_json "" "$PROVE_ID" "$PROVE_WORKTREE" "$PROVE_SHA" false 0 \
+    "$(( $(now_epoch) - ${PROVE_START_EPOCH:-$(now_epoch)} ))" "$cause" "$rc" "$step" "${PROVE_ERR_LINE:-}"
+
+  journal_line "$(now_iso)  burst-lane  prove  aborted  (step=$step line=${PROVE_ERR_LINE:-none} rc=$rc${tail:+ tail=\"$tail\"})"
+
+  prove_snapshot_cost
+  ( cmd_down >/dev/null 2>&1 ) || true
+  prove_journal_cost aborted
+
+  if [ -n "$PROVE_CLEANUP_WORKTREE" ]; then
+    git -C "$PROVE_DISPOSABLE_REPO" worktree remove --force "$PROVE_CLEANUP_WORKTREE" >/dev/null 2>&1 || rm -rf "$PROVE_CLEANUP_WORKTREE"
+  fi
+
+  exit "$rc"
+}
+
 cmd_prove() {
   local -x BUILD_BURST_ENABLED=1
   local worktree="" disposable_repo="" cleanup_worktree=""
@@ -2155,48 +2285,104 @@ cmd_prove() {
     esac
   done
 
-  local start_epoch; start_epoch="$(now_epoch)"
+  # `errtrace` lets the ERR trap below fire from inside this function (bash
+  # default: ERR is not inherited by functions) — best-effort $LINENO for an
+  # ordinary unguarded non-zero exit; see the file-header comment above for
+  # why a `set -u` kill never reaches it regardless.
+  set -o errtrace
+  PROVE_STEP="worktree"
+  PROVE_START_EPOCH="$(now_epoch)"
+  PROVE_WORKTREE="$worktree"
+  PROVE_DISPOSABLE_REPO=""
+  PROVE_CLEANUP_WORKTREE=""
+  PROVE_SHA="unknown"
+  PROVE_ID=""
+  PROVE_FINISHED=false
+  PROVE_ERR_LINE=""
+  PROVE_FAIL_TAIL=""
+  trap 'PROVE_ERR_LINE=$LINENO' ERR
+  trap 'prove_exit_trap "$?"' EXIT
+  # An uncaught TERM/INT kills bash immediately; the OS-reported process
+  # exit code still ends up 128+signal either way (verified by hand
+  # 2026-09-14), but `$?` AS SEEN BY THE EXIT TRAP ABOVE is NOT reliably
+  # 143/130 in that path (bash quirk: `$?` at EXIT-trap-fire time reflects
+  # whatever was last set before the async signal arrived, not the killed
+  # command's own status) — so proof.json's own exit_code field would be
+  # wrong even though the process's real exit code is right. Trapping the
+  # signal explicitly and calling `exit` ourselves makes it an ordinary,
+  # intentional exit: `$?` at the EXIT trap is then exactly what we passed.
+  trap 'exit 143' TERM
+  trap 'exit 130' INT
+
+  local start_epoch="$PROVE_START_EPOCH"
 
   if [ -z "$worktree" ]; then
     disposable_repo="${BURST_PROVE_MCPHOST_REPO:-$HOME/wintermute/mcphost}"
+    PROVE_DISPOSABLE_REPO="$disposable_repo"
     if [ ! -d "$disposable_repo/.git" ] && ! git -C "$disposable_repo" rev-parse --git-dir >/dev/null 2>&1; then
+      PROVE_FINISHED=true
       journal_line "$(now_iso)  burst-lane  prove  failed  (cause=mcphost-repo-missing)"
       echo "prove failed (cause=mcphost-repo-missing)" >&2
       exit 1
     fi
     worktree="$(mktemp -u "${TMPDIR:-/tmp}/burst-prove-mcphost.XXXXXX")"
+    PROVE_WORKTREE="$worktree"
     if ! git -C "$disposable_repo" worktree add --detach "$worktree" HEAD >/dev/null 2>&1; then
+      PROVE_FINISHED=true
       journal_line "$(now_iso)  burst-lane  prove  failed  (cause=worktree-add-failed)"
       echo "prove failed (cause=worktree-add-failed)" >&2
       exit 1
     fi
     cleanup_worktree="$worktree"
+    PROVE_CLEANUP_WORKTREE="$cleanup_worktree"
   fi
-  [ -d "$worktree" ] || { echo "prove failed (cause=no-such-worktree)" >&2; exit 1; }
+  if [ ! -d "$worktree" ]; then
+    PROVE_FINISHED=true
+    echo "prove failed (cause=no-such-worktree)" >&2
+    exit 1
+  fi
 
   local sha; sha="$(git -C "$worktree" rev-parse HEAD 2>/dev/null || echo unknown)"
+  PROVE_SHA="$sha"
   local fresh_marker; fresh_marker="$(mktemp "${TMPDIR:-/tmp}/burst-prove-marker.XXXXXX")"
   touch -d "@$start_epoch" "$fresh_marker" 2>/dev/null || true
 
   local routed=false bytes=0 cause="" id="" secs_remote=0
 
+  PROVE_STEP="up"
   local up_out up_rc; up_out="$(cmd_up 2>&1)"; up_rc=$?
+  prove_write_step_log up "$up_out"
   if [ "$up_rc" -ne 0 ]; then
     cause="up-failed"
   else
     id="$(state_read server_id)"
+    PROVE_ID="$id"
 
+    PROVE_STEP="run"
+    # Test-only fault injection (requirement 7's provefx selftest block):
+    # no real caller of `prove` ever sets BURST_PROVE_TEST_ABORT — grep the
+    # tree, only burst-lane-selftest.sh does. Lets the offline suite drive
+    # the abort trap at the "run" step without a real box, matching AC1 (a
+    # `set -u` kill) and AC2 (an external TERM) exactly.
+    case "${BURST_PROVE_TEST_ABORT:-}" in
+      run-unbound) echo "${BURST_PROVE_TEST_UNBOUND_VAR}" >/dev/null ;;
+      run-term) ( sleep 0.2; kill -TERM $$ ) & sleep 2 ;;
+    esac
     local run_out run_rc
     run_out="$(cmd_run "$worktree" -- cargo test --workspace 2>&1)"; run_rc=$?
+    prove_write_step_log run "$run_out"
     local run_line; run_line="$(grep "burst-lane  run  routed  (server_id=$id worktree=$worktree " "$JOURNAL" 2>/dev/null | tail -n1)"
     if [ "$run_rc" -ne 0 ] || [ -z "$run_line" ] || ! grep -q "exit=0" <<<"$run_line"; then
       cause="run-failed"
     else
+      PROVE_STEP="pull"
       local pull_out pull_rc
       pull_out="$(cmd_pull "$worktree" 2>&1)"; pull_rc=$?
+      prove_write_step_log pull "$pull_out"
       if [ "$pull_rc" -ne 0 ] || [ "$pull_out" != "pulled" ]; then
         cause="pull-failed"
       else
+        PROVE_STEP="assert"
         local pull_line; pull_line="$(grep "burst-lane  pull  ok  (worktree=$worktree " "$JOURNAL" 2>/dev/null | tail -n1)"
         bytes="$(sed -n 's/.*bytes=\([0-9][0-9]*\).*/\1/p' <<<"$pull_line" | tail -n1)"
         case "$bytes" in ''|*[!0-9]*) bytes=0 ;; esac
@@ -2230,38 +2416,40 @@ cmd_prove() {
   rm -f "$fresh_marker" 2>/dev/null || true
   secs_remote=$(( $(now_epoch) - start_epoch ))
 
+  # Requirement 2: a clean step failure gets the same forensics an abort
+  # gets — the captured step log's own tail, right in the failure line.
+  case "$cause" in
+    up-failed) PROVE_FAIL_TAIL="$(prove_log_tail up)" ;;
+    run-failed) PROVE_FAIL_TAIL="$(prove_log_tail run)" ;;
+    pull-failed) PROVE_FAIL_TAIL="$(prove_log_tail pull)" ;;
+  esac
+
   local image_id; image_id="$(resolve_boot_image | awk '{print $1}')"
-  python3 -c '
-import json, sys
-image_id, server_id, worktree, sha, routed, bytes_n, secs, cause, out_path = sys.argv[1:10]
-d = {
-    "ts": sys.argv[10],
-    "image_id": image_id,
-    "server_id": server_id,
-    "worktree": worktree,
-    "sha": sha,
-    "routed": routed == "true",
-    "bytes": int(bytes_n),
-    "secs_remote": int(secs),
-    "cause": cause,
-}
-json.dump(d, open(out_path, "w"), indent=2, sort_keys=True)
-' "$image_id" "${id:-}" "$worktree" "$sha" "$routed" "$bytes" "$secs_remote" "$cause" "$PROOF_STATE_FILE" "$(now_iso)"
+  local exit_code=1; [ "$routed" = true ] && exit_code=0
+  prove_write_proof_json "$image_id" "${id:-}" "$worktree" "$sha" "$routed" "$bytes" "$secs_remote" "$cause" "$exit_code" "$PROVE_STEP" ""
 
   # `prove` always ends with `down`, success or failure — never leaves a
-  # box up just because the proof itself failed a check.
+  # box up just because the proof itself failed a check. Requirement 5:
+  # snapshot server_id/boot_epoch for the cost line BEFORE down clears them.
+  prove_snapshot_cost
   ( cmd_down >/dev/null 2>&1 ) || true
+  if [ "$routed" = true ]; then
+    prove_journal_cost done
+  else
+    prove_journal_cost failed
+  fi
 
   if [ -n "$cleanup_worktree" ]; then
     git -C "$disposable_repo" worktree remove --force "$cleanup_worktree" >/dev/null 2>&1 || rm -rf "$cleanup_worktree"
   fi
 
+  PROVE_FINISHED=true
   if [ "$routed" = true ]; then
     journal_line "$(now_iso)  burst-lane  prove  done  (routed=true image_id=$image_id server_id=$id bytes=$bytes secs=$secs_remote)"
     echo "prove done: routed=true image_id=$image_id bytes=$bytes"
     exit 0
   fi
-  journal_line "$(now_iso)  burst-lane  prove  failed  (cause=$cause image_id=$image_id server_id=${id:-none})"
+  journal_line "$(now_iso)  burst-lane  prove  failed  (cause=$cause image_id=$image_id server_id=${id:-none}${PROVE_FAIL_TAIL:+ tail=\"$PROVE_FAIL_TAIL\"})"
   echo "prove failed (cause=$cause)" >&2
   exit 1
 }
@@ -2346,6 +2534,58 @@ cmd_disable() {
   exit 0
 }
 
+# ---- up-lock holder attribution (PRD-build-burst-prove-forensics req 4) --
+# DESIGN NOTE (deviation from the PRD's literal "/proc/locks by the lock
+# file's inode" text, verified by hand 2026-09-14): for the
+# `exec N>file; flock -n N` idiom this script (and cargo-budget.sh's own
+# slot locks) both use, /proc/locks' pid field is the short-lived `flock`
+# subprocess that merely tested/took the lock — it is reaped within ~1s of
+# acquisition, while the lock itself persists via the long-running shell's
+# OWN still-open fd (confirmed empirically: `ps -p <that pid>` finds
+# nothing a second later). cargo-budget.sh's slot_lock_holder_pid comment
+# already documents rejecting /proc/locks for exactly this reason. So
+# up.pid (written by the long-running holder itself, right after it wins
+# the flock, and live for as long as it holds the lock) is the reliable
+# primary signal for the common real-world case — a genuinely concurrent
+# second `up`. /proc/locks is kept as a second-line fallback for a holder
+# up.pid never named at all (a leaked fd from an unknown path, or a
+# selftest fixture that holds the lock some other way) — it still finds a
+# live pid correctly whenever the holder's own syscall-caller process is
+# the same one still running (e.g. `flock <file> -c '<held command>'`,
+# which never forks a separate short-lived acquirer).
+up_lock_holder_pid() {
+  local recorded; recorded="$(cat "$UP_PID_FILE" 2>/dev/null || true)"
+  case "$recorded" in
+    ''|*[!0-9]*) : ;;
+    *) if kill -0 "$recorded" 2>/dev/null; then printf '%s' "$recorded"; return 0; fi ;;
+  esac
+  local inode; inode="$(stat -c %i "$UP_LOCK_FILE" 2>/dev/null || true)"
+  [ -n "$inode" ] || { printf ''; return 0; }
+  local pid
+  pid="$(awk -v i="$inode" '{n=split($6,a,":"); if (n==3 && a[3]==i) print $5}' /proc/locks 2>/dev/null | head -1)"
+  case "$pid" in
+    ''|*[!0-9]*) printf '' ;;
+    *) kill -0 "$pid" 2>/dev/null && printf '%s' "$pid" || printf '' ;;
+  esac
+}
+
+# up_lock_holder_describe <pid> -> "pid=<n> comm=<c> age=<s>s cmdline=<first80>"
+# (or "pid=unknown" when the holder can't be identified at all).
+up_lock_holder_describe() {
+  local pid="${1:-}"
+  [ -n "$pid" ] || { printf 'pid=unknown'; return 0; }
+  local comm; comm="$(tr -d '\0\n' < "/proc/$pid/comm" 2>/dev/null)"
+  local start_ticks hz uptime_s age
+  start_ticks="$(awk '{print $22}' "/proc/$pid/stat" 2>/dev/null)"
+  hz="$(getconf CLK_TCK 2>/dev/null || echo 100)"
+  uptime_s="$(awk '{print $1}' /proc/uptime 2>/dev/null)"
+  if [ -n "$start_ticks" ] && [ -n "$uptime_s" ]; then
+    age="$(awk -v st="$start_ticks" -v hz="$hz" -v up="$uptime_s" 'BEGIN{printf "%d", up - (st/hz)}' 2>/dev/null)"
+  fi
+  local cmdline; cmdline="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | cut -c1-80)"
+  printf 'pid=%s comm=%s age=%ss cmdline=%s' "$pid" "${comm:-unknown}" "${age:-unknown}" "${cmdline:-unknown}"
+}
+
 cmd_up() {
   if ! burst_configured; then
     echo "burst: refused — not configured (RedBaron-local policy); set BUILD_BURST_ENABLED=1 to allow" >&2
@@ -2359,12 +2599,25 @@ cmd_up() {
   # against the box concurrently with a controlled provision).
   exec 221>"$UP_LOCK_FILE"
   if ! flock -n 221; then
-    local up_holder_pid; up_holder_pid="$(cat "$UP_PID_FILE" 2>/dev/null || true)"
-    journal_line "$(now_iso)  burst-lane  up  up-refused  (lock-held pid=${up_holder_pid:-unknown})"
-    echo "up-refused: lock held by pid=${up_holder_pid:-unknown}" >&2
+    local holder_pid; holder_pid="$(up_lock_holder_pid)"
+    local holder_desc; holder_desc="$(up_lock_holder_describe "$holder_pid")"
+    journal_line "$(now_iso)  burst-lane  up  up-refused  (lock-held $holder_desc)"
+    echo "up-refused: lock held by $holder_desc" >&2
     exit 3
   fi
+  # Requirement 4: up.pid's semantics change from "last successful up" to
+  # "live up" — written only after the lock is taken, removed (via this
+  # trap) whenever THIS invocation of `up` exits, on every exit path. A
+  # stale value found here (the lock was free, so nobody holds it, but a
+  # prior `up` died without going through a normal exit — a kill -9, say)
+  # is reclaimed and journaled rather than silently overwritten.
+  local prior_pid; prior_pid="$(cat "$UP_PID_FILE" 2>/dev/null || true)"
+  case "$prior_pid" in
+    ''|*[!0-9]*) : ;;
+    *) kill -0 "$prior_pid" 2>/dev/null || journal_line "$(now_iso)  burst-lane  up  lock-reclaimed  (stale_pid=$prior_pid)" ;;
+  esac
   echo "$$" > "$UP_PID_FILE" 2>/dev/null || true
+  trap 'rm -f "$UP_PID_FILE" 2>/dev/null || true' EXIT
   printf '%s %s %s\n' "$(now_epoch)" "$$" "up" >> "$INFLIGHT_LOG" 2>/dev/null || true
   # Requirement 5: reconcile the persistent-volume state file FIRST, before
   # even the already-up short-circuit below — an operator calling `up`
@@ -4624,7 +4877,18 @@ schedule_session_parity() {  # $1=session_id
       continue
     fi
     journal_line "$(now_iso)  burst-lane  parity  scheduled  (repo=$name session=$sid)"
-    ( cmd_parity "$repo" >/dev/null 2>&1 & disown ) 2>/dev/null || true
+    # Requirement 3 (PRD-build-burst-prove-forensics): a backgrounded child
+    # inherits whatever fds its parent has open at fork time — including a
+    # lock fd (220 provision, 221 up, 201 run, 203 worktree) `up` itself may
+    # currently hold. Left open, a `& disown` child keeps that flock alive
+    # long after the parent that actually took it has exited, so a refused
+    # `up` names a dead pid forever (the 2026-09-13 incident: this exact
+    # line, called from inside `cmd_up`, outlived it). Closing all four here
+    # is defensive for every caller of schedule_session_parity, not just the
+    # two that hold 221 today — `flock -u` is not needed in the child; a
+    # close on the fd it inherited is sufficient (see Technical
+    # considerations in the PRD).
+    ( cmd_parity "$repo" 220>&- 221>&- 201>&- 203>&- >/dev/null 2>&1 & disown ) 2>/dev/null || true
   done
 }
 
@@ -5773,8 +6037,23 @@ cmd_reap() {
   fi
   local proc_out; proc_out="$(reap_orphan_processes)"
   local out; out="$(reap_orphans)"
-  printf '%s\n%s\n' "$proc_out" "$out"
+  local prove_out; prove_out="$(reap_prove_logs)"
+  printf '%s\n%s\n%s\n' "$proc_out" "$out" "$prove_out"
   exit 0
+}
+
+# Requirement 2: prove's per-step logs (state/burst-lane/logs/prove.*.log)
+# are kept, never rm -f'd by prove itself — they're the forensics this PRD
+# exists to preserve. `reap` is what ages them out, same as any other
+# on-disk debris this script owns, after 14 days.
+reap_prove_logs() {  # -> stdout "prove-logs-reaped=N"
+  local dir="$STATE_DIR/logs" n=0 f
+  [ -d "$dir" ] || { echo "prove-logs-reaped=0"; return 0; }
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    rm -f "$f" 2>/dev/null && n=$((n+1))
+  done < <(find "$dir" -maxdepth 1 -type f -name 'prove.*.log' -mtime +14 2>/dev/null)
+  echo "prove-logs-reaped=$n"
 }
 
 # ---- orphan volume sweep (PRD-build-burst-teardown-lifecycle requirement 6) -

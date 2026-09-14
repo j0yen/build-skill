@@ -4671,6 +4671,194 @@ expect "reenable AC6: journal has prove failed (cause=host-mismatch)" \
 expect "reenable AC6: down still ran even though the proof failed" \
   "grep -q 'burst-lane  down  decision=' \"$BURST_LANE_JOURNAL\""
 
+# ---- provefx block (PRD-build-burst-prove-forensics) -----------------------
+# 2026-09-13: a real `prove` died silently between `up booted` and the first
+# `run` line — no journal entry, no proof.json, no stderr kept anywhere — and
+# the retry 90s later was refused because a disowned parity child had
+# inherited the up-lock fd from a `prove` that had already exited. AC1-3
+# exercise cmd_prove's own EXIT/ERR trap and per-step logging (requirements
+# 1-2); AC4-6 exercise the up-lock's fd-close and holder-attribution fixes
+# (requirements 3-4).
+block_start "provefx"
+
+# AC1/AC2 fault injection: no real caller of `prove` ever sets
+# BURST_PROVE_TEST_ABORT (grep the tree — only this file does). It stands in
+# for the PRD's own "fixture cmd_run" language: since cmd_run is a bash
+# function inside this same script, not a swappable external binary, the
+# offline-safe way to reproduce "cmd_run dies mid-step" is a named hook at
+# the exact call site cmd_prove itself documents — see its own comment.
+
+# ---- provefx AC1: an unbound-variable kill during the "run" step leaves
+# proof.json naming the step, a numeric-free (best-effort) line, and one
+# "prove aborted (step=run ...)" journal line followed by down.
+fresh_env
+WT_PFX1="$T/provefx-ac1"; mkdir -p "$WT_PFX1"
+pfx1_out="$(BURST_PROVE_TEST_ABORT=run-unbound "$BL" prove --worktree "$WT_PFX1" 2>&1)"; pfx1_rc=$?
+expect "provefx AC1: proof.json exists after an unbound-variable kill during run" \
+  "[ -f \"$BURST_LANE_STATE_DIR/proof.json\" ]"
+expect "provefx AC1: proof.json has routed=false cause=run-aborted and step=run" \
+  "python3 -c \"import json; d=json.load(open('$BURST_LANE_STATE_DIR/proof.json')); assert d['routed'] is False and d['cause'] == 'run-aborted' and d['step'] == 'run', d\""
+expect "provefx AC1: exactly one prove-aborted journal line naming step=run" \
+  "[ \"\$(grep -c 'burst-lane  prove  aborted  (step=run' \"$BURST_LANE_JOURNAL\")\" -eq 1 ]"
+expect "provefx AC1: down ran after the abort" \
+  "grep -q 'burst-lane  down  decision=' \"$BURST_LANE_JOURNAL\""
+expect "provefx AC1: prove's own cost line is journaled with outcome=aborted" \
+  "grep -Eq 'burst-lane  prove  cost  \\(.*outcome=aborted\\)' \"$BURST_LANE_JOURNAL\""
+
+# ---- provefx AC2: prove killed with TERM during the run step — same
+# cause, and prove's own exit code is 143 (128+15), not masked by the trap.
+fresh_env
+WT_PFX2="$T/provefx-ac2"; mkdir -p "$WT_PFX2"
+pfx2_out="$(BURST_PROVE_TEST_ABORT=run-term "$BL" prove --worktree "$WT_PFX2" 2>&1)"; pfx2_rc=$?
+expect "provefx AC2: prove's exit code is 143 when killed with TERM during run" "[ $pfx2_rc -eq 143 ]"
+expect "provefx AC2: proof.json cause=run-aborted after the TERM abort" \
+  "python3 -c \"import json; d=json.load(open('$BURST_LANE_STATE_DIR/proof.json')); assert d['routed'] is False and d['cause'] == 'run-aborted' and d['exit_code'] == 143, d\""
+expect "provefx AC2: down ran after the TERM abort" \
+  "grep -q 'burst-lane  down  decision=' \"$BURST_LANE_JOURNAL\""
+
+# ---- provefx AC3: a failing (not aborted) `up` step's own captured output
+# is written to logs/prove.<epoch>.up.log and the failure journal line
+# carries it collapsed — requirement 2 applies to a clean step failure too,
+# not only an abort.
+fresh_env
+WT_PFX3="$T/provefx-ac3"; mkdir -p "$WT_PFX3"
+pfx3_out="$(FAKE_HCLOUD_CREATE_FAIL=1 "$BL" prove --worktree "$WT_PFX3" 2>&1)"; pfx3_rc=$?
+expect "provefx AC3: prove exits 1 when up itself fails" "[ $pfx3_rc -eq 1 ]"
+expect "provefx AC3: a prove.<epoch>.up.log was written under state/burst-lane/logs" \
+  "compgen -G \"$BURST_LANE_STATE_DIR/logs/prove.*.up.log\" >/dev/null"
+expect "provefx AC3: the up log holds cmd_up's own captured output" \
+  "grep -q 'hcloud server create failed' \"$BURST_LANE_STATE_DIR\"/logs/prove.*.up.log"
+expect "provefx AC3: the failure journal line carries the up log's tail" \
+  "grep -q 'burst-lane  prove  failed  (cause=up-failed .*tail=\"fallback: hcloud server create failed' \"$BURST_LANE_JOURNAL\""
+
+# ---- provefx AC4 (requirement 3): schedule_session_parity's backgrounded
+# child must not inherit the up-lock fd. Rather than drive the whole
+# cmd_up->schedule_session_parity->cmd_parity integration (cmd_parity does
+# real gate-repo work this fixture has no need to stand up), this exercises
+# the mechanism directly: hold fd 221 exactly as `up` does, call
+# schedule_session_parity with a fixture cmd_parity that just sleeps, then
+# release the CALLER's own fd (mimicking `up` exiting) while the background
+# child is still running. Verified by hand 2026-09-14 that this same
+# construct fails (lock stays held) against the pre-fix line.
+fresh_env
+PFX4_REPO="$T/provefx-parity-repo"; mkdir -p "$PFX4_REPO"
+( cd "$PFX4_REPO" && git init -q && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init ) >/dev/null
+ln -sfn "$PFX4_REPO" "$BURST_LANE_REPOS_DIR/provefx-repo"
+(
+  source "$BL"
+  cmd_parity() { sleep 30; }
+  export BURST_PARITY_REPOS="provefx-repo"
+  exec 221>"$BURST_LANE_STATE_DIR/up.lock"
+  flock -n 221 || exit 1
+  schedule_session_parity "provefx-ac4-session"
+  sleep 0.3
+  exec 221>&-
+)
+pfx4_setup_rc=$?
+expect "provefx AC4 setup: the fixture ran cleanly (lock was takeable, parity scheduled)" "[ $pfx4_setup_rc -eq 0 ]"
+pfx4_reacquire_rc=0
+( exec 224>"$BURST_LANE_STATE_DIR/up.lock"; flock -n 224 ) || pfx4_reacquire_rc=$?
+expect "provefx AC4: a fresh flock succeeds immediately once the caller's own fd closes (background child did not inherit 221)" \
+  "[ $pfx4_reacquire_rc -eq 0 ]"
+
+# ---- provefx AC5 (requirement 4): up.pid names a dead pid and nothing
+# currently holds up.lock -> `up` reclaims the lock, journals
+# lock-reclaimed naming the stale pid, and proceeds (exits 0).
+fresh_env
+PFX5_DEAD_PID=999999
+while kill -0 "$PFX5_DEAD_PID" 2>/dev/null; do PFX5_DEAD_PID=$((PFX5_DEAD_PID - 1)); done
+mkdir -p "$BURST_LANE_STATE_DIR"
+echo "$PFX5_DEAD_PID" > "$BURST_LANE_STATE_DIR/up.pid"
+pfx5_out="$("$BL" up 2>&1)"; pfx5_rc=$?
+expect "provefx AC5: up succeeds despite a stale up.pid (the lock itself was free)" "[ $pfx5_rc -eq 0 ]"
+expect "provefx AC5: journal has up lock-reclaimed naming the stale pid" \
+  "grep -q \"burst-lane  up  lock-reclaimed  (stale_pid=$PFX5_DEAD_PID)\" \"$BURST_LANE_JOURNAL\""
+
+# ---- provefx AC6 (requirement 4): a live fixture process holds up.lock
+# directly (never went through up.pid at all) while up.pid names a
+# DIFFERENT, dead pid — `up` must refuse within 5s and name the fixture's
+# real, live pid/comm (via the /proc/locks fallback — see
+# up_lock_holder_pid's own design note for why up.pid alone can't cover
+# this case), not the stale pid on disk.
+fresh_env
+PFX6_DEAD_PID=999999
+while kill -0 "$PFX6_DEAD_PID" 2>/dev/null; do PFX6_DEAD_PID=$((PFX6_DEAD_PID - 1)); done
+mkdir -p "$BURST_LANE_STATE_DIR"
+echo "$PFX6_DEAD_PID" > "$BURST_LANE_STATE_DIR/up.pid"
+flock "$BURST_LANE_STATE_DIR/up.lock" -c 'sleep 10' &
+PFX6_HOLDER_PID=$!
+pfx6_tries=0
+while [ "$pfx6_tries" -lt 50 ]; do
+  if ( exec 225>"$BURST_LANE_STATE_DIR/up.lock"; flock -n 225 ) 2>/dev/null; then
+    pfx6_tries=$((pfx6_tries + 1)); sleep 0.05
+  else
+    break
+  fi
+done
+pfx6_t0="$(date +%s)"
+pfx6_out="$("$BL" up 2>&1)"; pfx6_rc=$?
+pfx6_t1="$(date +%s)"
+kill "$PFX6_HOLDER_PID" 2>/dev/null || true; wait "$PFX6_HOLDER_PID" 2>/dev/null || true
+expect "provefx AC6: up refuses (exit 3) within 5s when a live fixture holds up.lock" \
+  "[ $pfx6_rc -eq 3 ] && [ $(( pfx6_t1 - pfx6_t0 )) -lt 5 ]"
+expect "provefx AC6: refusal names the fixture's real, live pid, not the stale up.pid" \
+  "grep -q \"burst-lane  up  up-refused  (lock-held pid=$PFX6_HOLDER_PID \" \"$BURST_LANE_JOURNAL\""
+expect "provefx AC6: refusal does NOT name the stale/dead pid from up.pid" \
+  "! grep -q \"lock-held pid=$PFX6_DEAD_PID \" \"$BURST_LANE_JOURNAL\""
+expect "provefx AC6: refusal names a real comm for the fixture holder (not 'unknown')" \
+  "grep -q \"lock-held pid=$PFX6_HOLDER_PID comm=flock \" \"$BURST_LANE_JOURNAL\""
+
+# ---- provefx AC7 (requirement 3's own lint): a grep-based check that every
+# backgrounded call (&, & disown, setsid, nohup) in burst-lane.sh closes fds
+# 220/221/201/203 before it runs — fails naming the line on a planted
+# violation, passes on the real, shipped script.
+provefx_fd_lint() {  # $1=script path -> prints violating "file:line: text"
+  # to stdout, returns the violation count as its exit code (capped at 255).
+  local f="$1" n=0 bad=0 line stripped
+  while IFS= read -r line; do
+    n=$((n + 1))
+    stripped="${line#"${line%%[![:space:]]*}"}"  # leading whitespace trimmed
+    case "$stripped" in
+      '#'*) continue ;;  # a comment line merely discussing these tokens (as
+                         # this PRD's own requirement-3 prose does) is not a
+                         # backgrounded call
+    esac
+    local backgrounded=0
+    case "$line" in
+      *'& disown'*|*'&disown'*|*'setsid '*|*'nohup '*) backgrounded=1 ;;
+    esac
+    # A bare trailing `&` (background operator, not `&&` and not the `&` of
+    # a `2>&1`/`N>&-` style redirection, which never ends the line on `&`):
+    # not preceded by another `&`, followed only by optional whitespace/`)`
+    # to end of line.
+    if [[ "$line" =~ (^|[^&])\&[[:space:]]*\)?[[:space:]]*$ ]]; then
+      backgrounded=1
+    fi
+    if [ "$backgrounded" -eq 1 ]; then
+      local ok=1 tok
+      for tok in '220>&-' '221>&-' '201>&-' '203>&-'; do
+        case "$line" in *"$tok"*) ;; *) ok=0 ;; esac
+      done
+      if [ "$ok" -ne 1 ]; then
+        echo "$f:$n: $line"
+        bad=$((bad + 1))
+      fi
+    fi
+  done < "$f"
+  [ "$bad" -le 255 ] && return "$bad" || return 255
+}
+pfx7_real_out="$(provefx_fd_lint "$HERE/burst-lane.sh")"; pfx7_real_rc=$?
+expect "provefx AC7: the lint passes (0 violations) on the real, shipped burst-lane.sh" "[ $pfx7_real_rc -eq 0 ]"
+PFX7_PLANTED="$T/burst-lane-planted.sh"
+cp "$HERE/burst-lane.sh" "$PFX7_PLANTED"
+printf '( sleep 1 & )\n' >> "$PFX7_PLANTED"
+pfx7_bad_out="$(provefx_fd_lint "$PFX7_PLANTED")"; pfx7_bad_rc=$?
+expect "provefx AC7: the lint fails naming >=1 violation on a planted unclosed background job" "[ $pfx7_bad_rc -ge 1 ]"
+expect "provefx AC7: the lint names the exact planted line" \
+  "grep -q ': ( sleep 1 & )$' <<<\"$pfx7_bad_out\""
+
+expect_block_green "provefx" "provefx: every provefx case above ran green"
+
 # ---- reenable AC7: `enable` writes the systemd drop-in only when
 # proof.json is routed=true, younger than 7 days, and names the image `up`
 # would boot now; otherwise it refuses (rc 3, no drop-in). `disable` always

@@ -267,7 +267,7 @@ printf '%s %s %s\n' "$old_ts" "$FAKE_UP_PID" "up" >> "$BURST_LANE_STATE_DIR/infl
 ac5up_out="$("$BL" up 2>&1)"; ac5up_rc=$?
 expect "AC5: up refuses while the fake stale up process holds the lock" "[ $ac5up_rc -ne 0 ]"
 expect "AC5: up-refused journaled naming the stale process's pid" \
-  "grep -q \"up-refused  (lock-held pid=$FAKE_UP_PID)\" \"$BURST_LANE_JOURNAL\""
+  "grep -q \"up-refused  (lock-held pid=$FAKE_UP_PID \" \"$BURST_LANE_JOURNAL\""
 expect "AC5 setup: the fake stale up process is still alive before reap" "kill -0 $FAKE_UP_PID 2>/dev/null"
 
 reap_out="$("$BL" reap 2>&1)"
