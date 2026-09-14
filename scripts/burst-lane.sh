@@ -1869,9 +1869,9 @@ status_extra_fields_json() {  # stdout: one JSON object (never fails/exits)
   local img_id img_source
   read -r img_id img_source <<<"$(resolve_boot_image)"
   python3 -c '
-import calendar, json, sys, time
+import calendar, glob, json, os, sys, time
 
-img_id, img_source, snap_path, proof_path, dropin_path = sys.argv[1:6]
+img_id, img_source, snap_path, proof_path, dropin_path, logs_dir = sys.argv[1:7]
 
 def age_h(iso):
     try:
@@ -1890,14 +1890,43 @@ except Exception:
 
 proof_age_h = None
 proof_routed = None
+# PRD-build-burst-prove-forensics requirement 6: `prove_last` reads the
+# newest proof.json (routed/cause/step/exit_code/line — requirement 1s own
+# migration-note additions) plus, when a step is named, the matching
+# prove.<epoch>.<step>.log this same run wrote (requirement 2) — so the
+# tick/operator read the forensics from the last prove run without opening the
+# state dir by hand. Absent/malformed proof.json (never proved) leaves
+# prove_last null, same as proof_age_h/proof_routed above.
+prove_last = None
 try:
     proof = json.load(open(proof_path))
     proof_age_h = age_h(proof.get("ts", ""))
     proof_routed = proof.get("routed")
+    step = proof.get("step") or None
+    cause = proof.get("cause")
+    if proof_routed is True:
+        outcome = "done"
+    elif isinstance(cause, str) and cause.endswith("-aborted"):
+        outcome = "aborted"
+    else:
+        outcome = "failed"
+    log_path = None
+    if step:
+        cands = glob.glob(os.path.join(logs_dir, "prove.*.%s.log" % step))
+        cands = [c for c in cands if os.path.isfile(c)]
+        if cands:
+            log_path = max(cands, key=os.path.getmtime)
+    prove_last = {
+        "ts": proof.get("ts"),
+        "outcome": outcome,
+        "step": step,
+        "cause": cause,
+        "line": proof.get("line"),
+        "log": log_path,
+    }
 except Exception:
     pass
 
-import os
 enabled = os.path.isfile(dropin_path)
 
 print(json.dumps({
@@ -1907,8 +1936,9 @@ print(json.dumps({
     "proof_age_h": proof_age_h,
     "proof_routed": proof_routed,
     "enabled": enabled,
+    "prove_last": prove_last,
 }))
-' "$img_id" "$img_source" "$SNAPSHOT_STATE_FILE" "$PROOF_STATE_FILE" "$SYSTEMD_DROPIN"
+' "$img_id" "$img_source" "$SNAPSHOT_STATE_FILE" "$PROOF_STATE_FILE" "$SYSTEMD_DROPIN" "$STATE_DIR/logs"
 }
 
 # Same fields, one text-mode summary line (requirement 6: "text and --json").

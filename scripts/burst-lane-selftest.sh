@@ -4857,6 +4857,26 @@ expect "provefx AC7: the lint fails naming >=1 violation on a planted unclosed b
 expect "provefx AC7: the lint names the exact planted line" \
   "grep -q ': ( sleep 1 & )$' <<<\"$pfx7_bad_out\""
 
+# ---- provefx AC8 (requirement 6): status --json reports prove_last (ts,
+# outcome, step, cause, line, log) read from the newest proof.json/
+# prove.*.log, without needing to open the state dir by hand.
+fresh_env
+WT_PFX8="$T/provefx-ac8"; mkdir -p "$WT_PFX8"
+FAKE_HCLOUD_CREATE_FAIL=1 "$BL" prove --worktree "$WT_PFX8" >/dev/null 2>&1
+"$BL" status --json > "$T/pfx8-status.json"
+expect "provefx AC8: status --json prove_last.outcome is failed for an up-failed prove" \
+  "python3 -c \"import json; d=json.load(open('$T/pfx8-status.json')); assert d['prove_last']['outcome']=='failed', d['prove_last']\""
+expect "provefx AC8: status --json prove_last.step names the failing step" \
+  "python3 -c \"import json; d=json.load(open('$T/pfx8-status.json')); assert d['prove_last']['step']=='up', d['prove_last']\""
+expect "provefx AC8: status --json prove_last.cause matches proof.json" \
+  "python3 -c \"import json; d=json.load(open('$T/pfx8-status.json')); assert d['prove_last']['cause']=='up-failed', d['prove_last']\""
+expect "provefx AC8: status --json prove_last.log names an existing prove.<epoch>.up.log" \
+  "python3 -c \"import json, os; d=json.load(open('$T/pfx8-status.json')); log=d['prove_last']['log']; assert log and os.path.isfile(log), d['prove_last']\""
+fresh_env
+"$BL" status --json > "$T/pfx8b-status.json"
+expect "provefx AC8: status --json prove_last is null when prove has never run" \
+  "python3 -c \"import json; d=json.load(open('$T/pfx8b-status.json')); assert d['prove_last'] is None, d['prove_last']\""
+
 expect_block_green "provefx" "provefx: every provefx case above ran green"
 
 # ---- reenable AC7: `enable` writes the systemd drop-in only when
