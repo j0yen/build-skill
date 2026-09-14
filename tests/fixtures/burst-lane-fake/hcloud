@@ -87,20 +87,34 @@ case "${1:-}" in
         ;;
       create-image)
         # PRD-build-burst-dispatch-reenable requirement 1 (bake): fake
-        # `hcloud server create-image --type snapshot --description "..." -o
-        # json <server-id>`. State: "id|status" lines appended to
-        # $FAKE_HCLOUD_IMAGE_STATE (default /tmp/bl-fake-hcloud-image.state).
-        # Returns status=available synchronously by default (real hcloud
-        # blocks on the action); FAKE_HCLOUD_CREATE_IMAGE_FAIL injects a
-        # failure, FAKE_HCLOUD_CREATE_IMAGE_PENDING makes the image start
-        # "pending" so a caller's poll loop (via `image describe`) is
-        # exercised — it flips to "available" after
-        # FAKE_HCLOUD_CREATE_IMAGE_PENDING poll calls.
+        # `hcloud server create-image --type snapshot --description "..."
+        # <server-id>` — 2026-09-14 real-box finding: the real hcloud CLI
+        # (1.67.0) has no `-o`/`--output` flag on this subcommand at all, so
+        # production no longer passes one and no longer reads this call's
+        # own stdout for the new image id/status; it re-resolves both via
+        # `image list --type snapshot -o json`, matching on this call's own
+        # `--description` (see that subcommand below). This fake still
+        # prints a JSON line for anyone diffing old cassettes, but nothing
+        # in burst-lane.sh reads it any more. State: "id|status|pending_left|
+        # description" lines appended to $FAKE_HCLOUD_IMAGE_STATE (default
+        # /tmp/bl-fake-hcloud-image.state). Returns status=available
+        # synchronously by default (real hcloud blocks on the action);
+        # FAKE_HCLOUD_CREATE_IMAGE_FAIL injects a failure,
+        # FAKE_HCLOUD_CREATE_IMAGE_PENDING makes the image start "pending" so
+        # a caller's poll loop (via `image describe`) is exercised — it
+        # flips to "available" after FAKE_HCLOUD_CREATE_IMAGE_PENDING poll
+        # calls.
         [ "${FAKE_HCLOUD_CREATE_IMAGE_FAIL:-0}" = "1" ] && { echo "create-image failed" >&2; exit 1; }
+        img_desc=""
+        shift 2
+        while [ $# -gt 0 ]; do
+          if [ "$1" = "--description" ]; then img_desc="$2"; fi
+          shift
+        done
         img_id=$((RANDOM % 900000 + 100000))
         img_status="available"
         [ "${FAKE_HCLOUD_CREATE_IMAGE_PENDING:-0}" -gt 0 ] 2>/dev/null && img_status="pending"
-        echo "$img_id|$img_status|${FAKE_HCLOUD_CREATE_IMAGE_PENDING:-0}" >> "$IMGSTATE"
+        echo "$img_id|$img_status|${FAKE_HCLOUD_CREATE_IMAGE_PENDING:-0}|$img_desc" >> "$IMGSTATE"
         printf '{"image":{"id":%s,"status":"%s"},"action":{"progress":100}}\n' "$img_id" "$img_status"
         exit 0
         ;;
@@ -113,7 +127,7 @@ case "${1:-}" in
         key="$3"
         line="$(grep -E "^$key\|" "$IMGSTATE" 2>/dev/null | head -n1)"
         [ -z "$line" ] && exit 1
-        IFS='|' read -r iid istatus ileft <<<"$line"
+        IFS='|' read -r iid istatus ileft idesc <<<"$line"
         if [ "$istatus" = "pending" ]; then
           ileft=$((ileft - 1))
           if [ "$ileft" -le 0 ]; then
@@ -122,6 +136,34 @@ case "${1:-}" in
           sed -i -E "s/^$iid\|[^|]*\|[^|]*/$iid|$istatus|$ileft/" "$IMGSTATE" 2>/dev/null || true
         fi
         printf '{"image":{"id":%s,"status":"%s"}}\n' "$iid" "$istatus"
+        exit 0
+        ;;
+      list)
+        # PRD-build-burst-dispatch-reenable real-box finding (2026-09-14):
+        # production now resolves a just-baked image's id/status through
+        # `image list --type snapshot -o json` instead of parsing
+        # `create-image`'s own stdout (see that subcommand's comment
+        # above). Ignores every flag (--type, -o) — this fixture only ever
+        # holds snapshots — and emits every $IMGSTATE row as a JSON array
+        # of {"id","status","description"}, newest-appended-last, matching
+        # the real API's own array-of-objects shape.
+        python3 -c '
+import json, sys
+rows = []
+try:
+    with open(sys.argv[1]) as f:
+        for line in f:
+            line = line.rstrip("\n")
+            if not line:
+                continue
+            parts = line.split("|", 3)
+            iid, istatus = parts[0], parts[1]
+            idesc = parts[3] if len(parts) > 3 else ""
+            rows.append({"id": int(iid), "status": istatus, "description": idesc})
+except FileNotFoundError:
+    pass
+json.dump(rows, sys.stdout)
+' "$IMGSTATE"
         exit 0
         ;;
       *) exit 2 ;;

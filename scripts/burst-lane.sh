@@ -2019,9 +2019,20 @@ print(json.dumps(d.get("gate_tool_versions", {}), sort_keys=True))
   local created; created="$(now_iso)"
   local description="wm-burst-lane baked ${created%%T*} build-skill=$build_skill_sha tools=$n_tools"
 
-  local create_out create_err; create_err="$(mktemp)"
-  if ! create_out="$("$HCLOUD" server create-image --type snapshot --description "$description" \
-        -o json "$id" 2>"$create_err")"; then
+  # 2026-09-14 real-box finding (PRD-build-burst-dispatch-reenable real-box
+  # attempt): `server create-image` carries NO `--output`/`-o` flag at all
+  # in this hcloud version (1.67.0) — unlike `describe`/`list`/`create` for
+  # full resources, it never got one added, so `-o json` here fails at
+  # flag-parse time ("unknown shorthand flag: 'o' in -o"), not at the API
+  # call. Run it plain (human-readable stdout, discarded) and resolve the
+  # new image the same way `up`'s adopt-by-name path already resolves
+  # servers it didn't just create: list-and-match, here by this bake's own
+  # uniquely ISO-timestamped `$description` via `image list -o json` (which
+  # DOES support `-o`, confirmed against the real API), picking the
+  # highest id on a (should-never-happen) duplicate description.
+  local create_err; create_err="$(mktemp)"
+  if ! "$HCLOUD" server create-image --type snapshot --description "$description" "$id" \
+        >/dev/null 2>"$create_err"; then
     local emsg; emsg="$(tail -3 "$create_err" 2>/dev/null | tr '\n' ' ')"; rm -f "$create_err"
     journal_line "$(now_iso)  burst-lane  bake  refused  (cause=hcloud-create-image-failed: $emsg)"
     echo "bake refused (cause=hcloud-create-image-failed: $emsg)" >&2
@@ -2029,17 +2040,22 @@ print(json.dumps(d.get("gate_tool_versions", {}), sort_keys=True))
   fi
   rm -f "$create_err"
 
+  local list_out; list_out="$("$HCLOUD" image list --type snapshot -o json 2>/dev/null)"
   local new_image_id status
   read -r new_image_id status <<<"$(python3 -c '
 import json, sys
 try:
-    d = json.loads(sys.stdin.read())
+    imgs = json.loads(sys.stdin.read())
 except Exception:
+    imgs = []
+desc = sys.argv[1]
+matches = [i for i in imgs if i.get("description") == desc]
+matches.sort(key=lambda i: i.get("id", 0), reverse=True)
+if matches:
+    print(matches[0].get("id", ""), matches[0].get("status", ""))
+else:
     print("", "")
-    raise SystemExit(0)
-img = d.get("image", d)
-print(img.get("id", ""), img.get("status", ""))
-' <<<"$create_out" 2>/dev/null)"
+' "$description" <<<"$list_out" 2>/dev/null)"
   if [ -z "${new_image_id:-}" ]; then
     journal_line "$(now_iso)  burst-lane  bake  refused  (cause=could-not-parse-image-id)"
     echo "bake refused (cause=could-not-parse-image-id)" >&2
