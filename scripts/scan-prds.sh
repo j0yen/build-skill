@@ -211,7 +211,9 @@ is_collided() {
 # added to the bash-fallback emit_one() below isn't backfilled onto vellum's
 # rows here -- vellum is an external binary this repo doesn't own. Whichever
 # lane doesn't have vellum installed still gets the field via the fallback
-# path below.
+# path below. Same known gap applies to `operator_authorization`/
+# `operator_authorization_unparsed` (PRD-build-operator-authorization-
+# contract) -- not backfilled onto vellum's rows either, for the same reason.
 # Emit BOTH top-level (buildable) and ARCHIVE/ (already-done) so Phase 1 diff
 # can distinguish archived from truly-vanished. Without this, PRDs moved to
 # ARCHIVE/ after shipping would be marked "vanished" on the next scan and
@@ -249,7 +251,7 @@ JQ="${JQ:-$(command -v jq 2>/dev/null || echo /usr/bin/jq)}"
 [ -x "$JQ" ] || { echo "jq not at $JQ" >&2; exit 1; }
 
 emit_one() {
-  local path="$1" slug status_line build_auto build_target build_priority build_into build_version_bump deferred_acs deferred_ac_reasons publish test_prefix deferred_acs_unparsed
+  local path="$1" slug status_line build_auto build_target build_priority build_into build_version_bump deferred_acs deferred_ac_reasons publish test_prefix deferred_acs_unparsed operator_authorization operator_authorization_unparsed
   slug="$(basename "$path" .md)"
   slug="${slug#PRD-}"
 
@@ -276,6 +278,13 @@ emit_one() {
   # key at all" so verified-completed.sh can name the failure instead of
   # silently treating it the same as "none declared".
   deferred_acs_unparsed=false
+  # Per PRD-build-operator-authorization-contract AC2/AC3: an
+  # `Operator-authorization:` line is parsed into its own structured field
+  # (who, ts, words, scope) rather than left in the generic/display-only
+  # bucket -- same "prose value gets flagged, not silently dropped" contract
+  # as deferred_acs_unparsed above. null when no such line is present at all.
+  operator_authorization="null"
+  operator_authorization_unparsed=false
   # Per PRD-build-archive-autopair AC1: a PRD on a shared crate may declare
   # the test-file prefix its own ACs use (`test_prefix: http`, or a list
   # `test_prefix: [http, https]`) so the archive gate's derivation doesn't
@@ -290,7 +299,7 @@ emit_one() {
   # the parse. First-match-wins for build_* keys so real frontmatter
   # always beats later in-doc examples.
   local in_fence=false
-  local seen_target=false seen_priority=false seen_into=false seen_bump=false seen_deferred=false seen_test_prefix=false
+  local seen_target=false seen_priority=false seen_into=false seen_bump=false seen_deferred=false seen_test_prefix=false seen_operator_authorization=false
   # strip leading ws, trailing ws, trailing inline-comment (` #...`), surrounding quotes
   strip_val() {
     printf '%s' "$1" | sed -E 's/^[[:space:]]*//;s/[[:space:]]+#.*$//;s/[[:space:]]*$//;s/^"//;s/"$//'
@@ -374,6 +383,33 @@ emit_one() {
             ;;
         esac
         seen_deferred=true
+        ;;
+      "Operator-authorization:"*)
+        # PRD-build-operator-authorization-contract AC2/AC3: shape is
+        # `<who> <ISO-8601 ts> "<verbatim words>" scope: <what it permits>`.
+        # A line that doesn't match (most commonly: no `scope:` segment) is
+        # flagged operator_authorization_unparsed -- same "named, not
+        # silently dropped" contract as deferred_acs_unparsed above -- rather
+        # than silently treated as absent (an unparsed key must never
+        # accidentally widen to "anything is authorized").
+        [ "$seen_operator_authorization" = true ] && continue
+        v="$(strip_val "$(printf '%s' "$kline" | sed -E 's/^Operator-authorization[[:space:]]*:[[:space:]]*//')")"
+        if [ -n "$v" ]; then
+          if [[ "$v" =~ ^([^[:space:]]+)[[:space:]]+([^[:space:]]+)[[:space:]]+\"([^\"]*)\"[[:space:]]+scope:[[:space:]]*(.*)$ ]]; then
+            oa_who="${BASH_REMATCH[1]}"
+            oa_ts="${BASH_REMATCH[2]}"
+            oa_words="${BASH_REMATCH[3]}"
+            oa_scope="$(printf '%s' "${BASH_REMATCH[4]}" | sed -E 's/[[:space:]]+$//')"
+            esc_who="$(printf '%s' "$oa_who" | sed 's/\\/\\\\/g;s/"/\\"/g')"
+            esc_ts="$(printf '%s' "$oa_ts" | sed 's/\\/\\\\/g;s/"/\\"/g')"
+            esc_words="$(printf '%s' "$oa_words" | sed 's/\\/\\\\/g;s/"/\\"/g')"
+            esc_scope="$(printf '%s' "$oa_scope" | sed 's/\\/\\\\/g;s/"/\\"/g')"
+            operator_authorization="{\"who\":\"$esc_who\",\"ts\":\"$esc_ts\",\"words\":\"$esc_words\",\"scope\":\"$esc_scope\"}"
+          else
+            operator_authorization_unparsed=true
+          fi
+        fi
+        seen_operator_authorization=true
         ;;
       "test_prefix:"*)
         # Bare scalar (`test_prefix: http`) or bracket-list (`test_prefix:
@@ -482,13 +518,15 @@ except Exception:
     --argjson deferred_acs "$deferred_acs" \
     --argjson deferred_acs_unparsed "$deferred_acs_unparsed" \
     --argjson deferred_ac_reasons "$deferred_ac_reasons" \
+    --argjson operator_authorization "$operator_authorization" \
+    --argjson operator_authorization_unparsed "$operator_authorization_unparsed" \
     --argjson test_prefix "$test_prefix" \
     --arg status_line "$status_line" \
     --argjson size "$size" \
     --arg mtime "$mtime" \
     --argjson gate_stale "$gate_stale" \
     --arg substrate "$substrate" \
-    '{slug:$slug, path:$path, build_auto:$build_auto, build_target:$build_target, build_priority:$build_priority, build_into:$build_into, build_version_bump:$build_version_bump, publish:$publish, deferred_acs:$deferred_acs, deferred_acs_unparsed:$deferred_acs_unparsed, deferred_ac_reasons:$deferred_ac_reasons, test_prefix:$test_prefix, status_line:$status_line, size_bytes:$size, mtime_iso:$mtime, gate_stale:$gate_stale, substrate:$substrate}'
+    '{slug:$slug, path:$path, build_auto:$build_auto, build_target:$build_target, build_priority:$build_priority, build_into:$build_into, build_version_bump:$build_version_bump, publish:$publish, deferred_acs:$deferred_acs, deferred_acs_unparsed:$deferred_acs_unparsed, deferred_ac_reasons:$deferred_ac_reasons, operator_authorization:$operator_authorization, operator_authorization_unparsed:$operator_authorization_unparsed, test_prefix:$test_prefix, status_line:$status_line, size_bytes:$size, mtime_iso:$mtime, gate_stale:$gate_stale, substrate:$substrate}'
 }
 
 # Emit top-level PRDs (buildable) AND ARCHIVE/ PRDs (already done).

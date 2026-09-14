@@ -517,6 +517,29 @@ now_epoch() { echo "${BURST_LANE_NOW:-$(date -u +%s)}"; }
 now_iso()   { date -u -d "@$(now_epoch)" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ; }
 journal_line() { mkdir -p "$(dirname "$JOURNAL")" 2>/dev/null || true; printf '%s\n' "$1" >> "$JOURNAL"; }
 
+# ---- operator authorization (PRD-build-operator-authorization-contract) --
+# The money-spending commands below (prove/up/bake) never trust an agent's
+# own risk judgment for whether a dispatch is authorized to spend -- the
+# operator's PRD-carried `Operator-authorization:` line is a checkable field
+# instead. `BURST_LANE_AUTHZ` is the authorization string, set by the
+# coordinator's Dispatch injection (SKILL.md's "Operator-authorization,
+# dispatch-injected" section) from the PRD's own frontmatter line, verbatim.
+# `BURST_LANE_DISPATCH=1` is the dispatch-context marker: set ONLY by a
+# /build branch invocation, never by a human running this script directly at
+# a terminal -- a human at the keyboard IS the authorization (requirement 6's
+# own text), so the refusal below only ever fires for a dispatched call.
+authz_journal_suffix() {  # -> " authz=\"<string>\"" or "" when unset
+  [ -n "${BURST_LANE_AUTHZ:-}" ] && printf ' authz="%s"' "$BURST_LANE_AUTHZ"
+}
+authz_refuse_if_missing() {  # $1=subcommand name -> 0 ok to proceed, 1 refused (caller exits)
+  if [ "${BURST_LANE_DISPATCH:-0}" = "1" ] && [ -z "${BURST_LANE_AUTHZ:-}" ]; then
+    journal_line "$(now_iso)  burst-lane  $1  refused  (cause=no-operator-authorization)"
+    echo "$1 refused (cause=no-operator-authorization)" >&2
+    return 1
+  fi
+  return 0
+}
+
 mkdir -p "$STATE_DIR" 2>/dev/null || true
 
 # ---- config -------------------------------------------------------------
@@ -1982,6 +2005,7 @@ cmd_bake() {
     echo "burst: refused — not configured (RedBaron-local policy); set BUILD_BURST_ENABLED=1 to allow" >&2
     exit 3
   fi
+  authz_refuse_if_missing bake || exit 3
   if ! state_active; then
     journal_line "$(now_iso)  burst-lane  bake  refused  (cause=no-active-session)"
     echo "bake refused (cause=no-active-session)" >&2
@@ -2150,7 +2174,7 @@ json.dump(d, open(out_path, "w"), indent=2, sort_keys=True)
     "$gate_tool_versions" "$new_history" "$SNAPSHOT_STATE_FILE"
 
   local secs=$(( $(now_epoch) - start_epoch ))
-  journal_line "$(now_iso)  burst-lane  bake  done  (image_id=$new_image_id superseded=${prev_image_id:-none} secs=$secs)"
+  journal_line "$(now_iso)  burst-lane  bake  done  (image_id=$new_image_id superseded=${prev_image_id:-none} secs=$secs)$(authz_journal_suffix)"
   if [ -n "$superseded_id" ]; then
     journal_line "$(now_iso)  burst-lane  bake  superseded  (image_id=$superseded_id delete=operator)"
   fi
@@ -2359,7 +2383,7 @@ prove_journal_cost() {  # $1=outcome (done|failed|aborted)
 prove_write_proof_json() {  # image_id server_id worktree sha routed bytes secs cause exit_code step line [assert_diag_json]
   python3 -c '
 import json, sys
-image_id, server_id, worktree, sha, routed, bytes_n, secs, cause, exit_code, step, line, out_path, ts, diag_json = sys.argv[1:15]
+image_id, server_id, worktree, sha, routed, bytes_n, secs, cause, exit_code, step, line, out_path, ts, diag_json, authz = sys.argv[1:16]
 d = {
     "ts": ts,
     "image_id": image_id,
@@ -2383,8 +2407,15 @@ if diag_json:
         d.update(json.loads(diag_json))
     except Exception:
         pass
+# PRD-build-operator-authorization-contract requirement 5/AC7: the dispatch
+# authorization string, when one was present, so a real spend is checkable
+# from the receipt alone rather than trusting a journal line in isolation.
+# Absent (no dispatch, or a human-run prove) -> field omitted, not null, so
+# an existing reader checking only for presence is unaffected.
+if authz:
+    d["authz"] = authz
 json.dump(d, open(out_path, "w"), indent=2, sort_keys=True)
-' "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9" "${10}" "${11}" "$PROOF_STATE_FILE" "$(now_iso)" "${12:-}"
+' "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9" "${10}" "${11}" "$PROOF_STATE_FILE" "$(now_iso)" "${12:-}" "${BURST_LANE_AUTHZ:-}"
 }
 
 # Requirement 1: the EXIT trap armed at the top of cmd_prove, for the whole
@@ -2403,7 +2434,7 @@ prove_exit_trap() {
   prove_write_proof_json "" "$PROVE_ID" "$PROVE_WORKTREE" "$PROVE_SHA" false 0 \
     "$(( $(now_epoch) - ${PROVE_START_EPOCH:-$(now_epoch)} ))" "$cause" "$rc" "$step" "${PROVE_ERR_LINE:-}"
 
-  journal_line "$(now_iso)  burst-lane  prove  aborted  (step=$step line=${PROVE_ERR_LINE:-none} rc=$rc${tail:+ tail=\"$tail\"})"
+  journal_line "$(now_iso)  burst-lane  prove  aborted  (step=$step line=${PROVE_ERR_LINE:-none} rc=$rc${tail:+ tail=\"$tail\"})$(authz_journal_suffix)"
 
   prove_snapshot_cost
   ( cmd_down >/dev/null 2>&1 ) || true
@@ -2425,6 +2456,13 @@ cmd_prove() {
       *) echo "usage: burst-lane.sh prove [--worktree <path>]" >&2; exit 2 ;;
     esac
   done
+
+  # PRD-build-operator-authorization-contract requirement 6/AC8: refuse
+  # BEFORE anything below touches hcloud at all (worktree setup, `up`, ...)
+  # when dispatched with no authorization string. Deliberately ahead of the
+  # EXIT trap install below -- this is a plain, ordinary early exit, not an
+  # abort the trap needs to forensically capture.
+  authz_refuse_if_missing prove || exit 3
 
   # `errtrace` lets the ERR trap below fire from inside this function (bash
   # default: ERR is not inherited by functions) — best-effort $LINENO for an
@@ -2604,7 +2642,7 @@ cmd_prove() {
     # Requirement 12/AC14: local_target is named on a success line too — the
     # off-root target-dir case has nothing to diagnose, but the operator
     # still gets to see which path was actually inspected.
-    journal_line "$(now_iso)  burst-lane  prove  done  (routed=true image_id=$image_id server_id=$id bytes=$bytes secs=$secs_remote local_target=${PROVE_LOCAL_TARGET:-none})"
+    journal_line "$(now_iso)  burst-lane  prove  done  (routed=true image_id=$image_id server_id=$id bytes=$bytes secs=$secs_remote local_target=${PROVE_LOCAL_TARGET:-none})$(authz_journal_suffix)"
     echo "prove done: routed=true image_id=$image_id bytes=$bytes"
     exit 0
   fi
@@ -2614,7 +2652,7 @@ cmd_prove() {
   # diagnosis (files/newest_mtime/marker_mtime/remote_date/skew_s) right in
   # the journal line, same fields as proof.json.
   [ -n "$PROVE_ASSERT_DIAG_JSON" ] && fail_msg="$fail_msg $(prove_diag_tail "$PROVE_ASSERT_DIAG_JSON")"
-  journal_line "$(now_iso)  burst-lane  prove  failed  ($fail_msg)"
+  journal_line "$(now_iso)  burst-lane  prove  failed  ($fail_msg)$(authz_journal_suffix)"
   echo "prove failed (cause=$cause)" >&2
   exit 1
 }
@@ -2756,6 +2794,7 @@ cmd_up() {
     echo "burst: refused — not configured (RedBaron-local policy); set BUILD_BURST_ENABLED=1 to allow" >&2
     return 3
   fi
+  authz_refuse_if_missing up || exit 3
   # PRD-build-burst-provision-forensics requirement 4: exactly one live
   # `up` per lane. Same fd-tied-to-process, refuse-fast pattern as
   # cmd_provision's 220 above (never a detached holder); a second `up`
@@ -2831,7 +2870,7 @@ cmd_up() {
       "teardown_scheduled=false" "teardown_epoch=" "remote_user=$REMOTE_USER" \
       "gate_ready=$GATE_READY" "gate_tools_missing=$GATE_TOOLS_MISSING" \
       "phase=setup" "phase_epoch=$(now_epoch)"
-    journal_line "$(now_iso)  burst-lane  up  adopted  (server_id=$aid ip=$aip sandbox_ok=$sbx gate_ready=$GATE_READY)"
+    journal_line "$(now_iso)  burst-lane  up  adopted  (server_id=$aid ip=$aip sandbox_ok=$sbx gate_ready=$GATE_READY)$(authz_journal_suffix)"
     ( cmd_verify >/dev/null 2>&1 ) || journal_line "$(now_iso)  burst-lane  up  verify-failed-after-adopt  (lane unverified — run falls back local)"
     schedule_session_parity "$aid"
     echo "already-up: $aid $aip (adopted)"
@@ -2937,7 +2976,7 @@ print(d.get("id",""), d.get("public_net",{}).get("ipv4",{}).get("ip",""))
     "teardown_scheduled=false" "teardown_epoch=" "remote_user=$REMOTE_USER" \
     "gate_ready=$GATE_READY" "gate_tools_missing=$GATE_TOOLS_MISSING" \
     "phase=setup" "phase_epoch=$(now_epoch)"
-  journal_line "$(now_iso)  burst-lane  up  booted  (server_id=$id ip=$ip type=$SERVER_TYPE sandbox_ok=$sbx gate_ready=$GATE_READY remote_user=$REMOTE_USER)"
+  journal_line "$(now_iso)  burst-lane  up  booted  (server_id=$id ip=$ip type=$SERVER_TYPE sandbox_ok=$sbx gate_ready=$GATE_READY remote_user=$REMOTE_USER)$(authz_journal_suffix)"
   ( cmd_verify >/dev/null 2>&1 ) || journal_line "$(now_iso)  burst-lane  up  verify-failed-after-boot  (lane unverified — run falls back local)"
   if [ "$sbx" = false ]; then
     journal_line "$(now_iso)  burst-lane  up  sandbox-unavailable  (server_id=$id — rust selection falls back to local cap for python-kind sandboxed tests this tick)"

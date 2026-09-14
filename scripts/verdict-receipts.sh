@@ -28,6 +28,23 @@
 #                 non-network sanity probe) — a sandboxed shell cannot
 #                 brand a healthy host unreachable off a single probe.
 #
+# Operator-authorization deferral check (PRD-build-operator-authorization-
+# contract): not a reserved WORD but the same "a claim is only as good as
+# what it names, not what it asserts" shape. A journal/PRD line naming a
+# deferral (defer/deferred/deferring/deferral) whose owning PRD carries a
+# present, parsed `Operator-authorization:` line is a bad claim UNLESS the
+# deferral text itself names the word "scope" — the mechanical stand-in for
+# "cites why the action falls outside the authorized scope" (see
+# build-contract.md's `Operator-authorization` row and SKILL.md's Dispatch
+# section). A PRD with no authorization at all, or an unparsed one (no
+# `scope:` segment — never treated as blanket authorization), is never
+# flagged by this check; only a PRESENT, PARSED authorization creates the
+# obligation. Which AC a deferral is "for" is not verified line-by-line
+# (matching AC text to a free-form scope string is exactly the judgment
+# call the PRD's own Open Questions section leaves to this script, not a
+# lint-time or parse-time concern) — any deferral line belonging to a PRD
+# that carries an authorization must name the mismatch.
+#
 # Receipt reference syntax on a line: one `receipt: <path>` token per
 # receipt (comma-separate multiple `receipt: <path>` occurrences, one
 # label per path — do not put several paths after a single label). A
@@ -62,6 +79,10 @@ set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RECEIPTS_DIR="${BUILD_RECEIPTS_DIR:-$HOME/brain/journal/build/receipts}"
+# Same default/override convention as scan-prds.sh -- used to resolve which
+# PRD a journal deferral line belongs to (see check_operator_authorization_
+# deferral below).
+PRD_DIR="${PRD_DIR:-$HOME/Documents/PRDs}"
 
 utc_now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 epoch_of() { date -u -d "$1" +%s 2>/dev/null; }
@@ -231,6 +252,72 @@ check_flaky_infra() {
   return 0
 }
 
+# find_prd_file <slug> -> path, or empty if not found under build-queue/,
+# built-prds/, or PRD_DIR's own top level (legacy layout).
+find_prd_file() {
+  local slug="$1" d
+  for d in "$PRD_DIR/build-queue" "$PRD_DIR/built-prds" "$PRD_DIR"; do
+    if [ -f "$d/PRD-$slug.md" ]; then
+      printf '%s' "$d/PRD-$slug.md"
+      return 0
+    fi
+  done
+  printf ''
+  return 0
+}
+
+# operator_authorization_scope_of <prd-path> -> the `scope:` text of that
+# PRD's Operator-authorization line, or "" if absent/malformed/unparsed.
+# Deliberately a small duplicate of scan-prds.sh's own Operator-authorization
+# regex rather than shelling out to it -- this script stays a single
+# self-contained scan over the file, the same reasoning prd-lint.sh's
+# substrate check gives for its own duplication (see that script's header).
+# Keep the two regexes in step by hand if either changes.
+operator_authorization_scope_of() {
+  local path="$1" line kline v
+  [ -f "$path" ] || { printf ''; return 0; }
+  while IFS= read -r line; do
+    kline="$(printf '%s' "$line" | sed -E 's/^[[:space:]]*[-*+][[:space:]]+//')"
+    case "$kline" in
+      "Operator-authorization:"*)
+        v="$(printf '%s' "$kline" | sed -E 's/^Operator-authorization[[:space:]]*:[[:space:]]*//; s/[[:space:]]+#.*$//; s/[[:space:]]*$//')"
+        if [[ "$v" =~ ^[^[:space:]]+[[:space:]]+[^[:space:]]+[[:space:]]+\"[^\"]*\"[[:space:]]+scope:[[:space:]]*(.*)$ ]]; then
+          printf '%s' "${BASH_REMATCH[1]}"
+        else
+          printf ''
+        fi
+        return 0
+        ;;
+    esac
+  done < <(head -n 80 "$path")
+  printf ''
+}
+
+# check_operator_authorization_deferral <file> <line> -> 0 pass / 1 fail;
+# sets FAIL_REASON. Not a reserved-word check (no receipts involved) --
+# see the header comment for the "must name scope" design decision.
+check_operator_authorization_deferral() {
+  local file="$1" line="$2"
+  local prd_path="" base; base="$(basename "$file")"
+  if [[ "$base" == PRD-* ]]; then
+    prd_path="$file"
+  else
+    local slug; slug="$(awk '{print $2}' <<<"$line")"
+    [ -n "$slug" ] && prd_path="$(find_prd_file "$slug")"
+  fi
+  [ -n "$prd_path" ] && [ -f "$prd_path" ] || return 0
+  local scope; scope="$(operator_authorization_scope_of "$prd_path")"
+  [ -n "$scope" ] || return 0
+  # "scope"/"scopes" (AC6's own example text: "the authorization scopes only
+  # a ccx43" is the verb form, not the noun) both count as naming the
+  # mismatch.
+  if grep -qiE '\bscopes?\b' <<<"$line"; then
+    return 0
+  fi
+  FAIL_REASON="deferral while $prd_path carries an in-scope Operator-authorization (scope: $scope) — deferral text names no scope mismatch (must mention 'scope')"
+  return 1
+}
+
 check_unreachable() {
   local line="$1"
   extract_receipts "$line"
@@ -292,6 +379,11 @@ scan_line() {
   if grep -qiE '\bunreachable\b|\bssh timeout\b' <<<"$line"; then
     if ! check_unreachable "$line"; then
       BAD_LINES+=("FAIL $file:$n [unreachable] $FAIL_REASON")
+    fi
+  fi
+  if grep -qiE '\bdefer(red|ring|ral|s)?\b' <<<"$line"; then
+    if ! check_operator_authorization_deferral "$file" "$line"; then
+      BAD_LINES+=("FAIL $file:$n [operator-authorization-deferral] $FAIL_REASON")
     fi
   fi
 }

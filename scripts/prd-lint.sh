@@ -119,6 +119,19 @@ CRED_CLAIM_RE = re.compile(
     rf"|\b{ALREADY_HELD}\b[^.\n]{{0,60}}\b{CRED_WORD}\b",
     re.I,
 )
+# PRD-build-operator-authorization-contract requirement 8: an AC that names a
+# real Hetzner box, real money, or hcloud itself is a spend the loop cannot
+# make on its own risk judgment (see build-contract.md's Operator-
+# authorization row) -- a PRD describing one with no authorization key is not
+# wrong (it may legitimately defer that AC pending a future authorization),
+# just worth flagging before dispatch rather than discovering the gap mid-
+# tick. `ccx` deliberately has no trailing \b -- it needs to match the
+# Hetzner instance-type tokens themselves (ccx43, ccx53), not just a bare
+# "ccx" word.
+REAL_BOX_RE = re.compile(
+    r"\bhcloud\b|\bccx\w*|\breal box\b|\breal money\b|\bbilled\b|\bHetzner server\b",
+    re.I,
+)
 LINT_STATE_DIR = os.environ.get("LINT_STATE_DIR", "")
 
 
@@ -538,6 +551,23 @@ def lint_file(path):
             s = " ".join(it)
             if HOME_PATH_RE.search(s):
                 warn("home-path-in-ac", f"AC references a path under /home/: {it[0]!r}")
+
+        # pattern check: an AC naming a real box/real money/hcloud spend with
+        # no Operator-authorization key present (PRD-build-operator-
+        # authorization-contract requirement 8/AC11-12). Presence-only check
+        # -- a malformed/unparsed Operator-authorization line still counts as
+        # "present" here; whether it actually covers the AC's scope is a
+        # verdict-receipts-time judgment (see that script), not a lint-time one.
+        if "operator-authorization" not in fm:
+            for it in leveled_items:
+                s = " ".join(it)
+                m = REAL_BOX_RE.search(s)
+                if m:
+                    warn(
+                        "real-box-ac-no-authorization",
+                        f"AC mentions a real-box/real-money spend ({m.group(0)!r}) "
+                        f"with no `Operator-authorization:` key in frontmatter: {it[0]!r}",
+                    )
 
     # -- credential-reuse claim with no backing secrets-path file ------------
     # PRD-build-tenant-secret-continuity, AC3: a PRD whose own text (frontmatter,

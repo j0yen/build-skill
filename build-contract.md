@@ -39,6 +39,7 @@ inside fenced code blocks are ignored; first match wins.
 | `Depends-on` | `PRD-<slug>.md`, comma-separated | no | reconciler resolves against git |
 | `Loop` | `<loop-name>: <metric it moves>` | for loop-ready fleets | read by the buildloop's digest/dream phases, ignored here |
 | `Lane` | `<hostname> <ISO-ts>` | no | PRD-build-second-lane-carbon claim-protocol field, written by `scripts/lane-claim.sh claim` when a build lane (RedBaron/carbon) takes a PRD for this tick; a claim older than 3h with no subsequent commit is stale and reclaimable. Read by Phase 2's lane predicate (`scripts/lane-predicate.sh select`, 2026-09-06) for the cargo-free filter and target-repo exclusivity — see SKILL.md's "Lane predicate" section |
+| `Operator-authorization` | `<who> <ISO-8601 ts> "<verbatim words>" scope: <what it permits>` | no | binding within the stated scope only (PRD-build-operator-authorization-contract) — parsed by `scan-prds.sh` into a structured `operator_authorization` manifest field, injected verbatim into the branch-agent prompt by Dispatch, and checked by `verdict-receipts.sh`: an in-scope AC is executed, not deferred, and a deferral inside scope must name the scope mismatch or it's flagged as a bad claim |
 
 Keys `PM`, `Drafted`, `Owner`, `Date`, `Relates`, `Engineering target`, `Jira`,
 `Epic` are display-only.

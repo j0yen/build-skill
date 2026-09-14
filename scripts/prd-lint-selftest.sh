@@ -554,6 +554,34 @@ EOF
 expect_warn "$q/PRD-home-path.md" home-path-in-ac "home-path-in-ac/warn"
 expect_clean_no_id "$q/PRD-status-ok.md" warnings home-path-in-ac "home-path-in-ac/pass"
 
+# ================================================== real-box-ac-no-authorization
+# PRD-build-operator-authorization-contract requirement 8/AC11-12: an AC
+# naming a real box/real money/hcloud spend with no Operator-authorization
+# key present is a WARN (not FAIL -- a PRD may legitimately describe such an
+# AC and defer it pending a future authorization).
+cat > "$q/PRD-realbox-warn.md" <<'EOF'
+- Status: queued
+- build_target: shell
+- Vision: visions/plain.md
+
+## Acceptance criteria
+
+1. P0 — Given a real ccx43, When `hcloud server create` runs, Then the box boots and is billed for the hour.
+EOF
+expect_warn "$q/PRD-realbox-warn.md" real-box-ac-no-authorization "real-box-ac-no-authorization/warn"
+
+cat > "$q/PRD-realbox-ok.md" <<'EOF'
+- Status: queued
+- build_target: shell
+- Vision: visions/plain.md
+- Operator-authorization: Joe 2026-09-13T23:15:00Z "run prove" scope: one real ccx43 for prove
+
+## Acceptance criteria
+
+1. P0 — Given a real ccx43, When `hcloud server create` runs, Then the box boots and is billed for the hour.
+EOF
+expect_clean_no_id "$q/PRD-realbox-ok.md" warnings real-box-ac-no-authorization "real-box-ac-no-authorization/pass (key present)"
+
 # ============================================================ credential-reuse-unbacked
 # PRD-build-tenant-secret-continuity, AC3: a PRD claiming a credential is
 # "already held" with nothing under state/secrets/<slug>/ backing it up.

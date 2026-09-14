@@ -1891,6 +1891,31 @@ PRD needs the `claude` CLI login (SYNTHORG_LLM_BACKEND=cli /
 needs_claude_cli) — those suites must stay local; run them without this
 export instead."
 
+**Operator-authorization, dispatch-injected (2026-09-14,
+PRD-build-operator-authorization-contract).** A PRD-carried authorization is
+inert prose until the contract has a key for it (five-whys in
+visions/buildloop-operations.md — a branch agent deferred an in-scope,
+operator-authorized AC on its own risk judgment, and the identical text was
+honored one tick earlier by a different branch; neither outcome reflected a
+rule the loop enforces). When a PRD carries `Operator-authorization:`
+(`scan-prds.sh`'s parsed `operator_authorization` field is non-null), the
+coordinator's per-branch prompt includes this directive verbatim, in
+addition to (not instead of) every other applicable directive above: "This
+PRD carries an operator authorization: `Operator-authorization: <the line,
+verbatim>`. An AC whose action falls within this scope is executed, not
+deferred. Deferring it requires citing, in the deferral text, why the
+action falls outside the scope string above." An `operator_authorization_
+unparsed: true` PRD (the line is present but doesn't match the documented
+shape — most commonly, no `scope:` segment) carries NO authorization for
+this purpose — never inject a directive off an unparsed line, since that
+would silently widen an unparsed scope to "anything." This directive is
+orthogonal to the burst-lane PATH directives above: it does not itself
+route anything to a box, it only changes whether a branch executes or
+defers the AC the authorization covers; `burst-lane.sh`'s own money-
+spending commands (`prove`/`up`/`bake`) separately record the same
+authorization string and refuse when dispatched with none — see that
+script's own header.
+
 Each agent prompt must include, self-contained:
 
 - Prepend the output of `inoculate-preamble` (if installed) to the agent's task prompt, so spawned agents carry the in-force strain.
@@ -1929,6 +1954,14 @@ Each agent prompt must include, self-contained:
   through to local uv otherwise. Do NOT set BURST_PY=1 if any test in this
   PRD needs the claude CLI login — those suites must stay local; run them
   without this export instead."
+- When the PRD carries a parsed (not `operator_authorization_unparsed`)
+  `Operator-authorization:` (PRD-build-operator-authorization-contract, see
+  "Operator-authorization, dispatch-injected" above), the operator-
+  authorization directive verbatim — "This PRD carries an operator
+  authorization: `Operator-authorization: <the line, verbatim>`. An AC
+  whose action falls within this scope is executed, not deferred. Deferring
+  it requires citing, in the deferral text, why the action falls outside
+  the scope string above."
 - "You are advancing ONE PRD as part of a parallel /build tick.
   Run Phases 3 → 4 → 5 → 7 for this PRD only. Do not invoke /build
   recursively. Do not touch any PRD other than this one."
