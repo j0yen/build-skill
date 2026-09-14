@@ -32,6 +32,16 @@ case "$sub" in
     ;;
   loop)
     sleep_for "${FAKE_LOOP_SLEEP:-0}"
+    # PRD-build-cargo-budget-per-invocation AC1 (additive, default
+    # unchanged): when set, runs `cargo test` via $PATH after the sleep,
+    # standing in for the PRD's own "a fake autobuilder that sleeps then
+    # runs cargo test via PATH" — lets tests/slotinv_ac1_*.sh drive a real
+    # extend-gate.sh through this fixture and observe the cargo-budget-
+    # bin/cargo shim + ledger for real, without any other caller of this
+    # fixture (e.g. extend-gate-phase-timing-selftest.sh) ever setting it.
+    if [ -n "${FAKE_LOOP_RUN_CARGO_TEST:-}" ]; then
+      cargo test
+    fi
     exit "${FAKE_LOOP_RC:-0}"
     ;;
   vti-plan)
