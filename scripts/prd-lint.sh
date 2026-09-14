@@ -229,6 +229,11 @@ def slug_of(path):
 def parse_depends_on(raw):
     if not raw:
         return []
+    # `Depends-on: none` (also `-`, `n/a`) is the documented way to state an
+    # empty dependency list; 2026-09-14 the bare word was read as a filename
+    # and parked prd-contract-lint + prd-seed-inbox every tick.
+    if raw.strip().lower() in ("none", "-", "n/a", "na", "[]"):
+        return []
     return [t.strip() for t in raw.split(",") if t.strip()]
 
 

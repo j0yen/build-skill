@@ -339,6 +339,17 @@ cat > "$q/PRD-dep-ok.md" <<'EOF'
 1. P0 — Given a, When b, Then c.
 EOF
 expect_clean_no_id "$q/PRD-dep-ok.md" failures depends-on-missing "depends-on-missing/pass"
+cat > "$q/PRD-dep-none.md" <<'EOF'
+- Status: queued
+- build_target: shell
+- Vision: visions/plain.md
+- Depends-on: none
+
+## Acceptance criteria
+
+1. P0 — Given a, When b, Then c.
+EOF
+expect_clean_no_id "$q/PRD-dep-none.md" failures depends-on-missing "depends-on-none/pass"
 
 # ================================================================== depends-on-cycle
 # Real incident shape (2026-09-04): PRD-mcphost-harness-live-names briefly
