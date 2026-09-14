@@ -147,6 +147,41 @@ ck "AC8 summary flags the bad bisected line"  "grep -q 'missing-or-malformed' <<
 ck "AC8 summary marks the flaky-infra line receipted"  "echo \"\$out\" | grep 'flaky-infra' | grep -q 'receipted'"
 ck "AC8 summary marks the shipped line none-needed"    "echo \"\$out\" | grep 'shipped' | grep -q 'none-needed'"
 
+# ---- PRD-build-operator-authorization-contract AC5/AC6: a deferral for a
+# PRD that carries a present, parsed Operator-authorization is a bad claim
+# unless the deferral text names the scope mismatch. --------------------
+mkdir -p "$T/opauth/build-queue"
+cat > "$T/opauth/build-queue/PRD-opauth-fixture.md" <<'EOF'
+- Status: building
+- Operator-authorization: Joe 2026-09-13T23:15:00Z "run prove" scope: one real ccx43 for prove
+EOF
+cat > "$T/j-opauth-fail.md" <<EOF
+2026-09-14T05:00:00Z  opauth-fixture  archive-check  NOT-ARCHIVED  (AC9 deferred: risk too high)
+EOF
+cat > "$T/j-opauth-pass.md" <<EOF
+2026-09-14T05:00:00Z  opauth-fixture  archive-check  NOT-ARCHIVED  (AC9 deferred: the AC asks for a ccx53, the authorization scopes only a ccx43)
+EOF
+out="$(PRD_DIR="$T/opauth" bash "$VR" scan "$T/j-opauth-fail.md")"; rc=$?
+ck "opauth-AC5 unscoped deferral exits nonzero"   "[ $rc -gt 0 ]"
+ck "opauth-AC5 flags operator-authorization-deferral" "grep -q '\[operator-authorization-deferral\]' <<<\"\$out\""
+ck "opauth-AC5 names the PRD carrying the authorization" "grep -q 'PRD-opauth-fixture.md' <<<\"\$out\""
+out="$(PRD_DIR="$T/opauth" bash "$VR" scan "$T/j-opauth-pass.md")"; rc=$?
+ck "opauth-AC6 scope-naming deferral passes"      "[ $rc -eq 0 ]"
+ck "opauth-AC6 prints PASS"                       "grep -q '^PASS' <<<\"\$out\""
+
+# A deferral for a PRD with NO Operator-authorization line is unaffected
+# (never flagged) — the check only fires when a present, parsed
+# authorization creates the obligation.
+mkdir -p "$T/opauth-none/build-queue"
+cat > "$T/opauth-none/build-queue/PRD-opauth-none.md" <<'EOF'
+- Status: building
+EOF
+cat > "$T/j-opauth-none.md" <<EOF
+2026-09-14T05:00:00Z  opauth-none  archive-check  NOT-ARCHIVED  (AC9 deferred: risk too high)
+EOF
+out="$(PRD_DIR="$T/opauth-none" bash "$VR" scan "$T/j-opauth-none.md")"; rc=$?
+ck "opauth-noauth deferral unaffected without a key" "[ $rc -eq 0 ]"
+
 # ---- Edge case: reserved words in PRD body prose (not a Blocked: value)
 # are never scanned. ------------------------------------------------------
 cat > "$T/PRD-ac-prose.md" <<'EOF'

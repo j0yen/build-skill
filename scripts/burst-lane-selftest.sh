@@ -5149,6 +5149,94 @@ expect "reenable AC12e: text-mode 'no active session' is unchanged, byte-exact, 
 
 expect_block_green "reenable" "reenable: every reenable case above ran green"
 
+# =============================================================================
+# PRD-build-operator-authorization-contract: cmd_up/cmd_bake/cmd_prove
+# refuse a dispatched call with no authorization before touching hcloud
+# (AC8), record the authorization string as authz= in their journal_line
+# calls when one is present (AC7), and are unaffected when invoked with no
+# dispatch-context marker at all — the human-at-keyboard path (AC9).
+# (test_prefix: opauth)
+# =============================================================================
+block_start "opauth"
+
+# ---- opauth AC8: dispatched (BURST_LANE_DISPATCH=1) with no authorization
+# string -> up refuses before any hcloud call, exits non-zero, and journals
+# the named cause.
+fresh_env
+export BURST_LANE_DISPATCH=1
+unset BURST_LANE_AUTHZ
+opauth8_out="$("$BL" up 2>&1)"; opauth8_rc=$?
+expect "opauth AC8: dispatched up with no authorization exits non-zero" "[ $opauth8_rc -ne 0 ]"
+expect "opauth AC8: refusal names the cause on stderr" \
+  "grep -q 'up refused (cause=no-operator-authorization)' <<<\"\$opauth8_out\""
+expect "opauth AC8: journal records the refusal" \
+  "grep -q 'burst-lane  up  refused  (cause=no-operator-authorization)' \"\$BURST_LANE_JOURNAL\""
+expect "opauth AC8: no hcloud server create call was ever attempted" \
+  "[ \"\$(grep -c 'server create' \"\$FAKE_HCLOUD_CALLLOG\")\" -eq 0 ]"
+expect "opauth AC8: no session.json was written" "[ ! -f \"\$BURST_LANE_STATE_DIR/session.json\" ]"
+
+# Same refusal for bake and prove, dispatched with no authorization.
+fresh_env
+export BURST_LANE_DISPATCH=1
+unset BURST_LANE_AUTHZ
+opauth8b_out="$("$BL" bake 2>&1)"; opauth8b_rc=$?
+expect "opauth AC8: dispatched bake with no authorization exits non-zero" "[ $opauth8b_rc -ne 0 ]"
+expect "opauth AC8: bake journal records the refusal" \
+  "grep -q 'burst-lane  bake  refused  (cause=no-operator-authorization)' \"\$BURST_LANE_JOURNAL\""
+expect "opauth AC8: bake attempted no hcloud call" \
+  "[ \"\$(wc -l < \"\$FAKE_HCLOUD_CALLLOG\")\" -eq 0 ]"
+
+fresh_env
+export BURST_LANE_DISPATCH=1
+unset BURST_LANE_AUTHZ
+opauth8c_out="$("$BL" prove 2>&1)"; opauth8c_rc=$?
+expect "opauth AC8: dispatched prove with no authorization exits non-zero" "[ $opauth8c_rc -ne 0 ]"
+expect "opauth AC8: prove journal records the refusal" \
+  "grep -q 'burst-lane  prove  refused  (cause=no-operator-authorization)' \"\$BURST_LANE_JOURNAL\""
+expect "opauth AC8: prove attempted no hcloud call" \
+  "[ \"\$(wc -l < \"\$FAKE_HCLOUD_CALLLOG\")\" -eq 0 ]"
+expect "opauth AC8: prove wrote no proof.json on the pre-hcloud refusal" \
+  "[ ! -f \"\$BURST_LANE_STATE_DIR/proof.json\" ]"
+
+# ---- opauth AC9: no dispatch-context marker at all (a direct human-run
+# invocation) -> unaffected, proceeds exactly as before this PRD, even with
+# no authorization string set.
+fresh_env
+unset BURST_LANE_DISPATCH BURST_LANE_AUTHZ
+opauth9_out="$("$BL" up)"; opauth9_rc=$?
+expect "opauth AC9: undispatched up with no authorization still exits 0" "[ $opauth9_rc -eq 0 ]"
+expect "opauth AC9: undispatched up still creates a server" \
+  "[ \"\$(grep -c 'server create' \"\$FAKE_HCLOUD_CALLLOG\")\" -eq 1 ]"
+expect "opauth AC9: no refusal was journaled" \
+  "! grep -q 'cause=no-operator-authorization' \"\$BURST_LANE_JOURNAL\""
+
+# ---- opauth AC7: when an authorization string IS present, up's own
+# journal_line for the boot carries it under authz=, dispatched or not.
+fresh_env
+export BURST_LANE_AUTHZ='Joe 2026-09-13T23:15:00Z "run prove" scope: one real ccx43 for prove'
+opauth7_out="$("$BL" up)"; opauth7_rc=$?
+expect "opauth AC7: up with an authorization string still exits 0" "[ $opauth7_rc -eq 0 ]"
+expect "opauth AC7: the booted journal line carries authz=" \
+  "grep -q 'burst-lane  up  booted.*authz=\"Joe 2026-09-13T23:15:00Z' \"\$BURST_LANE_JOURNAL\""
+
+# Same for bake: authz rides into the journaled bake-done line.
+fresh_env
+REEN_OPAUTH_SRC="$T/fake-autobuilder-opauth"; mkdir -p "$REEN_OPAUTH_SRC"
+cat > "$REEN_OPAUTH_SRC/autobuilder" <<'EOF'
+#!/usr/bin/env bash
+echo "autobuilder 9.9.9"
+EOF
+chmod +x "$REEN_OPAUTH_SRC/autobuilder"
+export BURST_LANE_AUTOBUILDER_BIN="$REEN_OPAUTH_SRC/autobuilder"
+export BURST_LANE_AUTHZ='Joe 2026-09-13T23:15:00Z "run prove" scope: one real ccx43 for prove'
+"$BL" up >/dev/null 2>&1
+opauth7b_out="$("$BL" bake 2>&1)"; opauth7b_rc=$?
+expect "opauth AC7: bake with an authorization string exits 0" "[ $opauth7b_rc -eq 0 ]"
+expect "opauth AC7: the bake-done journal line carries authz=" \
+  "grep -q 'burst-lane  bake  done.*authz=\"Joe 2026-09-13T23:15:00Z' \"\$BURST_LANE_JOURNAL\""
+
+expect_block_green "opauth" "opauth: every opauth case above ran green"
+
 # ---- pullback AC11 (PRD-build-burst-pull-back-restore): record, on every
 # run, how many transfer-layer failures remain among this PRD's own
 # "pullback"-block fixtures (AC3/AC5/AC12 above) and the cause of each, to
