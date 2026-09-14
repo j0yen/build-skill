@@ -837,7 +837,22 @@ read it before assuming a step is "the last one this tick".
   setup): boxes 165737254/165738778 logged 0.0h each while Hetzner billed
   the started hour because nothing had captured server-creation time.
   Sessions written before this PRD have no `create_epoch` and fall back to
-  `boot_epoch`, unchanged.
+  `boot_epoch`, unchanged. `assert`'s freshness check is clock-independent
+  (2026-09-14, same PRD, requirements 11-12): two real runs after the fixes
+  above (boxes 165754863/165762013) still failed `no-fresh-artifact` with a
+  genuinely fresh remote compile and a verified multi-GB pull — the
+  reference was a local `mktemp` marker stamped on THIS caller's clock, so
+  any disagreement between this machine's clock and the box's own read as
+  "nothing is fresh". `run` (when driven by `prove`) now touches
+  `<remote_path>/target/.burst-run-marker` on the box itself immediately
+  before cargo starts; that marker rides back in the same pull `assert`
+  already reads, so freshness is judged entirely on the box's own clock.
+  The local `mktemp` marker is gone. A `no-fresh-artifact` verdict now
+  carries its own diagnosis in both `proof.json` and the journal —
+  `local_target`, `files`, `newest_mtime`, `marker_mtime`,
+  `remote_date` (the box's own `date -u`, captured at run start), and
+  `skew_s` — so it is explainable from the receipt alone, without another
+  box.
 
   **Ship rule (updated 2026-09-06, PRD-build-gate-delta-baseline): `pass`
   OR `delta-pass` ships — not just absolute `block=0`.** `extend-gate.sh`

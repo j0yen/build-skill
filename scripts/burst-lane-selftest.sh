@@ -4628,6 +4628,13 @@ if [ "${1:-}" = "--version" ]; then
 fi
 mkdir -p target
 echo built > target/out.txt
+# PRD-build-burst-prove-forensics AC13/AC15: FAKE_CARGO_ARTIFACT_EPOCH lets a
+# fixture backdate (or forward-date) this artifact's own mtime — offline
+# stand-in for a box whose clock disagrees with the caller's. Unset changes
+# nothing (real "now", same as before this PRD).
+if [ -n "${FAKE_CARGO_ARTIFACT_EPOCH:-}" ]; then
+  touch -d "@$FAKE_CARGO_ARTIFACT_EPOCH" target/out.txt
+fi
 exit 0
 EOF
 chmod +x "$REEN_PROVE_CARGO/cargo"
@@ -4912,6 +4919,89 @@ import json
 rows = [json.loads(l) for l in open('$BURST_LANE_COST_LEDGER') if l.strip()]
 assert any(abs(r.get('hours', -1) - 19/60.0) < 0.0001 for r in rows), rows
 \""
+
+# ---- provefx AC13 (requirement 11): assert compares artifact mtimes
+# against the marker `run` touched on the BOX's own clock, not against this
+# caller's local clock — a box whose own artifacts (and marker) land 15
+# minutes behind wall-clock time (simulating clock skew) must still route
+# true, because the marker rode back from the exact same clock the
+# artifacts did. Scoped to a private TMPDIR so the "no burst-prove-marker.*
+# left behind" check below can never see an unrelated file from this host's
+# own real /tmp (production still has ten stale ones from before this PRD).
+fresh_env
+export BURST_LANE_AUTOBUILDER_BIN="$REEN_PROVE_AB_SRC/autobuilder"
+WT_PFX13="$T/provefx-ac13"; mkdir -p "$WT_PFX13"
+PFX13_TMP="$T/provefx-ac13-tmp"; mkdir -p "$PFX13_TMP"
+pfx13_marker_epoch=$(( $(date +%s) - 900 ))
+pfx13_artifact_epoch=$(( pfx13_marker_epoch + 5 ))
+pfx13_out="$(PATH="$REEN_PROVE_CARGO:$PATH" TMPDIR="$PFX13_TMP" \
+  FAKE_SSH_HOSTNAME=wm-burst-lane-fake-box \
+  BURST_PROVE_TEST_MARKER_EPOCH="$pfx13_marker_epoch" \
+  FAKE_CARGO_ARTIFACT_EPOCH="$pfx13_artifact_epoch" \
+  "$BL" prove --worktree "$WT_PFX13" 2>&1)"; pfx13_rc=$?
+expect "provefx AC13: prove routes true when the box's own artifacts land 15m behind wall-clock" \
+  "[ $pfx13_rc -eq 0 ]"
+expect "provefx AC13: proof.json routed=true despite the clock skew" \
+  "python3 -c \"import json; d=json.load(open('$BURST_LANE_STATE_DIR/proof.json')); assert d['routed'] is True, d\""
+expect "provefx AC13: no burst-prove-marker.* file remains in TMPDIR after prove" \
+  "[ -z \"\$(find \"$PFX13_TMP\" -maxdepth 1 -name 'burst-prove-marker.*' 2>/dev/null)\" ]"
+
+# ---- provefx AC14 (requirement 11): a worktree whose .cargo/config.toml
+# points target-dir at an absolute off-root path — the pull already lands
+# there (pull_target_incremental, PRD-build-worktree-targets-off-root); this
+# proves assert inspects that SAME path (never $worktree/target) and names
+# it in the journal on success too.
+fresh_env
+export BURST_LANE_AUTOBUILDER_BIN="$REEN_PROVE_AB_SRC/autobuilder"
+WT_PFX14="$T/provefx-ac14"; mkdir -p "$WT_PFX14/.cargo"
+PFX14_OFFROOT="$T/provefx-ac14-offroot-target"
+printf '[build]\ntarget-dir = "%s"\n' "$PFX14_OFFROOT" > "$WT_PFX14/.cargo/config.toml"
+pfx14_out="$(PATH="$REEN_PROVE_CARGO:$PATH" FAKE_SSH_HOSTNAME=wm-burst-lane-fake-box "$BL" prove --worktree "$WT_PFX14" 2>&1)"; pfx14_rc=$?
+expect "provefx AC14: prove routes true against an off-root target-dir override" "[ $pfx14_rc -eq 0 ]"
+expect "provefx AC14: proof.json routed=true" \
+  "python3 -c \"import json; d=json.load(open('$BURST_LANE_STATE_DIR/proof.json')); assert d['routed'] is True, d\""
+expect "provefx AC14: the pull actually landed the artifact under the override, not \$worktree/target" \
+  "[ -f '$PFX14_OFFROOT/out.txt' ]"
+expect "provefx AC14: the done journal line names local_target as the override path" \
+  "grep -q \"burst-lane  prove  done  (routed=true.*local_target=$PFX14_OFFROOT\" \"$BURST_LANE_JOURNAL\""
+
+# ---- provefx AC15 (requirement 12): when assert fails, proof.json and the
+# journal carry the full diagnosis (local_target/files/newest_mtime/
+# marker_mtime/remote_date/skew_s) — a no-fresh-artifact verdict must be
+# explainable from the receipt alone. A dedicated fixture cargo that
+# compiles nothing at all (mkdir -p target; exit 0) reproduces "the pull
+# landed zero files newer than the marker" without depending on AC13's
+# epoch arithmetic.
+PFX15_CARGO="$T/fakebin-provefx-ac15-cargo"; mkdir -p "$PFX15_CARGO"
+cat > "$PFX15_CARGO/cargo" <<'EOF'
+#!/usr/bin/env bash
+if [ "${1:-}" = "--version" ]; then
+  echo "cargo 1.85.0-fake"
+  exit 0
+fi
+mkdir -p target
+exit 0
+EOF
+chmod +x "$PFX15_CARGO/cargo"
+fresh_env
+export BURST_LANE_AUTOBUILDER_BIN="$REEN_PROVE_AB_SRC/autobuilder"
+WT_PFX15="$T/provefx-ac15"; mkdir -p "$WT_PFX15"
+pfx15_out="$(PATH="$PFX15_CARGO:$PATH" FAKE_SSH_HOSTNAME=wm-burst-lane-fake-box FAKE_SSH_REMOTE_DATE="2026-09-14T05:00:00Z" "$BL" prove --worktree "$WT_PFX15" 2>&1)"; pfx15_rc=$?
+expect "provefx AC15: prove exits 1 when the box compiled nothing newer than the marker" "[ $pfx15_rc -eq 1 ]"
+expect "provefx AC15: proof.json cause=no-fresh-artifact" \
+  "python3 -c \"import json; d=json.load(open('$BURST_LANE_STATE_DIR/proof.json')); assert d['routed'] is False and d['cause']=='no-fresh-artifact', d\""
+expect "provefx AC15: proof.json carries the full assert diagnosis" \
+  "python3 -c \"
+import json
+d = json.load(open('$BURST_LANE_STATE_DIR/proof.json'))
+assert d.get('files') == 0, d
+assert d.get('local_target'), d
+assert 'marker_mtime' in d and d['marker_mtime'], d
+assert d.get('remote_date') == '2026-09-14T05:00:00Z', d
+assert 'skew_s' in d, d
+\""
+expect "provefx AC15: the journal failed line carries the same diagnosis fields" \
+  "grep -qE 'burst-lane  prove  failed  \\(cause=no-fresh-artifact .*files=0.*remote_date=2026-09-14T05:00:00Z' \"$BURST_LANE_JOURNAL\""
 
 expect_block_green "provefx" "provefx: every provefx case above ran green"
 

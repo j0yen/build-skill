@@ -22,7 +22,17 @@ run_suite_and_expect_labels() {  # $@ = exact "ok  <label>" lines required
   # burst-lane-selftest.sh already self-exports this at its own top, but
   # every tests/*.sh is required to export it too, so this wrapper does not
   # rely solely on the suite it calls remembering to.
-  out="$(BURST_LANE_TEST=1 bash "$suite" 2>&1)"; rc=$?
+  # burst-lane-selftest.sh sources lib/burst-configured.sh and SKIPs its
+  # entire offline fixture suite (exit 0, nothing run) unless the caller
+  # either opts in via BUILD_BURST_ENABLED=1 or the real ~/.config/wm-burst
+  # env names a live box — by design, so a fake/simulated session run by
+  # accident is never mistaken for proof the (2026-09-11-dormant) real lane
+  # works. Every one of these wrapper's own assertions runs entirely against
+  # fake hcloud/ssh/rsync (tests/fixtures/burst-lane-fake/) and never
+  # touches a real box regardless of this flag — this is exactly the
+  # "one-off forced test run" opt-in burst-configured.sh's own header
+  # documents, not a re-enable of the dormant production lane.
+  out="$(BURST_LANE_TEST=1 BUILD_BURST_ENABLED=1 bash "$suite" 2>&1)"; rc=$?
   if [ "$rc" -ne 0 ]; then
     echo "FAIL: burst-lane-selftest.sh exited $rc" >&2
     echo "$out" | tail -20 >&2

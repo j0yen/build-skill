@@ -341,6 +341,19 @@ case "$cmd" in
     echo "${FAKE_SSH_HOSTNAME:-$(hostname 2>/dev/null || echo unknown)}"
     exit 0
     ;;
+  'date -u +%Y-%m-%dT%H:%M:%SZ')
+    # PRD-build-burst-prove-forensics requirement 12: `run`'s own capture of
+    # the box's clock at run start, for assert's skew_s diagnosis.
+    # FAKE_SSH_REMOTE_DATE pins a deterministic answer (AC15); unset falls
+    # through to this fixture's own real clock (this "remote" is really the
+    # local filesystem, so there is no true skew to report offline).
+    if [ -n "${FAKE_SSH_REMOTE_DATE:-}" ]; then
+      echo "$FAKE_SSH_REMOTE_DATE"
+    else
+      date -u +%Y-%m-%dT%H:%M:%SZ
+    fi
+    exit 0
+    ;;
 esac
 if [ "${FAKE_SSH_REMOTE_FAIL:-0}" != "0" ]; then exit "${FAKE_SSH_REMOTE_FAIL}"; fi
 eval "$cmd"

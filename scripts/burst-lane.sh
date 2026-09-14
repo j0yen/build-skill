@@ -2206,6 +2206,24 @@ PROVE_FAIL_TAIL=""
 PROVE_COST_ID=""
 PROVE_COST_MINUTES=0
 PROVE_COST_EUR="0.0000"
+# Requirement 11: cmd_run reads this (never `local`, same plain-global
+# reasoning as every other PROVE_* above — cmd_run runs in a command-
+# substitution subshell that inherits the parent's globals fine, but any
+# `local` cmd_run itself sets would never be visible back in cmd_prove
+# anyway) to know whether it should touch the remote clock-based marker at
+# all — an ordinary (non-prove) run never does.
+PROVE_ACTIVE=false
+# Requirement 12: set only when the assert step's freshness check fails,
+# holding a JSON object with local_target/files/newest_mtime/marker_mtime/
+# remote_date/skew_s — merged into proof.json and rendered into the
+# journal's failure line so a no-fresh-artifact verdict is explainable from
+# the receipt alone. Empty on any other outcome.
+PROVE_ASSERT_DIAG_JSON=""
+# The local_target assert actually inspected (the cargo_target_dir_for
+# override, or $worktree/target) — named in both the done and failed
+# journal lines (AC14) once assert has resolved it; "none" if prove never
+# reached assert.
+PROVE_LOCAL_TARGET=""
 
 # Requirement 2: capture a step's raw output to a KEPT (never rm -f'd) log
 # file before its result is tested; `reap` prunes these after 14 days (see
@@ -2228,6 +2246,90 @@ prove_log_tail() {  # $1=step -> collapsed last 3 non-empty lines, <=240 chars
   t="$(printf '%s' "$t" | tr -s '[:space:]' ' ')"
   t="${t# }"; t="${t% }"
   printf '%s' "${t:0:240}"
+}
+
+# Requirement 11/12: where cmd_run stashes the box's own `date -u` (captured
+# at run start, before cargo runs) for cmd_prove's assert step to read back
+# — cmd_run runs in a command-substitution subshell, so a plain variable set
+# there never survives back to cmd_prove; a file keyed by this same prove's
+# PROVE_START_EPOCH does.
+prove_remote_date_path() {
+  printf '%s' "$STATE_DIR/logs/prove.${PROVE_START_EPOCH}.remote-date"
+}
+
+# Requirement 12: the assert step's own diagnosis, computed once when the
+# freshness check fails so a no-fresh-artifact verdict is explainable from
+# proof.json/the journal alone, without another box. $2 (the marker) is
+# itself excluded from both the file count and "newest" scan — it is
+# forensic metadata, never a build artifact. Prints one JSON object line;
+# any read/parse failure degrades to nulls/empty rather than aborting
+# prove's own assert step over a diagnostics bug.
+prove_assert_diag_json() {  # $1=local_target $2=marker_path $3=remote_date_iso -> JSON object (one line)
+  python3 -c '
+import calendar, json, os, sys, time
+
+local_target, marker, remote_date = sys.argv[1:4]
+
+def iso(epoch):
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(epoch))
+
+files = []
+if os.path.isdir(local_target):
+    for root, _dirs, names in os.walk(local_target):
+        for n in names:
+            if n == ".burst-run-marker":
+                continue
+            files.append(os.path.join(root, n))
+
+newest_mtime = ""
+if files:
+    try:
+        newest_mtime = iso(max(os.path.getmtime(f) for f in files))
+    except OSError:
+        newest_mtime = ""
+
+marker_mtime = ""
+if os.path.isfile(marker):
+    try:
+        marker_mtime = iso(os.path.getmtime(marker))
+    except OSError:
+        marker_mtime = ""
+
+skew_s = None
+if remote_date:
+    try:
+        remote_epoch = calendar.timegm(time.strptime(remote_date, "%Y-%m-%dT%H:%M:%SZ"))
+        skew_s = int(remote_epoch - time.time())
+    except Exception:
+        skew_s = None
+
+print(json.dumps({
+    "local_target": local_target,
+    "files": len(files),
+    "newest_mtime": newest_mtime,
+    "marker_mtime": marker_mtime,
+    "remote_date": remote_date,
+    "skew_s": skew_s,
+}))
+' "$1" "$2" "$3"
+}
+
+# Renders a prove_assert_diag_json object back into "k=v k=v ..." for a
+# journal line — same field order every time, empty/null values render as
+# the empty string rather than the literal "None"/"null".
+prove_diag_tail() {  # $1=diag_json -> "local_target=... files=... newest_mtime=... marker_mtime=... remote_date=... skew_s=..."
+  python3 -c '
+import json, sys
+try:
+    d = json.loads(sys.argv[1]) if sys.argv[1] else {}
+except Exception:
+    d = {}
+parts = []
+for k in ("local_target", "files", "newest_mtime", "marker_mtime", "remote_date", "skew_s"):
+    v = d.get(k)
+    parts.append("{}={}".format(k, "" if v is None else v))
+print(" ".join(parts))
+' "$1"
 }
 
 # Requirement 5: prove's own `down` and cost line are always journaled by
@@ -2254,10 +2356,10 @@ prove_journal_cost() {  # $1=outcome (done|failed|aborted)
 # Shared proof.json writer — the normal tail and the abort trap both call
 # this so the schema (now with exit_code/step/line — Migration note: existing
 # readers use only routed/ts and are unaffected) never drifts between paths.
-prove_write_proof_json() {  # image_id server_id worktree sha routed bytes secs cause exit_code step line
+prove_write_proof_json() {  # image_id server_id worktree sha routed bytes secs cause exit_code step line [assert_diag_json]
   python3 -c '
 import json, sys
-image_id, server_id, worktree, sha, routed, bytes_n, secs, cause, exit_code, step, line, out_path, ts = sys.argv[1:14]
+image_id, server_id, worktree, sha, routed, bytes_n, secs, cause, exit_code, step, line, out_path, ts, diag_json = sys.argv[1:15]
 d = {
     "ts": ts,
     "image_id": image_id,
@@ -2272,8 +2374,17 @@ d = {
     "step": step,
     "line": int(line) if line.isdigit() else None,
 }
+# Requirement 12: merged in only when the assert step computed one (a
+# no-fresh-artifact verdict) — local_target/files/newest_mtime/marker_mtime/
+# remote_date/skew_s. Existing readers use only routed/ts and are
+# unaffected by these extra keys.
+if diag_json:
+    try:
+        d.update(json.loads(diag_json))
+    except Exception:
+        pass
 json.dump(d, open(out_path, "w"), indent=2, sort_keys=True)
-' "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9" "${10}" "${11}" "$PROOF_STATE_FILE" "$(now_iso)"
+' "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9" "${10}" "${11}" "$PROOF_STATE_FILE" "$(now_iso)" "${12:-}"
 }
 
 # Requirement 1: the EXIT trap armed at the top of cmd_prove, for the whole
@@ -2330,6 +2441,9 @@ cmd_prove() {
   PROVE_FINISHED=false
   PROVE_ERR_LINE=""
   PROVE_FAIL_TAIL=""
+  PROVE_ACTIVE=true
+  PROVE_ASSERT_DIAG_JSON=""
+  PROVE_LOCAL_TARGET=""
   trap 'PROVE_ERR_LINE=$LINENO' ERR
   trap 'prove_exit_trap "$?"' EXIT
   # An uncaught TERM/INT kills bash immediately; the OS-reported process
@@ -2374,8 +2488,6 @@ cmd_prove() {
 
   local sha; sha="$(git -C "$worktree" rev-parse HEAD 2>/dev/null || echo unknown)"
   PROVE_SHA="$sha"
-  local fresh_marker; fresh_marker="$(mktemp "${TMPDIR:-/tmp}/burst-prove-marker.XXXXXX")"
-  touch -d "@$start_epoch" "$fresh_marker" 2>/dev/null || true
 
   local routed=false bytes=0 cause="" id="" secs_remote=0
 
@@ -2419,11 +2531,26 @@ cmd_prove() {
         if [ "$bytes" -le 0 ]; then
           cause="pull-zero-bytes"
         else
-          local override local_target
+          # Requirement 11: the reference is the marker `run` touched INSIDE
+          # the remote target dir immediately before cargo started — it rode
+          # back in the very same pull, on the box's OWN clock, so comparing
+          # against it (never against this caller's local `mktemp` marker,
+          # removed by this requirement) is correct regardless of any skew
+          # between this machine's clock and the box's.
+          local override local_target remote_marker remote_date
           override="$(cargo_target_dir_for "$worktree")"
           local_target="${override:-$worktree/target}"
-          if ! find "$local_target" -type f -newer "$fresh_marker" 2>/dev/null | grep -q .; then
+          PROVE_LOCAL_TARGET="$local_target"
+          remote_marker="$local_target/.burst-run-marker"
+          remote_date=""
+          [ -f "$(prove_remote_date_path)" ] && remote_date="$(cat "$(prove_remote_date_path)" 2>/dev/null)"
+          if [ ! -f "$remote_marker" ] || ! find "$local_target" -type f ! -name '.burst-run-marker' -newer "$remote_marker" 2>/dev/null | grep -q .; then
             cause="no-fresh-artifact"
+            # Requirement 12: capture the diagnosis right here, before
+            # anything below has a chance to change local_target/marker
+            # state — a no-fresh-artifact verdict must be explainable from
+            # proof.json alone.
+            PROVE_ASSERT_DIAG_JSON="$(prove_assert_diag_json "$local_target" "$remote_marker" "$remote_date")"
           else
             local ip local_hostname box_hostname
             ip="$(state_read ip)"
@@ -2443,7 +2570,6 @@ cmd_prove() {
     fi
   fi
 
-  rm -f "$fresh_marker" 2>/dev/null || true
   secs_remote=$(( $(now_epoch) - start_epoch ))
 
   # Requirement 2: a clean step failure gets the same forensics an abort
@@ -2456,7 +2582,7 @@ cmd_prove() {
 
   local image_id; image_id="$(resolve_boot_image | awk '{print $1}')"
   local exit_code=1; [ "$routed" = true ] && exit_code=0
-  prove_write_proof_json "$image_id" "${id:-}" "$worktree" "$sha" "$routed" "$bytes" "$secs_remote" "$cause" "$exit_code" "$PROVE_STEP" ""
+  prove_write_proof_json "$image_id" "${id:-}" "$worktree" "$sha" "$routed" "$bytes" "$secs_remote" "$cause" "$exit_code" "$PROVE_STEP" "" "$PROVE_ASSERT_DIAG_JSON"
 
   # `prove` always ends with `down`, success or failure — never leaves a
   # box up just because the proof itself failed a check. Requirement 5:
@@ -2475,11 +2601,20 @@ cmd_prove() {
 
   PROVE_FINISHED=true
   if [ "$routed" = true ]; then
-    journal_line "$(now_iso)  burst-lane  prove  done  (routed=true image_id=$image_id server_id=$id bytes=$bytes secs=$secs_remote)"
+    # Requirement 12/AC14: local_target is named on a success line too — the
+    # off-root target-dir case has nothing to diagnose, but the operator
+    # still gets to see which path was actually inspected.
+    journal_line "$(now_iso)  burst-lane  prove  done  (routed=true image_id=$image_id server_id=$id bytes=$bytes secs=$secs_remote local_target=${PROVE_LOCAL_TARGET:-none})"
     echo "prove done: routed=true image_id=$image_id bytes=$bytes"
     exit 0
   fi
-  journal_line "$(now_iso)  burst-lane  prove  failed  (cause=$cause image_id=$image_id server_id=${id:-none}${PROVE_FAIL_TAIL:+ tail=\"$PROVE_FAIL_TAIL\"})"
+  local fail_msg="cause=$cause image_id=$image_id server_id=${id:-none} local_target=${PROVE_LOCAL_TARGET:-none}"
+  [ -n "$PROVE_FAIL_TAIL" ] && fail_msg="$fail_msg tail=\"$PROVE_FAIL_TAIL\""
+  # Requirement 12/AC15: a no-fresh-artifact verdict carries its own
+  # diagnosis (files/newest_mtime/marker_mtime/remote_date/skew_s) right in
+  # the journal line, same fields as proof.json.
+  [ -n "$PROVE_ASSERT_DIAG_JSON" ] && fail_msg="$fail_msg $(prove_diag_tail "$PROVE_ASSERT_DIAG_JSON")"
+  journal_line "$(now_iso)  burst-lane  prove  failed  ($fail_msg)"
   echo "prove failed (cause=$cause)" >&2
   exit 1
 }
@@ -4413,7 +4548,33 @@ cmd_run() {
   # target dir at $remote_path/target regardless of $remote_cwd, matching
   # ordinary cargo workspace semantics (one target dir at the workspace
   # root, not one per member).
-  local remote_cmd="cd $remote_cwd && export PATH=$GATE_TOOLS_REMOTE_BIN_DIR:\$PATH:$ROOT_CARGO_HOME/bin:/root/.local/bin RUSTUP_HOME=$ROOT_RUSTUP_HOME CARGO_HOME=$RUN_CARGO_HOME CARGO_TARGET_DIR=$remote_path/target RUSTC_WRAPPER=sccache SCCACHE_DIR=$REMOTE_SCCACHE_DIR SCCACHE_CACHE_SIZE=${BURST_SCCACHE_GB}G; timeout 5 sccache --show-stats >/dev/null 2>&1 || { sccache --stop-server >/dev/null 2>&1; sccache --start-server >/dev/null 2>&1; sleep 1; }; timeout 5 sccache --show-stats >/dev/null 2>&1 || { echo 'burst-lane: sccache_unreachable on remote box' >&2; exit 97; }; $first $*"
+  # PRD-build-burst-prove-forensics requirement 11/12: when `prove` is
+  # driving this run (never for an ordinary agent run — PROVE_ACTIVE is a
+  # plain global only cmd_prove ever sets true), capture the box's own
+  # clock and arrange for a marker to be touched INSIDE the remote target
+  # dir immediately before cargo starts. The marker rides back in the same
+  # pull `assert` already reads, on the box's OWN clock — the fix for
+  # `assert` failing "no-fresh-artifact" against a real, fresh remote
+  # compile whenever this caller's clock and the box's disagreed (real
+  # boxes 165754863/165762013, 2026-09-14).
+  local marker_cmd=""
+  if [ "${PROVE_ACTIVE:-false}" = true ]; then
+    local remote_date_iso
+    remote_date_iso="$("$SSH_BIN" -o BatchMode=yes -o ConnectTimeout=5 $(ssh_kh_args) \
+        -i "$SSH_KEY" "$REMOTE_USER@$ip" "date -u +%Y-%m-%dT%H:%M:%SZ" 2>/dev/null)"
+    if [ -n "$remote_date_iso" ]; then
+      mkdir -p "$STATE_DIR/logs" 2>/dev/null || true
+      printf '%s' "$remote_date_iso" > "$(prove_remote_date_path)" 2>/dev/null || true
+    fi
+    # BURST_PROVE_TEST_MARKER_EPOCH: offline-only hook (grep the tree — only
+    # burst-lane-selftest.sh sets it), so a fixture can reproduce a box
+    # whose own clock disagrees with the caller's (AC13) without a real
+    # skewed box.
+    local marker_touch="touch"
+    [ -n "${BURST_PROVE_TEST_MARKER_EPOCH:-}" ] && marker_touch="touch -d @${BURST_PROVE_TEST_MARKER_EPOCH}"
+    marker_cmd="mkdir -p $remote_path/target; $marker_touch $remote_path/target/.burst-run-marker; "
+  fi
+  local remote_cmd="cd $remote_cwd && export PATH=$GATE_TOOLS_REMOTE_BIN_DIR:\$PATH:$ROOT_CARGO_HOME/bin:/root/.local/bin RUSTUP_HOME=$ROOT_RUSTUP_HOME CARGO_HOME=$RUN_CARGO_HOME CARGO_TARGET_DIR=$remote_path/target RUSTC_WRAPPER=sccache SCCACHE_DIR=$REMOTE_SCCACHE_DIR SCCACHE_CACHE_SIZE=${BURST_SCCACHE_GB}G; timeout 5 sccache --show-stats >/dev/null 2>&1 || { sccache --stop-server >/dev/null 2>&1; sccache --start-server >/dev/null 2>&1; sleep 1; }; timeout 5 sccache --show-stats >/dev/null 2>&1 || { echo 'burst-lane: sccache_unreachable on remote box' >&2; exit 97; }; ${marker_cmd}$first $*"
   local rc=0
   local remote_out_log="$STATE_DIR/logs/run-remote.$$.log"
   "$SSH_BIN" $(ssh_kh_args) -i "$SSH_KEY" "$REMOTE_USER@$ip" "$remote_cmd" 2>&1 | tee "$remote_out_log"
