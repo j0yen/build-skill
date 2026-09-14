@@ -108,7 +108,15 @@ unset FAKE_VTI_PLAN_SLEEP FAKE_CI_CHECKS_SLEEP FAKE_GATE_SLEEP FAKE_REVCLAUDE_SL
 line1="$(tail -1 "$JOURNAL")"
 expect "AC1: extend-gate.sh exits 0 on an all-pass fake gate" "[ $rc1 -eq 0 ]"
 expect "AC1: journal line carries a phases= field after wall=" "[[ '$line1' == *'wall='*'phases='* ]]"
-for pair in "risk-gate:skip" "intake:0:0" "proof-receipt:0:0" "vti-plan:1:1" "rollback-plan:0:0" "ci-checks:2:1" "receipts:0:0" "reviewer:1:1" "gate:3:1"; do
+# proof-receipt's tolerance is ±1s, not ±0s like its sibling near-instant
+# fakes: PRD-build-cargo-budget-per-invocation requirement 7 wrapped this
+# step in gate-wedge.sh, whose own "while tree_alive" poll loop has a 1s
+# granularity — a fake producer that exits in well under a second can
+# still be caught "alive" on the loop's first check and pay one full
+# `sleep 1` before the recheck notices it already finished. Real
+# `autobuilder loop` runs take seconds-to-minutes, so this is invisible in
+# production; only this fixture's near-zero fake sleep makes it visible.
+for pair in "risk-gate:skip" "intake:0:0" "proof-receipt:0:1" "vti-plan:1:1" "rollback-plan:0:0" "ci-checks:2:1" "receipts:0:0" "reviewer:1:1" "gate:3:1"; do
   name="${pair%%:*}"
   rest="${pair#*:}"
   if [ "$rest" = "skip" ]; then

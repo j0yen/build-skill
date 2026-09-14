@@ -73,6 +73,15 @@ case "$sub" in
 esac
 
 if [ "$route" -eq 1 ] && [ -x "$WRAPPER" ]; then
+  # PRD-build-cargo-budget-per-invocation requirement 1 (parent-step
+  # tagging): CARGO_BUDGET_PARENT_STEP, when a producer (extend-gate.sh's
+  # unslotted `autobuilder loop` / `extended-receipts.sh`) set it, is
+  # already inherited automatically through this process's own environment
+  # — this `export` is a defensive no-op that just makes sure it's ALWAYS
+  # explicitly present (even empty) in what cargo-budget.sh sees, so a
+  # caller that set it via a function-local `local` (which does not
+  # export) never silently produces a `parent_step: null` ledger row.
+  export CARGO_BUDGET_PARENT_STEP="${CARGO_BUDGET_PARENT_STEP:-}"
   exec "$WRAPPER" run -- "$REAL_CARGO" "$@"
 fi
 

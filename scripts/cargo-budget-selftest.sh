@@ -268,6 +268,258 @@ else
   fail "lane-status.sh tick-summary: expected lane-health + cargo-budget lines in $j9, got: $(cat "$j9" 2>/dev/null)"
 fi
 
+
+# =============================================================================
+# slotinv block (PRD-build-cargo-budget-per-invocation, test_prefix: slotinv)
+# — a slot is held only while a cargo process tree is alive and busy. Every
+# fixture below is a real live process tree (a fake `cargo` that sleeps, a
+# fake producer that sleeps idle then calls cargo) — never a synthetic
+# /proc tree — same discipline as the assertions above. AC1 (extend-gate.sh
+# producer routing) and AC9/AC11 (the gate's own wedge-wrapped loop, and the
+# real-mcphost-gate run) are extend-gate.sh-level/real-host ACs, exercised
+# separately, not here.
+
+# === slotinv 1: nested reuse — a nested `run` under a live ancestor's slot
+# takes no second slot (AC2) =================================================
+ds1="$T/slotinv-nested"; mkdir -p "$ds1"
+(
+  common_env "$ds1"
+  export CARGO_BUDGET_SLOTS=2
+  export CARGO_BUDGET_WAIT_MAX=30
+  cat > "$ds1/child.sh" <<EOF
+#!/usr/bin/env bash
+set -uo pipefail
+"$CB" run -- true
+echo "\$?" > "$ds1/nested_rc.txt"
+# hold the outer slot open a little longer so the probe below can check
+# the OTHER slot is still free while nesting is in flight.
+sleep 2
+EOF
+  chmod +x "$ds1/child.sh"
+  "$CB" run -- "$ds1/child.sh" &
+  outer_p=$!
+  # while the outer+nested pair are in flight, slot 1 (the one NEVER taken
+  # by either) must stay free.
+  sleep 1
+  if flock -n "$ds1/state/slot-1.lock" -c true 2>/dev/null; then
+    echo yes > "$ds1/other_slot_free_during.txt"
+  else
+    echo no > "$ds1/other_slot_free_during.txt"
+  fi
+  wait "$outer_p"
+)
+nested_rc="$(cat "$ds1/nested_rc.txt" 2>/dev/null || echo x)"
+other_free_during="$(cat "$ds1/other_slot_free_during.txt" 2>/dev/null || echo no)"
+nested_row="$(jq -c 'select(.nested == true)' "$ds1/state/ledger.jsonl" 2>/dev/null | head -1)"
+nested_journaled=0
+grep -q 'cargo-budget  nested reuse slot=' "$ds1/journal.md" 2>/dev/null && nested_journaled=1
+if [ "$nested_rc" = "0" ] && [ "$other_free_during" = "yes" ] && [ -n "$nested_row" ] \
+   && [ "$(jq -r '.wait_s' <<<"$nested_row")" = "0" ] && [ "$nested_journaled" -eq 1 ]; then
+  pass "slotinv nested reuse: nested run took no second slot (other slot stayed free), wait_s=0, journaled ($nested_row)"
+else
+  fail "slotinv nested reuse: rc=$nested_rc other_slot_free_during=$other_free_during journaled=$nested_journaled row=$nested_row"
+fi
+
+# === slotinv 2: dead holder pid falls through to normal acquisition (AC3) ==
+ds2="$T/slotinv-dead-holder"; mkdir -p "$ds2"
+(
+  common_env "$ds2"
+  export CARGO_BUDGET_SLOTS=2
+  export CARGO_BUDGET_WAIT_MAX=30
+  # a pid that is guaranteed dead by the time we use it.
+  sleep 0.1 & dead_pid=$!
+  wait "$dead_pid" 2>/dev/null
+  export CARGO_BUDGET_HELD_SLOT=0
+  export CARGO_BUDGET_HOLDER_PID="$dead_pid"
+  "$CB" run -- true
+)
+dead_row="$(jq -c 'select(true)' "$ds2/state/ledger.jsonl" 2>/dev/null | tail -1)"
+if [ "$(jq -r '.nested' <<<"$dead_row")" = "false" ]; then
+  pass "slotinv dead holder pid: stale CARGO_BUDGET_HOLDER_PID (already-dead) acquires normally, nested=false ($dead_row)"
+else
+  fail "slotinv dead holder pid: expected nested=false, got $dead_row"
+fi
+
+# === slotinv 3: child fd hygiene — a backgrounded grandchild never keeps the
+# flock alive past `run`'s own return (AC4) ==================================
+ds3="$T/slotinv-fdhygiene"; mkdir -p "$ds3"
+(
+  common_env "$ds3"
+  export CARGO_BUDGET_SLOTS=2
+  export CARGO_BUDGET_WAIT_MAX=30
+  cat > "$ds3/child.sh" <<'EOF'
+#!/usr/bin/env bash
+set -uo pipefail
+( sleep 600 & )
+exit 0
+EOF
+  chmod +x "$ds3/child.sh"
+  "$CB" run -- "$ds3/child.sh"
+)
+if flock -n "$ds3/state/slot-0.lock" -c true 2>/dev/null || flock -n "$ds3/state/slot-1.lock" -c true 2>/dev/null; then
+  pass "slotinv fd hygiene: a fresh flock -n on the used slot succeeds immediately after run returns (backgrounded grandchild did not inherit the lock fd)"
+else
+  fail "slotinv fd hygiene: flock -n on both slot files failed right after run returned — a descendant is still holding the fd"
+fi
+pkill -f "sleep 600" 2>/dev/null || true
+
+# === slotinv 4: idle-release — no live cargo/rustc descendant (AC5) ========
+ds4="$T/slotinv-idle-release"; mkdir -p "$ds4"
+(
+  common_env "$ds4"
+  export CARGO_BUDGET_SLOTS=1
+  export CARGO_BUDGET_WAIT_MAX=30
+  export CARGO_BUDGET_IDLE_HOLD_S=3
+  export CARGO_BUDGET_IDLE_CPU_PCT=5
+  cat > "$ds4/idle_producer.sh" <<'EOF'
+#!/usr/bin/env bash
+sleep 8
+exit 7
+EOF
+  chmod +x "$ds4/idle_producer.sh"
+  "$CB" run -- "$ds4/idle_producer.sh" &
+  p1=$!
+  # once idle-released (~3s in), a second run must be able to take the
+  # (now sole) slot while the first producer is still sleeping.
+  sleep 5
+  t0=$(date +%s)
+  "$CB" run -- true
+  second_rc=$?
+  t1=$(date +%s)
+  echo "$((t1 - t0))" > "$ds4/second_wall.txt"
+  echo "$second_rc" > "$ds4/second_rc.txt"
+  wait "$p1"
+  echo "$?" > "$ds4/first_rc.txt"
+)
+idle_journaled=0
+grep -q 'cargo-budget  idle-release slot=' "$ds4/journal.md" 2>/dev/null && idle_journaled=1
+second_wall="$(cat "$ds4/second_wall.txt" 2>/dev/null || echo 999)"
+second_rc="$(cat "$ds4/second_rc.txt" 2>/dev/null || echo 1)"
+first_rc="$(cat "$ds4/first_rc.txt" 2>/dev/null || echo x)"
+if [ "$idle_journaled" -eq 1 ] && [ "$second_rc" = "0" ] && [ "$second_wall" -le 3 ] && [ "$first_rc" = "7" ]; then
+  pass "slotinv idle-release: journaled after idle threshold, freed slot acquired by another run within ${second_wall}s, producer's own exit code (7) preserved"
+else
+  fail "slotinv idle-release: idle_journaled=$idle_journaled second_rc=$second_rc second_wall=${second_wall}s first_rc=$first_rc"
+fi
+
+# === slotinv 5: idle-release does NOT fire while a live cargo/rustc
+# descendant exists (AC6) =====================================================
+ds5="$T/slotinv-idle-with-cargo"; mkdir -p "$ds5/bin"
+(
+  common_env "$ds5"
+  export CARGO_BUDGET_SLOTS=1
+  export CARGO_BUDGET_WAIT_MAX=30
+  export CARGO_BUDGET_IDLE_HOLD_S=3
+  export CARGO_BUDGET_IDLE_CPU_PCT=5
+  # tree_has_cargo_or_rustc matches on /proc/<pid>/comm, which the kernel
+  # sets from the EXECUTED FILE's own basename — a `#!/usr/bin/env bash`
+  # script named "cargo" would actually run as comm=bash (the interpreter
+  # the shebang re-execs to), not comm=cargo. `sleep` on this box is a
+  # uutils coreutils multi-call binary that self-dispatches by its own
+  # argv[0]/basename (so a copy named "cargo" refuses to run: "unknown
+  # program 'cargo'") — use `perl`, a real standalone ELF interpreter that
+  # doesn't self-dispatch by name, copied to a file literally named
+  # `cargo` so execve-ing it directly (no shebang indirection) gives it
+  # real comm=cargo, the same way a real `cargo` binary would show up.
+  cp "$(command -v perl)" "$ds5/bin/cargo"
+  chmod +x "$ds5/bin/cargo"
+  cat > "$ds5/idle_producer_with_cargo.sh" <<EOF
+#!/usr/bin/env bash
+"$ds5/bin/cargo" -e 'sleep 8' &
+wait
+EOF
+  chmod +x "$ds5/idle_producer_with_cargo.sh"
+  "$CB" run -- "$ds5/idle_producer_with_cargo.sh" &
+  p1=$!
+  sleep 6
+  # the sole slot must still be held (idle-release must NOT have fired).
+  if flock -n "$ds5/state/slot-0.lock" -c true 2>/dev/null; then
+    echo free > "$ds5/slot_state.txt"
+  else
+    echo held > "$ds5/slot_state.txt"
+  fi
+  wait "$p1"
+)
+slot_state="$(cat "$ds5/slot_state.txt" 2>/dev/null || echo free)"
+idle_journaled5=0
+grep -q 'cargo-budget  idle-release slot=' "$ds5/journal.md" 2>/dev/null && idle_journaled5=1
+if [ "$slot_state" = "held" ] && [ "$idle_journaled5" -eq 0 ]; then
+  pass "slotinv idle-release skipped: slot stayed held (no idle-release line) while a live 'cargo' descendant existed"
+else
+  fail "slotinv idle-release skipped: expected slot held / no idle-release line, got slot_state=$slot_state idle_journaled=$idle_journaled5"
+fi
+
+# === slotinv 6: timeout diagnostics — holders=[...] names both real pids
+# (AC7) ========================================================================
+ds6="$T/slotinv-timeout-holders"; mkdir -p "$ds6"
+(
+  common_env "$ds6"
+  export CARGO_BUDGET_SLOTS=2
+  export CARGO_BUDGET_WAIT_MAX=8
+  "$CB" run -- sleep 20 & h1=$!
+  "$CB" run -- sleep 20 & h2=$!
+  sleep 1
+  "$CB" run -- true
+  echo "$?" > "$ds6/third_rc.txt"
+  wait "$h1" "$h2" 2>/dev/null
+)
+third_rc="$(cat "$ds6/third_rc.txt" 2>/dev/null || echo 0)"
+timeout_line="$(grep 'cargo-budget  wait slot timeout' "$ds6/journal.md" 2>/dev/null | tail -1)"
+holders_ok=0
+if printf '%s' "$timeout_line" | grep -Eq 'holders=\[slot0:[0-9]+:[0-9]+s:[^,]*, slot1:[0-9]+:[0-9]+s:'; then
+  holders_ok=1
+fi
+if [ "$third_rc" = "3" ] && [ "$holders_ok" -eq 1 ]; then
+  pass "slotinv timeout diagnostics: exit 3 preserved, journal names both real holder pids ($timeout_line)"
+else
+  fail "slotinv timeout diagnostics: third_rc=$third_rc holders_ok=$holders_ok line='$timeout_line'"
+fi
+
+# === slotinv 7: ledger gains parent_step/nested/tree_cpu_s/idle_released,
+# and summary gains holds=/idle_slot_s=/nested=/timeouts= (AC8) =============
+ds7="$T/slotinv-ledger-fields"; mkdir -p "$ds7"
+(
+  common_env "$ds7"
+  export CARGO_BUDGET_SLOTS=2
+  export CARGO_BUDGET_WAIT_MAX=30
+  export CARGO_BUDGET_PARENT_STEP="autobuilder-loop"
+  "$CB" run -- true
+)
+row7="$(tail -1 "$ds7/state/ledger.jsonl" 2>/dev/null)"
+fields_ok=0
+if [ "$(jq -r '.parent_step' <<<"$row7")" = "autobuilder-loop" ] \
+   && jq -e 'has("nested") and has("tree_cpu_s") and has("idle_released")' <<<"$row7" >/dev/null 2>&1; then
+  fields_ok=1
+fi
+summary7="$(CARGO_BUDGET_STATE_DIR="$ds7/state" "$CB" summary --since 0 2>/dev/null)"
+summary_ok=0
+printf '%s' "$summary7" | grep -Eq 'holds=[0-9]+ idle_slot_s=[0-9.]+ nested=[0-9]+ timeouts=[0-9]+' && summary_ok=1
+if [ "$fields_ok" -eq 1 ] && [ "$summary_ok" -eq 1 ]; then
+  pass "slotinv ledger fields: row carries parent_step/nested/tree_cpu_s/idle_released; summary carries holds=/idle_slot_s=/nested=/timeouts= ('$summary7')"
+else
+  fail "slotinv ledger fields: fields_ok=$fields_ok summary_ok=$summary_ok row='$row7' summary='$summary7'"
+fi
+
+# === slotinv 8: `status` prints both slots' holder/held_s/tree_cpu_s (AC10) =
+ds8="$T/slotinv-status"; mkdir -p "$ds8"
+(
+  common_env "$ds8"
+  export CARGO_BUDGET_SLOTS=2
+  export CARGO_BUDGET_WAIT_MAX=30
+  "$CB" run -- sleep 6 &
+  "$CB" run -- sleep 6 &
+  sleep 1
+  "$CB" status > "$ds8/status.txt"
+  wait
+)
+status8="$(cat "$ds8/status.txt" 2>/dev/null)"
+if printf '%s' "$status8" | grep -Eq 'slot0=pid:[0-9]+,held_s:[0-9]+,tree_cpu_s:[0-9]+' \
+   && printf '%s' "$status8" | grep -Eq 'slot1=pid:[0-9]+,held_s:[0-9]+,tree_cpu_s:[0-9]+'; then
+  pass "slotinv status: both slots report pid/held_s/tree_cpu_s ('$status8')"
+else
+  fail "slotinv status: expected both slots' pid/held_s/tree_cpu_s, got '$status8'"
+fi
+
 echo "-----"
 if [ "$fails" -eq 0 ]; then
   echo "cargo-budget-selftest: ALL PASS"

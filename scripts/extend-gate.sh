@@ -249,28 +249,59 @@ CARGO_BUDGET="${CARGO_BUDGET:-$BUILD_SCRIPTS/cargo-budget.sh}"
 # unconditional 120 to the PRD's specified 90).
 EXTEND_GATE_PRODUCER_LOCK_WAIT="${EXTEND_GATE_PRODUCER_LOCK_WAIT:-90}"
 # PRD-build-burst-pull-on-demand requirement 2: this IS the gate harness's
-# own local-cargo choke point — every producer below (the proof-receipt
-# loop's `autobuilder loop` AND extended-receipts.sh's 17 producers) funnels
-# through cargo_budgeted, always running LOCALLY (cargo-budget.sh is a local
-# concurrency cap, never a remote route). A burst-lane `run` elsewhere may
-# have left $repo's target/ remote-dirty in the meantime; overridable so
-# tests/ can point at a fixture without touching production behavior.
+# own local-cargo choke point (cargo-budget.sh is a local concurrency cap,
+# never a remote route). A burst-lane `run` elsewhere may have left
+# $repo's target/ remote-dirty in the meantime; overridable so tests/ can
+# point at a fixture without touching production behavior.
 BURST_LANE_SH="${BURST_LANE_SH:-$BUILD_SCRIPTS/burst-lane.sh}"
+# PRD-build-cargo-budget-per-invocation requirement 7: the proof-receipt
+# loop's `autobuilder loop` step runs under gate-wedge.sh so a producer
+# idle for EXTEND_GATE_LOOP_WALL_S (default 1800s) is killed and the gate
+# blocks instead of holding the gate (and, pre-this-PRD, a whole cargo-
+# budget slot) for an hour and then blocking anyway. Overridable so
+# tests/ can point at a fixture / shrink the wall without touching
+# production behavior.
+GATE_WEDGE_SH="${GATE_WEDGE_SH:-$BUILD_SCRIPTS/gate-wedge.sh}"
+EXTEND_GATE_LOOP_WALL_S="${EXTEND_GATE_LOOP_WALL_S:-1800}"
+GATE_WEDGE_STATE_DIR="${GATE_WEDGE_STATE_DIR:-$BUILD_SCRIPTS/../state/gate-wedge}"
 cargo_budgeted() {
-  # Fails open (never blocks the gate) if burst-lane.sh is missing or the
-  # pull itself fails — this gate must still run against whatever is on
-  # disk rather than turn a lazy-pull hiccup into a gate outage.
+  # Retained for any DIRECT `cargo test`/`clippy`/`deny` call this gate
+  # makes itself (none today — see run_unslotted_producer() below for
+  # where the two producer-phase call sites moved to,
+  # PRD-build-cargo-budget-per-invocation requirement 1). Fails open
+  # (never blocks the gate) if burst-lane.sh or cargo-budget.sh is
+  # missing — this gate must still run against whatever is on disk
+  # rather than turn a missing helper into a gate outage.
   if [ -x "$BURST_LANE_SH" ]; then
     "$BURST_LANE_SH" ensure-fresh "$repo" >/dev/null 2>&1 || true
   fi
-  # Runs "$@" through the budget wrapper when it's present+executable;
-  # fails open (runs "$@" directly) if cargo-budget.sh is missing so a
-  # partial checkout never turns a missing helper into a gate outage.
   if [ -x "$CARGO_BUDGET" ]; then
     "$CARGO_BUDGET" run -- "$@"
   else
     "$@"
   fi
+}
+# PRD-build-cargo-budget-per-invocation requirement 1: a producer phase
+# (the proof-receipt loop's `autobuilder loop`, extended-receipts.sh's 17
+# producers) no longer takes ONE cargo-budget slot for its whole phase —
+# that let an agent-driven, mostly-idle phase hold a slot for up to an
+# hour (the 2026-09-13 incident: one hold at peak_load=0.83, no compiler
+# running, while 20 other cargo invocations elsewhere timed out on the 2
+# slots this budgets). Instead the producer runs UNSLOTTED, with
+# cargo-budget-bin FIRST on $PATH (so every real `cargo test`/`clippy`/
+# `deny`/`nextest`/`build --release` call it shells to takes its own slot
+# for exactly its own duration — see cargo-budget.sh) and
+# CARGO_BUDGET_PARENT_STEP set so each of those slots' ledger rows records
+# which producer spawned it. The `VAR=val PATH=... cmd` prefix form here
+# scopes both to this one command's own process tree — it never mutates
+# this script's own $PATH/env for any later phase.
+CARGO_BUDGET_BIN_DIR="${CARGO_BUDGET_BIN_DIR:-$BUILD_SCRIPTS/cargo-budget-bin}"
+run_unslotted_producer() {  # $1=parent-step name, then the producer command
+  local step="$1"; shift
+  if [ -x "$BURST_LANE_SH" ]; then
+    "$BURST_LANE_SH" ensure-fresh "$repo" >/dev/null 2>&1 || true
+  fi
+  PATH="$CARGO_BUDGET_BIN_DIR:$PATH" CARGO_BUDGET_PARENT_STEP="$step" "$@"
 }
 
 die() { echo "extend-gate: $2" >&2; exit "$1"; }
@@ -790,15 +821,32 @@ else
   record_phase intake $(( $(date +%s) - _phase_t0 )) fail
 fi
 
-# 3. proof receipt + session trace. Budgeted (PRD-build-cargo-concurrency-
-#    budget): this producer shells to `cargo test`/`cargo build` internally,
-#    so the whole phase takes one cargo-budget slot rather than racing every
-#    other budgeted cargo caller on the host.
+# 3. proof receipt + session trace. PRD-build-cargo-budget-per-invocation:
+#    runs UNSLOTTED (see run_unslotted_producer above) — the cargo test/
+#    build calls it shells to each take their own budget slot for exactly
+#    their own duration, not one slot for this whole (often agent-idle)
+#    phase. Wedge-wrapped (requirement 7): a producer idle past
+#    EXTEND_GATE_LOOP_WALL_S is killed instead of holding the gate open.
 _phase_t0=$(date +%s)
-if ( cd "$repo" && cargo_budgeted autobuilder loop --project "$project_rel" --iteration 0 --head-sha "$head_now" --trace ) 9>&-; then
+if ( cd "$repo" && run_unslotted_producer autobuilder-loop \
+       "$GATE_WEDGE_SH" run --budget "$EXTEND_GATE_LOOP_WALL_S" --step autobuilder-loop \
+       -- autobuilder loop --project "$project_rel" --iteration 0 --head-sha "$head_now" --trace ) 9>&-; then
   record_phase proof-receipt $(( $(date +%s) - _phase_t0 )) ok
 else
-  note_block "proof-receipt — autobuilder loop --iteration 0 exited non-zero"
+  _loop_rc=$?
+  if [ "$_loop_rc" -eq 98 ]; then
+    # gate-wedge.sh's own wedged-after-retry exit — name the wall/cpu it
+    # recorded (requirement 7) rather than the generic "exited non-zero".
+    _wedge_receipt="$(ls -t "$GATE_WEDGE_STATE_DIR"/*-autobuilder-loop-wedge-receipt.json 2>/dev/null | head -1)"
+    _wedge_wall="?"; _wedge_cpu="?"
+    if [ -n "$_wedge_receipt" ]; then
+      _wedge_wall="$(jq -r '.elapsed_s // "?"' "$_wedge_receipt" 2>/dev/null)"
+      _wedge_cpu="$(jq -r '[.cpu_delta_table[]? | ((.cpu_ticks_t1 // .cpu_ticks_t0) - .cpu_ticks_t0)] | add // 0' "$_wedge_receipt" 2>/dev/null)"
+    fi
+    note_block "proof-receipt — autobuilder loop wedged (wall=${_wedge_wall}s cpu=${_wedge_cpu})"
+  else
+    note_block "proof-receipt — autobuilder loop --iteration 0 exited non-zero"
+  fi
   record_phase proof-receipt $(( $(date +%s) - _phase_t0 )) fail
 fi
 
@@ -889,13 +937,13 @@ fi
 # the final `autobuilder gate` read from.
 # subshell wraps the direct exec so 9>&- has a scope to apply to — this
 # call is not otherwise inside a `( ... )` group.
-# Budgeted as ONE phase (PRD-build-cargo-concurrency-budget): the internal
-# $parallelism fan-out is exactly the "each branch/gate assumes it owns the
-# box" pattern the 2026-09-09 OOM came from, so the whole extended-receipts
-# run takes a single cargo-budget slot rather than each of its 17 producers
-# racing every other budgeted cargo caller independently.
+# PRD-build-cargo-budget-per-invocation: runs UNSLOTTED (see
+# run_unslotted_producer above) — the internal $parallelism fan-out no
+# longer takes one cargo-budget slot for the whole phase; each of the 17
+# producers' own real cargo calls takes its own slot for exactly its own
+# duration instead.
 _phase_t0=$(date +%s)
-if ( cargo_budgeted "$RUSTBUILD_SCRIPTS/extended-receipts.sh" "$project_abs" "$parallelism" ) 9>&-; then
+if ( run_unslotted_producer extended-receipts "$RUSTBUILD_SCRIPTS/extended-receipts.sh" "$project_abs" "$parallelism" ) 9>&-; then
   record_phase receipts $(( $(date +%s) - _phase_t0 )) ok
 else
   note_block "extended-receipts — one or more extended producers did not pass|skip (see output above)"
