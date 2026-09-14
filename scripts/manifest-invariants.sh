@@ -329,6 +329,27 @@ for h in json.loads(sys.argv[1]):
 
 alarms_json="$(python3 -c 'import json,sys; print(json.dumps(json.loads(sys.argv[1])["alarms"]))' "$plan_json")"
 
+# PRD-build-prd-slug-uniqueness P1 "standing report": fold corpus-level
+# slug collisions into the same alarms list this audit already surfaces --
+# one standing report for "how healthy is this build loop" instead of a
+# second command a human has to remember to run separately.
+SLUG_COLLISIONS_PY="${SLUG_COLLISIONS_PY:-$HERE/slug-collisions.py}"
+if [ -x "$SLUG_COLLISIONS_PY" ]; then
+  collisions_json="$("$SLUG_COLLISIONS_PY" --prd-dir "$PRD_DIR" 2>/dev/null)"
+  [ -n "$collisions_json" ] || collisions_json="[]"
+else
+  collisions_json="[]"
+fi
+alarms_json="$(python3 -c 'import json,sys
+alarms = json.loads(sys.argv[1])
+for c in json.loads(sys.argv[2]):
+    alarms.append({
+        "slug": c["slug"], "class": "slug-collision",
+        "message": "slug " + c["slug"] + " resolves to " + str(len(c["paths"])) +
+                    " files, not one: " + ", ".join(c["paths"]),
+    })
+print(json.dumps(alarms))' "$alarms_json" "$collisions_json")"
+
 heals_count="$(python3 -c 'import json,sys; print(len(json.loads(sys.argv[1])))' "$final_heals")"
 alarms_count="$(python3 -c 'import json,sys; print(len(json.loads(sys.argv[1])))' "$alarms_json")"
 

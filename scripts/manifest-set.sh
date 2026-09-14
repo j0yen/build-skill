@@ -25,7 +25,9 @@
 #   manifest-set.sh --replay-orphans       # parent end-of-tick recovery
 #
 # Exit: 0 ok | 2 bad args/usage | 3 lock-ceiling-exceeded (intent kept)
-#       | 4 patch/io error
+#       | 4 patch/io error | 5 refused (slug resolves to >1 file in the
+#       corpus -- PRD-build-prd-slug-uniqueness; only patches that touch
+#       `status` are gated, see cmd_set)
 set -uo pipefail
 
 SKILL_DIR="${BUILD_SKILL_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
@@ -33,6 +35,9 @@ STATE_DIR="${BUILD_STATE_DIR:-$SKILL_DIR/state}"
 MANIFEST="${BUILD_MANIFEST:-$STATE_DIR/manifest.json}"
 INTENT_DIR="$STATE_DIR/intent"
 LOCK_DIR="$STATE_DIR/manifest.lock.d"
+PRD_DIR="${PRD_DIR:-$HOME/Documents/PRDs}"
+JOURNAL="${JOURNAL:-$HOME/brain/journal/build/$(date -u +%F).md}"
+SLUG_COLLISIONS_PY="${SLUG_COLLISIONS_PY:-$SKILL_DIR/scripts/slug-collisions.py}"
 
 LOCK_RETRY_INTERVAL="${MANIFEST_LOCK_RETRY:-0.2}"
 LOCK_CEILING_SECS="${MANIFEST_LOCK_CEILING:-60}"
@@ -170,6 +175,47 @@ raise SystemExit(0)
 PY
 }
 
+# PRD-build-prd-slug-uniqueness, P0 "manifest guard": the manifest is
+# keyed on slug, so a status write while the corpus holds >1 file for that
+# slug would silently pick a side in an ambiguity only a human can resolve
+# (the build-post-ship-reality-check incident: the manifest kept the
+# shipped PRD's `archived` status while a distinct queued PRD sharing the
+# slug read it too). Only patches that touch `status` are gated -- other
+# fields (iter_log, blockers, ...) on an already in-progress slug are
+# unaffected. Best-effort: any error in the scanner itself (script or
+# python3 missing) never blocks a write -- this guard protects against a
+# KNOWN collision, it must not become a new single point of failure for
+# every manifest write.
+patch_touches_status() {
+  python3 -c 'import json,sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(1)
+sys.exit(0 if isinstance(d, dict) and "status" in d else 1)' "$1" 2>/dev/null
+}
+
+slug_collision_paths() {
+  local slug="$1"
+  [ -x "$SLUG_COLLISIONS_PY" ] || return 1
+  local out
+  out="$(PRD_DIR="$PRD_DIR" "$SLUG_COLLISIONS_PY" --prd-dir "$PRD_DIR" --slug "$slug" 2>/dev/null)" || return 1
+  [ -n "$out" ] && [ "$out" != "[]" ] || return 1
+  printf '%s' "$out"
+  return 0
+}
+
+journal_collision_refusal() {
+  local slug="$1" collisions_json="$2"
+  local paths
+  paths="$(printf '%s' "$collisions_json" | python3 -c 'import json,sys
+c = json.load(sys.stdin)
+print("|".join(c[0]["paths"]) if c else "")' 2>/dev/null)"
+  mkdir -p "$(dirname "$JOURNAL")" 2>/dev/null || true
+  printf '%s  manifest-set  slug-collision-refuse (slug=%s paths="%s")  (host=%s)\n' \
+    "$(utc_now)" "$slug" "$paths" "$(hostname)" >> "$JOURNAL" 2>/dev/null || true
+}
+
 cmd_set() {
   local slug="$1" patch_path="$2"
   if [ -z "$slug" ] || [ -z "$patch_path" ]; then
@@ -177,6 +223,15 @@ cmd_set() {
   fi
   if [ ! -f "$patch_path" ]; then
     log "manifest-set: patch file not found: $patch_path"; return 2
+  fi
+
+  if patch_touches_status "$patch_path"; then
+    local collisions
+    if collisions="$(slug_collision_paths "$slug")"; then
+      journal_collision_refusal "$slug" "$collisions"
+      log "manifest-set: refused -- slug '$slug' resolves to more than one file in the corpus (see: $SLUG_COLLISIONS_PY --prd-dir '$PRD_DIR' --slug '$slug')"
+      return 5
+    fi
   fi
 
   # 1. Write-ahead intent BEFORE the lock.

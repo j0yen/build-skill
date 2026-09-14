@@ -124,8 +124,36 @@ resolve_prd_path() {
   printf '%s\n' "$candidate"
 }
 
-prd_path="$(resolve_prd_path "$prd_arg")" \
-  || die "not-found: no PRD file resolvable from '$prd_arg' (checked directly, and as a slug under $PRD_DIR/build-queue/)" 3
+# PRD-build-prd-slug-uniqueness AC8: when a bare slug (or a queue path that
+# no longer exists, e.g. after an archive) doesn't resolve under
+# build-queue/, look in built-prds/ and parked/ too -- not to operate on it
+# there (this script only ever writes to a build-queue/ PRD, by contract),
+# but so the failure names where the PRD actually lives instead of a bare
+# "not found", which used to send a human hunting by hand for a PRD that
+# had simply shipped or been parked since this slug was last looked up.
+locate_prd_elsewhere() {
+  local slug="$1" d
+  for d in built-prds parked; do
+    if [ -f "$PRD_DIR/$d/PRD-$slug.md" ]; then
+      printf '%s\n' "$PRD_DIR/$d/PRD-$slug.md"
+      return 0
+    fi
+  done
+  return 1
+}
+
+prd_path="$(resolve_prd_path "$prd_arg")"
+resolve_rc=$?
+if [ "$resolve_rc" -ne 0 ] || [ -z "$prd_path" ]; then
+  slug_guess="$(basename "$prd_arg")"
+  slug_guess="${slug_guess#PRD-}"
+  slug_guess="${slug_guess%.md}"
+  elsewhere="$(locate_prd_elsewhere "$slug_guess" || true)"
+  if [ -n "$elsewhere" ]; then
+    die "not-found: '$prd_arg' resolves to a PRD that has already moved out of build-queue/ -- it now lives at $elsewhere; this script only ever writes to a build-queue/ PRD, refusing rather than creating a stray file at the old queue path" 3
+  fi
+  die "not-found: no PRD file resolvable from '$prd_arg' (checked directly, and as a slug under $PRD_DIR/build-queue/, built-prds/, and parked/)" 3
+fi
 case "$(basename "$(dirname "$prd_path")")" in
   build-queue) ;;
   *) die "not-found: $prd_path is not under a build-queue/ directory" 3 ;;

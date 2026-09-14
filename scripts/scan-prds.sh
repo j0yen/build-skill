@@ -162,6 +162,50 @@ elif d.get("ok"):
 }
 run_lint_pass || true
 
+# --- PRD-build-prd-slug-uniqueness: corpus collision detection -------------
+# A slug (`PRD-<slug>.md`) should resolve to exactly one file across
+# build-queue/, built-prds/, and parked/. When it doesn't (the
+# build-post-ship-reality-check incident this PRD was drafted from), the
+# manifest's per-slug status becomes ambiguous and a tick can spend cycles
+# on a slug the manifest calls archived. Journal every collision and
+# suppress the build-queue (buildable) entry for it -- the built-prds/
+# ARCHIVE copy is still emitted so Phase 1's archived-vs-vanished diff is
+# unaffected; only the "this is buildable" entry is withheld.
+#
+# Known gap (mirrors the vellum/substrate-field gap noted below): this only
+# runs on the bash-fallback emission path, not the `vellum scan` fast path
+# -- vellum is an external binary this repo doesn't own, so whichever lane
+# doesn't have vellum installed still gets full coverage via the fallback.
+SLUG_COLLISIONS_PY="$SCAN_HERE/slug-collisions.py"
+COLLIDED_SLUGS=""
+run_collision_pass() {
+  [ -x "$SLUG_COLLISIONS_PY" ] || return 0
+  local out
+  out="$("$SLUG_COLLISIONS_PY" --prd-dir "$PRD_DIR" 2>/dev/null)" || return 0
+  [ -n "$out" ] || return 0
+  local cslug cpaths
+  while IFS=$'\t' read -r cslug cpaths; do
+    [ -n "$cslug" ] || continue
+    mkdir -p "$(dirname "$JOURNAL")" 2>/dev/null || true
+    printf '%s  scan-prds  slug-collision (slug=%s paths="%s")  (host=%s)\n' \
+      "$(utc_now)" "$cslug" "$cpaths" "$(hostname)" >> "$JOURNAL" 2>/dev/null || true
+    COLLIDED_SLUGS="$COLLIDED_SLUGS $cslug"
+  done < <(printf '%s' "$out" | python3 -c '
+import json, sys
+for c in json.load(sys.stdin):
+    print(c["slug"] + "\t" + "|".join(c["paths"]))
+' 2>/dev/null)
+  return 0
+}
+run_collision_pass || true
+is_collided() {
+  local slug="$1"
+  case " $COLLIDED_SLUGS " in
+    *" $slug "*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 # Fast path: use vellum if available (same output format, faster + more correct).
 # Known gap (PRD-build-classification-self-heal P2): the `substrate` field
 # added to the bash-fallback emit_one() below isn't backfilled onto vellum's
@@ -472,6 +516,12 @@ except Exception:
       first=true
       printf '['
       while IFS= read -r -d '' f; do
+        case "$f" in
+          "$PRD_DIR/build-queue/"*)
+            _bn="$(basename "$f")"; _sl="${_bn#PRD-}"; _sl="${_sl%.md}"
+            is_collided "$_sl" && continue
+            ;;
+        esac
         $first || printf ','
         first=false
         emit_one "$f"

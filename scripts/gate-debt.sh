@@ -283,7 +283,22 @@ draft_debt_prd() {
   local fname="PRD-${slug}.md"
   local dest="$prd_dir/build-queue/$fname"
 
-  if [ -f "$dest" ] || [ -f "$prd_dir/built-prds/$fname" ]; then
+  # PRD-build-prd-slug-uniqueness, weakest-link 5: every in-repo PRD writer
+  # calls the shared slug check before minting a file, so a drafted PRD can
+  # never silently collide with one already living anywhere in the corpus.
+  # A hit here is virtually always THIS exact draft re-running (the
+  # shortsha suffix makes a foreign collision on this slug vanishingly
+  # unlikely) -- report the existing file and skip re-drafting, same as
+  # the old inline `-f` checks this replaces (which only looked at
+  # build-queue/ and built-prds/, missing parked/).
+  local gd_here; gd_here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  local slug_check="${PRD_SLUG_CHECK:-$gd_here/prd-slug-check.sh}"
+  if [ -x "$slug_check" ]; then
+    if ! PRD_DIR="$prd_dir" "$slug_check" "$slug" >/dev/null 2>&1; then
+      echo "$fname"
+      return 0
+    fi
+  elif [ -f "$dest" ] || [ -f "$prd_dir/built-prds/$fname" ] || [ -f "$prd_dir/parked/$fname" ]; then
     echo "$fname"
     return 0
   fi

@@ -204,6 +204,27 @@ def ac_section_lines(all_lines):
     return out, in_section
 
 
+def slug_corpus_dirs_for(path):
+    """Same as queue_dirs_for but also includes parked/ -- the corpus scope
+    for slug uniqueness (PRD-build-prd-slug-uniqueness: 'for every slug,
+    exactly one file across build-queue/, built-prds/, and parked/')."""
+    d = os.path.dirname(os.path.abspath(path)) or "."
+    base = os.path.basename(d)
+    if base in ("build-queue", "built-prds", "parked"):
+        root = os.path.dirname(d)
+        dirs = [os.path.join(root, x) for x in ("build-queue", "built-prds", "parked")]
+        return [x for x in dirs if os.path.isdir(x)]
+    return [d]
+
+
+def extract_title(path):
+    for line in read_lines(path):
+        s = line.strip()
+        if s.startswith("# "):
+            return s[2:].strip()
+    return ""
+
+
 def queue_dirs_for(path):
     """Resolve the sibling queue directories used for Depends-on lookups and
     cycle detection. A file under .../build-queue/ or .../built-prds/ pulls
@@ -309,6 +330,46 @@ def lint_file(path):
     fm = parse_frontmatter(path)
     all_lines = read_lines(path)
     prd_root = os.path.dirname(os.path.dirname(os.path.abspath(path))) if os.path.basename(os.path.dirname(os.path.abspath(path))) in ("build-queue", "built-prds") else os.path.dirname(os.path.abspath(path))
+
+    # -- slug uniqueness across the corpus (PRD-build-prd-slug-uniqueness) --
+    # A slug is a primary key -- the manifest, claims, receipts, and
+    # test_prefix pairing all key on it -- so exactly one PRD-<slug>.md may
+    # exist across build-queue/, built-prds/, and parked/ at a time.
+    # archive-commit.sh's own in-flight move (queue copy about to be
+    # removed, built-prds copy just landed, same commit) is tolerated: two
+    # copies with an identical title and an identical `Drafted:` value are
+    # "the same PRD in transit", not a collision. Anything else -- three or
+    # more copies, or two that disagree on title or Drafted -- fails.
+    corpus_dirs = slug_corpus_dirs_for(path)
+    this_abs = os.path.abspath(path)
+    seen_abs = {this_abs}
+    matches = [this_abs]
+    for d in corpus_dirs:
+        cand = os.path.join(d, name)
+        cand_abs = os.path.abspath(cand)
+        if cand_abs not in seen_abs and os.path.isfile(cand):
+            seen_abs.add(cand_abs)
+            matches.append(cand_abs)
+    if len(matches) > 1:
+        titles = [extract_title(p) for p in matches]
+        drafted = [parse_frontmatter(p).get("drafted", "") for p in matches]
+        tolerated = (
+            len(matches) == 2
+            and titles[0] == titles[1]
+            and drafted[0] == drafted[1]
+        )
+        if not tolerated:
+            detail = "; ".join(
+                f"{p} (title={t!r}, Drafted={dr!r})"
+                for p, t, dr in zip(matches, titles, drafted)
+            )
+            fail(
+                "slug-not-unique",
+                f"slug {slug!r} resolves to {len(matches)} files, not one: "
+                f"{detail} -- test_prefix pairing and receipts also key on "
+                f"this slug, so every layer downstream degrades silently "
+                f"until the corpus is deduplicated",
+            )
 
     # -- frontmatter presence -------------------------------------------------
     if "status" not in fm:

@@ -113,6 +113,28 @@ and auto-resolution for a PRD this check parks live in
 subcommands, wired into `scan-prds.sh`'s lint pass) — see that script's own
 header for the full contract.
 
+**Slug uniqueness check, `slug-not-unique` (PRD-build-prd-slug-uniqueness,
+2026-09-13).** A slug (`PRD-<slug>.md`) is a primary key — the manifest,
+claims, receipts, and `test_prefix` pairing all key on it — so exactly one
+file for a given slug may exist across `build-queue/`, `built-prds/`, and
+`parked/` at a time. A duplicate is a lint FAILURE naming both (or all)
+paths, titles, and `Drafted:` dates. `archive-commit.sh`'s own in-flight
+move (the same PRD briefly in two of those directories within one commit)
+is tolerated: exactly two copies with an identical title and an identical
+`Drafted:` value are "the same PRD in transit," not a collision.
+`scripts/scan-prds.sh` runs the same corpus scan (`scripts/slug-
+collisions.py`) and, on a real collision, journals `slug-collision
+(slug=… paths="…")` and withholds the `build-queue/` (buildable) entry —
+the `built-prds/`/`ARCHIVE` copy is still emitted so the archived-vs-
+vanished diff is unaffected. `scripts/manifest-set.sh` refuses (exit 5) a
+patch that changes `status` while a slug still resolves to more than one
+file. `scripts/prd-slug-check.sh <slug>` is the shared pre-write check
+every in-repo PRD writer (e.g. `gate-debt.sh`) calls before minting a new
+`build-queue/PRD-<slug>.md`, exiting 1 with the existing location and a
+proposed free suffix (`-v2`, `-followup`) when the slug is already taken.
+`scripts/manifest-invariants.sh --report` folds any standing collision
+into its alarms list as `class: slug-collision`.
+
 ## Branch message trust (PRD-build-coordinator-message-distrust, 2026-09-08)
 
 A dispatched branch is not isolated — this fleet runs up to 30 concurrent
