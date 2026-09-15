@@ -102,15 +102,38 @@ or wait for confirmation.**):
   removed (uncapped, per user instruction 2026-05-30).** New repos, commits,
   pushes, and follow-on PRDs are unlimited. `used[k]` counters are still
   recorded as telemetry but `caps[k]` are always null and never block an action.
-- **Lock:** `~/.claude/skills/build/state/tick.lock` — `flock`-style
-  guard so two concurrent ticks never race.
+- **Lock:** `~/.claude/skills/build/state/tick.lock` — held by
+  `scripts/tick-run.sh` (PRD-build-tick-lock-held, 2026-09-15) for the
+  whole life of the coordinator process, not just the `flock -n` call that
+  acquires it (see Phase 0 below). `scripts/tick-run.sh --status` reports
+  the current holder's pid/age/cmdline or `free`.
 
 ## Phases (each tick)
 
 ### Phase 0 — Guard
 
-1. Acquire `tick.lock` with `flock -n`. If already held, exit cleanly:
-   another tick is in flight.
+1. **Verify, never acquire (PRD-build-tick-lock-held, 2026-09-15).** The
+   coordinator (this Claude process) never runs `flock -n tick.lock`
+   itself — a lock taken inside one Bash tool call is released the
+   instant that call returns, which is exactly how two coordinators ran
+   concurrently on RedBaron for hours on 2026-09-15. `tick.lock`'s
+   lifetime is tied to a PROCESS instead: `scripts/tick-run.sh` is the
+   only thing that ever acquires it, opening it on a fixed fd and
+   `exec`ing the coordinator (`claude -p /build...`) with that fd still
+   open, so the flock lives exactly as long as the coordinator does.
+   Every entry path — the timer, `claude-build-headless.sh`, a manual
+   batch — goes through `tick-run.sh`; see "Manual invocation" below.
+   Phase 0 step 1 is therefore a VERIFICATION, run once at tick start:
+   `scripts/tick-run.sh --check-held`. Exit 0 (prints `held-by-ancestor`)
+   means `tick.lock` is genuinely held — by construction, only this
+   coordinator's own `tick-run.sh` launcher can hold it, so a successful
+   check proves it's held by an ancestor of this process even without
+   walking `$PPID` by hand. Exit 1 (prints `not-held`) means this
+   coordinator was started WITHOUT going through `tick-run.sh` (e.g. a
+   bare `claude -p /build` run by hand) — journal
+   `phase0 tick-lock-not-held` and exit without selecting a PRD. Never
+   fall back to acquiring the lock yourself in this case; fix the launch
+   path instead.
 2. (Removed 2026-05-25 per user request.) The skill no longer defers
    on active interactive Claude sessions. Ticks coexist with live
    terminals; `tick.lock` plus one-action-per-tick are the guardrails.
@@ -2771,12 +2794,27 @@ vellum amend PRD-<slug>.md --append-iter-log "v0.1 — all ACs green"
 
 ## Manual invocation
 
-- `/build` → run one tick (same as the timer).
+- `/build` → run one tick (same as the timer), inside an already-running
+  interactive Claude session.
 - `/build status` → dump manifest as a human-readable table; exit.
 - `/build run <slug>` → advance that specific PRD this tick regardless
   of the priority rules.
 - `/build pause` → write `state/paused` sentinel; subsequent timer
   fires exit immediately. `/build resume` clears it.
+
+**Headless/out-of-session manual batch (PRD-build-tick-lock-held,
+requirement 6, 2026-09-15): `BUILD_TICK_ARGS="run <slug...>"
+~/.local/bin/claude-build-headless.sh` is the ONLY manual path for
+starting a tick from outside a live session.** It is the same launcher the
+timer uses — overlap-safe by construction (checks the
+`claude-build-work.service` transient unit state, then routes through
+`claude-build-tick.sh` → `scripts/tick-run.sh`, which holds `tick.lock`
+for the coordinator's whole life). Do **not** hand-run `claude -p /build`
+or `systemd-run ... claude -p /build` directly — that bypasses
+`tick.lock` entirely and is exactly how the 2026-09-15 concurrent-tick
+incident happened. `BUILD_TICK_ARGS` is the one knob: set it to whatever
+argument string `/build` should receive (`run <slug>`, `status`, etc.);
+everything else about the manual path is identical to the timer's.
 
 ## Disable
 
