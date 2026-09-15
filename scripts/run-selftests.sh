@@ -88,6 +88,25 @@ resolve_test() {
   return 1
 }
 
+# resolve_test_prefix <name> -> zero or more matching test files on stdout.
+# A PRD's own `test_prefix` (e.g. `pullmiss`) names a FAMILY of
+# tests/<prefix>_ac*.sh files, not one file — resolve_test above only ever
+# resolves a single exact name, so a bare `run-selftests.sh pullmiss` with
+# no exact tests/pullmiss(.sh) file would otherwise fail to resolve even
+# though nine tests/pullmiss_ac*.sh exist. Only consulted when resolve_test
+# itself found nothing (existing exact-name/path behavior is unchanged).
+# Sorted glob expansion; a literal non-matching pattern is dropped by the
+# `-f` check below, so no nullglob is needed.
+resolve_test_prefix() {
+  local name="$1" g found=1
+  for g in "$REPO_ROOT"/tests/"$name"_ac*.sh; do
+    [ -f "$g" ] || continue
+    printf '%s\n' "$g"
+    found=0
+  done
+  return $found
+}
+
 [ "$#" -ge 1 ] || usage
 
 all_mode=false
@@ -104,8 +123,16 @@ if [ "$1" = "--all" ]; then
   done
 else
   for n in "$@"; do
-    resolved="$(resolve_test "$n")" || { echo "run-selftests: cannot resolve test: $n" >&2; exit 2; }
-    to_run+=("$resolved")
+    if resolved="$(resolve_test "$n")"; then
+      to_run+=("$resolved")
+      continue
+    fi
+    if prefix_matches="$(resolve_test_prefix "$n")"; then
+      while IFS= read -r m; do to_run+=("$m"); done <<<"$prefix_matches"
+      continue
+    fi
+    echo "run-selftests: cannot resolve test: $n" >&2
+    exit 2
   done
 fi
 
