@@ -228,6 +228,33 @@ the mis-park prose) it used to run by hand.
 
 ### Phase 2 — Select
 
+**One script decides (2026-09-15, PRD-build-select-tick-deterministic).**
+Selection used to be this whole section's prose, executed by hand,
+candidate by candidate — which let a tick dispatch before it finished
+selecting (2026-09-15 07:11Z: 2 dispatched, then 7 more evaluated and
+dropped because a second wave is forbidden). Run
+`scripts/select-tick.sh --prd-dir ~/Documents/PRDs --lane $(hostname)
+--format json` exactly once per tick. It composes `scan-prds.sh` (post-
+reconcile, post-lint), the hard pre-filter, Depends-on resolution,
+own-claim continuations first, the priority sort, and `select-guard.sh`
+(cap + same-target + lane-predicate, branch-count/admitted-targets
+threaded internally) into one call, and emits `{"admitted":[...],
+"skipped":[...],"counts":{...}}`.
+The coordinator must dispatch every entry of admitted[] in one message — do not re-derive the pool, do not call any of the
+composed guards a second time, and do not stop selecting partway through;
+`select-tick.sh` already finished selecting before you saw its output. A
+coordinator that dispatches fewer than `counts.admitted` PRDs must journal
+`select-tick  under-dispatched  (admitted=<n> dispatched=<m>
+cause=<text>)` — the line exists so the deviation is countable, not so it
+is allowed. `select-tick.sh --explain <slug>` answers "why wasn't my PRD
+picked" without reading the coordinator's own narration.
+
+#### How select-tick decides
+
+The rest of this section documents the checks `select-tick.sh` composes,
+kept as reference for anyone reading or extending the script — none of it
+is prose a coordinator executes by hand anymore.
+
 **Depends-on gate (2026-09-02).** A queued PRD whose frontmatter `Depends-on:`
 names a PRD that is not yet in `built-prds/` is not selectable this tick.
 Log one line per skipped PRD (`waiting on PRD-<slug>`), do not mark it
@@ -1823,16 +1850,23 @@ end-of-pool.
 
 ### Dispatch
 
-Issue the selected PRDs as **parallel Agent tool calls in a single
-tool-use message**, one Agent call per PRD. Use
+Issue every entry of `select-tick.sh`'s `admitted[]` as **parallel Agent
+tool calls in a single tool-use message**, one Agent call per PRD. Use
 `subagent_type=general-purpose` unless the PRD frontmatter declares
-otherwise.
+otherwise. A coordinator that issues fewer calls than `counts.admitted`
+must journal `select-tick  under-dispatched  (admitted=<n> dispatched=<m>
+cause=<text>)` in the same tick — see Phase 2's lead section.
 
-**Model override (added 2026-05-28).** Dispatch each branch with
-`model: "sonnet"`. Branch work is well-specified PRD execution behind a
-gate (cargo test / the autobuilder 7-receipt gate catches errors), which
-is Sonnet's sweet spot — running branches on Opus burns tokens without a
-quality gain the gate can't already enforce. The parent tick orchestrator
+**Model override (added 2026-05-28).** Each `admitted[]` entry already
+carries the `model` `select-tick.sh` computed for it (requirement 5) —
+pass it straight to the Agent call's `model` field rather than
+re-deriving it; today it mechanizes two of the three legs below
+(`kernel-extend`, prior-stall) and defaults every other entry to
+`"sonnet"`. Dispatch each branch with `model: "sonnet"`. Branch work is
+well-specified PRD execution behind a gate (cargo test / the autobuilder
+7-receipt gate catches errors), which is Sonnet's sweet spot — running
+branches on Opus burns tokens without a quality gain the gate can't
+already enforce. The parent tick orchestrator
 (this skill, selecting/dispatching/journaling) runs on Sonnet (`model: sonnet`
 in the skill frontmatter). **Escalate a branch to `model: "opus"`** when any of:
 - the PRD declares `build_priority: high` AND its shape is architectural /

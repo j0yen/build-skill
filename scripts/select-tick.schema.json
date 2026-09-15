@@ -1,0 +1,68 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "select-tick.schema.json",
+  "title": "select-tick.sh --format json output",
+  "description": "PRD-build-select-tick-deterministic requirement 1/6. One call's whole pool-to-admitted transformation: the admitted set (dispatched verbatim by the coordinator) and every non-admission with a machine-readable reason.",
+  "type": "object",
+  "required": ["admitted", "skipped", "counts"],
+  "additionalProperties": false,
+  "properties": {
+    "admitted": {
+      "type": "array",
+      "items": { "$ref": "#/definitions/admitted_entry" }
+    },
+    "skipped": {
+      "type": "array",
+      "items": { "$ref": "#/definitions/skipped_entry" }
+    },
+    "counts": { "$ref": "#/definitions/counts" }
+  },
+  "definitions": {
+    "admitted_entry": {
+      "type": "object",
+      "required": ["slug", "path", "build_target", "build_priority", "build_into", "continuation", "shared_target", "model"],
+      "additionalProperties": false,
+      "properties": {
+        "slug": { "type": "string" },
+        "path": { "type": "string" },
+        "build_target": { "type": ["string", "null"] },
+        "build_priority": { "type": ["string", "null"] },
+        "build_into": { "type": ["string", "null"] },
+        "continuation": { "type": "boolean" },
+        "shared_target": { "type": "boolean" },
+        "model": { "type": "string", "enum": ["sonnet", "opus"] }
+      }
+    },
+    "skipped_entry": {
+      "type": "object",
+      "required": ["slug", "reason", "detail"],
+      "additionalProperties": false,
+      "properties": {
+        "slug": { "type": "string" },
+        "reason": {
+          "type": "string",
+          "enum": [
+            "archived", "vanished", "needs_classification", "parked",
+            "verified-within-24h", "waiting-on", "cap", "same-target",
+            "busy", "cargo-bound", "blocked", "error"
+          ]
+        },
+        "detail": { "type": "string" }
+      }
+    },
+    "counts": {
+      "type": "object",
+      "required": ["pool", "admitted", "skipped", "cap", "distinct_targets", "burst_session", "sub_cap"],
+      "additionalProperties": false,
+      "properties": {
+        "pool": { "type": "integer", "minimum": 0 },
+        "admitted": { "type": "integer", "minimum": 0 },
+        "skipped": { "type": "integer", "minimum": 0 },
+        "cap": { "type": "integer", "minimum": 1 },
+        "distinct_targets": { "type": "integer", "enum": [0, 1] },
+        "burst_session": { "type": "integer", "enum": [0, 1] },
+        "sub_cap": { "type": "integer", "minimum": 1 }
+      }
+    }
+  }
+}
