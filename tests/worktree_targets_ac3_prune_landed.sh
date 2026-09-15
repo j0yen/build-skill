@@ -64,4 +64,52 @@ expect "s2 target dir untouched"     "[ -d '$tdir2' ]"
 expect "s2 unmerged file still present" "[ -f '$wt2/unmerged.txt' ]"
 expect "prune-landed output names s1" "[[ '$out' == *'s1'* ]]"
 
+# s3: rebased onto main with no new commits of its own (tip == origin/main
+# exactly) — the "trivially landed" case that silently deleted a live
+# mid-gate worktree on 2026-09-15 (mcphost-gate-debt-6d51e76). Holding its
+# PRD lock must keep it alive through prune-landed; once the lock is
+# released and the worktree is stale (past the 6h freshness window), it
+# really is safe to prune.
+export BUILD_STATE_DIR="$T/state"
+export WORKTREE_EXTEND_JOURNAL="$T/journal.md"
+mkdir -p "$BUILD_STATE_DIR"
+
+wt3="$(BUILD_TARGET_ROOT="$TARGETS" "$WTE" add "$REPO" gate-debt-s3)"
+tip3="$(git -C "$REPO" rev-parse refs/heads/autobuilder/gate-debt-s3)"
+main3="$(git -C "$REPO" rev-parse refs/remotes/origin/main)"
+expect "s3 tip equals origin/main (fixture setup)" "[ '$tip3' = '$main3' ]"
+
+lockfile3="$BUILD_STATE_DIR/prd-gate-debt-s3.lock"
+(
+  exec 220>"$lockfile3"
+  flock -n 220 || exit 1
+  sleep 10
+) &
+holder_pid=$!
+# wait for the background holder to actually acquire the lock (it wins the
+# race against our own probe below once flock -n starts failing)
+for _ in $(seq 1 50); do
+  if flock -n "$lockfile3" -c true >/dev/null 2>&1; then
+    sleep 0.05
+  else
+    break
+  fi
+done
+
+"$WTE" prune-landed "$REPO" >/dev/null 2>&1
+expect "s3 worktree survives while PRD lock held" "[ -d '$wt3' ]"
+journal_lock_ok=0
+if [ -f "$WORKTREE_EXTEND_JOURNAL" ] && grep -qF "$wt3" "$WORKTREE_EXTEND_JOURNAL" && grep -q "cause=lock-held" "$WORKTREE_EXTEND_JOURNAL"; then
+  journal_lock_ok=1
+fi
+expect "journal records lock-held skip for s3" "[ $journal_lock_ok -eq 1 ]"
+
+kill "$holder_pid" 2>/dev/null; wait "$holder_pid" 2>/dev/null
+
+# Release the lock, backdate the worktree past the 6h freshness window,
+# leave the tree clean — prune-landed should now remove it.
+touch -d "@$(( $(date +%s) - 25200 ))" "$wt3"
+"$WTE" prune-landed "$REPO" >/dev/null 2>&1
+expect "s3 worktree pruned once lock released and stale" "[ ! -d '$wt3' ]"
+
 exit $fail

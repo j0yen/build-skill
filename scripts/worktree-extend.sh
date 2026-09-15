@@ -804,6 +804,22 @@ cmd_cleanup() {
 # ancestor of origin/main, run cleanup (worktree + target dir; branch is left
 # alone — it's already merged, dropping it is a separate/optional step).
 # Unmerged sibling worktrees are untouched.
+#
+# "Landed" alone is not enough — with several branches gating the SAME repo
+# concurrently (extend-gate.sh calls this at the top of every gate, before
+# any producer runs), a sibling's tip can be a TRIVIAL ancestor of
+# origin/main (freshly rebased, no new commits yet) while that worktree is
+# actively mid-gate. Pruning it out from under its own gate deleted the
+# worktree (and its agent/proof-lanes.toml) while producers were reading it
+# — 2026-09-15 09:22Z, mcphost-gate-debt-6d51e76. So a worktree only counts
+# as landed-and-free-to-remove when it is ALSO not in use, where in-use is
+# any of: its PRD lock is currently held, its tree is dirty, or its tip
+# equals origin/main exactly and the worktree was touched within the last 6
+# hours (a branch that has just been rebased onto main and hasn't started
+# its own commits yet looks identical to a long-landed, forgotten one —
+# only recency tells them apart). Skips are journaled the same way a gated
+# land/integrate already is, so a false-prune shows up in the build journal
+# instead of surfacing only as a mystery "not a git repository" downstream.
 cmd_prune_landed() {
   local repo="${1:-}"; need "$repo" "usage: prune-landed <repo>"
   [ -d "$repo/.git" ] || git -C "$repo" rev-parse --git-dir >/dev/null 2>&1 || die 2 "not a git repo: $repo"
@@ -812,6 +828,8 @@ cmd_prune_landed() {
     echo "worktree-extend: prune-landed: no origin/main in $repo, nothing to compare against" >&2
     return 0
   fi
+  local state_dir="${BUILD_STATE_DIR:-$HOME/.claude/skills/build/state}"
+  local origin_main; origin_main="$(git -C "$repo" rev-parse refs/remotes/origin/main)"
   local prefix="$WT_ROOT/$(basename "$repo")-"
   local wt="" branch="" line
   while IFS= read -r line; do
@@ -823,8 +841,36 @@ cmd_prune_landed() {
           local tip; tip="$(git -C "$repo" rev-parse --verify -q "refs/heads/$branch" 2>/dev/null)"
           if [ -n "$tip" ] && git -C "$repo" merge-base --is-ancestor "$tip" refs/remotes/origin/main 2>/dev/null; then
             local slug="${branch#autobuilder/}"
-            echo "worktree-extend: prune-landed: $branch landed on origin/main, cleaning $slug" >&2
-            cmd_cleanup "$repo" "$slug" >&2
+            local cause="" lockfile
+            lockfile="$state_dir/prd-$slug.lock"
+            mkdir -p "$state_dir" 2>/dev/null
+            if ! flock -n "$lockfile" -c true >/dev/null 2>&1; then
+              cause="lock-held"
+            elif [ -n "$(git -C "$wt" status --porcelain 2>/dev/null)" ]; then
+              cause="dirty"
+            elif [ "$tip" = "$origin_main" ]; then
+              local wt_mtime now
+              wt_mtime="$(stat -c %Y "$wt" 2>/dev/null || echo 0)"
+              now="$(date +%s)"
+              if [ "$wt_mtime" -gt 0 ] && [ $(( now - wt_mtime )) -lt 21600 ]; then
+                cause="fresh-rebase"
+              fi
+            fi
+            if [ -n "$cause" ]; then
+              echo "worktree-extend: prune-landed: skip $branch ($slug) — in use ($cause)" >&2
+              local journal="${WORKTREE_EXTEND_JOURNAL:-$HOME/brain/journal/build/$(date -u +%Y-%m-%d).md}"
+              if [ -r "$(dirname "$0")/isolation-guard.sh" ]; then
+                # shellcheck source=isolation-guard.sh
+                source "$(dirname "$0")/isolation-guard.sh"
+                isolation_guard_path "$journal" "worktree-extend.sh"
+              fi
+              mkdir -p "$(dirname "$journal")"
+              printf '%s  prune-landed  skip  %s  (cause=%s)\n' \
+                "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$wt" "$cause" >>"$journal"
+            else
+              echo "worktree-extend: prune-landed: $branch landed on origin/main, cleaning $slug" >&2
+              cmd_cleanup "$repo" "$slug" >&2
+            fi
           fi
         fi
         wt=""; branch=""
