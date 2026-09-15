@@ -5003,6 +5003,34 @@ assert 'skew_s' in d, d
 expect "provefx AC15: the journal failed line carries the same diagnosis fields" \
   "grep -qE 'burst-lane  prove  failed  \\(cause=no-fresh-artifact .*files=0.*remote_date=2026-09-14T05:00:00Z' \"$BURST_LANE_JOURNAL\""
 
+# ---- provefx AC16 (requirement 11 regression): real proof.json from
+# 2026-09-15T05:08:20Z (RedBaron, after prove-forensics req 11/12, commit
+# 778dd2a) — files=5816, marker_mtime=05:02:53Z, newest_mtime=05:04:15Z
+# (82s AFTER the marker), remote_date=05:02:50Z, skew_s=-330 — yet the
+# verdict was cause=no-fresh-artifact even though a genuinely fresher
+# artifact existed. skew_s is diagnostic only (prove_assert_diag_json) and
+# must never be applied to the routed decision, which compares box-clock
+# file mtimes directly against the box-clock marker mtime (both preserved
+# by rsync -a, immune to any caller/box clock disagreement). Reuses AC13's
+# marker-epoch/artifact-epoch backdating fixture, at the exact 82s gap, plus
+# a FAKE_SSH_REMOTE_DATE chosen so this run's own skew_s reads -330, the
+# same sign+magnitude as the real incident.
+fresh_env
+export BURST_LANE_AUTOBUILDER_BIN="$REEN_PROVE_AB_SRC/autobuilder"
+WT_PFX16="$T/provefx-ac16"; mkdir -p "$WT_PFX16"
+pfx16_marker_epoch=1789456973   # 2026-09-15T05:02:53Z
+pfx16_artifact_epoch=$((pfx16_marker_epoch + 82))   # 2026-09-15T05:04:15Z
+pfx16_remote_date="2026-09-15T05:02:50Z"
+pfx16_out="$(PATH="$REEN_PROVE_CARGO:$PATH" FAKE_SSH_HOSTNAME=wm-burst-lane-fake-box \
+  BURST_PROVE_TEST_MARKER_EPOCH="$pfx16_marker_epoch" \
+  FAKE_CARGO_ARTIFACT_EPOCH="$pfx16_artifact_epoch" \
+  FAKE_SSH_REMOTE_DATE="$pfx16_remote_date" \
+  "$BL" prove --worktree "$WT_PFX16" 2>&1)"; pfx16_rc=$?
+expect "provefx AC16: artifacts 82s newer than the marker with skew_s=-330 assert routed=true" \
+  "[ $pfx16_rc -eq 0 ]"
+expect "provefx AC16: proof.json routed=true, not no-fresh-artifact" \
+  "python3 -c \"import json; d=json.load(open('$BURST_LANE_STATE_DIR/proof.json')); assert d['routed'] is True, d\""
+
 expect_block_green "provefx" "provefx: every provefx case above ran green"
 
 # ---- proveguard block (PRD-build-burst-prove-inflight-guard) ---------------
@@ -5095,6 +5123,27 @@ fresh_env
 WT_PG5="$T/proveguard-ac5"; mkdir -p "$WT_PG5"
 BURST_PROVE_TEST_ABORT=run-unbound "$BL" prove --worktree "$WT_PG5" >/dev/null 2>&1
 expect "proveguard AC5: prove.inflight does not outlive an aborted fixture prove" "[ ! -f \"$BURST_LANE_STATE_DIR/prove.inflight\" ]"
+
+# ---- proveguard AC6: prove's own FINISHING down is never blocked by its --
+# own inflight marker. Real run 2026-09-15T05:08:20Z: cmd_prove's own
+# finishing `down` (the normal, non-aborted tail — never reaches
+# prove_exit_trap's unconditional marker rm, which only fires on an early/
+# abort exit) journaled "down decision=keep (cause=prove-inflight
+# pid=4191204 age_s=633)" where pid 4191204 was prove itself, still alive
+# while its own down call ran in a subshell — the box was left running and
+# billing. Reuses AC13/AC14's own fixture cargo + FAKE_SSH_HOSTNAME so this
+# prove genuinely completes (any outcome — routed here) end to end, through
+# the real success tail, not the abort trap AC5 already covers.
+fresh_env
+export BURST_LANE_AUTOBUILDER_BIN="$REEN_PROVE_AB_SRC/autobuilder"
+WT_PG6="$T/proveguard-ac6"; mkdir -p "$WT_PG6"
+pg6_out="$(PATH="$REEN_PROVE_CARGO:$PATH" FAKE_SSH_HOSTNAME=wm-burst-lane-fake-box "$BL" prove --worktree "$WT_PG6" 2>&1)"; pg6_rc=$?
+expect "proveguard AC6: the fixture prove itself completes (routed)" "[ $pg6_rc -eq 0 ]"
+pg6_sid="$(python3 -c "import json; print(json.load(open('$BURST_LANE_STATE_DIR/proof.json')).get('server_id',''))" 2>/dev/null)"
+expect "proveguard AC6: proof.json names the server_id prove created" "[ -n \"$pg6_sid\" ]"
+expect "proveguard AC6: prove.inflight is gone" "[ ! -f \"$BURST_LANE_STATE_DIR/prove.inflight\" ]"
+expect "proveguard AC6: the journal has prove's own down decision, never decision=keep cause=prove-inflight" \
+  "grep -qE \"burst-lane  down  decision=(deleted|scheduled)\" \"$BURST_LANE_JOURNAL\" && ! grep -q \"burst-lane  down  decision=keep  (server_id=$pg6_sid cause=prove-inflight\" \"$BURST_LANE_JOURNAL\""
 
 expect_block_green "proveguard" "proveguard: every proveguard case above ran green"
 

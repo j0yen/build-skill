@@ -2608,7 +2608,23 @@ cmd_prove() {
           remote_marker="$local_target/.burst-run-marker"
           remote_date=""
           [ -f "$(prove_remote_date_path)" ] && remote_date="$(cat "$(prove_remote_date_path)" 2>/dev/null)"
-          if [ ! -f "$remote_marker" ] || ! find "$local_target" -type f ! -name '.burst-run-marker' -newer "$remote_marker" 2>/dev/null | grep -q .; then
+          # PRD-build-burst-prove-forensics requirement 11 regression (real
+          # run 2026-09-15T05:08:20Z, RedBaron, commit 778dd2a): a genuinely
+          # fresher artifact (newest_mtime 82s after marker_mtime) still
+          # verdicted no-fresh-artifact. `-L` here matches
+          # prove_assert_diag_json's own os.path.getmtime, which STATS
+          # THROUGH a symlink to its target's mtime — cargo's target dir can
+          # (re)point a symlinked binary/alias at an unchanged cache object
+          # on every invocation without this `find` (previously plain
+          # `-type f`, which excludes symlinks outright) ever seeing it as a
+          # candidate file at all, silently narrowing "at least one file
+          # newer than the marker" to "at least one non-symlink file newer
+          # than the marker" — a real file can exist and be fresh while the
+          # only path find walks to it is the symlink. skew_s is never
+          # consulted here or anywhere below — it is diagnostic-only
+          # (prove_assert_diag_json), and both sides of this comparison are
+          # plain on-disk mtimes rsync -a preserved from the box's own clock.
+          if [ ! -f "$remote_marker" ] || ! find -L "$local_target" -type f ! -name '.burst-run-marker' -newer "$remote_marker" 2>/dev/null | grep -q .; then
             cause="no-fresh-artifact"
             # Requirement 12: capture the diagnosis right here, before
             # anything below has a chance to change local_target/marker
@@ -2652,6 +2668,15 @@ cmd_prove() {
   # box up just because the proof itself failed a check. Requirement 5:
   # snapshot server_id/boot_epoch for the cost line BEFORE down clears them.
   prove_snapshot_cost
+  # PRD-build-burst-prove-inflight-guard AC6: this is prove's OWN finishing
+  # down call — remove the marker first so prove_inflight_guard (checked by
+  # cmd_down at the top, before any delete decision) doesn't see prove's own
+  # still-alive pid and keep the box under itself (2026-09-15T05:08:20Z: box
+  # left running with journal line "decision=keep cause=prove-inflight
+  # pid=4191204" where pid 4191204 was prove itself, not another prove/down/
+  # watchdog). The trap below (prove_exit_trap) also removes it unconditionally
+  # on every exit path, so this is a no-op if reached twice.
+  rm -f "$PROVE_INFLIGHT_FILE" 2>/dev/null || true
   ( cmd_down >/dev/null 2>&1 ) || true
   if [ "$routed" = true ]; then
     prove_journal_cost done
