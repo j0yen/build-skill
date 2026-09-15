@@ -163,6 +163,18 @@ fixture_lines_today_stat() {
   printf '%s\n' "${n:-0}"
 }
 
+# main_push_refused_today_stat <journal-file> -> count of
+# `main-push  refused` lines in today's journal (PRD-build-main-push-gate
+# requirement 8 / P2) -- same "today's cumulative count" convention as
+# fixture_lines_today_stat above, not a since-last-tick delta (this journal
+# has no per-tick cursor to derive one from, same limitation the PROBES:
+# line already lives with).
+main_push_refused_today_stat() {
+  local journal="$1" n
+  n="$(grep -c '  main-push  refused  ' "$journal" 2>/dev/null || true)"
+  printf '%s\n' "${n:-0}"
+}
+
 cmd_tick_summary() {
   local lane="$1" claimed="$2" skipped="$3"
   local journal="${4:-$HOME/brain/journal/build/$(date -u +%F).md}"
@@ -200,6 +212,12 @@ cmd_tick_summary() {
   local fixture_lines_today; fixture_lines_today="$(fixture_lines_today_stat)"
   printf '%s  lane-health  JOURNAL: fixture_lines_today=%s\n' \
     "$(now_iso)" "$fixture_lines_today" >> "$journal"
+  # PRD-build-main-push-gate requirement 8 (P2): the tick summary counts
+  # `main-push refused` lines so a red-main scare shows up on the same
+  # health line ops already reads, instead of only in the raw journal.
+  local main_push_refused_today; main_push_refused_today="$(main_push_refused_today_stat "$journal")"
+  printf '%s  lane-health  MAIN-PUSH: refused_today=%s\n' \
+    "$(now_iso)" "$main_push_refused_today" >> "$journal"
   echo "appended: $journal"
 }
 

@@ -671,6 +671,21 @@ print(json.dumps({
     "amendment_removed": amendment_removed,
     "extended_gates_synced": extended_gates_synced,
 }))
+
+# PRD-build-main-push-gate requirement 5: name every path this run actually
+# wrote or removed, repo-root-relative, so main-push-gate.sh's delta
+# mapping doesn't have to depend on `git diff --name-only` alone for a
+# refresh that touches generated files a worktree-relative git diff might
+# not see the same way the repo's own git does. One line, space-separated,
+# always printed (even when the only change is the card itself) --
+# main-push-gate.sh's --changed flag consumes this verbatim.
+changed_paths = [os.path.relpath(plan["card_path"], repo_dir),
+                 os.path.relpath(plan["carried_sidecar_path"], repo_dir)]
+if amendment_removed:
+    changed_paths.append(os.path.relpath(amendment_path, repo_dir))
+if extended_gates_synced:
+    changed_paths.append(os.path.relpath(gates_path, repo_dir))
+print("changed: " + " ".join(changed_paths))
 PY
 stage2_rc=$?
 rm -f "$plan_path"

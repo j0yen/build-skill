@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# scripts/repo-hooks/pre-push — the local half of main-push-gate.sh
+# (PRD-build-main-push-gate requirement 4). Installed via
+# `core.hooksPath = ~/.claude/skills/build/scripts/repo-hooks` (one shared
+# directory for every build_into repo — see install-repo-hooks.sh — so a
+# fix here reaches every installed repo without a per-repo copy step).
+#
+# git invokes a pre-push hook with cwd = the repo's worktree root and feeds
+# it lines of `<local ref> <local sha1> <remote ref> <remote sha1>` on
+# stdin, one per ref being pushed. For any line updating refs/heads/main,
+# this runs the same check the loop's own push step runs
+# (main-push-gate.sh --gated <remote sha1> --head <local sha1>) so a human
+# `git push` from a build_into repo gets refused the same way, before
+# GitHub ever sees the head — "As Joe, when I git push by hand ... the
+# pre-push hook runs the same check and tells me which test would go red
+# before GitHub does" (User stories).
+#
+# MAIN_PUSH_GATE_BYPASS=1 skips the check entirely (never silently — a
+# `bypassed` journal line is always written, per requirement 4).
+#
+# Exit: 0 lets the push proceed (every checked ref was ok, or bypassed);
+#       nonzero refuses the WHOLE push (git's pre-push contract has no
+#       per-ref exit — refusing one ref refuses the batch).
+set -uo pipefail
+
+repo_root="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
+hook_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+skill_dir="$(cd "$hook_dir/.." && pwd)"
+main_push_gate="$skill_dir/main-push-gate.sh"
+
+# shellcheck source=../lib/journal.sh
+source "$skill_dir/lib/journal.sh"
+
+zero_sha="0000000000000000000000000000000000000000"
+refused=0
+
+while read -r local_ref local_sha remote_ref remote_sha; do
+  [ "$remote_ref" = "refs/heads/main" ] || continue
+  [ "$local_sha" != "$zero_sha" ] || continue   # a branch delete, nothing to gate
+
+  if [ "${MAIN_PUSH_GATE_BYPASS:-0}" = "1" ]; then
+    journal_line "$(date -u +%Y-%m-%dT%H:%M:%SZ)  $(basename "$repo_root")  main-push  bypassed  (repo=$(basename "$repo_root") local=${local_sha:0:7} remote=${remote_sha:0:7} via=pre-push-hook)"
+    continue
+  fi
+
+  gated_arg="$remote_sha"
+  [ "$remote_sha" = "$zero_sha" ] && gated_arg=""   # first push of main: nothing to diff against
+
+  if [ -n "$gated_arg" ]; then
+    "$main_push_gate" "$repo_root" --gated "$gated_arg" --head "$local_sha"
+  else
+    "$main_push_gate" "$repo_root" --head "$local_sha"
+  fi
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    echo "pre-push: main-push-gate refused $local_ref -> $remote_ref (rc=$rc) — see $(journal_root)/$(date -u +%F).md" >&2
+    refused=1
+  fi
+done
+
+exit "$refused"
