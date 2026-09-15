@@ -159,10 +159,16 @@
 #           that can only be proven on real hardware — see build-
 #           contract.md's Acceptance-criteria section and PRD-build-burst-
 #           dispatch-reenable's own AC10/AC11 for the worked example).
-#           Tried LAST, only after (a)-(e) all miss — a real-box AC still
-#           prefers an actual test file if one somehow exists. A fixture
-#           test would misrepresent a one-time real-hardware run as
-#           automated coverage, so this rule instead re-checks the SAME
+#           Tried FIRST and EXCLUSIVELY for a tagged AC — before (a)-(e),
+#           before ANY collision detection. A real-box AC is by definition
+#           never meant to own a tests/ file, so tests/ content (including
+#           an unrelated sibling PRD's same-numbered file) is never a real
+#           pairing OR a real collision candidate for it (bug found live:
+#           checking this rule LAST let a sibling PRD's mid-tick
+#           `tests/lintdr_ac10_*.sh` land make AC10 misreport as
+#           `ac-number-collision` instead of PAIRED). A fixture test would
+#           misrepresent a one-time real-hardware run as automated
+#           coverage anyway, so this rule instead re-checks the SAME
 #           durable, git-ignored receipts `burst-lane.sh enable` itself
 #           trusts as proof a real box did the work: `state/burst-lane/
 #           proof.json` (`routed=true`, `bytes>0`, younger than 7 days —
@@ -669,23 +675,27 @@ print("state/burst-lane/proof.json (routed=true image=%s bytes=%s ts=%s)" % (
 ' "$proof_path" "$boot_image"
 }
 
-# realbox_or_missing <n> — the shared MISSING-fallback used by every dead
-# end in classify_ac below: rule f (real-box, see header) is tried last, only
-# for an AC tagged via ac_is_realbox, so a real test file (rules a-e) or an
-# explicit prefix mismatch always wins first when one exists.
-realbox_or_missing() {
-  local n="$1" evidence
-  if [ -n "${ac_is_realbox[$n]:-}" ] && evidence="$(check_real_box_evidence "$repo")"; then
-    printf 'PAIRED|real-box|%s|\n' "$evidence"
-    return
-  fi
-  printf 'MISSING|||\n'
-}
-
 classify_ac() {
   local n="$1" padded="" repo_tests="$repo/tests" f p numform matches ext other
   [ "$n" -lt 10 ] && padded="0$n"
-  if [ ! -d "$repo_tests" ]; then realbox_or_missing "$n"; return; fi
+  # f. real-box — checked FIRST, exclusively, for an AC tagged via
+  # ac_is_realbox: this AC is provable ONLY on real hardware (see header),
+  # so tests/ content is never relevant to it either way — a same-numbered
+  # bare/fn-scan file belonging to some unrelated sibling PRD is not a real
+  # collision candidate for it and must never be treated as one. Tried
+  # before rules a-e and before any collision detection (bug found live:
+  # a sibling PRD landing tests/lintdr_ac10_*.sh mid-tick made AC10 read
+  # `ac-number-collision` instead of PAIRED, because the declared-prefix
+  # branch's find_collision ran before this rule did).
+  if [ -n "${ac_is_realbox[$n]:-}" ]; then
+    if evidence="$(check_real_box_evidence "$repo")"; then
+      printf 'PAIRED|real-box|%s|\n' "$evidence"
+    else
+      printf 'MISSING|||\n'
+    fi
+    return
+  fi
+  if [ ! -d "$repo_tests" ]; then printf 'MISSING|||\n'; return; fi
 
   shopt -s nullglob
   # a. prefix rule — tried first; see header "Derivation" step 3a.
@@ -731,7 +741,7 @@ classify_ac() {
       printf 'COLLISION|declared-prefix-no-match|%s|%s\n' "$f" "$other"
       return
     fi
-    realbox_or_missing "$n"
+    printf 'MISSING|||\n'
     return
   fi
   # b. bare ac<N> — SKIPPED when this PRD has a working (guessed) prefix
@@ -797,7 +807,7 @@ classify_ac() {
     printf 'PAIRED|fn-scan|%s|\n' "${fnscan_path[$n]}"
     return
   fi
-  realbox_or_missing "$n"
+  printf 'MISSING|||\n'
 }
 
 # One-time whole-tree scan for rule (e), building n -> "relpath::fnname".

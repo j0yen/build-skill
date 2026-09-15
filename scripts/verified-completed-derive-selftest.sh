@@ -369,6 +369,55 @@ out="$("$VC" "$T/prds/PRD-realbox-fixture.md" --derive --format table 2>/dev/nul
 ck "AC11 no proof.json at all -> AC2 MISSING (never crashes)" \
   'printf "%s\n" "$out" | awk -F"\t" "\$1==2{print \$4}" | grep -qx MISSING'
 
+# ---- AC12 (PRD-build-burst-dispatch-reenable, follow-up): a real-box AC
+# must win over an unrelated sibling PRD's same-numbered bare file, never
+# report ac-number-collision — the exact live defect found when a sibling
+# PRD's mid-tick tests/lintdr_ac10_*.sh landed while this PRD's own AC10
+# was checked LAST, after find_collision. Reproduce with a declared-prefix
+# PRD (so classify_ac takes the declared-prefix-no-match/find_collision
+# branch) whose real-box AC number bare-matches a DIFFERENT sibling PRD's
+# own declared-prefix file. -------------------------------------------------
+cat > "$T/prds/PRD-realbox-declared-fixture.md" <<EOF
+# PRD: real-box + declared prefix fixture
+Status: Draft v0.1
+build_target: shell
+build_into: $T/realbox-repo
+test_prefix: rbdecl
+
+## Acceptance
+
+1. a normal declared-prefix AC (no file -> MISSING, not this test's concern).
+2. a real-box-only AC that happens to share its number with a sibling's bare file. (Real-box; deferrable only with a justification naming why no box was reachable.)
+EOF
+cat > "$T/prds/PRD-other-sibling.md" <<EOF
+# PRD: unrelated sibling declaring its own AC2 under a different prefix
+Status: Draft v0.1
+build_target: shell
+build_into: $T/realbox-repo
+test_prefix: othersib
+
+## Acceptance
+
+1. a.
+2. an unrelated requirement, also numbered 2.
+EOF
+: > "$T/realbox-repo/tests/othersib_ac2_unrelated.sh"
+python3 - "$T/state/manifest.json" "$T/realbox-repo" <<'PY'
+import json, sys
+manifest_path, repo_path = sys.argv[1], sys.argv[2]
+d = json.load(open(manifest_path))
+d["prds"].append({"slug": "realbox-declared-fixture", "output_repo_path": repo_path})
+d["prds"].append({"slug": "other-sibling", "output_repo_path": repo_path})
+json.dump(d, open(manifest_path, "w"))
+PY
+echo '{"routed":true,"bytes":123,"image_id":"img-current","ts":"'"$now_ts"'"}' \
+  > "$T/realbox-repo/state/burst-lane/proof.json"
+out="$("$VC" "$T/prds/PRD-realbox-declared-fixture.md" --derive --format table 2>/dev/null)"
+ck "AC12 real-box AC beats an unrelated sibling's same-numbered bare file (PAIRED, not collision)" \
+  'printf "%s\n" "$out" | awk -F"\t" "\$1==2{print \$2\"|\"\$4}" | grep -qx "real-box|PAIRED"'
+ck "AC12 AC1 (plain declared-prefix, no file, not real-box) still MISSING (rule unaffected for non-tagged ACs)" \
+  'printf "%s\n" "$out" | awk -F"\t" "\$1==1{print \$4}" | grep -qx MISSING'
+
 echo "----"
 echo "verified-completed-derive-selftest: pass=$PASS fail=$FAIL"
 [ "$FAIL" -eq 0 ]
