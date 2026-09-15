@@ -5944,19 +5944,37 @@ expect "reenable AC14b: the pending registration was consumed (file removed)" \
   "[ ! -f \"$REALITY_CHECK_PENDING_DIR/reenable-ac14-ac9.json\" ]"
 expect "reenable AC14b: a reality receipt was written for it" \
   "ls \"$BUILD_RECEIPTS_DIR\"/*-reenable-ac14-ac9-reality-boxrun.txt >/dev/null 2>&1"
-# PRD-build-burst-dispatch-reenable AC14b root cause: reality-check.sh's
-# box-tier verdict line goes through the shared scripts/lib/journal.sh
-# journal_line() (no --file), whose journal_root() honors BUILD_JOURNAL_ROOT
-# outright once it's set — and run-selftests.sh's isolation.sh always sets
-# it — ahead of BUILD_JOURNAL_DIR (only a legacy alias, consulted when
-# BUILD_JOURNAL_ROOT is unset). This fixture's own $BUILD_JOURNAL_DIR
-# override above is therefore never where the verdict actually lands once
-# isolated; read from wherever journal_line() really wrote (BUILD_JOURNAL_ROOT
-# when isolation set it, else the fixture's own BUILD_JOURNAL_DIR for a bare,
-# non-isolated invocation of this file).
-reen_14b_journal_dir="${BUILD_JOURNAL_ROOT:-$BUILD_JOURNAL_DIR}"
+# PRD-build-burst-dispatch-reenable AC14b root cause (part 1, fixed
+# 98cbbb7): reality-check.sh's box-tier verdict line goes through the
+# shared scripts/lib/journal.sh journal_line() (no --file), whose
+# journal_root() honors BUILD_JOURNAL_ROOT outright once it's set — and
+# run-selftests.sh's isolation.sh always sets it — ahead of any legacy
+# alias. That part is right under the isolated entrypoint. Root cause
+# (part 2, found re-deriving this AC via tests/reenable_ac14_*.sh, which
+# — like every other tests/<prefix>_ac<N>_*.sh wrapper in this repo —
+# runs this suite BARE, i.e. NOT through run-selftests.sh's isolation.sh,
+# so BUILD_JOURNAL_ROOT is unset here): journal.sh's legacy-var detection
+# checks FILE vars before DIR vars (BURST_LANE_JOURNAL, GATE_WEDGE_JOURNAL,
+# SELECT_GUARD_JOURNAL, CARGO_BUDGET_JOURNAL, then JOURNAL_DIR,
+# BUILD_JOURNAL_DIR, TICK_JOURNAL_DIR), and fresh_env (above, every case)
+# unconditionally exports BURST_LANE_JOURNAL for burst-lane.sh's own
+# operational log — so under a bare invocation BURST_LANE_JOURNAL wins
+# ahead of this fixture's own BUILD_JOURNAL_DIR override, and
+# reality-check.sh's verdict line lands in burst-lane.sh's journal file,
+# not a BUILD_JOURNAL_DIR/BUILD_JOURNAL_ROOT-dated file at all. Rather
+# than re-guess journal.sh's precedence a second time (that's exactly how
+# part 1 of this bug shipped), source the real implementation and ask it.
+reen_14b_journal_target="$(
+  source "$HERE/lib/journal.sh"
+  legacy="$(_journal_legacy_active_name)"
+  if [ -n "$legacy" ]; then
+    _journal_legacy_target "$legacy"
+  else
+    printf '%s\n' "$(journal_root)/$(date -u +%F).md"
+  fi
+)"
 expect "reenable AC14b: reality-check's own journal records the verdict (tier=box)" \
-  "grep -q 'reality  reenable-ac14  ok  (lane=.*tier=box ac=9' \"$reen_14b_journal_dir/$(date -u +%F).md\""
+  "grep -q 'reality  reenable-ac14  ok  (lane=.*tier=box ac=9' \"$reen_14b_journal_target\""
 expect "reenable AC14b: burst-lane's own up journals pending-reality-run (rc=0) too" \
   "grep -q 'burst-lane  up  pending-reality-run  (rc=0)' \"$BURST_LANE_JOURNAL\""
 
