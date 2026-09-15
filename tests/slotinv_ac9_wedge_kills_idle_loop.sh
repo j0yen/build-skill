@@ -73,7 +73,7 @@ expect() {
 
 expect "AC9: extend-gate.sh does not hang forever (finished within the 60s timeout)" "[ $gate_rc -ne 124 ]"
 expect "AC9: the wedge note is printed naming wall= and cpu=" \
-  "grep -Eq 'proof-receipt . autobuilder loop wedged \(wall=[0-9]+s cpu=[0-9]+s?\)' '$T/gate.out'"
+  "grep -Eq 'proof-receipt . autobuilder loop wedged \(wall=[0-9]+s cpu=-?[0-9]+ io=-?[0-9]+ remote=(unsampled|-?[0-9]+) waits=[0-9]+\)' '$T/gate.out'"
 expect "AC9: gate-wedge wrote at least one wedge receipt for autobuilder-loop" \
   "ls '$T/gate-wedge-state'/*-autobuilder-loop-wedge-receipt.json >/dev/null 2>&1"
 expect "AC9: no leaked fake-loop sleep process remains" "! pgrep -f 'fixtures/gatephase-fake/autobuilder loop' >/dev/null 2>&1"

@@ -954,15 +954,22 @@ if ( cd "$repo" && run_unslotted_producer autobuilder-loop \
 else
   _loop_rc=$?
   if [ "$_loop_rc" -eq 98 ]; then
-    # gate-wedge.sh's own wedged-after-retry exit — name the wall/cpu it
-    # recorded (requirement 7) rather than the generic "exited non-zero".
+    # gate-wedge.sh's own wedged-after-retry exit — name the wall/cpu/io/
+    # remote/waits it recorded (requirement 7, "the watchdog follows the
+    # work") rather than the generic "exited non-zero", so an operator can
+    # tell a genuine local hang from a routed-to-the-box run apart at a
+    # glance. Falls back to "?"/"unsampled" on an older-format receipt
+    # missing the newer fields.
     _wedge_receipt="$(ls -t "$GATE_WEDGE_STATE_DIR"/*-autobuilder-loop-wedge-receipt.json 2>/dev/null | head -1)"
-    _wedge_wall="?"; _wedge_cpu="?"
+    _wedge_wall="?"; _wedge_cpu="?"; _wedge_io="?"; _wedge_remote="unsampled"; _wedge_waits="?"
     if [ -n "$_wedge_receipt" ]; then
       _wedge_wall="$(jq -r '.elapsed_s // "?"' "$_wedge_receipt" 2>/dev/null)"
-      _wedge_cpu="$(jq -r '[.cpu_delta_table[]? | ((.cpu_ticks_t1 // .cpu_ticks_t0) - .cpu_ticks_t0)] | add // 0' "$_wedge_receipt" 2>/dev/null)"
+      _wedge_cpu="$(jq -r '.progress.local_cpu_delta // ([.cpu_delta_table[]? | ((.cpu_ticks_t1 // .cpu_ticks_t0) - .cpu_ticks_t0)] | add) // 0' "$_wedge_receipt" 2>/dev/null)"
+      _wedge_io="$(jq -r '.progress.descendants_io_delta // 0' "$_wedge_receipt" 2>/dev/null)"
+      _wedge_remote="$(jq -r 'if .progress.remote.sampled == true then (.progress.remote.cpu_delta // 0 | tostring) else "unsampled" end' "$_wedge_receipt" 2>/dev/null)"
+      _wedge_waits="$(jq -r '.progress.lock_waits | length // 0' "$_wedge_receipt" 2>/dev/null)"
     fi
-    note_block "proof-receipt — autobuilder loop wedged (wall=${_wedge_wall}s cpu=${_wedge_cpu})"
+    note_block "proof-receipt — autobuilder loop wedged (wall=${_wedge_wall}s cpu=${_wedge_cpu} io=${_wedge_io} remote=${_wedge_remote} waits=${_wedge_waits})"
   else
     note_block "proof-receipt — autobuilder loop --iteration 0 exited non-zero"
   fi
