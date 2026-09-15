@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# fake systemd-run for tests/gatelaunch_ac*.sh (PRD-build-gate-launch-survives-tick).
+# Models the real, observed-on-RedBaron 2026-09-15 behavior of `--collect`:
+# a unit's properties become unreadable (LoadState=not-found) very soon
+# after it exits — gate-status.sh's whole "receipts freshness" fallback
+# exists because of exactly this. FAKE_SYSTEMD_COLLECT_DELAY (seconds,
+# default 0) controls how long the unit stays in a "finished-loaded"
+# state (LoadState=loaded, a real ExecMainStatus) before "collection"
+# (LoadState=not-found) — 0 mimics what was actually observed here.
+#
+# Understands: --user --unit <name> --collect -p WorkingDirectory=<dir>
+#              --setenv=K=V [--setenv=K=V ...] bash -c '<script>'
+set -uo pipefail
+
+[ -n "${FAKE_SYSTEMD_LOG:-}" ] && printf '%s\n' "$*" >> "$FAKE_SYSTEMD_LOG"
+: "${FAKE_SYSTEMD_STATE_DIR:?FAKE_SYSTEMD_STATE_DIR not set}"
+
+unit="" workdir=""
+envkvs=()
+cmd=()
+args=("$@")
+i=0
+n=${#args[@]}
+while [ $i -lt "$n" ]; do
+  a="${args[$i]}"
+  case "$a" in
+    --user|--collect) ;;
+    --unit) i=$((i + 1)); unit="${args[$i]}" ;;
+    -p)
+      i=$((i + 1))
+      case "${args[$i]}" in
+        WorkingDirectory=*) workdir="${args[$i]#WorkingDirectory=}" ;;
+      esac
+      ;;
+    --setenv=*) envkvs+=("${a#--setenv=}") ;;
+    bash)
+      cmd=("${args[@]:$i}")
+      i=$n
+      ;;
+  esac
+  i=$((i + 1))
+done
+
+[ -n "$unit" ] || { echo "fake systemd-run: no --unit given" >&2; exit 1; }
+[ ${#cmd[@]} -gt 0 ] || { echo "fake systemd-run: no command given" >&2; exit 1; }
+
+state_dir="$FAKE_SYSTEMD_STATE_DIR/$unit"
+mkdir -p "$state_dir"
+delay="${FAKE_SYSTEMD_COLLECT_DELAY:-0}"
+
+run_child() {
+  [ -n "$workdir" ] && cd "$workdir"
+  local kv
+  for kv in "${envkvs[@]}"; do export "${kv?}"; done
+  exec "${cmd[@]}"
+}
+
+# The fork AND the wait must happen in the SAME subshell: `wait <pid>`
+# only works on the invoking shell's own direct children, and a sibling
+# subshell waiting on another sibling's background pid gets a bogus 127
+# ("not a child of this shell") — bit us once already writing this fixture.
+(
+  ( run_child ) >"$state_dir/stdout.log" 2>"$state_dir/stderr.log" &
+  child_pid=$!
+  echo "$child_pid" > "$state_dir/pid"
+  echo "active" > "$state_dir/state"
+  wait "$child_pid" 2>/dev/null
+  rc=$?
+  echo "$rc" > "$state_dir/rc"
+  echo "finished-loaded" > "$state_dir/state"
+  if [ "$delay" -gt 0 ] 2>/dev/null; then
+    sleep "$delay"
+  fi
+  echo "collected" > "$state_dir/state"
+) &
+disown -a 2>/dev/null || true
+
+echo "Running as unit: $unit (fake)"
+exit 0

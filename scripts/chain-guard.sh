@@ -54,11 +54,21 @@
 # Exit 1 + "stop: <slug>: <reason>"       chaining stops; <reason> is one of:
 #   excluded-kernel-extend | excluded-reflect-candidate | archive-done |
 #   blockers | needs-user | cap | lock-contended | target-busy: <detail> |
-#   no-manifest-entry
+#   no-manifest-entry | gate-running | gate-relaunched | gate-lost-twice
 #   `archive-done` is only returned when status is `shipped` AND the
 #   filesystem agrees (built-prds/ present, build-queue/ absent) —
 #   requirement 3, re-verified against --prd-dir on every call, never
 #   taken on the manifest's word alone.
+#   `gate-running`/`gate-relaunched`/`gate-lost-twice`
+#   (PRD-build-gate-launch-survives-tick) fire when the manifest's
+#   last_error/iter_log narrates a gate as running: gate-status.sh (never
+#   the narration itself) is consulted for the real state. A `lost` gate
+#   (the tick-teardown defect this PRD fixes — systemd-run's unit is gone
+#   with no receipt to show for it) is relaunched via gate-launch.sh ONCE
+#   (`gate-relaunched`); a SECOND consecutive `lost` for the same marker
+#   is `gate-lost-twice` and the sidecar records
+#   `status=blocked last_error=gate-lost-twice` instead of relaunching
+#   forever.
 # Exit 4                                   usage / IO error.
 set -uo pipefail
 
@@ -67,6 +77,12 @@ SKILL_DIR="${BUILD_SKILL_DIR:-$(cd "$HERE/.." && pwd)}"
 STATE_DIR="${BUILD_STATE_DIR:-$SKILL_DIR/state}"
 MANIFEST="${BUILD_MANIFEST:-$STATE_DIR/manifest.json}"
 SELECT_GUARD="$HERE/select-guard.sh"
+GATE_STATUS="${CHAIN_GUARD_GATE_STATUS:-$HERE/gate-status.sh}"
+GATE_LAUNCH="${CHAIN_GUARD_GATE_LAUNCH:-$HERE/gate-launch.sh}"
+SIDECAR="${CHAIN_GUARD_SIDECAR:-$HERE/manifest-sidecar.sh}"
+INFLIGHT_DIR="$STATE_DIR/gate-inflight"
+JQ="${JQ:-jq}"
+CHAIN_GUARD_JOURNAL="${CHAIN_GUARD_JOURNAL:-$HOME/brain/journal/build/$(date -u +%Y-%m-%d).md}"
 
 die() { echo "chain-guard: $*" >&2; exit "${2:-4}"; }
 usage() { echo "usage: chain-guard.sh check <slug> [options]" >&2; exit 4; }
@@ -97,10 +113,88 @@ if not isinstance(entry, dict):
 if field == "blockers":
     b = entry.get("blockers") or []
     print(len(b) if isinstance(b, list) else 0)
+elif field == "iter_log_last":
+    il = entry.get("iter_log") or []
+    last = il[-1] if il else None
+    if isinstance(last, dict):
+        print(last.get("text") or last.get("note") or "")
+    elif isinstance(last, str):
+        print(last)
+    else:
+        print("")
 else:
     v = entry.get(field)
     print("" if v is None else v)
 PY
+}
+
+# Requirement 3 (PRD-build-gate-launch-survives-tick): a PRD whose
+# last_error/iter_log narrates a gate as "running" is NEVER taken on
+# that narration's word — the exact 2026-09-15 16:07Z/16:12Z incident
+# this closes is two ticks in a row printing "Gate is running in the
+# background" for a gate the tick's own cgroup had already killed, with
+# nothing to detect it. gate-status.sh (marker + systemd, never prose)
+# is the only thing consulted below.
+gate_narration_pending() {
+  local slug="$1"
+  local le il
+  le="$(manifest_field "$slug" last_error)"
+  il="$(manifest_field "$slug" iter_log_last)"
+  printf '%s\n%s\n' "$le" "$il" | grep -qiE 'gate[-_ ]?(is[-_ ]?)?runn|running.*gate|gate.*background'
+}
+
+# Consults gate-status.sh for <slug> when narration claims a gate is
+# in flight. Prints its own "stop: ..." line and returns 1 when chaining
+# must stop here; returns 0 silently (nothing printed) when there is no
+# gate signal to act on and the caller's normal precondition checks
+# should proceed.
+check_gate_inflight() {
+  local slug="$1"
+  [ -x "$GATE_STATUS" ] || return 0
+  gate_narration_pending "$slug" || return 0
+
+  local st; st="$("$GATE_STATUS" "$slug")"
+  case "$st" in
+    running)
+      echo "stop: $slug: gate-running"
+      return 1
+      ;;
+    lost)
+      local marker_file="$INFLIGHT_DIR/$slug.json"
+      local unit head scope repo started relaunch_count
+      unit="$("$JQ" -r '.unit // empty' "$marker_file" 2>/dev/null)"
+      head="$("$JQ" -r '.head // empty' "$marker_file" 2>/dev/null)"
+      scope="$("$JQ" -r '.scope // empty' "$marker_file" 2>/dev/null)"
+      repo="$("$JQ" -r '.repo // empty' "$marker_file" 2>/dev/null)"
+      started="$("$JQ" -r '.started_ts // empty' "$marker_file" 2>/dev/null)"
+      relaunch_count="$("$JQ" -r '.relaunch_count // 0' "$marker_file" 2>/dev/null)"
+      if [ "${relaunch_count:-0}" -ge 1 ]; then
+        [ -x "$SIDECAR" ] && "$SIDECAR" write "$slug" "status=blocked" "last_error=gate-lost-twice" >/dev/null 2>&1 || true
+        printf '%s  %s  gate  lost-twice  (unit=%s started=%s)\n' \
+          "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$slug" "$unit" "$started" >> "$CHAIN_GUARD_JOURNAL"
+        echo "stop: $slug: gate-lost-twice"
+        return 1
+      fi
+      printf '%s  %s  gate  lost  (unit=%s started=%s relaunching)\n' \
+        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$slug" "$unit" "$started" >> "$CHAIN_GUARD_JOURNAL"
+      if [ -x "$GATE_LAUNCH" ] && [ -n "$repo" ] && [ -n "$head" ] && [ -n "$scope" ]; then
+        "$GATE_LAUNCH" "$repo" --head "$head" --scope "$scope" --slug "$slug" >/dev/null 2>&1 || true
+        # Stamp relaunch_count=1 onto the fresh marker so a SECOND
+        # consecutive loss blocks instead of relaunching forever.
+        if [ -f "$marker_file" ]; then
+          local tmp; tmp="$(mktemp "$INFLIGHT_DIR/.${slug}.relaunch.XXXXXX" 2>/dev/null)" || true
+          if [ -n "${tmp:-}" ]; then
+            "$JQ" '. + {relaunch_count: 1}' "$marker_file" > "$tmp" 2>/dev/null && mv -f "$tmp" "$marker_file" || rm -f "$tmp"
+          fi
+        fi
+      fi
+      echo "stop: $slug: gate-relaunched"
+      return 1
+      ;;
+    *)
+      return 0
+      ;;
+  esac
 }
 
 cmd_check() {
@@ -143,6 +237,11 @@ cmd_check() {
     echo "stop: $slug: no-manifest-entry"
     return 1
   fi
+
+  if ! check_gate_inflight "$slug"; then
+    return 1
+  fi
+
   if [ "$status" = "shipped" ]; then
     # PRD-build-archive-verify-before-shipped requirement 3: manifest
     # status alone is not proof of archival — re-check the filesystem

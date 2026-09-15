@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+# fake systemctl for tests/gatelaunch_ac*.sh (PRD-build-gate-launch-survives-tick),
+# paired with the fake systemd-run in this same directory. Never touches a
+# real unit. Reproduces the real gotcha this PRD's gate-status.sh guards
+# against: a collected (LoadState=not-found) unit's ExecMainStatus still
+# prints "0" (a lying default) rather than erroring — verified against
+# real systemd 259 on RedBaron 2026-09-15, which is exactly why
+# gate-status.sh checks LoadState BEFORE trusting ExecMainStatus.
+set -uo pipefail
+
+[ -n "${FAKE_SYSTEMD_LOG:-}" ] && printf '%s\n' "$*" >> "$FAKE_SYSTEMD_LOG"
+: "${FAKE_SYSTEMD_STATE_DIR:?FAKE_SYSTEMD_STATE_DIR not set}"
+
+args=()
+for a in "$@"; do
+  [ "$a" = "--user" ] && continue
+  args+=("$a")
+done
+
+state_of() {
+  cat "$FAKE_SYSTEMD_STATE_DIR/$1/state" 2>/dev/null || echo ""
+}
+rc_of() {
+  cat "$FAKE_SYSTEMD_STATE_DIR/$1/rc" 2>/dev/null || echo 0
+}
+
+cmd="${args[0]:-}"
+case "$cmd" in
+  is-active)
+    unit="${args[1]:-}"
+    st="$(state_of "$unit")"
+    case "$st" in
+      active) echo "active"; exit 0 ;;
+      finished-loaded)
+        rc="$(rc_of "$unit")"
+        [ "$rc" = "0" ] && { echo "inactive"; exit 3; }
+        echo "failed"; exit 3
+        ;;
+      *) echo "inactive"; exit 3 ;;
+    esac
+    ;;
+  show)
+    prop="" unit=""
+    i=0
+    n=${#args[@]}
+    while [ $i -lt "$n" ]; do
+      case "${args[$i]}" in
+        -p) i=$((i + 1)); prop="${args[$i]}" ;;
+        --value) ;;
+        *) unit="${args[$i]}" ;;
+      esac
+      i=$((i + 1))
+    done
+    st="$(state_of "$unit")"
+    case "$prop" in
+      LoadState)
+        if [ "$st" = "active" ] || [ "$st" = "finished-loaded" ]; then
+          echo "loaded"
+        else
+          echo "not-found"
+        fi
+        ;;
+      ExecMainStatus)
+        if [ "$st" = "finished-loaded" ]; then
+          rc_of "$unit"
+        else
+          # Matches real systemd: a not-found/never-existed unit still
+          # prints "0" for this property rather than erroring.
+          echo "0"
+        fi
+        ;;
+      MainPID)
+        cat "$FAKE_SYSTEMD_STATE_DIR/$unit/pid" 2>/dev/null || echo 0
+        ;;
+      *) echo "" ;;
+    esac
+    exit 0
+    ;;
+  *) exit 0 ;;
+esac

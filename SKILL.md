@@ -782,10 +782,22 @@ read it before assuming a step is "the last one this tick".
   extend-gate-receipts: the extend path lands, bumps and pushes on the
   default branch without ever regenerating autobuilder's 25 receipts, so
   every ship since the last human-run regeneration is gate-red at the
-  landed commit — this action closes that gap. Run:
+  landed commit — this action closes that gap.
+
+  **Never start a gate as a background job of the coordinator session:
+  the tick's cgroup kills it on exit (2026-09-15 16:07Z/16:12Z) — `ps`
+  showed zero extend-gate/cargo processes afterward and nothing detected
+  it.** Launch it via `scripts/gate-launch.sh`, which runs
+  `extend-gate.sh` under a `systemd-run --user --collect` unit that
+  outlives the tick regardless: either `--wait` in the FOREGROUND of the
+  tool call, or without `--wait`, ending this step with
+  `scripts/gate-status.sh <slug>` (`running` — resume next step/tick;
+  `finished:<rc>` — treat `<rc>` as `extend-gate.sh`'s own verdict below;
+  `lost` — chain-guard.sh already relaunches this once on its own, don't
+  hand-relaunch). Run:
 
   ```
-  scripts/extend-gate.sh <build_into> --head <landed sha>
+  scripts/gate-launch.sh <build_into> --head <landed sha> --scope main --slug <slug> --wait
   ```
 
   `<landed sha>` is the bump commit's sha on `origin/<default>` right after
@@ -805,7 +817,11 @@ read it before assuming a step is "the last one this tick".
   gates in its OWN worktree, off-root target, PRD-build-worktree-targets-
   off-root); the lock now only needs to guard the few-second merge itself.
   Replace `worktree-extend.sh integrate` (and the standalone `gate` step
-  above) with ONE call:
+  above) with ONE call. **Never start this as a background job of the
+  coordinator session: the tick's cgroup kills it on exit (2026-09-15
+  16:07Z/16:12Z) — it wraps a gate plus a locked merge, so a backgrounded
+  loss is worse than the standalone gate case.** Run it in the FOREGROUND
+  of the tool call and let it take however long the gate + retries need:
 
   ```
   scripts/gate-then-land.sh <build_into> <slug> <bump> <tldr-file> [--project-root <rel>] [--ensure-main]
@@ -835,8 +851,10 @@ read it before assuming a step is "the last one this tick".
   before invoking it, nothing about those mechanics changes.
 
   **Post-land main check is now a cache hit, not a re-run.** After `push`,
-  still run the SAME `scripts/extend-gate.sh <build_into> --head <landed
-  sha>` command shown above — but because `worktree-extend.sh integrate`
+  still run the SAME `scripts/gate-launch.sh <build_into> --head <landed
+  sha> --scope main --slug <slug> --wait` command shown above (same
+  foreground-or-gate-status.sh rule as above — never backgrounded) — but
+  because `worktree-extend.sh integrate`
   just transferred the branch's verdict onto main's cache under the
   merge's tree key (PRD-build-gate-before-land requirement 4), and the
   merge's tree equals what the branch already gated (main had not
@@ -882,8 +900,10 @@ read it before assuming a step is "the last one this tick".
   cargo-heavy producers execute on the box while orchestration stays here:
   ```
   export PATH="$HOME/.claude/skills/build/scripts/burst-lane-bin:$PATH" BURST_LANE=1
-  scripts/extend-gate.sh <build_into> --head <landed sha>
+  scripts/gate-launch.sh <build_into> --head <landed sha> --scope main --slug <slug> --wait
   ```
+  (`gate-launch.sh` inherits the exported `PATH`/`BURST_LANE` for its own
+  unit — never background this call either, same rule as above.)
   `should-route` reporting `local` (or any shim fallback) means the same
   command simply runs its cargo locally — today's behavior, unchanged, and
   the ONLY behavior when burst is not configured. `gate-burst.sh run`'s own
@@ -921,9 +941,10 @@ read it before assuming a step is "the last one this tick".
   `Receipts:` line below are all unchanged. Any failure before the remote
   gate starts (routing disabled, burst not configured, parity unknown/diff,
   provisioning, ssh, rsync) prints `fallback: <cause>` and exits 3: treat
-  exactly like `gate-burst.sh run`'s own fallback — run the LOCAL command:
+  exactly like `gate-burst.sh run`'s own fallback — run the LOCAL command
+  (foreground, never backgrounded — same rule as above):
   ```
-  scripts/extend-gate.sh <build_into> --head <landed sha>
+  scripts/gate-launch.sh <build_into> --head <landed sha> --scope main --slug <slug> --wait
   ```
   A failure AFTER the remote gate starts is a normal gate verdict (0 or
   1), carried in the synced-back receipts, not a fallback. Default is
@@ -2582,8 +2603,10 @@ python-specific contract.
    step 3 above (`extend-gate.sh <worktree> --head <worktree HEAD> --scope
    branch --slug <slug>`, no crate-wide lock — see the **gate** action's
    "Shared-target path" earlier). This step is the same command as the
-   non-shared rust-extend path — `scripts/extend-gate.sh <repo> --head
-   <landed sha>` after `push`, before the PRD reads `built` — but now
+   non-shared rust-extend path — `scripts/gate-launch.sh <repo> --head
+   <landed sha> --scope main --slug <slug> --wait` (foreground, never a
+   backgrounded job of the coordinator session — 2026-09-15 16:07Z/16:12Z)
+   after `push`, before the PRD reads `built` — but now
    expected to be a CACHE HIT: `worktree-extend.sh integrate` transferred
    the branch's verdict onto main's cache under the merge's tree key
    (PRD-build-gate-before-land requirement 4), so this run replays it (no

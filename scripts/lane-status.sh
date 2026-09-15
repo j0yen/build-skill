@@ -27,6 +27,9 @@ set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LANE_CLAIM="$HERE/lane-claim.sh"
 CARGO_BUDGET="${CARGO_BUDGET:-$HERE/cargo-budget.sh}"
+SKILL_DIR="${BUILD_SKILL_DIR:-$(cd "$HERE/.." && pwd)}"
+STATE_DIR="${BUILD_STATE_DIR:-$SKILL_DIR/state}"
+GATE_STATUS="${GATE_STATUS:-$HERE/gate-status.sh}"
 
 die() { echo "lane-status: $*" >&2; exit "${2:-4}"; }
 usage() { echo "usage: lane-status.sh {tick-summary|report} ..." >&2; exit 4; }
@@ -84,6 +87,29 @@ journal_stale_stashes() {
   done < <(git -C "$d" stash list --format='%gd' 2>/dev/null)
 }
 
+# PRD-build-gate-launch-survives-tick: `inflight`/`lost` gate counts for
+# the tick summary, read from state/gate-inflight/*.json + gate-status.sh
+# — never from a tick's own narration (that is exactly the 2026-09-15
+# 16:07Z/16:12Z defect: two ticks in a row claimed "gate is running in
+# the background" for a gate systemd had already lost, and nothing
+# printed a number anyone could notice was wrong). Prints "<inflight>
+# <lost>" on stdout; "0 0" when the gate-inflight dir is empty/absent or
+# gate-status.sh is missing (never fatal — this is a health line).
+gate_inflight_stats() {
+  local dir="$STATE_DIR/gate-inflight" inflight=0 lost=0 f slug st
+  [ -x "$GATE_STATUS" ] && [ -d "$dir" ] || { printf '0 0\n'; return; }
+  for f in "$dir"/*.json; do
+    [ -f "$f" ] || continue
+    slug="$(basename "$f" .json)"
+    st="$("$GATE_STATUS" "$slug" 2>/dev/null)"
+    case "$st" in
+      running) inflight=$((inflight + 1)) ;;
+      lost)    lost=$((lost + 1)) ;;
+    esac
+  done
+  printf '%s %s\n' "$inflight" "$lost"
+}
+
 cmd_tick_summary() {
   local lane="$1" claimed="$2" skipped="$3"
   local journal="${4:-$HOME/brain/journal/build/$(date -u +%F).md}"
@@ -98,6 +124,10 @@ cmd_tick_summary() {
     local cb_line; cb_line="$("$CARGO_BUDGET" summary 2>/dev/null || true)"
     [ -n "$cb_line" ] && printf '%s\n' "$cb_line" >> "$journal"
   fi
+  local gate_inflight gate_lost
+  read -r gate_inflight gate_lost < <(gate_inflight_stats)
+  printf '%s  lane-health  gate  inflight=%s lost=%s\n' \
+    "$(now_iso)" "$gate_inflight" "$gate_lost" >> "$journal"
   echo "appended: $journal"
 }
 
@@ -148,6 +178,21 @@ cmd_report() {
     "$CARGO_BUDGET" last 5
   else
     echo "(cargo-budget.sh not found at $CARGO_BUDGET)"
+  fi
+
+  echo
+  echo "== gate: inflight/lost (state/gate-inflight/*.json, PRD-build-gate-launch-survives-tick) =="
+  local gr_inflight gr_lost
+  read -r gr_inflight gr_lost < <(gate_inflight_stats)
+  echo "inflight=$gr_inflight lost=$gr_lost"
+  local gdir="$STATE_DIR/gate-inflight" gf gslug gst
+  if [ -d "$gdir" ]; then
+    for gf in "$gdir"/*.json; do
+      [ -f "$gf" ] || continue
+      gslug="$(basename "$gf" .json)"
+      gst="$([ -x "$GATE_STATUS" ] && "$GATE_STATUS" "$gslug" 2>/dev/null || echo "?")"
+      [ "$gst" = "lost" ] && echo "  lost: $gslug"
+    done
   fi
 }
 
