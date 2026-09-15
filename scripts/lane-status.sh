@@ -39,12 +39,61 @@ read_lane_line() {
     | sed -E 's/^(- *Lane:|Lane:|\*\*Lane:\*\*)[[:space:]]*//'
 }
 
+# PRD-build-classification-durable-heal requirement 5: name any stash left
+# behind in the PRDs checkout (lane-claim.sh's hardened pull autostashes a
+# sibling's transient dirt, but a rebase that dies mid-flight can leave the
+# stash itself un-popped) so it shows up on the standing lane-health line
+# instead of sitting silent -- RedBaron carried two 2026-09-09/10 stashes
+# (14 evidence files, 1 built-PRD edit) that nothing listed until an
+# operator went looking by hand. Prints "<n> <oldest_age_hours>" on
+# stdout; "0 0" for a non-repo or a repo with no stashes (never fatal —
+# this is a health line, not a gate).
+stash_stats() {
+  local d="$1" n=0 oldest_h=0 now_ts ts age_h ref
+  git -C "$d" rev-parse --is-inside-work-tree >/dev/null 2>&1 || { printf '0 0\n'; return; }
+  now_ts="$(date -u +%s)"
+  while IFS= read -r ref; do
+    [ -n "$ref" ] || continue
+    n=$((n + 1))
+    ts="$(git -C "$d" show -s --format=%ct "$ref" 2>/dev/null || true)"
+    [ -n "$ts" ] || continue
+    age_h=$(( (now_ts - ts) / 3600 ))
+    [ "$age_h" -gt "$oldest_h" ] && oldest_h=$age_h
+  done < <(git -C "$d" stash list --format='%gd' 2>/dev/null)
+  printf '%s %s\n' "$n" "$oldest_h"
+}
+
+# Journals one `stash-stale` line per stash older than STASH_STALE_HOURS
+# (default 24), once per tick-summary call -- not per report, so a repeat
+# `report` read never re-alarms the same stash.
+journal_stale_stashes() {
+  local d="$1" journal="$2" stale_hours="${STASH_STALE_HOURS:-24}"
+  local now_ts ref ts age_h files message
+  git -C "$d" rev-parse --is-inside-work-tree >/dev/null 2>&1 || return 0
+  now_ts="$(date -u +%s)"
+  while IFS= read -r ref; do
+    [ -n "$ref" ] || continue
+    ts="$(git -C "$d" show -s --format=%ct "$ref" 2>/dev/null || true)"
+    [ -n "$ts" ] || continue
+    age_h=$(( (now_ts - ts) / 3600 ))
+    [ "$age_h" -ge "$stale_hours" ] || continue
+    files="$(git -C "$d" stash show --include-untracked --stat "$ref" 2>/dev/null | tail -n1 | sed -E 's/^[[:space:]]*//')"
+    message="$(git -C "$d" show -s --format=%s "$ref" 2>/dev/null || true)"
+    printf '%s  lane-health  stash-stale  (age_h=%s files=%s message="%s")\n' \
+      "$(now_iso)" "$age_h" "${files:-?}" "$message" >> "$journal"
+  done < <(git -C "$d" stash list --format='%gd' 2>/dev/null)
+}
+
 cmd_tick_summary() {
   local lane="$1" claimed="$2" skipped="$3"
   local journal="${4:-$HOME/brain/journal/build/$(date -u +%F).md}"
+  local prd_dir="${PRD_DIR:-$HOME/Documents/PRDs}"
   mkdir -p "$(dirname "$journal")" 2>/dev/null || true
-  printf '%s  lane-health  tick  claimed=%s skipped=%s  (lane=%s)\n' \
-    "$(now_iso)" "$claimed" "$skipped" "$lane" >> "$journal"
+  local stash_n stash_oldest_h
+  read -r stash_n stash_oldest_h < <(stash_stats "$prd_dir")
+  printf '%s  lane-health  tick  claimed=%s skipped=%s  (lane=%s)  stashes=%s oldest=%sh\n' \
+    "$(now_iso)" "$claimed" "$skipped" "$lane" "$stash_n" "$stash_oldest_h" >> "$journal"
+  journal_stale_stashes "$prd_dir" "$journal"
   if [ -x "$CARGO_BUDGET" ]; then
     local cb_line; cb_line="$("$CARGO_BUDGET" summary 2>/dev/null || true)"
     [ -n "$cb_line" ] && printf '%s\n' "$cb_line" >> "$journal"
