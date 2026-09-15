@@ -1239,7 +1239,13 @@ read it before assuming a step is "the last one this tick".
      - the AC is in BOTH `deferred_acs:` AND `mock_unjustified_for:`
        with a companion `mock_justifications:` entry (one sentence per
        listed AC; an entry with no companion justification is a parser
-       error per `scan-prds.sh`).
+       error per `scan-prds.sh`), OR the same shape under
+       `deferred_ac_reasons:` (an inline JSON object keyed by AC number,
+       e.g. `{"10": "...", "11": "..."}` — equivalent to
+       `mock_justifications:` for this checklist, and to `prd-lint.sh`'s
+       `deferred-acs-missing-justification` check; either key alone
+       satisfies both, see build-contract.md's key table,
+       PRD-build-prd-lint-deferred-reasons-key).
 
      Any AC with none of the three remains a hard fail: the PRD is NOT
      verified-completed — leave `status: in_progress` and surface the

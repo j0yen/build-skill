@@ -306,6 +306,65 @@ EOF
 expect_fail "$q/PRD-deferred-nojust.md" deferred-acs-missing-justification "deferred-acs-missing-justification/fail"
 expect_clean_no_id "$q/PRD-deferred-list.md" failures deferred-acs-missing-justification "deferred-acs-missing-justification/pass"
 
+# ================================================ deferred_ac_reasons key (PRD-build-prd-lint-deferred-reasons-key)
+# Real defect (2026-09-15): PRD-mcphost-tenant-tables carries this exact
+# shape -- `deferred_ac_reasons:` only, no `mock_justifications:` -- and
+# bounced needs_classification three times before the lint learned this key.
+cat > "$q/PRD-deferred-reasons-complete.md" <<'EOF'
+- Status: queued
+- build_target: shell
+- Vision: visions/plain.md
+- deferred_acs: [10, 11]
+- deferred_ac_reasons: {"10": "needs a live deploy restore drill, not a unit test.", "11": "P2 export held until table usage exists."}
+
+## Acceptance criteria
+
+1. P0 — Given a, When b, Then c.
+EOF
+expect_clean_no_id "$q/PRD-deferred-reasons-complete.md" failures deferred-acs-missing-justification "deferred-acs-missing-justification/pass (deferred_ac_reasons only, real defect: mcphost-tenant-tables)"
+expect_clean_no_id "$q/PRD-deferred-reasons-complete.md" failures deferred-acs-reason-missing "deferred-acs-reason-missing/pass (both ACs covered)"
+expect_clean_no_id "$q/PRD-deferred-reasons-complete.md" failures deferred-acs-reasons-prose "deferred-acs-reasons-prose/pass (valid JSON object)"
+
+cat > "$q/PRD-deferred-reasons-partial.md" <<'EOF'
+- Status: queued
+- build_target: shell
+- Vision: visions/plain.md
+- deferred_acs: [10, 11]
+- deferred_ac_reasons: {"10": "needs a live deploy restore drill, not a unit test."}
+
+## Acceptance criteria
+
+1. P0 — Given a, When b, Then c.
+EOF
+expect_fail "$q/PRD-deferred-reasons-partial.md" deferred-acs-reason-missing "deferred-acs-reason-missing/fail (AC 11 uncovered)"
+
+cat > "$q/PRD-deferred-reasons-prose.md" <<'EOF'
+- Status: queued
+- build_target: shell
+- Vision: visions/plain.md
+- deferred_acs: [10, 11]
+- deferred_ac_reasons: see below
+
+## Acceptance criteria
+
+1. P0 — Given a, When b, Then c.
+EOF
+expect_fail "$q/PRD-deferred-reasons-prose.md" deferred-acs-reasons-prose "deferred-acs-reasons-prose/fail"
+
+cat > "$q/PRD-deferred-both-keys.md" <<'EOF'
+- Status: queued
+- build_target: shell
+- Vision: visions/plain.md
+- deferred_acs: [10, 11]
+- mock_justifications: AC10 needs a live drill; AC11 is held pending usage.
+- deferred_ac_reasons: {"10": "needs a live deploy restore drill, not a unit test.", "11": "P2 export held until table usage exists."}
+
+## Acceptance criteria
+
+1. P0 — Given a, When b, Then c.
+EOF
+expect_clean_no_id "$q/PRD-deferred-both-keys.md" failures deferred-acs-missing-justification "deferred-acs-missing-justification/pass (both keys present)"
+
 # ================================================================ depends-on-missing
 cat > "$q/PRD-dep-missing.md" <<'EOF'
 - Status: queued
@@ -731,6 +790,78 @@ if has_id "$out" failures build-target-unknown; then
   echo "ok: --contract override -> shell now fails against a restricted test contract"
 else
   echo "FAIL: --contract override expected build-target-unknown, got: $out"
+  fails=$((fails+1))
+fi
+
+# ==================================================== key-parity (PRD-build-prd-lint-deferred-reasons-key requirement 6)
+# Every literal frontmatter key scan-prds.sh's own PRD-parsing function
+# declares (its wide `local ...` line, plus every --arg/--argjson name it
+# feeds to jq) must be either a key prd-lint.sh specifically checks the
+# shape of, or named in the allowlist below with a one-line reason -- so a
+# key one script parses and the other has never heard of (the exact
+# `deferred_ac_reasons` defect this PRD fixes) fails THIS selftest instead
+# of silently stranding some future PRD the same way.
+SCAN_PRDS="$HERE/scan-prds.sh"
+
+# Keys prd-lint.sh actually validates the shape of -- kept in sync BY HAND
+# with prd-lint.sh's own fm.get("...")/"..." in fm checks, same
+# duplicate-and-comment convention prd-lint.sh itself uses for
+# RUST_SUBSTRATE_TARGETS mirroring substrate-probe.sh.
+KNOWN_LINT_KEYS="status build_target build_into deferred_acs mock_justifications deferred_ac_reasons depends_on vision loop operator_authorization grounding"
+
+# scan-prds.sh-only fields with no lint shape to check -- one reason each.
+declare -A PARITY_ALLOWLIST=(
+  [slug]="derived from the filename, not a frontmatter key"
+  [path]="filesystem path argument, not frontmatter"
+  [status_line]="raw Status line text; prd-lint checks presence via 'status'"
+  [build_auto]="hardcoded true since 2026-05-27 (every PRD is buildable); frontmatter value is ignored, nothing to validate"
+  [build_priority]="free-form enum (high/normal/low); any value is legal per build-contract.md, no shape to validate"
+  [build_version_bump]="free-form enum (patch/minor/major); any value is legal, no shape to validate"
+  [deferred_acs_unparsed]="a derived flag from parsing deferred_acs, not itself a frontmatter key"
+  [operator_authorization_unparsed]="a derived flag from parsing operator-authorization, not itself a frontmatter key"
+  [publish]="free-form enum (j0yen/private, j0yen/public, none); no shape to validate at lint time"
+  [test_prefix]="free-form scalar or list naming a test-file prefix; no shape to validate at lint time"
+  [size]="file stat metadata, not frontmatter"
+  [mtime]="file stat metadata, not frontmatter"
+  [substrate]="computed diagnostic (substrate-probe.sh's own algorithm), not frontmatter"
+  [gate_stale]="computed diagnostic, not frontmatter"
+)
+
+scan_keys="$(python3 -c '
+import re, sys
+text = open(sys.argv[1]).read()
+names = set()
+# The one wide `local ...` line declaring every field this function reads
+# (anchored on two fields that only appear together there) -- not every
+# `local` in the file, which would also pull in unrelated loop-internal
+# bash variables (in_fence, seen_target, bi_path, ...).
+wide = next(
+    (l for l in text.splitlines()
+     if l.strip().startswith("local ") and "deferred_acs" in l and "build_target" in l),
+    "",
+)
+for tok in wide.split():
+    if tok == "local":
+        continue
+    name = tok.split("=")[0]
+    if re.match(r"^[a-z][a-z0-9_]*$", name):
+        names.add(name)
+for m in re.finditer(r"--arg(?:json)?\s+([A-Za-z_][A-Za-z0-9_]*)", text):
+    names.add(m.group(1))
+print(" ".join(sorted(names)))
+' "$SCAN_PRDS")"
+
+total=$((total+1))
+unaccounted=""
+for k in $scan_keys; do
+  case " $KNOWN_LINT_KEYS " in *" $k "*) continue ;; esac
+  [ -n "${PARITY_ALLOWLIST[$k]+x}" ] && continue
+  unaccounted="$unaccounted $k"
+done
+if [ -z "$unaccounted" ]; then
+  echo "ok: key-parity -> every scan-prds.sh field is known to prd-lint.sh or allowlisted ($scan_keys)"
+else
+  echo "FAIL: key-parity -> scan-prds.sh field(s) unknown to prd-lint.sh and not allowlisted:$unaccounted"
   fails=$((fails+1))
 fi
 
