@@ -33,6 +33,11 @@
         "state": {
           "type": "string",
           "enum": ["live", "long-running", "stale", "unknown"]
+        },
+        "cause": {
+          "description": "PRD-build-stale-claim-auto-recovery P1 'honest listing': set only when state==stale, distinguishing dead-pid (coordinator confirmed gone, any age) from stale-age (the pre-existing age-past-threshold fallback). Empty string otherwise. Additive.",
+          "type": "string",
+          "enum": ["", "dead-pid", "stale-age"]
         }
       },
       "additionalProperties": true

@@ -473,15 +473,19 @@ print(json.dumps(alarms))' "$alarms_json" "$slug" "$claim_json")"
         # (2026-09-11 mcphost-schedules incident: stale-claim alarm fired at
         # 05:43Z, nothing reclaimed it, the PRD sat gate-pending another
         # hour+ until a human intervened) — the alarm line above is kept
-        # unchanged (it's the audit trail); this adds the actual release.
-        # Requirement P1: the probes that justified this reclaim are
-        # carried into the journal line verbatim (a reclaim line without
-        # them is a lint failure — see lane-claim.sh's lint-reclaims).
-        if release_out="$("$LANE_CLAIM" release "$path" 2>&1)"; then
-          printf '%s  %s  claim  reclaimed  (prd=%s age=%ss probes: %s lane=%s)\n' \
-            "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$slug" "$slug" "$age" "$probes" "$(hostname)" >> "$JOURNAL"
-        else
-          log "lane-claim.sh release failed for $slug (stale claim alarmed but not reclaimed): $release_out"
+        # unchanged (it's the audit trail); this adds the actual reclaim.
+        # PRD-build-stale-claim-auto-recovery P1 "invariants pass converges":
+        # this calls lane-claim.sh's atomic `reclaim` (release + Status
+        # reset, together, in the PRD file and the manifest) instead of the
+        # old bare `release` -- a bare release here used to leave `Status:
+        # building` behind, so the PRD stayed unselectable even after the
+        # claim was gone (that PRD's own Problem statement). `reclaim`
+        # journals its own `claim  reclaimed  (... cause=... status_reset=...
+        # probes: ...)` line (Requirement P0 "journal and alarm", keeping
+        # the `probes:` field lint-reclaims requires), so this no longer
+        # constructs that line itself.
+        if ! reclaim_out="$("$LANE_CLAIM" reclaim "$path" 2>&1)"; then
+          log "lane-claim.sh reclaim failed for $slug (stale claim alarmed but not reclaimed): $reclaim_out"
         fi
       fi
       # state == "live" or "unknown": no alarm, no reclaim, no journal

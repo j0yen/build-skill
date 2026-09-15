@@ -22,6 +22,40 @@
 #   lane-claim.sh release <prd-path>
 #       Remove the Lane: line (claim relinquished; Status untouched).
 #       Same exit codes as claim, minus 2.
+#   lane-claim.sh reclaim <prd-path>
+#       Atomic reconcile (PRD-build-stale-claim-auto-recovery). Only acts
+#       on a claim whose claim_state() verdict is "stale" (dead-pid via
+#       coordinator_gone at any age, or the pre-existing age-past-threshold
+#       rule with every probe negative) -- a live/long-running/unknown
+#       claim is refused untouched (exit 1, `not-stale: state=<state>`).
+#       On a reclaimable claim: releases the Lane: line, resets
+#       `Status: building` to `queued` (both in the SAME file write/commit
+#       -- Requirement P0 "atomic reconcile"), UNLESS the PRD's status is
+#       `blocked`, in which case only the claim is released and the status
+#       is left `blocked` (Requirement P0 "blocked stays blocked"). If the
+#       build_into repo holds a commit whose message names this PRD's slug
+#       (`PRD-<slug>` trailer, this codebase's own commit-message
+#       convention) since the claim's own timestamp, that commit's sha(s)
+#       are recorded in an `iter_log:` line before the claim is released
+#       (Requirement P0 "committed-work safety", AC7). On success, also
+#       patches the manifest entry to `status: queued` via manifest-set.sh
+#       (best-effort -- a failure here is journaled, never rolled back
+#       against the already-landed PRD-file commit, since manifest-set.sh's
+#       own write-ahead-intent mechanism recovers it via --replay-orphans).
+#       Every reclaim (or refusal past the not-stale check) is journaled to
+#       $JOURNAL_DIR/<today>.md as
+#       `claim  reclaimed  (prd=<slug> pid=<pid|none> age=<n>s cause=dead-pid|stale-age status_reset=yes|no probes: ...)`
+#       (Requirement P0 "journal and alarm" -- keeps the `probes:` field
+#       lint-reclaims requires). A slug reclaimed more than twice in the
+#       trailing 24h also gets a `claim  reclaim-alarm  (count=<n>
+#       window=24h)` line. A simulated write failure
+#       (LANE_CLAIM_RECLAIM_FAIL_WRITE=1, selftest-only) journals a
+#       `claim  reclaim-failed` line and exits 4 BEFORE any file write or
+#       commit -- claim, file, and manifest all stay exactly as found
+#       (AC5).
+#       Exit 0  reclaimed (or already-free, no-op).
+#       Exit 1  claim is not stale (live/long-running/unknown) -- refused.
+#       Exit 2/3/4  same git-plumbing failures as claim/release.
 #   lane-claim.sh status <prd-path> [--json]
 #       Print the current claim: free, or `<lane> <iso-ts> age=<s>s
 #       stale=<yes|no>` (stale threshold 3h). `stale=yes` now means the
@@ -120,6 +154,13 @@ JSON_SCHEMA_VERSION=1
 # targets while a session is up. Overridable so selftests can point this
 # at a fake script without a real Hetzner session.
 BURST_LANE_SH="${BURST_LANE_SH:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/burst-lane.sh}"
+
+# PRD-build-stale-claim-auto-recovery: path to manifest-set.sh, whose
+# locked/durable RMW `reclaim` uses to patch the manifest entry's `status`
+# to `queued` alongside the PRD-file reset. Overridable (same convention as
+# BURST_LANE_SH above) so a selftest can point BUILD_STATE_DIR/BUILD_MANIFEST
+# at a scratch dir without a real manifest.json.
+MANIFEST_SET_SH="${MANIFEST_SET_SH:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/manifest-set.sh}"
 # PRD-build-burst-selftest-isolation: this script never resolves a
 # state/journal/box path of its own for the burst-lane call above — it
 # only shells out to burst-lane.sh (which owns and guards those paths
@@ -132,7 +173,7 @@ BURST_LANE_SH="${BURST_LANE_SH:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/bu
 die() { echo "lane-claim: $*" >&2; exit "${2:-4}"; }
 
 usage() {
-  echo "usage: lane-claim.sh {claim|release|status|target-busy|claims|lint-reclaims|--json} ..." >&2
+  echo "usage: lane-claim.sh {claim|release|reclaim|status|target-busy|claims|lint-reclaims|--json} ..." >&2
   exit 4
 }
 
@@ -144,6 +185,15 @@ read_lane_line() {
   local f="$1"
   head -n 80 "$f" | grep -E '^(- *Lane:|Lane:|\*\*Lane:\*\*)' | head -n1 \
     | sed -E 's/^(- *Lane:|Lane:|\*\*Lane:\*\*)[[:space:]]*//'
+}
+
+# First token of the current Status: value (any of the three frontmatter
+# forms), e.g. "blocked" or "building" -- used by cmd_reclaim to decide
+# whether a reclaimed claim's status resets to queued or stays blocked
+# (Requirement P0 "blocked stays blocked").
+read_status_line() {
+  head -n 80 "$1" | grep -E '^(- *Status:|Status:|\*\*Status:\*\*)' | head -n1 \
+    | sed -E 's/^(- *Status:|Status:|\*\*Status:\*\*)[[:space:]]*//' | awk '{print $1}'
 }
 
 read_build_into() {
@@ -442,6 +492,94 @@ with open(f, 'w') as fh:
 PYEOF
 }
 
+# Atomic reconcile write for `reclaim` (PRD-build-stale-claim-auto-recovery,
+# Requirement P0 "atomic reconcile"): removes the Lane: line, optionally
+# resets Status to queued (skipped when $2 != "yes" -- the blocked-stays-
+# blocked path), and optionally appends one iter_log line recording
+# committed-work shas ($3, empty = no line). All three edits land in the
+# single file write this function makes, so the caller's one git commit
+# carries the claim release and the status reset together -- never one
+# without the other.
+write_reclaim() {
+  local f="$1" reset_status="$2" iter_text="$3"
+  python3 - "$f" "$reset_status" "$iter_text" <<'PYEOF'
+import re, sys, datetime
+f, reset_status, iter_text = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(f) as fh:
+    lines = fh.readlines()
+head = lines[:80]
+rest = lines[80:]
+
+status_re = re.compile(r'^(?P<pre>-\s*Status:|Status:|\*\*Status:\*\*)\s*(?P<val>.*)$')
+lane_re = re.compile(r'^(?:-\s*Lane:|Lane:|\*\*Lane:\*\*)\s*.*$')
+iter_re = re.compile(r'^(?:-\s*iter_log:|iter_log:|\*\*iter_log:\*\*)\s*.*$')
+
+head = [ln for ln in head if not lane_re.match(ln.rstrip('\n'))]
+
+status_idx = None
+for i, ln in enumerate(head):
+    if status_idx is None and status_re.match(ln.rstrip('\n')):
+        status_idx = i
+
+if reset_status == "yes":
+    if status_idx is not None:
+        m = status_re.match(head[status_idx].rstrip('\n'))
+        head[status_idx] = f"{m.group('pre')} queued\n"
+    else:
+        head.insert(1, "- Status: queued\n")
+        status_idx = 1
+
+if iter_text:
+    iso_ts = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+    last_iter_idx = None
+    for i, ln in enumerate(head):
+        if iter_re.match(ln.rstrip('\n')):
+            last_iter_idx = i
+    insert_at = (last_iter_idx + 1) if last_iter_idx is not None else ((status_idx if status_idx is not None else 0) + 1)
+    head.insert(insert_at, f"- iter_log: {iso_ts} {iter_text}\n")
+
+with open(f, 'w') as fh:
+    fh.writelines(head + rest)
+PYEOF
+}
+
+# Committed-work safety (Requirement P0, AC7): shas of commits in $1 (a
+# build_into repo) whose message names PRD-$2 (this codebase's own
+# commit-message convention -- see e.g. this repo's own log), landed since
+# $3 (the dead claim's own ISO timestamp -- commits from an earlier,
+# unrelated cycle on the same slug must not be re-attributed to this dead
+# step). Fixed-string grep (-F) since a slug is free text, not a regex.
+# Best-effort: any git error yields no shas, never a hard failure --
+# missing/incomplete attribution here should never block the reclaim that
+# recovers the PRD (Non-goal territory otherwise).
+find_dead_work_commits() {
+  local repo="$1" slug="$2" since="$3" since_arg=""
+  [ -d "$repo/.git" ] || return 0
+  [ -n "$since" ] && since_arg="--since=$since"
+  git -C "$repo" log --all $since_arg --grep="PRD-$slug" -F --format='%h' 2>/dev/null | sort -u
+}
+
+# Repeat-offender count (Requirement P0 "journal and alarm"): number of
+# `claim  reclaimed` journal lines for $1 (slug) across every
+# $JOURNAL_DIR/*.md file whose leading ISO-ts falls within the trailing
+# $2 seconds. Mirrors journal_activity_since()'s scan shape.
+count_recent_reclaims() {
+  local slug="$1" window="$2" now_e since_e count=0 f line ts_tok epoch
+  now_e=$(date -u +%s)
+  since_e=$((now_e - window))
+  [ -d "$JOURNAL_DIR" ] || { echo 0; return; }
+  for f in "$JOURNAL_DIR"/*.md; do
+    [ -f "$f" ] || continue
+    while IFS= read -r line; do
+      [[ "$line" == *"  claim  reclaimed  (prd=$slug "* ]] || continue
+      ts_tok=$(awk '{print $1}' <<<"$line")
+      epoch=$(date -u -d "$ts_tok" +%s 2>/dev/null) || continue
+      [ "$epoch" -ge "$since_e" ] && count=$((count + 1))
+    done < "$f"
+  done
+  echo "$count"
+}
+
 push_or_resolve_race() {
   # $1 = repo root, $2 = prd path, $3 = our lane, $4 = "claim"|"release"
   local root="$1" prd="$2" our_lane="$3" mode="$4"
@@ -483,7 +621,7 @@ cmd_status() {
   local prd="$1" json=0
   [ "${2:-}" = "--json" ] && json=1
   [ -f "$prd" ] || die "no such file: $prd" 4
-  local lane_val host ts pid boot age stale
+  local lane_val host ts pid boot age stale cause
   lane_val=$(read_lane_line "$prd")
   if [ -z "$lane_val" ]; then
     if [ "$json" = 1 ]; then
@@ -499,17 +637,31 @@ cmd_status() {
   age="$CS_AGE"
   [ "$CS_STATE" = "stale" ] && stale=yes || stale=no
   if [ "$json" = 1 ]; then
+    # PRD-build-stale-claim-auto-recovery P1 "honest listing": cause
+    # distinguishes WHY a "stale" verdict fired -- dead-pid (coordinator
+    # confirmed gone, any age) vs stale-age (the pre-existing
+    # age-past-threshold-with-every-probe-negative fallback) -- without
+    # touching the existing state enum any other consumer already keys on.
+    # Empty string for live/long-running/unknown (additive field, schema's
+    # additionalProperties is true).
+    cause=""
+    if [ "$CS_STATE" = "stale" ]; then
+      case "$CS_PROBES" in
+        *coordinator=gone*) cause="dead-pid" ;;
+        *) cause="stale-age" ;;
+      esac
+    fi
     # Built entirely by jq (never string interpolation) so a host/ts/prd
     # value containing quotes, newlines, or UTF-8 still round-trips —
     # AC1/AC2. `stale` stays the pre-existing bare-word-bug field name but
-    # is now a real JSON boolean; `schema_version`/`prd`/`host`/`state`
-    # are additive (Migration/compatibility: schema is additive-only).
+    # is now a real JSON boolean; `schema_version`/`prd`/`host`/`state`/
+    # `cause` are additive (Migration/compatibility: schema is additive-only).
     jq -nc --argjson v "$JSON_SCHEMA_VERSION" --arg prd "$prd" --arg lane "$host" \
       --arg host "$host" --arg ts "$ts" --argjson age_s "$age" \
-      --arg state "$CS_STATE" --arg probes "$CS_PROBES" \
+      --arg state "$CS_STATE" --arg probes "$CS_PROBES" --arg cause "$cause" \
       --argjson stale_bool "$([ "$stale" = yes ] && echo true || echo false)" \
       '{schema_version:$v, claimed:true, prd:$prd, lane:$lane, host:$host, ts:$ts,
-        age_seconds:$age_s, age_s:$age_s, state:$state, probes:$probes, stale:$stale_bool}'
+        age_seconds:$age_s, age_s:$age_s, state:$state, cause:$cause, probes:$probes, stale:$stale_bool}'
   else
     echo "$host $ts age=${age}s stale=$stale"
   fi
@@ -582,6 +734,93 @@ cmd_release() {
     commit -q -m "release: $slug" -- "$prd"
   push_or_resolve_race "$root" "$prd" "" "release"
   echo "released: $slug"
+}
+
+cmd_reclaim() {
+  local prd="$1"
+  [ -f "$prd" ] || die "no such file: $prd" 4
+  local root; root=$(git_repo_root "$prd") || die "not a git repo: $prd" 4
+  git_pull_or_die "$root"
+
+  local slug; slug=$(slug_of "$prd")
+  local jdir_ok=0
+  mkdir -p "$JOURNAL_DIR" 2>/dev/null && jdir_ok=1
+  local jfile="$JOURNAL_DIR/$(date -u +%F).md"
+
+  local existing; existing=$(read_lane_line "$prd")
+  if [ -z "$existing" ]; then
+    echo "already-free"
+    exit 0
+  fi
+
+  local host ts pid boot
+  host=$(lane_host_of "$existing"); ts=$(lane_ts_of "$existing")
+  pid=$(lane_pid_of "$existing"); boot=$(lane_boot_of "$existing")
+  claim_state "$prd" "$host" "$ts" "$pid" "$boot"
+  local age="$CS_AGE" probes="$CS_PROBES" state="$CS_STATE"
+
+  if [ "$state" != "stale" ]; then
+    echo "not-stale: state=$state"
+    exit 1
+  fi
+
+  # Requirement P0 "liveness-based reclaim": distinguish the two ways
+  # claim_state() reaches "stale" for the journal grammar's cause= field --
+  # coordinator_gone fired (dead-pid, any age) vs the pre-existing
+  # age-past-threshold-with-every-probe-negative fallback (stale-age).
+  local cause="stale-age"
+  [[ "$probes" == *"coordinator=gone"* ]] && cause="dead-pid"
+
+  local cur_status; cur_status=$(read_status_line "$prd")
+  local reset_status="yes"
+  [ "$cur_status" = "blocked" ] && reset_status="no"
+
+  # Requirement P0 "committed-work safety" (AC7).
+  local build_into; build_into=$(read_build_into "$prd")
+  local work_shas="" iter_text=""
+  if [ -n "$build_into" ]; then
+    work_shas=$(find_dead_work_commits "$build_into" "$slug" "$ts")
+  fi
+  if [ -n "$work_shas" ]; then
+    local shas_csv; shas_csv=$(tr '\n' ',' <<<"$work_shas" | sed -E 's/,$//')
+    iter_text="reclaim: committed work found sha=$shas_csv (dead claim lane=$host pid=${pid:-none} cause=$cause)"
+  fi
+
+  # AC5: a simulated write failure must leave the claim, file, and manifest
+  # exactly as found -- checked BEFORE any write or commit.
+  if [ "${LANE_CLAIM_RECLAIM_FAIL_WRITE:-0}" = "1" ]; then
+    [ "$jdir_ok" = 1 ] && printf '%s  %s  claim  reclaim-failed  (prd=%s pid=%s age=%ss cause=%s reason=simulated-write-failure probes: %s)\n' \
+      "$(now_iso)" "$slug" "$slug" "${pid:-none}" "$age" "$cause" "$probes" >> "$jfile"
+    die "reclaim write failed (simulated) for $slug" 4
+  fi
+
+  write_reclaim "$prd" "$reset_status" "$iter_text"
+  git -C "$root" add -- "$prd"
+  git -C "$root" -c user.name="Joe Yen" -c user.email=jyen.tech@gmail.com \
+    commit -q -m "reclaim: $slug cause=$cause status_reset=$reset_status" -- "$prd"
+  push_or_resolve_race "$root" "$prd" "" "release"
+
+  if [ "$reset_status" = "yes" ] && [ -x "$MANIFEST_SET_SH" ]; then
+    local patch_file; patch_file=$(mktemp)
+    printf '{"status":"queued"}' > "$patch_file"
+    if ! manifest_out="$("$MANIFEST_SET_SH" "$slug" "$patch_file" 2>&1)"; then
+      [ "$jdir_ok" = 1 ] && printf '%s  %s  claim  reclaim-manifest-failed  (prd=%s reason=%s)\n' \
+        "$(now_iso)" "$slug" "$slug" "$(tr '\n' ' ' <<<"$manifest_out")" >> "$jfile"
+    fi
+    rm -f "$patch_file"
+  fi
+
+  if [ "$jdir_ok" = 1 ]; then
+    printf '%s  %s  claim  reclaimed  (prd=%s pid=%s age=%ss cause=%s status_reset=%s probes: %s)\n' \
+      "$(now_iso)" "$slug" "$slug" "${pid:-none}" "$age" "$cause" "$reset_status" "$probes" >> "$jfile"
+    local recent; recent=$(count_recent_reclaims "$slug" 86400)
+    if [ "$recent" -gt 2 ]; then
+      printf '%s  %s  claim  reclaim-alarm  (count=%s window=24h)\n' \
+        "$(now_iso)" "$slug" "$recent" >> "$jfile"
+    fi
+  fi
+
+  echo "reclaimed: $slug cause=$cause status_reset=$reset_status"
 }
 
 # Cheap, existence-only rust-target detection for effective_subcap() below:
@@ -708,7 +947,7 @@ cmd_json_all() {
       *) shift ;;
     esac
   done
-  local f lane_val host ts pid boot
+  local f lane_val host ts pid boot cause
   local tmp; tmp=$(mktemp)
   : > "$tmp"
   for f in "$prd_dir"/build-queue/PRD-*.md; do
@@ -718,9 +957,16 @@ cmd_json_all() {
     host=$(lane_host_of "$lane_val"); ts=$(lane_ts_of "$lane_val")
     pid=$(lane_pid_of "$lane_val"); boot=$(lane_boot_of "$lane_val")
     claim_state "$f" "$host" "$ts" "$pid" "$boot"
+    cause=""
+    if [ "$CS_STATE" = "stale" ]; then
+      case "$CS_PROBES" in
+        *coordinator=gone*) cause="dead-pid" ;;
+        *) cause="stale-age" ;;
+      esac
+    fi
     jq -nc --arg prd "$f" --arg lane "$host" --arg host "$host" --arg ts "$ts" \
-      --argjson age_s "$CS_AGE" --arg state "$CS_STATE" --arg probes "$CS_PROBES" \
-      '{prd:$prd, lane:$lane, host:$host, ts:$ts, age_s:$age_s, state:$state, probes:$probes}' >> "$tmp"
+      --argjson age_s "$CS_AGE" --arg state "$CS_STATE" --arg cause "$cause" --arg probes "$CS_PROBES" \
+      '{prd:$prd, lane:$lane, host:$host, ts:$ts, age_s:$age_s, state:$state, cause:$cause, probes:$probes}' >> "$tmp"
   done
   jq -sc --argjson v "$JSON_SCHEMA_VERSION" '{schema_version:$v, claims: .}' "$tmp"
   rm -f "$tmp"
@@ -756,6 +1002,7 @@ main() {
   case "$sub" in
     claim)          [ $# -ge 1 ] || usage; cmd_claim "$@" ;;
     release)        [ $# -ge 1 ] || usage; cmd_release "$@" ;;
+    reclaim)        [ $# -ge 1 ] || usage; cmd_reclaim "$@" ;;
     status)         [ $# -ge 1 ] || usage; cmd_status "$@" ;;
     target-busy)    [ $# -ge 1 ] || usage; cmd_target_busy "$@" ;;
     claims)         cmd_json_all "$@" ;;

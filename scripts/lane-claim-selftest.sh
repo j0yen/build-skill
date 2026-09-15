@@ -558,4 +558,190 @@ grep -q 'bad-prd' /tmp/lintout.txt || { echo "FAIL lint-reclaims didn't name the
 rm -f "$LINTJ" /tmp/lintout.txt
 echo ok
 
+echo "== reclaim (PRD-build-stale-claim-auto-recovery): setup a dedicated scratch journal + manifest state =="
+RECLAIM_JOURNAL_DIR=$(mktemp -d /tmp/lane-claim-reclaim-journal.XXXXXX)
+RECLAIM_STATE_DIR=$(mktemp -d /tmp/lane-claim-reclaim-state.XXXXXX)
+trap 'rm -rf "$ROOT" "$JOURNAL_DIR" "$RECLAIM_JOURNAL_DIR" "$RECLAIM_STATE_DIR"' EXIT
+mkdir -p "$RECLAIM_STATE_DIR"
+echo '{"prds":{}}' > "$RECLAIM_STATE_DIR/manifest.json"
+export BUILD_STATE_DIR="$RECLAIM_STATE_DIR" BUILD_MANIFEST="$RECLAIM_STATE_DIR/manifest.json"
+
+mk_reclaim_prd() {
+  # $1 = slug $2 = Status value $3 = extra frontmatter lines (may be empty)
+  local slug="$1" status_val="$2" extra="${3:-}"
+  local f="$ROOT/clone/build-queue/PRD-$slug.md"
+  {
+    printf '# PRD: %s\n\n' "$slug"
+    printf -- '- Status: %s\n' "$status_val"
+    printf -- '- build_target: shell\n'
+    printf -- '- build_priority: high\n'
+    [ -n "$extra" ] && printf '%s\n' "$extra"
+  } > "$f"
+  git -C "$ROOT/clone" add -A
+  git -C "$ROOT/clone" -c user.name=t -c user.email=t@t commit -q -m "add-$slug"
+  git -C "$ROOT/clone" push -q origin "$BR"
+  echo "$f"
+}
+
+echo "== AC1: dead-pid claim reclaimed — claim released, Status reset to queued, one commit, journaled with cause=dead-pid status_reset=yes =="
+RC1_PRD=$(mk_reclaim_prd reclaim-deadpid building)
+DEAD_PID2=999998
+while kill -0 "$DEAD_PID2" 2>/dev/null; do DEAD_PID2=$((DEAD_PID2 - 1)); done
+ts_fresh=$(now_iso)
+write_claim "$RC1_PRD" building "$(hostname) $ts_fresh pid=$DEAD_PID2 boot=$(current_boot_id)"
+git -C "$ROOT/clone" add -A
+git -C "$ROOT/clone" -c user.name=t -c user.email=t@t commit -q -m "claim: reclaim-deadpid (fixture, dead pid)"
+git -C "$ROOT/clone" push -q origin "$BR"
+
+out=$(JOURNAL_DIR="$RECLAIM_JOURNAL_DIR" "$LC" reclaim "$RC1_PRD")
+echo "$out" | grep -q '^reclaimed: reclaim-deadpid cause=dead-pid status_reset=yes$' || { echo "FAIL reclaim output: $out"; exit 1; }
+grep -q '^- Status: queued' "$RC1_PRD" || { echo "FAIL status not reset to queued"; exit 1; }
+grep -q '^- Lane:' "$RC1_PRD" && { echo "FAIL Lane: line still present after reclaim"; exit 1; }
+jline=$(grep 'claim  reclaimed' "$RECLAIM_JOURNAL_DIR"/*.md)
+echo "$jline" | grep -q 'prd=reclaim-deadpid' || { echo "FAIL journal missing prd=: $jline"; exit 1; }
+echo "$jline" | grep -q 'cause=dead-pid' || { echo "FAIL journal missing cause=dead-pid: $jline"; exit 1; }
+echo "$jline" | grep -q 'status_reset=yes' || { echo "FAIL journal missing status_reset=yes: $jline"; exit 1; }
+echo "$jline" | grep -q 'probes: ' || { echo "FAIL journal missing probes: $jline"; exit 1; }
+manifest_status=$(python3 -c 'import json,sys
+m = json.load(open(sys.argv[1]))
+print(m["prds"].get("reclaim-deadpid", {}).get("status"))' "$RECLAIM_STATE_DIR/manifest.json")
+[ "$manifest_status" = "queued" ] || { echo "FAIL manifest entry not set to queued: $manifest_status"; exit 1; }
+echo ok
+
+echo "== AC2: live claim untouched by reclaim — refused, nothing changed, nothing journaled =="
+RC2_PRD=$(mk_reclaim_prd reclaim-live building)
+ts_fresh=$(now_iso)
+write_claim "$RC2_PRD" building "$(hostname) $ts_fresh pid=$$ boot=$(current_boot_id)"
+git -C "$ROOT/clone" add -A
+git -C "$ROOT/clone" -c user.name=t -c user.email=t@t commit -q -m "claim: reclaim-live (fixture, live pid)"
+git -C "$ROOT/clone" push -q origin "$BR"
+before_head=$(git -C "$ROOT/clone" rev-parse HEAD)
+set +e
+out=$(JOURNAL_DIR="$RECLAIM_JOURNAL_DIR" "$LC" reclaim "$RC2_PRD" 2>&1); rc=$?
+set -e
+[ "$rc" -eq 1 ] || { echo "FAIL expected exit 1 for live claim, got $rc: $out"; exit 1; }
+echo "$out" | grep -q '^not-stale: state=live$' || { echo "FAIL live-claim refusal message: $out"; exit 1; }
+after_head=$(git -C "$ROOT/clone" rev-parse HEAD)
+[ "$before_head" = "$after_head" ] || { echo "FAIL live claim reclaim mutated the repo"; exit 1; }
+grep -q '^- Lane:' "$RC2_PRD" || { echo "FAIL live Lane: line removed"; exit 1; }
+! grep -q 'reclaim-live' "$RECLAIM_JOURNAL_DIR"/*.md 2>/dev/null || { echo "FAIL journal noise for a live claim"; exit 1; }
+echo ok
+
+echo "== AC4: blocked stays blocked — claim released, Status left blocked =="
+RC4_PRD=$(mk_reclaim_prd reclaim-blocked blocked)
+DEAD_PID3=999997
+while kill -0 "$DEAD_PID3" 2>/dev/null; do DEAD_PID3=$((DEAD_PID3 - 1)); done
+ts_fresh=$(now_iso)
+write_claim "$RC4_PRD" blocked "$(hostname) $ts_fresh pid=$DEAD_PID3 boot=$(current_boot_id)"
+git -C "$ROOT/clone" add -A
+git -C "$ROOT/clone" -c user.name=t -c user.email=t@t commit -q -m "claim: reclaim-blocked (fixture, dead pid + blocked)"
+git -C "$ROOT/clone" push -q origin "$BR"
+
+out=$(JOURNAL_DIR="$RECLAIM_JOURNAL_DIR" "$LC" reclaim "$RC4_PRD")
+echo "$out" | grep -q '^reclaimed: reclaim-blocked cause=dead-pid status_reset=no$' || { echo "FAIL blocked reclaim output: $out"; exit 1; }
+grep -q '^- Status: blocked' "$RC4_PRD" || { echo "FAIL blocked status was changed"; exit 1; }
+grep -q '^- Lane:' "$RC4_PRD" && { echo "FAIL blocked Lane: line still present"; exit 1; }
+grep -q 'reclaim-blocked.*status_reset=no' "$RECLAIM_JOURNAL_DIR"/*.md || { echo "FAIL blocked journal missing status_reset=no"; exit 1; }
+echo ok
+
+echo "== AC5: simulated write failure — exits non-zero, journals the failure, leaves claim/file/manifest unchanged =="
+RC5_PRD=$(mk_reclaim_prd reclaim-writefail building)
+DEAD_PID4=999996
+while kill -0 "$DEAD_PID4" 2>/dev/null; do DEAD_PID4=$((DEAD_PID4 - 1)); done
+ts_fresh=$(now_iso)
+write_claim "$RC5_PRD" building "$(hostname) $ts_fresh pid=$DEAD_PID4 boot=$(current_boot_id)"
+git -C "$ROOT/clone" add -A
+git -C "$ROOT/clone" -c user.name=t -c user.email=t@t commit -q -m "claim: reclaim-writefail (fixture, dead pid)"
+git -C "$ROOT/clone" push -q origin "$BR"
+before_head=$(git -C "$ROOT/clone" rev-parse HEAD)
+manifest_before=$(cat "$RECLAIM_STATE_DIR/manifest.json")
+
+set +e
+out=$(LANE_CLAIM_RECLAIM_FAIL_WRITE=1 JOURNAL_DIR="$RECLAIM_JOURNAL_DIR" "$LC" reclaim "$RC5_PRD" 2>&1); rc=$?
+set -e
+[ "$rc" -eq 4 ] || { echo "FAIL expected exit 4 on simulated write failure, got $rc: $out"; exit 1; }
+after_head=$(git -C "$ROOT/clone" rev-parse HEAD)
+[ "$before_head" = "$after_head" ] || { echo "FAIL simulated write failure still committed"; exit 1; }
+grep -q '^- Lane:' "$RC5_PRD" || { echo "FAIL simulated write failure removed the Lane: line"; exit 1; }
+grep -q '^- Status: building' "$RC5_PRD" || { echo "FAIL simulated write failure changed Status"; exit 1; }
+[ "$(cat "$RECLAIM_STATE_DIR/manifest.json")" = "$manifest_before" ] || { echo "FAIL simulated write failure touched the manifest"; exit 1; }
+grep -q 'reclaim-writefail.*claim  reclaim-failed' "$RECLAIM_JOURNAL_DIR"/*.md || { echo "FAIL simulated write failure not journaled"; exit 1; }
+echo ok
+
+echo "== AC6: a slug reclaimed a 3rd time within 24h journals an alarm naming the slug and count =="
+mk_alarm_claim() {
+  local pid_dead=999995
+  while kill -0 "$pid_dead" 2>/dev/null; do pid_dead=$((pid_dead - 1)); done
+  local ts_fresh; ts_fresh=$(now_iso)
+  write_claim "$RC6_PRD" building "$(hostname) $ts_fresh pid=$pid_dead boot=$(current_boot_id)"
+  git -C "$ROOT/clone" add -A
+  git -C "$ROOT/clone" -c user.name=t -c user.email=t@t commit -q -m "claim: reclaim-alarm (fixture, dead pid, re-claim)"
+  git -C "$ROOT/clone" push -q origin "$BR"
+}
+RC6_PRD=$(mk_reclaim_prd reclaim-alarm building)
+for i in 1 2 3; do
+  mk_alarm_claim
+  out=$(JOURNAL_DIR="$RECLAIM_JOURNAL_DIR" "$LC" reclaim "$RC6_PRD")
+  echo "$out" | grep -q '^reclaimed: reclaim-alarm ' || { echo "FAIL reclaim #$i failed: $out"; exit 1; }
+done
+grep -q 'reclaim-alarm  claim  reclaim-alarm  (count=3 window=24h)' "$RECLAIM_JOURNAL_DIR"/*.md \
+  || { echo "FAIL missing 3rd-reclaim alarm line: $(cat "$RECLAIM_JOURNAL_DIR"/*.md)"; exit 1; }
+echo ok
+
+echo "== AC7: committed-work safety — a build_into commit naming the slug has its sha recorded in iter_log before release =="
+WORK_REPO=$(mktemp -d /tmp/lane-claim-workrepo.XXXXXX)
+git init -q "$WORK_REPO"
+git -C "$WORK_REPO" -c user.name=t -c user.email=t@t commit -q --allow-empty -m init
+RC7_PRD=$(mk_reclaim_prd reclaim-workfound building "- build_into: $WORK_REPO")
+ts_fresh=$(now_iso)
+DEAD_PID5=999994
+while kill -0 "$DEAD_PID5" 2>/dev/null; do DEAD_PID5=$((DEAD_PID5 - 1)); done
+write_claim "$RC7_PRD" building "$(hostname) $ts_fresh pid=$DEAD_PID5 boot=$(current_boot_id)"
+git -C "$ROOT/clone" add -A
+git -C "$ROOT/clone" -c user.name=t -c user.email=t@t commit -q -m "claim: reclaim-workfound (fixture, dead pid)"
+git -C "$ROOT/clone" push -q origin "$BR"
+sleep 1  # ensure the work commit's timestamp strictly follows the claim's ts_fresh (git log --since boundary)
+git -C "$WORK_REPO" -c user.name=t -c user.email=t@t commit -q --allow-empty \
+  -m "landed a step (PRD-reclaim-workfound requirement 1)"
+work_sha=$(git -C "$WORK_REPO" rev-parse --short HEAD)
+
+out=$(JOURNAL_DIR="$RECLAIM_JOURNAL_DIR" "$LC" reclaim "$RC7_PRD")
+echo "$out" | grep -q '^reclaimed: reclaim-workfound cause=dead-pid status_reset=yes$' || { echo "FAIL AC7 reclaim output: $out"; exit 1; }
+grep -q "iter_log:.*sha=$work_sha" "$RC7_PRD" || { echo "FAIL AC7: committed work sha not recorded in iter_log: $(cat "$RC7_PRD")"; exit 1; }
+echo ok
+rm -rf "$WORK_REPO"
+
+echo "== AC8: a reclaimed PRD reads Status: queued for a plain-status scan (selector admits it) =="
+[ "$(read_status_line "$RC1_PRD")" = "queued" ] || { echo "FAIL AC8: reclaim-deadpid not queued for the selector"; exit 1; }
+echo ok
+
+echo "== P1 AC9: cause field distinguishes dead-pid vs stale-age in --json =="
+RC9_PRD=$(mk_reclaim_prd reclaim-staleage building)
+old4h=$(date -u -d '4 hours ago' +%Y-%m-%dT%H:%M:%SZ)
+write_claim "$RC9_PRD" building "carbon $old4h"
+git -C "$ROOT/clone" add -A
+GIT_AUTHOR_DATE="$old4h" GIT_COMMITTER_DATE="$old4h" \
+  git -C "$ROOT/clone" -c user.name=t -c user.email=t@t commit -q -m "claim: reclaim-staleage (fixture, no pid, age-only)"
+git -C "$ROOT/clone" push -q origin "$BR"
+st=$(LANE_CLAIM_REACHABLE_OVERRIDE="carbon=yes" "$LC" status "$RC9_PRD" --json)
+echo "$st" | jq -e '.state == "stale" and .cause == "stale-age"' >/dev/null \
+  || { echo "FAIL expected cause=stale-age: $st"; exit 1; }
+validate_schema "$st" || { echo "FAIL AC9 stale-age schema: $st"; exit 1; }
+
+RC9B_PRD=$(mk_reclaim_prd reclaim-deadpid-json building)
+DEAD_PID6=999993
+while kill -0 "$DEAD_PID6" 2>/dev/null; do DEAD_PID6=$((DEAD_PID6 - 1)); done
+ts_fresh=$(now_iso)
+write_claim "$RC9B_PRD" building "$(hostname) $ts_fresh pid=$DEAD_PID6 boot=$(current_boot_id)"
+git -C "$ROOT/clone" add -A
+git -C "$ROOT/clone" -c user.name=t -c user.email=t@t commit -q -m "claim: reclaim-deadpid-json (fixture, dead pid)"
+git -C "$ROOT/clone" push -q origin "$BR"
+st=$("$LC" status "$RC9B_PRD" --json)
+echo "$st" | jq -e '.state == "stale" and .cause == "dead-pid"' >/dev/null \
+  || { echo "FAIL expected cause=dead-pid: $st"; exit 1; }
+validate_schema "$st" || { echo "FAIL AC9 dead-pid schema: $st"; exit 1; }
+echo ok
+
+unset BUILD_STATE_DIR BUILD_MANIFEST
+
 echo "ALL SELFTESTS PASSED"
