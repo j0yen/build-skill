@@ -5957,6 +5957,112 @@ expect "reenable AC14c: the pending registration is left untouched" \
   "[ -f \"$REALITY_CHECK_PENDING_DIR/reenable-ac14c-ac1.json\" ]"
 unset FAKE_SSH_GATE_TOOLS_MISSING FAKE_SSH_GATE_TOOLS_INSTALL_FAIL
 
+# ---- reenable AC15 (requirement 1, auto-bake at down): a session that had
+# to install at least one gate tool and still ended gate_ready=true gets
+# baked automatically by `down`, before the delete — the next boot
+# shouldn't repeat this session's own install cost. A session with zero
+# install-start lines deletes without baking, unchanged. A third bake
+# (auto or operator-invoked, same mechanism) still only ever supersedes —
+# never deletes — the oldest image, matching cmd_bake's own two-image-keep
+# cap (reenable AC1).
+REEN15_AB_SRC="$T/fake-autobuilder-src-15"; mkdir -p "$REEN15_AB_SRC"
+cat > "$REEN15_AB_SRC/autobuilder" <<'EOF'
+#!/usr/bin/env bash
+echo "autobuilder 9.9.9"
+EOF
+chmod +x "$REEN15_AB_SRC/autobuilder"
+
+# Cases a/b call `auto_bake_before_delete` directly (source-and-call, the
+# same unit-test technique this file's own "cargo_target_dir_for" case
+# above uses) rather than driving it through a full `down` — this
+# environment's `destroy_verify`/`server_alive` never reaches the "gone"
+# branch against the fake hcloud (no `server list` subcommand exists in
+# tests/fixtures/burst-lane-fake/hcloud, so its fail-open fallback always
+# reports the just-deleted server as still alive and `down` never prints
+# `decision=deleted` here) — a real, pre-existing gap this PRD did not
+# introduce and whose fix belongs to whatever PRD owns that shared
+# fixture, not this one. `auto_bake_before_delete` itself does not call
+# `destroy_verify`, so this case still proves exactly what AC15 asks: that
+# the trigger fires (or doesn't) correctly given a session's own
+# gate_ready/install-start history. Its wiring at the correct point in
+# `down`'s own delete path — strictly before the delete is attempted — is
+# proven separately below as a source-order lint.
+
+# Case a: one tool missing this session (exactly one install-start line),
+# gate_ready reached true -> the trigger fires and bakes.
+fresh_env
+export BURST_LANE_AUTOBUILDER_BIN="$REEN15_AB_SRC/autobuilder"
+export FAKE_SSH_GATE_TOOLS_MISSING="jq"
+"$BL" up >/dev/null 2>&1
+r15a_gate_ready="$(grep -oE '"gate_ready":"[^"]*"' "$BURST_LANE_STATE_DIR/session.json" | cut -d'"' -f4)"
+expect "reenable AC15a setup: session is gate_ready=true" "[ \"$r15a_gate_ready\" = true ]"
+r15a_installs="$(grep -c 'burst-lane  gate-tools  install-start' "$BURST_LANE_JOURNAL")"
+expect "reenable AC15a setup: exactly one install-start line" "[ \"$r15a_installs\" -eq 1 ]"
+r15a_id="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+( source "$BL"; auto_bake_before_delete "$r15a_id" down ) >/dev/null 2>&1
+expect "reenable AC15a: journal has the auto-bake trigger naming the install count" \
+  "grep -qE 'burst-lane  down  auto-bake  \\(cause=install-start-count=1 server_id=' \"$BURST_LANE_JOURNAL\""
+expect "reenable AC15a: journal has bake done" \
+  "grep -qE 'burst-lane  bake  done  \\(image_id=[0-9]+ superseded=none secs=[0-9]+\\)' \"$BURST_LANE_JOURNAL\""
+expect "reenable AC15a: snapshot.json now names the new image" \
+  "python3 -c \"import json; d=json.load(open('$BURST_LANE_STATE_DIR/snapshot.json')); assert d.get('image_id')\""
+unset FAKE_SSH_GATE_TOOLS_MISSING
+
+# Case b: zero install-start lines this session (every tool already
+# present) -> the trigger is a no-op; no bake at all.
+fresh_env
+export BURST_LANE_AUTOBUILDER_BIN="$REEN15_AB_SRC/autobuilder"
+"$BL" up >/dev/null 2>&1
+r15b_installs="$(grep -c 'burst-lane  gate-tools  install-start' "$BURST_LANE_JOURNAL")"
+expect "reenable AC15b setup: zero install-start lines" "[ \"$r15b_installs\" -eq 0 ]"
+r15b_id="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+( source "$BL"; auto_bake_before_delete "$r15b_id" down ) >/dev/null 2>&1
+expect "reenable AC15b: no auto-bake was journaled" \
+  "! grep -q 'burst-lane  down  auto-bake' \"$BURST_LANE_JOURNAL\""
+expect "reenable AC15b: no bake done was journaled" \
+  "! grep -q 'burst-lane  bake  done' \"$BURST_LANE_JOURNAL\""
+expect "reenable AC15b: no snapshot.json was written" "[ ! -f \"$BURST_LANE_STATE_DIR/snapshot.json\" ]"
+
+# Case d (source-order lint): `auto_bake_before_delete` is wired into
+# `teardown_and_delete` strictly BEFORE `destroy_verify` — the property
+# cases a/b above cannot exercise end to end (see the note above) but that
+# AC15's "bake ran first" still requires. A grep over burst-lane.sh's own
+# source, not a runtime trace: the two call sites' line numbers inside
+# teardown_and_delete's body must appear in that order.
+r15d_tad_start="$(grep -n '^teardown_and_delete()' "$BL" | head -1 | cut -d: -f1)"
+r15d_bake_call="$(awk -v from="$r15d_tad_start" 'NR>from && /auto_bake_before_delete "\$id" "\$caller"/{print NR; exit}' "$BL")"
+r15d_destroy_call="$(awk -v from="$r15d_tad_start" 'NR>from && /if destroy_verify "\$id"; then/{print NR; exit}' "$BL")"
+expect "reenable AC15d: auto_bake_before_delete is wired into teardown_and_delete before destroy_verify" \
+  "[ -n \"$r15d_bake_call\" ] && [ -n \"$r15d_destroy_call\" ] && [ \"$r15d_bake_call\" -lt \"$r15d_destroy_call\" ]"
+
+# Case c: a bake landing on an ALREADY-full two-image history (seeded
+# directly, same technique reenable AC4 uses for snapshot.json, rather than
+# three live bakes in a row — the fake hcloud's `create-image` mints a
+# RANDOM id (tests/fixtures/burst-lane-fake/hcloud), so three calls sharing
+# one same-day description can't be relied on to resolve strictly
+# increasing ids the way real Hetzner ids do) supersedes (journals, never
+# deletes) the oldest of the two.
+fresh_env
+export BURST_LANE_AUTOBUILDER_BIN="$REEN15_AB_SRC/autobuilder"
+mkdir -p "$BURST_LANE_STATE_DIR"
+cat > "$BURST_LANE_STATE_DIR/snapshot.json" <<'JSON'
+{"image_id": "222222", "created": "2026-09-14T00:00:00Z", "base_image_id": "427125061", "build_skill_sha": "abc123", "gate_tool_versions": {}, "baked_history": ["111111", "222222"]}
+JSON
+"$BL" up >/dev/null 2>&1
+r15c_out="$("$BL" bake)"; r15c_rc=$?
+r15c_new_id="$(sed -n 's/^bake done: image_id=//p' <<<"$r15c_out")"
+expect "reenable AC15c: bake against an already-full history still exits 0" "[ $r15c_rc -eq 0 ]"
+expect "reenable AC15c: the new bake's own id is neither of the two prior ones" \
+  "[ -n \"$r15c_new_id\" ] && [ \"$r15c_new_id\" != 111111 ] && [ \"$r15c_new_id\" != 222222 ]"
+expect "reenable AC15c: the bake journals the second (most recent) prior image as superseded=... in bake done" \
+  "grep -qE 'burst-lane  bake  done  \\(image_id='\"$r15c_new_id\"' superseded=222222 secs=[0-9]+\\)' \"$BURST_LANE_JOURNAL\""
+expect "reenable AC15c: the bake journals the first (oldest) prior image as superseded, delete=operator" \
+  "grep -qE 'burst-lane  bake  superseded  \\(image_id=111111 delete=operator\\)' \"$BURST_LANE_JOURNAL\""
+expect "reenable AC15c: snapshot.json's baked_history now holds exactly the two most recent images" \
+  "python3 -c \"import json; d=json.load(open('$BURST_LANE_STATE_DIR/snapshot.json')); assert d.get('baked_history') == ['222222', '$r15c_new_id'], d\""
+expect "reenable AC15c: no hcloud image delete call was ever made by the lane" \
+  "! grep -q 'image delete' \"$FAKE_HCLOUD_CALLLOG\""
+
 expect_block_green "reenable" "reenable: every reenable case above ran green"
 
 # =============================================================================
