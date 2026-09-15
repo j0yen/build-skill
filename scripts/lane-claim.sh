@@ -560,15 +560,15 @@ find_dead_work_commits() {
 }
 
 # Repeat-offender count (Requirement P0 "journal and alarm"): number of
-# `claim  reclaimed` journal lines for $1 (slug) across every
-# $JOURNAL_DIR/*.md file whose leading ISO-ts falls within the trailing
-# $2 seconds. Mirrors journal_activity_since()'s scan shape.
+# `claim  reclaimed` journal lines for $1 (slug) across every *.md file
+# under $2 (a directory) whose leading ISO-ts falls within the trailing
+# $3 seconds. Mirrors journal_activity_since()'s scan shape.
 count_recent_reclaims() {
-  local slug="$1" window="$2" now_e since_e count=0 f line ts_tok epoch
+  local slug="$1" jdir="$2" window="$3" now_e since_e count=0 f line ts_tok epoch
   now_e=$(date -u +%s)
   since_e=$((now_e - window))
-  [ -d "$JOURNAL_DIR" ] || { echo 0; return; }
-  for f in "$JOURNAL_DIR"/*.md; do
+  [ -d "$jdir" ] || { echo 0; return; }
+  for f in "$jdir"/*.md; do
     [ -f "$f" ] || continue
     while IFS= read -r line; do
       [[ "$line" == *"  claim  reclaimed  (prd=$slug "* ]] || continue
@@ -743,9 +743,18 @@ cmd_reclaim() {
   git_pull_or_die "$root"
 
   local slug; slug=$(slug_of "$prd")
+  # Journal target: honor a single-file $JOURNAL override first (the
+  # convention manifest-invariants.sh/manifest-set.sh callers already use
+  # to sandbox a run, e.g. gatedebt_ac5_stale_claim_reclaimed_same_tick.sh)
+  # so a caller isolating one env var isolates the reclaim journal too;
+  # fall back to $JOURNAL_DIR/<today>.md (this file's own pre-existing
+  # per-day convention) when $JOURNAL isn't set. The repeat-offender scan
+  # below always looks in whichever directory this resolves to, so the
+  # two never disagree about where "recent" reclaims live.
+  local jfile="${JOURNAL:-$JOURNAL_DIR/$(date -u +%F).md}"
+  local jscan_dir; jscan_dir="$(dirname "$jfile")"
   local jdir_ok=0
-  mkdir -p "$JOURNAL_DIR" 2>/dev/null && jdir_ok=1
-  local jfile="$JOURNAL_DIR/$(date -u +%F).md"
+  mkdir -p "$jscan_dir" 2>/dev/null && jdir_ok=1
 
   local existing; existing=$(read_lane_line "$prd")
   if [ -z "$existing" ]; then
@@ -813,7 +822,7 @@ cmd_reclaim() {
   if [ "$jdir_ok" = 1 ]; then
     printf '%s  %s  claim  reclaimed  (prd=%s pid=%s age=%ss cause=%s status_reset=%s probes: %s)\n' \
       "$(now_iso)" "$slug" "$slug" "${pid:-none}" "$age" "$cause" "$reset_status" "$probes" >> "$jfile"
-    local recent; recent=$(count_recent_reclaims "$slug" 86400)
+    local recent; recent=$(count_recent_reclaims "$slug" "$jscan_dir" 86400)
     if [ "$recent" -gt 2 ]; then
       printf '%s  %s  claim  reclaim-alarm  (count=%s window=24h)\n' \
         "$(now_iso)" "$slug" "$recent" >> "$jfile"
