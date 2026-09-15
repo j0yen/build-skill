@@ -5423,6 +5423,59 @@ expect "reenable AC7f: the drop-in no longer exists" "[ ! -f \"$BURST_LANE_SYSTE
 expect "reenable AC7f: journal has disable done (cause=operator)" \
   "grep -q 'burst-lane  disable  done  (cause=operator)' \"$BURST_LANE_JOURNAL\""
 
+# ---- reenable AC8: fail-closed at the tick for the ORDINARY (non-gate)
+# cargo/uv path — `up` or `verify` failing inside `run`, or an explicit
+# `pull`'s rsync-down failing, journals a "fallback (cause=...)" line and
+# the caller gets rc=3 (falls back local) rather than a silent stdout-only
+# message. `gate`'s own up-failed/rsync-up-failed/gate-tools-missing lines
+# already proved this contract for the gate path (PRD-build-gate-on-casper,
+# PRD-build-burst-gate-tools-scope); this proves the matching `run`/`pull`
+# gap just closed above.
+
+# Case a: `up` itself fails (no session yet) -> run exits 3, journals
+# cause=up-failed (no server_id — up never got one).
+fresh_env
+export FAKE_HCLOUD_CREATE_FAIL=1
+WT8A="$T/worktree-ac8a"; mkdir -p "$WT8A"
+echo 'exit 0' > "$WT8A/build.sh"
+r8a_out="$("$BL" run "$WT8A" -- bash build.sh 2>&1)"; r8a_rc=$?
+unset FAKE_HCLOUD_CREATE_FAIL
+expect "reenable AC8a: run exits 3 when up itself fails" "[ $r8a_rc -eq 3 ]"
+expect "reenable AC8a: journal has run fallback (cause=up-failed worktree=$WT8A)" \
+  "grep -qF \"burst-lane  run  fallback  (cause=up-failed worktree=$WT8A)\" \"$BURST_LANE_JOURNAL\""
+
+# Case b: `up` succeeds but `verify` fails -> run exits 3, journals
+# cause=verify-failed naming the server_id.
+fresh_env
+"$BL" up >/dev/null
+sed -i 's/"verified":"true"/"verified":"false"/' "$BURST_LANE_STATE_DIR/session.json"
+r8b_sid="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+WT8B="$T/worktree-ac8b"; mkdir -p "$WT8B"
+echo 'exit 0' > "$WT8B/build.sh"
+export FAKE_SSH_REMOTE_FAIL=1
+r8b_out="$("$BL" run "$WT8B" -- bash build.sh 2>&1)"; r8b_rc=$?
+unset FAKE_SSH_REMOTE_FAIL
+expect "reenable AC8b: run exits 3 when verify fails" "[ $r8b_rc -eq 3 ]"
+expect "reenable AC8b: journal has run fallback (cause=verify-failed server_id=$r8b_sid worktree=$WT8B)" \
+  "grep -qF \"burst-lane  run  fallback  (cause=verify-failed server_id=$r8b_sid worktree=$WT8B)\" \"$BURST_LANE_JOURNAL\""
+
+# Case c: an explicit pull whose rsync-down fails -> exits 3; already
+# journaled by do_marker_pull itself as
+# "pull fallback (cause=rsync-failed ...)" (AC8's pull-failed cause is this
+# existing line, not a new duplicate one — see the comment at cmd_pull's own
+# end).
+fresh_env
+"$BL" up >/dev/null
+WT8C="$T/worktree-ac8c"; mkdir -p "$WT8C"
+echo 'mkdir -p target && echo built > target/out.txt; exit 0' > "$WT8C/build.sh"
+"$BL" run "$WT8C" -- bash build.sh >/dev/null 2>&1
+export FAKE_RSYNC_FAIL=1
+r8c_out="$("$BL" pull "$WT8C" 2>&1)"; r8c_rc=$?
+unset FAKE_RSYNC_FAIL
+expect "reenable AC8c: pull exits 3 when the rsync-down fails" "[ $r8c_rc -eq 3 ]"
+expect "reenable AC8c: journal has pull fallback (cause=rsync-failed worktree=$WT8C)" \
+  "grep -qF \"burst-lane  pull  fallback  (cause=rsync-failed worktree=$WT8C\" \"$BURST_LANE_JOURNAL\""
+
 # ---- reenable AC9: auto-disable fires on either trigger — two sessions
 # within 24h both zero-run (cause=zero-run-sessions), or a day's deleted-box
 # cost reaching BURST_AUTO_DISABLE_EUR_PER_DAY with no routed run

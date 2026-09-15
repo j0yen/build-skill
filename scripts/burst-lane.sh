@@ -4866,6 +4866,13 @@ cmd_run() {
   if ! state_active; then
     local up_out; up_out="$(cmd_up 2>&1)"; local up_rc=$?
     if [ "$up_rc" -ne 0 ]; then
+      # PRD-build-burst-dispatch-reenable requirement 5 (AC8): the tick's
+      # own fail-closed contract — an ordinary (non-gate) run whose `up`
+      # fails must journal the same "run fallback (cause=up-failed ...)"
+      # shape the gate wrapper already journals at its own up call site, not
+      # just print to stdout and fall back silently as far as the journal
+      # is concerned. No server_id yet — up itself never got one.
+      journal_line "$(now_iso)  burst-lane  run  fallback  (cause=up-failed worktree=$worktree)"
       echo "$up_out"
       exit 3
     fi
@@ -4875,7 +4882,10 @@ cmd_run() {
   if [ "$(state_read verified)" != "true" ]; then
     ( cmd_verify >/dev/null 2>&1 ) || true
     if [ "$(state_read verified)" != "true" ]; then
-      journal_line "$(now_iso)  burst-lane  run  lane-unverified  (server_id=$id worktree=$worktree — falling back local)"
+      # AC8: cause=verify-failed, same fallback shape as up-failed above
+      # (formerly journaled as a bespoke "lane-unverified" event with no
+      # other reader depending on that literal text).
+      journal_line "$(now_iso)  burst-lane  run  fallback  (cause=verify-failed server_id=$id worktree=$worktree)"
       echo "fallback: lane not verified (burst-lane.sh verify) — running locally"
       exit 3
     fi
@@ -5374,6 +5384,12 @@ cmd_pull() {
     exit 0
   fi
   flock -u 205
+  # PRD-build-burst-dispatch-reenable requirement 5 (AC8, cause=pull-failed):
+  # already satisfied by do_marker_pull's own
+  # "pull fallback (cause=rsync-failed worktree=... trigger=... — marker
+  # left dirty for retry)" line just above this return path — not
+  # duplicated here with a second, differently-worded fallback line for the
+  # same event.
   echo "fallback: pull failed"
   exit 3
 }
