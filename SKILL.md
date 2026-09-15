@@ -559,9 +559,11 @@ read it before assuming a step is "the last one this tick".
   use `worktree-extend.sh add <build_into> <slug>` instead of
   `wm-buildtree ensure` — the shared-target helper uses a different
   worktree root (`~/.cache/build-worktrees/`) and defers the version
-  bump + CHANGELOG to a serial locked `integrate` step. See "Worktree
-  isolation" for details. Do NOT use `wm-buildtree land` for
-  shared-target branches; use `worktree-extend.sh integrate` + `cleanup`.
+  bump + CHANGELOG to a serial locked `integrate` step (now wrapped by
+  `gate-then-land.sh`, which gates the branch BEFORE calling `integrate` —
+  see the **gate** action's "Shared-target path" below). See "Worktree
+  isolation" for details. Do NOT use `wm-buildtree land` for shared-target
+  branches; use `scripts/gate-then-land.sh` + `cleanup`.
 - **iter-1 (kernel-extend)** [kernel-extend only]: do NOT call
   `/rustbuild`. Hand-write the kernel C source per the PRD spec:
   drop new C file(s) into `<build_into>/` (e.g.
@@ -688,14 +690,14 @@ read it before assuming a step is "the last one this tick".
   # After wm-push succeeds: answerable-emit.sh push <repo> "v<ver> — <one-line>" false
 - **gate** [rust-extend only — the PRD's non-goals exclude python-* (already
   gated by `pybuilder gate ready`) and kernel-extend (gated by `makepkg`,
-  no autobuilder receipts)] —
-  after `push` and before anything reads `built`, on EITHER landing path
-  (`wm-buildtree land` + `wm-push`, or the shared-target `worktree-extend.sh
-  integrate` + `wm-push` + `cleanup`). PRD-build-extend-gate-receipts: the
-  extend path lands, bumps and pushes on the default branch without ever
-  regenerating autobuilder's 25 receipts, so every ship since the last
-  human-run regeneration is gate-red at the landed commit — this action
-  closes that gap. Run:
+  no autobuilder receipts)] — the SOLO `wm-buildtree land` path only (a
+  single PRD lands on `build_into` this tick, so there is no crate-lock
+  contention for this path to solve — see the shared-target replacement
+  below). After `push` and before anything reads `built`. PRD-build-
+  extend-gate-receipts: the extend path lands, bumps and pushes on the
+  default branch without ever regenerating autobuilder's 25 receipts, so
+  every ship since the last human-run regeneration is gate-red at the
+  landed commit — this action closes that gap. Run:
 
   ```
   scripts/extend-gate.sh <build_into> --head <landed sha>
@@ -707,6 +709,58 @@ read it before assuming a step is "the last one this tick".
   worktree — the worktree's `target/` holds none of the crate's real
   receipts) and runs `autobuilder gate --project .` as the single verdict.
   Counts as one tick action.
+
+  **Shared-target path (PRD-build-gate-before-land, 2026-09-14): gate BEFORE
+  land, not after.** The old land-then-gate order held the crate's
+  integration lock for the gate's entire wall time (332s-3864s observed
+  2026-09-13) because the gate's producers wrote into the main checkout's
+  shared receipts dir — every other same-target branch waited out the
+  whole gate, which is why `select-guard.sh` had to cap same-target
+  admission at 1. That receipts-location problem is gone (each branch
+  gates in its OWN worktree, off-root target, PRD-build-worktree-targets-
+  off-root); the lock now only needs to guard the few-second merge itself.
+  Replace `worktree-extend.sh integrate` (and the standalone `gate` step
+  above) with ONE call:
+
+  ```
+  scripts/gate-then-land.sh <build_into> <slug> <bump> <tldr-file> [--project-root <rel>] [--ensure-main]
+  ```
+
+  This gates the branch's OWN worktree (`extend-gate.sh <worktree> --head
+  <worktree HEAD> --scope branch --slug <slug>` — no crate-wide lock,
+  `lock_wait=0s` against every sibling gating the same crate), then calls
+  `worktree-extend.sh integrate --gated-at <main HEAD at gate start>
+  --verdict <that gate's last-verdict.json>` — which merges only if main is
+  STILL at that sha and the verdict is pass/delta-pass, holding the
+  integration lock for the merge + bump + commit alone (target: under 30s).
+  If a sibling landed first (exit 6, `land-stale-base`), this is not a
+  failure: `gate-then-land.sh` rebases the worktree onto main's new HEAD,
+  re-gates, and retries (up to 3 attempts) — after 3 consecutive stale
+  bases the PRD is `blocked: land-retries-exhausted` with all 3 main shas
+  recorded, leave `status: in_progress` and retry next tick. If the
+  branch's own gate verdict is `block` (exit 7, `land-ungated`), the
+  branch is kept and main is untouched — do NOT retry, this is a real red
+  gate, not a race; record `next: gate-red` same as any other block. On
+  success, `gate-then-land.sh` prints the landed sha on stdout — proceed
+  straight to **intent card refresh** and **push + cleanup** below with it
+  (the merge already happened; there is no separate `integrate` call left
+  to make). The branch-scope gate call inside `gate-then-land.sh` honors
+  the exact same Mixed-tick burst routing / Full-gate remote routing
+  described below — arm the same `BURST_LANE`/`BURST_GATE_REMOTE` env
+  before invoking it, nothing about those mechanics changes.
+
+  **Post-land main check is now a cache hit, not a re-run.** After `push`,
+  still run the SAME `scripts/extend-gate.sh <build_into> --head <landed
+  sha>` command shown above — but because `worktree-extend.sh integrate`
+  just transferred the branch's verdict onto main's cache under the
+  merge's tree key (PRD-build-gate-before-land requirement 4), and the
+  merge's tree equals what the branch already gated (main had not
+  diverged, or this run would have hit `land-stale-base` above instead),
+  this run replays the cached verdict — no producer runs, and the journal
+  reads `(cached tree=... from=branch slug=<slug>)` instead of a fresh
+  `gate ... wall=<n>s` line. A DIFFERENT tree (should not happen given the
+  precondition above, but fails safe) falls through to a full run exactly
+  as before this PRD. Counts as one tick action, same as today.
 
   **Mixed-tick burst routing (2026-09-06, PRD-build-gate-cloudburst;
   updated 2026-09-09, PRD-build-burst-lane-ccx53 requirement 5; gated
@@ -2339,8 +2393,14 @@ python-specific contract.
    directory along with the worktree. `scripts/extend-gate.sh` calls
    `prune-landed` for its repo before producing receipts, so a gate never
    starts on a disk full of landed worktrees.
-3. **integrate (serial, locked)** — `worktree-extend.sh integrate [--no-rebase] <repo>
-   <slug> <bump> <tldr-file>` takes the per-repo integration lock,
+3. **integrate (serial, locked)** — invoked BY `scripts/gate-then-land.sh`
+   (PRD-build-gate-before-land, 2026-09-14; see the **gate** action's
+   "Shared-target path" earlier), which calls it with `--gated-at <main
+   HEAD at gate start> --verdict <the branch's own gate's last-verdict.json>`
+   — do not call `integrate` directly for a shared-target rust-extend
+   branch; call `gate-then-land.sh` instead, which gates the worktree first
+   and then makes this call. `worktree-extend.sh integrate [--no-rebase] <repo>
+   <slug> <bump> <tldr-file> [--gated-at <sha> --verdict <path>]` takes the per-repo integration lock,
    **refuses if the target's main tree is dirty (exit 3 → leave PRD
    in_progress, surface `target-dirty`)**, merges `autobuilder/<slug>`
    into `main` (`--no-ff`), then bumps the version and prepends the
@@ -2410,17 +2470,30 @@ python-specific contract.
    --drop-branch`. On a deferred branch (dirty target / conflict / red
    gate) run `cleanup` WITHOUT `--drop-branch` so the next tick resumes
    the same branch via `add`.
-6. **gate** — same `gate` action as the non-shared rust-extend path (see
-   above): `scripts/extend-gate.sh <repo> --head <landed sha>` after this
-   push, before the PRD reads `built`. On pass, `ship-tag.sh` tags the
-   integrated HEAD (not any individual branch's commit — main's HEAD after
-   `integrate` + `wm-push` is what's shipped) and the `Receipts:` line is
-   written; on block, `blockers` + `next: gate-red` as above. With ≥2
-   integrates landing on one crate this tick, the receipts on main after
-   all of them carry only the LAST-landed HEAD — earlier integrates' `gate`
-   actions see their receipts superseded by the next integrate before their
-   own `gate` runs; only the PRD whose integrate was actually last should
-   expect its `gate` action to find HEAD unchanged underneath it.
+6. **gate** — the real gate already ran, INSIDE `gate-then-land.sh`, BEFORE
+   step 3 above (`extend-gate.sh <worktree> --head <worktree HEAD> --scope
+   branch --slug <slug>`, no crate-wide lock — see the **gate** action's
+   "Shared-target path" earlier). This step is the same command as the
+   non-shared rust-extend path — `scripts/extend-gate.sh <repo> --head
+   <landed sha>` after `push`, before the PRD reads `built` — but now
+   expected to be a CACHE HIT: `worktree-extend.sh integrate` transferred
+   the branch's verdict onto main's cache under the merge's tree key
+   (PRD-build-gate-before-land requirement 4), so this run replays it (no
+   producer runs, journal reads `(cached tree=... from=branch
+   slug=<slug>)`) instead of regenerating all 25 receipts. On pass,
+   `ship-tag.sh` tags the integrated HEAD (not any individual branch's
+   commit — main's HEAD after `integrate` + `wm-push` is what's shipped)
+   and the `Receipts:` line is written; on block, `blockers` + `next:
+   gate-red` as above — this should not happen given `gate-then-land.sh`
+   already refused to land an ungated branch (exit 7), but a DIFFERENT
+   tree than what was gated (should not happen given `land-stale-base`
+   above, but fails safe) falls through to a full run exactly as before
+   this PRD, and its verdict is what counts. With ≥2 integrates landing on
+   one crate this tick, the receipts on main after all of them carry only
+   the LAST-landed HEAD — earlier integrates' `gate` actions see their
+   receipts superseded by the next integrate before their own `gate` runs;
+   only the PRD whose integrate was actually last should expect its `gate`
+   action to find HEAD unchanged underneath it.
 
 **Dispatch additions for shared-target branches.** Each such branch's
 agent prompt must also include: its `build_into` repo, that it shares the
