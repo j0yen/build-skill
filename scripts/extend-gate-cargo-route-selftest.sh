@@ -467,6 +467,56 @@ expect "AC2: local stayed 0 — a correctly-armed shim never silently falls loca
 mismatch_count_after="$(grep -c 'gate  route-mismatch' "$T/gate-journal.md" 2>/dev/null || echo 0)"
 expect "AC2: no NEW route-mismatch line was journaled by this (correctly-armed) run" "[ \"$mismatch_count_after\" -eq \"$mismatch_count_before\" ]"
 
+# =========================================================================
+# AC10 (PRD-build-gate-before-land requirement 6, P1) — a BRANCH-SCOPED
+# gate routed to the box counts against the box's slots, never RedBaron's
+# CARGO_BUDGET_SLOTS: the cargo=burst:<n>/local:<n> attestation and the
+# "never a local ledger entry" guarantee AC2 just proved for a --scope
+# main run hold identically for --scope branch (the routing code path —
+# run_unslotted_producer / CARGO_BUDGET_BIN_DIR — never reads $scope at
+# all, so this is a regression check that requirement 1's branch-scoped
+# gate didn't accidentally special-case cargo routing, not a new
+# mechanism). Reuses REPO2's fixture and the SAME already-up ac2 burst
+# session (no need to bring up a second one) — just gates a WORKTREE of
+# it with --scope branch instead of REPO2 directly.
+# =========================================================================
+echo "=== AC10: a --scope branch gate routed to the box shows local:0 and leaves no cargo-budget ledger entry ==="
+WORKTREE_EXTEND="$HERE/worktree-extend.sh"
+LEDGER="$T/cargo-budget-state/ledger.jsonl"
+ledger_rows_before="$([ -f "$LEDGER" ] && wc -l < "$LEDGER" || echo 0)"
+
+SLUG10="gateroute-ac10-$$"
+WT10="$(BUILD_WT_ROOT="$T/build-worktrees" BUILD_TARGET_ROOT="$T/offroot-target-ac10" "$WORKTREE_EXTEND" add "$REPO2" "$SLUG10" 2>/dev/null)"
+expect "AC10 setup: worktree of repo2 exists" "[ -d \"$WT10\" ]"
+echo "// ac10 branch edit" >> "$WT10/src/lib.rs"
+git -C "$WT10" -c user.name=t -c user.email=t@t commit -q -am "ac10 branch edit"
+WT10_HEAD="$(git -C "$WT10" rev-parse HEAD)"
+
+ac10_out="$T/ac10.log"
+env "${COMMON_EXTEND_GATE_ENV[@]}" \
+  PATH="$HERE/burst-lane-bin:$FAKEBIN:$FAKE:$PATH" BURST_LANE=1 \
+  timeout -k 5 "$TIMEOUT_S" "$EXTEND_GATE" "$WT10" --head "$WT10_HEAD" --scope branch --slug "$SLUG10" --force >"$ac10_out" 2>&1
+ac10_rc=$?
+expect "AC10: gate completed (not a hang/timeout)" "[ $ac10_rc -ne 124 ] && [ $ac10_rc -ne 137 ]"
+
+cache10="$T/offroot-target-ac10/$(basename "$REPO2")-$SLUG10/autobuilder/last-verdict.json"
+expect "AC10: cargo_route.intended=burst (branch-scoped gate, same session)" \
+  "[ -f \"$cache10\" ] && [ \"\$(route_field \"$cache10\" .cargo_route.intended)\" = burst ]"
+burst10="$(route_field "$cache10" .cargo_route.burst)"
+local10="$(route_field "$cache10" .cargo_route.local)"
+echo "  repo2-worktree(ac10) cargo_route: burst=$burst10 local=$local10"
+expect "AC10: at least one cargo call was decided burst" "[ \"${burst10:-0}\" -gt 0 ]"
+expect "AC10: local:0 — a branch-scoped gate routed to the box books nothing local" "[ \"${local10:-1}\" = 0 ]"
+
+ac10_journal_line="$(grep '  gate  ' "$T/gate-journal.md" | grep "scope=branch slug=$SLUG10" | grep -v route-mismatch | tail -1)"
+expect "AC10: journal line exists and carries scope=branch slug=$SLUG10" "[ -n \"$ac10_journal_line\" ]"
+expect "AC10: journal line's cargo= field reads burst:<n>/local:0" \
+  "printf '%s' \"$ac10_journal_line\" | grep -qE 'cargo=burst:[0-9]+/local:0'"
+
+ledger_rows_after="$([ -f "$LEDGER" ] && wc -l < "$LEDGER" || echo 0)"
+expect "AC10: RedBaron's (isolated) cargo-budget ledger gained NO new rows from this run" \
+  "[ \"$ledger_rows_after\" -eq \"$ledger_rows_before\" ]"
+
 echo "-----"
 if [ "$fail" -eq 0 ]; then
   echo "extend-gate-cargo-route-selftest: ALL PASS"
