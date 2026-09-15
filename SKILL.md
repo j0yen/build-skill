@@ -1281,12 +1281,19 @@ read it before assuming a step is "the last one this tick".
   4. **mocks** — `tests/mocks/ac<N>.rs` (and `.py`, `.sh`).
   5. **fn-scan** — a `#[test] fn ac<N>_...` or `def test_ac<N>_...` /
      `def test_ac_<N>_...` anywhere under `tests/`. Last resort.
-  6. **real-box** (PRD-build-burst-dispatch-reenable) — tried only for an AC
+  6. **real-box** (PRD-build-burst-dispatch-reenable) — checked FIRST and
+     EXCLUSIVELY (ahead of rules 1-5 and all collision detection) for an AC
      whose own PRD text carries the `(Real-box` marker (build-contract.md's
      Acceptance-criteria section; e.g. "(Real-box; deferrable only with a
-     justification naming why no box was reachable.)"). A fixture test would
-     misrepresent a one-time real-hardware run as automated coverage, so
-     these ACs instead pair against burst-lane's own durable, git-ignored
+     justification naming why no box was reachable.)"). A real-box AC is by
+     definition never meant to own a `tests/` file, so `tests/` content —
+     including an unrelated sibling PRD's same-numbered file — is never a
+     real pairing OR a real collision candidate for it; checking this rule
+     LAST once let a sibling PRD's own `tests/lintdr_ac10_*.sh` misreport
+     this PRD's AC10 as `ac-number-collision` instead of PAIRED. A fixture
+     test would misrepresent a one-time real-hardware run as automated
+     coverage anyway, so these ACs instead pair against burst-lane's own
+     durable, git-ignored
      receipts — `state/burst-lane/proof.json` (`routed=true`, `bytes>0`,
      younger than 7 days) naming the image `burst-lane.sh status --json`
      reports as what `up` would boot right now — the exact same fields
