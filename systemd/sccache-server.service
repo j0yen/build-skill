@@ -14,6 +14,19 @@ Description=Managed sccache compilation-cache server (PRD-build-gate-wall-clock)
 # Type=forking + systemd's default GuessMainPID finds the detached child
 # inside this unit's own cgroup once the ExecStart process exits.
 Type=forking
+# The server sits on the critical path of every compile: when it starves
+# under concurrent gates (8-wide on RedBaron, 2026-09-15), its --show-stats
+# reply times out and sccache-assert.sh's OLD logic read that as "dead" and
+# restarted it — killing every in-flight compile of every concurrent gate
+# twice in the same minute (12:33:08Z/12:33:09Z). CPUWeight/IOWeight/Nice
+# below keep it fed instead. NOTE for deploy: RedBaron independently
+# carried a hand-made drop-in `sccache-server.service.d/priority.conf`
+# (CPUWeight=50 IOWeight=50 Nice=10) that STARVED it on purpose — that
+# drop-in must be deleted when this unit is redeployed there, or it will
+# silently override these values back to the starving ones.
+CPUWeight=500
+IOWeight=200
+Nice=0
 Environment=SCCACHE_IDLE_TIMEOUT=0
 # `info` only logs server lifecycle (start/stop) events, not individual
 # compile requests, so a gate step that never wedges would show zero log

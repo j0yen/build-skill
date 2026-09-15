@@ -5368,6 +5368,29 @@ acquire_run_slot() {
   done
 }
 
+# remote_sccache_guard — PRD-build-gate-wall-clock requirement 2, box side.
+# Same rule sccache-assert.sh now enforces locally (2026-09-15: "busy is
+# not dead"): a `--show-stats` timeout means the server didn't ANSWER in
+# time, not that it's gone — up to 4 routed runs hit this box concurrently,
+# and one run's old stop/start guard was killing every sibling run's
+# in-flight compile (the same double-restart anti-pattern proven on
+# RedBaron at 12:33:08Z/12:33:09Z the same day). This never calls
+# `--stop-server`: a live-but-busy server is left alone; only a genuinely
+# DEAD one (no `sccache` process at all) gets started, once, under a flock
+# so two concurrent runs can't both start it. Emitted as a function (not
+# inlined into $remote_cmd's own quoting) because the loop needs its own
+# `$(...)`/`$var` remote-side expansions, which would otherwise have to be
+# backslash-escaped inside that already-dense double-quoted string; instead
+# this is built with an UNQUOTED heredoc so ${dir} expands here (locally,
+# once, to a literal path) while `\$(seq...)`/`\$ok` stay escaped and reach
+# the remote shell literally, to be expanded there when $remote_cmd runs.
+remote_sccache_guard() {
+  local dir="$REMOTE_SCCACHE_DIR"
+  cat <<GUARD
+timeout 30 sccache --show-stats >/dev/null 2>&1 || { pgrep -x sccache >/dev/null 2>&1 || { flock -x ${dir}.guard.lock sccache --start-server >/dev/null 2>&1; ok=0; for i in \$(seq 1 60); do timeout 1 sccache --show-stats >/dev/null 2>&1 && { ok=1; break; }; sleep 1; done; [ "\$ok" = 1 ] || { echo 'burst-lane: sccache_unreachable on remote box' >&2; exit 97; }; }; }
+GUARD
+}
+
 cmd_run() {
   local worktree="${1:-}"; shift || true
   while [ "${1:-}" = "--" ]; do shift; done  # guard: doubled -- from stacked wrappers
@@ -5633,11 +5656,16 @@ cmd_run() {
   # the 2026-09-10 RedBaron incident — an unmanaged sccache restarting
   # mid-request orphans clients for the whole gate's wall clock). This box
   # is an ephemeral root ssh session with no systemd-user unit to manage,
-  # so the equivalent guard is inlined here rather than shelling out to
-  # scripts/sccache-assert.sh (which drives a local systemd-user unit that
-  # does not exist on this remote): assert once, restart-once on failure
-  # via a plain `sccache --stop-server && --start-server` (self-contained,
-  # no sudo, no unit), assert again, else refuse before $first ever runs.
+  # so the equivalent guard runs inline (via remote_sccache_guard() below)
+  # rather than shelling out to scripts/sccache-assert.sh (which drives a
+  # local systemd-user unit that does not exist on this remote). 2026-09-15:
+  # this guard used to be a plain `sccache --stop-server && --start-server`
+  # on any timeout — up to 4 runs route to this box concurrently, and a
+  # BUSY (not dead) server got stopped out from under every sibling run's
+  # in-flight compile. It now only starts a server that is actually gone
+  # (no `sccache` process found); a live-but-slow one is left running and
+  # simply gets more time to answer. See remote_sccache_guard()'s own
+  # comment for the mechanics.
   # PRD-build-burst-unprivileged-user requirement 2: RUSTUP_HOME hardcoded
   # at root's shared, read-only toolchain regardless of who's running this
   # (a no-op for the REMOTE_USER=root rollback, since that's already root's
@@ -5684,7 +5712,7 @@ cmd_run() {
     [ -n "${BURST_PROVE_TEST_MARKER_EPOCH:-}" ] && marker_touch="touch -d @${BURST_PROVE_TEST_MARKER_EPOCH}"
     marker_cmd="mkdir -p $remote_path/target; $marker_touch $remote_path/target/.burst-run-marker; "
   fi
-  local remote_cmd="cd $remote_cwd && export PATH=$GATE_TOOLS_REMOTE_BIN_DIR:\$PATH:$ROOT_CARGO_HOME/bin:/root/.local/bin RUSTUP_HOME=$ROOT_RUSTUP_HOME CARGO_HOME=$RUN_CARGO_HOME CARGO_TARGET_DIR=$remote_path/target RUSTC_WRAPPER=sccache SCCACHE_DIR=$REMOTE_SCCACHE_DIR SCCACHE_CACHE_SIZE=${BURST_SCCACHE_GB}G; timeout 5 sccache --show-stats >/dev/null 2>&1 || { sccache --stop-server >/dev/null 2>&1; sccache --start-server >/dev/null 2>&1; sleep 1; }; timeout 5 sccache --show-stats >/dev/null 2>&1 || { echo 'burst-lane: sccache_unreachable on remote box' >&2; exit 97; }; ${marker_cmd}$first $*"
+  local remote_cmd="cd $remote_cwd && export PATH=$GATE_TOOLS_REMOTE_BIN_DIR:\$PATH:$ROOT_CARGO_HOME/bin:/root/.local/bin RUSTUP_HOME=$ROOT_RUSTUP_HOME CARGO_HOME=$RUN_CARGO_HOME CARGO_TARGET_DIR=$remote_path/target RUSTC_WRAPPER=sccache SCCACHE_DIR=$REMOTE_SCCACHE_DIR SCCACHE_CACHE_SIZE=${BURST_SCCACHE_GB}G SCCACHE_IDLE_TIMEOUT=0; $(remote_sccache_guard); ${marker_cmd}$first $*"
   local rc=0
   local remote_out_log="$STATE_DIR/logs/run-remote.$$.log"
   "$SSH_BIN" $SSH_RUN_KEEPALIVE_OPTS $(ssh_kh_args) -i "$SSH_KEY" "$REMOTE_USER@$ip" "$remote_cmd" 2>&1 | tee "$remote_out_log"

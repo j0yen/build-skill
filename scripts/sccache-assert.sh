@@ -7,27 +7,51 @@
 # script is the "never run a compile against a server that does not
 # answer" guard.
 #
+# 2026-09-15 ("busy is not dead"): under a saturated box (8 concurrent
+# cargo gates, the server unit running at Nice=10/CPUWeight=50 so it
+# starved first) `--show-stats` timing out at 5s meant BUSY, not dead —
+# but the old flow restarted the server on ANY timeout, killing every
+# in-flight compile of every concurrent gate. Two asserters did exactly
+# that at 12:33:08Z/12:33:09Z the same day: each restarted the unit, the
+# second killing the first's fresh server. This version never restarts a
+# server whose process is still alive; it only restarts one that is
+# actually gone, and does that restart under a lock so two concurrent
+# asserters can't double-restart / restart each other's fresh server.
+#
 # Usage:
-#   sccache-assert.sh [--unit <name>] [--timeout <secs>]
+#   sccache-assert.sh [--unit <name>] [--timeout <secs>] [--busy-wait <secs>] [--start-wait <secs>]
 #
 # On success, prints exactly one line to STDOUT:
-#   sccache-assert: ok pid=<n|unknown> started_at=<iso|unknown>
+#   sccache-assert: ok pid=<n|unknown> started_at=<iso|unknown>[ (suffix)]
 # and exits 0. <n>/<iso> are read from the managed systemd-user unit
 # (MainPID / ActiveEnterTimestamp) when it is installed — "unknown" when
 # it isn't (a box without sccache-server.service installed yet, or a
 # test): sccache actually answering is what gates the compile, unit
-# bookkeeping is best-effort and never a hard dependency.
+# bookkeeping is best-effort and never a hard dependency. The optional
+# suffix names which path produced the ok:
+#   (busy Ns)            — didn't answer at first, but answered after Ns of
+#                          busy-waiting on a server that was already alive.
+#   (busy-unconfirmed)   — still alive after the full --busy-wait budget but
+#                          never answered; NEVER restarted (see above).
+#   (restarted-by-peer)  — was dead; another concurrent assert had already
+#                          restarted it by the time this one got the lock.
+#   (restarted)          — was dead; this process restarted it.
 #
 # On failure, prints `sccache-assert: sccache_unreachable ...` to STDERR
 # and exits 1 — the caller must fail the step closed, never run a compile
 # against a server it could not prove was up.
 #
-# Sequence: `sccache --show-stats` within --timeout (default 5s). On
-# failure: restart ONCE — `systemctl --user restart <unit>` if the unit
-# is known to systemd, else `sccache --start-server` directly (self-heals
-# a box where this PRD's unit isn't installed yet) — then re-check within
-# --timeout again. Still failing -> exit 1. Never retries more than once;
-# a repeat failure is "unreachable", not a retry loop.
+# Sequence: `sccache --show-stats` within --timeout (default 20s). If that
+# doesn't answer, check whether the server PROCESS is alive:
+#   ALIVE (just slow to answer) -> re-check every 5s up to --busy-wait
+#     (default 60s); never restarted — see header for why.
+#   DEAD (no process at all) -> take an exclusive lock (state dir below),
+#     re-check once more inside it (a sibling assert may have just fixed
+#     it), restart ONCE if still dead, then poll every 1s up to
+#     --start-wait (default 30s — a cold start walks the whole cache
+#     directory). Still not answering -> exit 1. Never retries more than
+#     one restart attempt; a repeat failure is "unreachable", not a retry
+#     loop.
 #
 # Env overrides (test-only hooks; production defaults unchanged):
 #   SCCACHE_BIN               (sccache)
@@ -38,6 +62,12 @@
 #                             no embedded spaces works exactly like the
 #                             two-word production default)
 #   SCCACHE_ASSERT_UNIT       (sccache-server.service)
+#   SCCACHE_ASSERT_ALIVE_CMD  (unset) — a command string `server_alive`
+#                             evaluates instead of its own MainPID/pgrep
+#                             check when set (exit 0 = alive); same style
+#                             as SCCACHE_ASSERT_SYSTEMCTL, for tests that
+#                             need to fake "server is/isn't alive" without
+#                             a real sccache process on the test box.
 #   SCCACHE_ASSERT_RESTART_LOG (<skill-dir>/state/sccache-assert/restarts.log)
 #                             — PRD-build-gate-wall-clock requirement 8: one
 #                             flock-appended NDJSON line per SUCCESSFUL
@@ -47,6 +77,10 @@
 #                             gate-wedge-rollup.sh can count "sccache
 #                             restarts by the assert path" without re-deriving
 #                             it from ledger pid deltas.
+#   SCCACHE_ASSERT_RESTART_LOCK (<skill-dir>/state/sccache-assert/restart.lock)
+#                             — flock path serializing the DEAD-path restart
+#                             between concurrent asserters (2026-09-15 fix
+#                             for the double-restart incident above).
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
@@ -56,14 +90,19 @@ SCCACHE_BIN="${SCCACHE_BIN:-sccache}"
 SYSTEMCTL="${SCCACHE_ASSERT_SYSTEMCTL:-systemctl --user}"
 UNIT="${SCCACHE_ASSERT_UNIT:-sccache-server.service}"
 RESTART_LOG="${SCCACHE_ASSERT_RESTART_LOG:-$SKILL_DIR/state/sccache-assert/restarts.log}"
-timeout_s=5
+RESTART_LOCK="${SCCACHE_ASSERT_RESTART_LOCK:-$SKILL_DIR/state/sccache-assert/restart.lock}"
+timeout_s=20
+busy_wait_s=60
+start_wait_s=30
 
-usage() { echo "usage: sccache-assert.sh [--unit <name>] [--timeout <secs>]" >&2; exit 2; }
+usage() { echo "usage: sccache-assert.sh [--unit <name>] [--timeout <secs>] [--busy-wait <secs>] [--start-wait <secs>]" >&2; exit 2; }
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --unit)    UNIT="${2:?sccache-assert: --unit needs a value}"; shift 2 ;;
-    --timeout) timeout_s="${2:?sccache-assert: --timeout needs a value}"; shift 2 ;;
+    --unit)       UNIT="${2:?sccache-assert: --unit needs a value}"; shift 2 ;;
+    --timeout)    timeout_s="${2:?sccache-assert: --timeout needs a value}"; shift 2 ;;
+    --busy-wait)  busy_wait_s="${2:?sccache-assert: --busy-wait needs a value}"; shift 2 ;;
+    --start-wait) start_wait_s="${2:?sccache-assert: --start-wait needs a value}"; shift 2 ;;
     -h|--help) usage ;;
     *) usage ;;
   esac
@@ -79,6 +118,27 @@ unit_known() {
   local ls
   ls="$($SYSTEMCTL show -p LoadState --value "$UNIT" 2>/dev/null)"
   [ -n "$ls" ] && [ "$ls" != "not-found" ]
+}
+
+# True when the server PROCESS is alive, regardless of whether it has
+# answered a --show-stats call yet — the busy-vs-dead distinction this
+# whole rewrite exists to make (see header). Prefers the managed unit's own
+# MainPID (a live pid there is authoritative); falls back to `pgrep -x
+# sccache` only when the unit itself isn't known to systemd (a box without
+# the unit installed). Overridable via SCCACHE_ASSERT_ALIVE_CMD for tests
+# that can't rely on a real sccache process/unit on the test box.
+server_alive() {
+  if [ -n "${SCCACHE_ASSERT_ALIVE_CMD:-}" ]; then
+    eval "$SCCACHE_ASSERT_ALIVE_CMD"
+    return $?
+  fi
+  if unit_known; then
+    local pid
+    pid="$($SYSTEMCTL show -p MainPID --value "$UNIT" 2>/dev/null)"
+    [ -n "$pid" ] && [ "$pid" != "0" ] && kill -0 "$pid" 2>/dev/null
+  else
+    pgrep -x sccache >/dev/null 2>&1
+  fi
 }
 
 # Prints "<pid> <iso>" — "unknown" for either field it cannot determine.
@@ -122,9 +182,56 @@ if check_answering; then
   exit 0
 fi
 
-echo "sccache-assert: sccache did not answer within ${timeout_s}s — restarting once" >&2
+if server_alive; then
+  # BUSY, not dead: on a saturated box --show-stats can time out just
+  # because the server hasn't gotten a scheduler slice yet, not because
+  # it's gone (2026-09-15 incident — see header). Restarting here would
+  # kill every concurrent gate's in-flight compile, so this path NEVER
+  # restarts; it only waits, re-checking every 5s (capped to the
+  # remaining budget so a small --busy-wait in tests doesn't overshoot).
+  elapsed=0
+  while [ "$elapsed" -lt "$busy_wait_s" ]; do
+    step=5
+    remaining=$((busy_wait_s - elapsed))
+    [ "$remaining" -lt "$step" ] && step="$remaining"
+    sleep "$step"
+    elapsed=$((elapsed + step))
+    if check_answering; then
+      read -r pid iso <<<"$(server_identity)"
+      echo "sccache-assert: ok pid=$pid started_at=$iso (busy ${elapsed}s)"
+      exit 0
+    fi
+  done
+  read -r pid iso <<<"$(server_identity)"
+  echo "sccache-assert: ok pid=$pid started_at=$iso (busy-unconfirmed)"
+  echo "sccache-assert: warning — sccache process is alive but did not answer --show-stats within ${busy_wait_s}s of busy-waiting; proceeding WITHOUT restarting it (a live server is never restarted here — see header)" >&2
+  exit 0
+fi
+
+# DEAD: no process at all. Lock so two concurrent asserters can't restart
+# each other's fresh server (the double-restart failure mode above) —
+# mkdir -p first since $RESTART_LOCK's directory may not exist on a fresh
+# box.
+mkdir -p "$(dirname "$RESTART_LOCK")" 2>/dev/null || true
+exec 201>>"$RESTART_LOCK"
+flock -x 201
+
+# A sibling assert may have already restarted it while we waited on the
+# lock — check again before restarting a second time.
+if check_answering; then
+  read -r pid iso <<<"$(server_identity)"
+  echo "sccache-assert: ok pid=$pid started_at=$iso (restarted-by-peer)"
+  exit 0
+fi
+
+echo "sccache-assert: sccache did not answer within ${timeout_s}s and no process is alive — restarting once" >&2
 restart_once
-sleep 1
+
+start_elapsed=0
+while [ "$start_elapsed" -lt "$start_wait_s" ] && ! check_answering; do
+  sleep 1
+  start_elapsed=$((start_elapsed + 1))
+done
 
 if check_answering; then
   read -r pid iso <<<"$(server_identity)"
