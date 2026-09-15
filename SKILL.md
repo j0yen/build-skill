@@ -1281,6 +1281,19 @@ read it before assuming a step is "the last one this tick".
   4. **mocks** — `tests/mocks/ac<N>.rs` (and `.py`, `.sh`).
   5. **fn-scan** — a `#[test] fn ac<N>_...` or `def test_ac<N>_...` /
      `def test_ac_<N>_...` anywhere under `tests/`. Last resort.
+  6. **real-box** (PRD-build-burst-dispatch-reenable) — tried only for an AC
+     whose own PRD text carries the `(Real-box` marker (build-contract.md's
+     Acceptance-criteria section; e.g. "(Real-box; deferrable only with a
+     justification naming why no box was reachable.)"). A fixture test would
+     misrepresent a one-time real-hardware run as automated coverage, so
+     these ACs instead pair against burst-lane's own durable, git-ignored
+     receipts — `state/burst-lane/proof.json` (`routed=true`, `bytes>0`,
+     younger than 7 days) naming the image `burst-lane.sh status --json`
+     reports as what `up` would boot right now — the exact same fields
+     `burst-lane.sh enable` itself gates on. This is a LIVE re-check, not a
+     memo of a past run: once the proof goes stale or a bake supersedes the
+     image without a fresh `prove`, the AC reverts to MISSING on the next
+     `verified-completed.sh` run.
 
   A guessed slug-derived prefix that doesn't match the crate's real
   convention (e.g. `mcphost-rest-tools`'s tests are actually `http_ac*`,

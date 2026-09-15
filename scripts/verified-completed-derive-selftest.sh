@@ -316,6 +316,59 @@ ck "AC10 AC6 names the other PRD (live-gold)" \
 ck "AC10 AC1-5 still MISSING (declared judge prefix, no files at all)" \
   '[ "$(printf "%s\n" "$out" | awk -F"\t" "\$1<=5{print \$4}" | grep -c "^MISSING$")" -eq 5 ]'
 
+# ---- AC11 (PRD-build-burst-dispatch-reenable): rule f "real-box" — an AC
+# tagged "(Real-box" pairs against a fake burst-lane.sh's state/burst-lane/
+# proof.json instead of a tests/ file; MISSING again the moment that proof
+# goes stale, names a superseded image, or is simply absent. ---------------
+mkdir -p "$T/realbox-repo/tests" "$T/realbox-repo/scripts" "$T/realbox-repo/state/burst-lane"
+cat > "$T/realbox-repo/scripts/burst-lane.sh" <<'EOF'
+#!/usr/bin/env bash
+# fake burst-lane.sh for the selftest — only `status --json`'s image_id
+# field is read by verified-completed.sh's real-box rule.
+if [ "${1:-}" = "status" ]; then
+  echo '{"image_id":"img-current"}'
+fi
+EOF
+chmod +x "$T/realbox-repo/scripts/burst-lane.sh"
+
+cat > "$T/prds/PRD-realbox-fixture.md" <<EOF
+# PRD: real-box fixture
+Status: Draft v0.1
+build_target: shell
+build_into: $T/realbox-repo
+
+## Acceptance
+
+1. a normal AC with no real-box tag at all.
+2. a real-box-only AC. (Real-box; deferrable only with a justification naming why no box was reachable.)
+EOF
+
+now_ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+echo '{"routed":true,"bytes":123,"image_id":"img-current","ts":"'"$now_ts"'"}' \
+  > "$T/realbox-repo/state/burst-lane/proof.json"
+out="$("$VC" "$T/prds/PRD-realbox-fixture.md" --derive --format table 2>/dev/null)"
+ck "AC11 fresh routed matching proof -> AC2 PAIRED via real-box" \
+  'printf "%s\n" "$out" | awk -F"\t" "\$1==2{print \$2\"|\"\$4}" | grep -qx "real-box|PAIRED"'
+ck "AC11 untagged AC1 unaffected by the same fresh proof (still MISSING)" \
+  'printf "%s\n" "$out" | awk -F"\t" "\$1==1{print \$4}" | grep -qx MISSING'
+
+echo '{"routed":true,"bytes":123,"image_id":"img-current","ts":"2020-01-01T00:00:00Z"}' \
+  > "$T/realbox-repo/state/burst-lane/proof.json"
+"$VC" "$T/prds/PRD-realbox-fixture.md" --derive >/dev/null 2>&1; rc=$?
+ck "AC11 stale (>168h) proof -> AC2 reverts to MISSING, exit 1" '[ "$rc" -eq 1 ]'
+
+echo '{"routed":true,"bytes":123,"image_id":"img-superseded","ts":"'"$now_ts"'"}' \
+  > "$T/realbox-repo/state/burst-lane/proof.json"
+out="$("$VC" "$T/prds/PRD-realbox-fixture.md" --derive --format table 2>/dev/null)"
+ck "AC11 image-id mismatch (superseded bake) -> AC2 MISSING" \
+  'printf "%s\n" "$out" | awk -F"\t" "\$1==2{print \$4}" | grep -qx MISSING'
+
+rm -f "$T/realbox-repo/state/burst-lane/proof.json"
+out="$("$VC" "$T/prds/PRD-realbox-fixture.md" --derive --format table 2>/dev/null)"
+ck "AC11 no proof.json at all -> AC2 MISSING (never crashes)" \
+  'printf "%s\n" "$out" | awk -F"\t" "\$1==2{print \$4}" | grep -qx MISSING'
+
 echo "----"
 echo "verified-completed-derive-selftest: pass=$PASS fail=$FAIL"
 [ "$FAIL" -eq 0 ]

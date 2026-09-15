@@ -71,6 +71,16 @@ inline and keep Given/When/Then on that line:
 `AC-1:` prefixes, tables, or unnumbered prose are not counted; the C5 archive
 gate then sees zero ACs.
 
+**`(Real-box` marker (PRD-build-burst-dispatch-reenable).** An AC line that
+ends with a parenthetical starting `(Real-box` (e.g. "(Real-box; deferrable
+only with a justification naming why no box was reachable.)") declares that
+AC provable only on real burst-lane hardware, never a fixture. `verified-
+completed.sh --derive`'s rule 6 (see SKILL.md "archive" / Verified-completed
+checklist) pairs such an AC against `state/burst-lane/proof.json`'s live
+routed/fresh/image-matching state instead of a `tests/` file — a re-checked
+claim, not a one-time memo. Use it sparingly; it exists for burst-lane's
+one-time real-hardware ACs, not as a general escape from writing tests.
+
 ## Language routing
 
 - `rust-*` → `/rustbuild` (cargo runs on RedBaron: locally there, remotely from every other node via the skill's cargo shim).
