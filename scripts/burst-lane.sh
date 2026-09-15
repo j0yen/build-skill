@@ -249,6 +249,13 @@ CURRENT_BOOT_IMAGE_SOURCE=""
 # removes/`status` reports the existence of; overridable so a selftest
 # never touches this host's REAL ~/.config/systemd/user tree.
 PROOF_STATE_FILE="$STATE_DIR/proof.json"
+# PRD-build-burst-dispatch-reenable requirement 7: the image_id `up` resolved
+# (resolve_boot_image) the last time a session started — plain text, not
+# JSON, since it is only ever compared for equality. Absent file == "no
+# tracked baseline image yet" (first session ever, or a selftest's fresh_env)
+# and never triggers a refresh on its own; see
+# refresh_parity_baseline_on_image_change.
+PARITY_BASELINE_IMAGE_FILE="$STATE_DIR/parity-baseline-image"
 SYSTEMD_DROPIN="${BURST_LANE_SYSTEMD_DROPIN:-$HOME/.config/systemd/user/claude-build.service.d/burst.conf}"
 COST_LEDGER="${BURST_LANE_COST_LEDGER:-$STATE_DIR/cost.jsonl}"
 # Requirement 13: which PRD slugs this session served, one per line,
@@ -3166,6 +3173,30 @@ up_lock_holder_describe() {
   printf 'pid=%s comm=%s age=%ss cmdline=%s' "$pid" "${comm:-unknown}" "${age:-unknown}" "${cmdline:-unknown}"
 }
 
+# ---- pending box-only reality checks on a gate-ready boot (PRD-build-burst-
+# dispatch-reenable requirement 8, AC14) -------------------------------------
+# `reality-check.sh pending-run` executes every registered box-only pending
+# AC (for example volume-id-parse AC9) against whichever box the lane just
+# booted or adopted — idempotent (each registration is consumed and removed
+# the first time it runs) and a no-op when nothing is pending, so calling it
+# on every gate-ready boot is safe even when the pending directory is empty.
+# `up` calls this right after gate readiness is known and BEFORE any of its
+# own ordinary work (session bookkeeping, `verify`, scheduled parity) so a
+# pending registration clears on the very first real boot after this PRD
+# lands. Overridable ($BURST_LANE_REALITY_CHECK_SH) so a selftest never
+# points a fixture boot at the real reality-check.sh / pending-registration
+# directory. Best-effort: never fails `up` — reality-check.sh's own job is
+# to record reality, not to gate this lane's boot.
+REALITY_CHECK_SH="${BURST_LANE_REALITY_CHECK_SH:-$SKILL_DIR/scripts/reality-check.sh}"
+run_pending_reality_check_if_gate_ready() {
+  [ "${GATE_READY:-false}" = "true" ] || return 0
+  [ -x "$REALITY_CHECK_SH" ] || return 0
+  local rc=0
+  "$REALITY_CHECK_SH" pending-run build-skill >/dev/null 2>&1 || rc=$?
+  journal_line "$(now_iso)  burst-lane  up  pending-reality-run  (rc=$rc)"
+  return 0
+}
+
 cmd_up() {
   if ! burst_configured; then
     echo "burst: refused — not configured (RedBaron-local policy); set BUILD_BURST_ENABLED=1 to allow" >&2
@@ -3233,6 +3264,7 @@ cmd_up() {
     local sbx; sbx="$(sandbox_probe "$aip")"
     provision_gate_tools "$aip"
     place_gate_credential "$aip"
+    run_pending_reality_check_if_gate_ready
     : > "$SERVED_FILE"
     # Requirement 9: no `server create` happened on this path (the box
     # already existed), so its true creation moment is unknown here — no
@@ -3249,6 +3281,8 @@ cmd_up() {
       "phase=setup" "phase_epoch=$(now_epoch)"
     journal_line "$(now_iso)  burst-lane  up  adopted  (server_id=$aid ip=$aip sandbox_ok=$sbx gate_ready=$GATE_READY)$(authz_journal_suffix)"
     ( cmd_verify >/dev/null 2>&1 ) || journal_line "$(now_iso)  burst-lane  up  verify-failed-after-adopt  (lane unverified — run falls back local)"
+    local _adopt_image_id; read -r _adopt_image_id _ <<<"$(resolve_boot_image)"
+    refresh_parity_baseline_on_image_change "$_adopt_image_id"
     schedule_session_parity "$aid"
     echo "already-up: $aid $aip (adopted)"
     exit 0
@@ -3345,6 +3379,7 @@ print(d.get("id",""), d.get("public_net",{}).get("ipv4",{}).get("ip",""))
   local sbx; sbx="$(sandbox_probe "$ip")"
   provision_gate_tools "$ip"
   place_gate_credential "$ip"
+  run_pending_reality_check_if_gate_ready
   : > "$SERVED_FILE"
   state_write "server_id=$id" "ip=$ip" "server_type=$SERVER_TYPE" \
     "boot_ts=$(now_iso)" "boot_epoch=$(now_epoch)" "create_epoch=$create_epoch" \
@@ -3358,6 +3393,7 @@ print(d.get("id",""), d.get("public_net",{}).get("ipv4",{}).get("ip",""))
   if [ "$sbx" = false ]; then
     journal_line "$(now_iso)  burst-lane  up  sandbox-unavailable  (server_id=$id — rust selection falls back to local cap for python-kind sandboxed tests this tick)"
   fi
+  refresh_parity_baseline_on_image_change "$image_id"
   schedule_session_parity "$id"
   echo "up: $id $ip"
   exit 0
@@ -5511,6 +5547,42 @@ if not fp or d.get("toolchain_fp") != fp:
     print("toolchain"); raise SystemExit(0)
 print("")
 ' "$parity_file" "$cur_session" "$cur_fp"
+}
+
+# ---- parity baseline refresh on image change (PRD-build-burst-dispatch-
+# reenable requirement 7, AC13) ----------------------------------------------
+# toolchain_fingerprint() already folds SNAPSHOT_ID into the parity key, but
+# the CACHED LOCAL suite capture (test-output.txt — the "parity-robust"
+# refresh path's own cache, PRD-build-burst-parity-robust) is keyed by repo
+# only, never by image. A bake landing between two sessions must not let a
+# stale local capture (taken before the bake) get compared against a box
+# that just booted a new, differently-tooled image: that comparison is not
+# a real parity diff, just a stale cache. Tracks the image `up` resolved at
+# the START of the previous session (PARITY_BASELINE_IMAGE_FILE, plain
+# text — first-ever session or a selftest's fresh_env leaves it absent and
+# never refreshes on that alone); on a change, deletes each configured
+# repo's cached local capture so cmd_parity's own "no cached baseline ->
+# full local rerun" branch fires fresh on both sides. Called from `up`
+# (both the fresh-boot and adopt paths) BEFORE schedule_session_parity so
+# the refresh — and its journal line — always precede any parity
+# comparison, per AC13.
+refresh_parity_baseline_on_image_change() {  # $1=current resolved image_id
+  local cur_id="$1" prev_id=""
+  [ -f "$PARITY_BASELINE_IMAGE_FILE" ] && prev_id="$(cat "$PARITY_BASELINE_IMAGE_FILE" 2>/dev/null || true)"
+  if [ -n "$cur_id" ] && [ -n "$prev_id" ] && [ "$cur_id" != "$prev_id" ]; then
+    local name repo f cleared=0
+    for name in $BURST_PARITY_REPOS; do
+      repo="$ATTR_REPOS_DIR/$name"
+      f="$repo/target/autobuilder/test-output.txt"
+      if [ -f "$f" ]; then
+        rm -f "$f" 2>/dev/null || true
+        cleared=$((cleared + 1))
+      fi
+    done
+    journal_line "$(now_iso)  burst-lane  parity  baseline-refreshed  (cause=bake image_id=$cur_id repos_cleared=$cleared)"
+  fi
+  mkdir -p "$(dirname "$PARITY_BASELINE_IMAGE_FILE")" 2>/dev/null || true
+  printf '%s' "$cur_id" > "$PARITY_BASELINE_IMAGE_FILE" 2>/dev/null || true
 }
 
 # requirement 3: once a session exists (adopted or freshly booted), schedule

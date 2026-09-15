@@ -361,6 +361,21 @@ fresh_env() {
   # state/probes/ledger.jsonl or ~/brain/journal/build/.
   export BUILD_STATE_DIR="$T/state"
   export PROBE_JOURNAL_DIR="$T/probe-journal"
+  # PRD-build-burst-dispatch-reenable requirement 8 (AC14): `up` now calls
+  # reality-check.sh pending-run on every gate-ready boot/adopt (see
+  # run_pending_reality_check_if_gate_ready in burst-lane.sh) — which, left
+  # at its own defaults, reads/writes $HOME/brain/journal/build and this
+  # repo's real state/reality-pending, and (had a registration existed)
+  # would write_frontmatter_keys + commit_and_push against a REAL PRD file.
+  # Isolation is a property of the harness (PRD-build-burst-selftest-
+  # isolation's own framing), not of each fixture remembering this one new
+  # call path — every `up` fixture in this file gets these three overrides
+  # for free. The pending dir is left empty/absent here (created lazily by
+  # reality-check.sh itself), so the ordinary case is a pure no-op; AC14's
+  # own cases below populate it explicitly.
+  export BUILD_JOURNAL_DIR="$T/reality-journal"
+  export BUILD_RECEIPTS_DIR="$T/reality-journal/receipts"
+  export REALITY_CHECK_PENDING_DIR="$T/reality-pending"
   # PRD-build-cost-attribution: sandbox the attribution ledger, the
   # known-repo root attribution_slug_for() consults, and the tick-journal
   # directory the daily rollup line lands in — never the real
@@ -5468,6 +5483,144 @@ fresh_env
 r12e_text="$("$BL" status)"
 expect "reenable AC12e: text-mode 'no active session' is unchanged, byte-exact, single-line" \
   "[ \"$r12e_text\" = 'no active session' ]"
+
+# ---- reenable AC13: a bake that changed the image id refreshes the cached
+# LOCAL parity capture on the next session, journaling cause=bake BEFORE any
+# parity comparison — see refresh_parity_baseline_on_image_change in
+# burst-lane.sh (requirement 7).
+# Case a: a tracked prior image differs from the current one -> each
+# configured repo's cached test-output.txt is deleted and the refresh is
+# journaled.
+fresh_env
+mkdir -p "$BURST_LANE_REPOS_DIR/mcphost/target/autobuilder"
+echo "stale local capture" > "$BURST_LANE_REPOS_DIR/mcphost/target/autobuilder/test-output.txt"
+echo -n "111" > "$BURST_LANE_STATE_DIR/parity-baseline-image"
+(
+  source "$BL"
+  refresh_parity_baseline_on_image_change "222"
+)
+expect "reenable AC13a: the stale cached local capture was deleted" \
+  "[ ! -f \"$BURST_LANE_REPOS_DIR/mcphost/target/autobuilder/test-output.txt\" ]"
+expect "reenable AC13a: journal has parity baseline-refreshed (cause=bake image_id=222)" \
+  "grep -q 'burst-lane  parity  baseline-refreshed  (cause=bake image_id=222' \"$BURST_LANE_JOURNAL\""
+expect "reenable AC13a: the tracked baseline image is now the new one" \
+  "[ \"\$(cat \"$BURST_LANE_STATE_DIR/parity-baseline-image\")\" = 222 ]"
+
+# Case b: no prior tracked image (first-ever session, or a fresh_env) ->
+# nothing to compare against, so no refresh/journal — just records the
+# current image for next time.
+fresh_env
+mkdir -p "$BURST_LANE_REPOS_DIR/mcphost/target/autobuilder"
+echo "first capture" > "$BURST_LANE_REPOS_DIR/mcphost/target/autobuilder/test-output.txt"
+(
+  source "$BL"
+  refresh_parity_baseline_on_image_change "333"
+)
+expect "reenable AC13b: no prior baseline -> the cached local capture is left alone" \
+  "[ -f \"$BURST_LANE_REPOS_DIR/mcphost/target/autobuilder/test-output.txt\" ]"
+expect "reenable AC13b: no baseline-refreshed line was journaled" \
+  "! grep -q 'parity  baseline-refreshed' \"$BURST_LANE_JOURNAL\""
+expect "reenable AC13b: the tracked baseline image is now recorded" \
+  "[ \"\$(cat \"$BURST_LANE_STATE_DIR/parity-baseline-image\")\" = 333 ]"
+
+# Case c: the resolved image is unchanged from the tracked one -> no refresh,
+# no journal, cache untouched (the ordinary case, no bake happened).
+fresh_env
+mkdir -p "$BURST_LANE_REPOS_DIR/mcphost/target/autobuilder"
+echo "still fresh" > "$BURST_LANE_REPOS_DIR/mcphost/target/autobuilder/test-output.txt"
+echo -n "444" > "$BURST_LANE_STATE_DIR/parity-baseline-image"
+(
+  source "$BL"
+  refresh_parity_baseline_on_image_change "444"
+)
+expect "reenable AC13c: same image -> the cached local capture is left alone" \
+  "[ -f \"$BURST_LANE_REPOS_DIR/mcphost/target/autobuilder/test-output.txt\" ]"
+expect "reenable AC13c: no baseline-refreshed line was journaled" \
+  "! grep -q 'parity  baseline-refreshed' \"$BURST_LANE_JOURNAL\""
+
+# Case d (structural ordering guard): `up` must call the refresh on BOTH the
+# fresh-boot and adopt paths, and in each case BEFORE it calls
+# schedule_session_parity, so the refresh (and its journal line) always
+# precede the actual backgrounded parity comparison — grep-checked directly
+# against cmd_up's own source rather than driving two full `up` sessions
+# (adopt + a real second boot) just to observe ordering.
+expect "reenable AC13d: cmd_up's fresh-boot path calls the refresh before scheduling parity" \
+  "awk '/^cmd_up\\(\\)/,/^}/' \"$BL\" | grep -B2 'schedule_session_parity \"\\\$id\"' | grep -q refresh_parity_baseline_on_image_change"
+expect "reenable AC13d: cmd_up's adopt path calls the refresh before scheduling parity" \
+  "awk '/^cmd_up\\(\\)/,/^}/' \"$BL\" | grep -B2 'schedule_session_parity \"\\\$aid\"' | grep -q refresh_parity_baseline_on_image_change"
+
+# ---- reenable AC14: `up` on a gate-ready boot calls
+# `reality-check.sh pending-run build-skill` before ordinary work, so a
+# pending box-only registration clears on the first real boot after this
+# PRD lands — see run_pending_reality_check_if_gate_ready in burst-lane.sh
+# (requirement 8).
+# Case a: no pending registrations -> a bare, default (gate_ready=true) `up`
+# still calls it — a no-op, rc=0, journaled — never a hard failure.
+# BURST_LANE_AUTOBUILDER_BIN (same fixture as reenable AC1's setup) makes
+# the LOCAL autobuilder version match the fake ssh's own reported remote
+# version — this host's real ~/.cargo/bin/autobuilder would otherwise read
+# as version-drift and gate_ready would never reach true, unrelated to
+# anything this AC is testing.
+fresh_env
+REEN_14A_SRC="$T/fake-autobuilder-src-14a"; mkdir -p "$REEN_14A_SRC"
+cat > "$REEN_14A_SRC/autobuilder" <<'EOF'
+#!/usr/bin/env bash
+echo "autobuilder 9.9.9"
+EOF
+chmod +x "$REEN_14A_SRC/autobuilder"
+export BURST_LANE_AUTOBUILDER_BIN="$REEN_14A_SRC/autobuilder"
+"$BL" up >/dev/null 2>&1
+expect "reenable AC14a: session reached gate_ready=true (default fixture)" \
+  "grep -q '\"gate_ready\":\"true\"' \"$BURST_LANE_STATE_DIR/session.json\""
+expect "reenable AC14a: up journals pending-reality-run (rc=0) with nothing pending" \
+  "grep -q 'burst-lane  up  pending-reality-run  (rc=0)' \"$BURST_LANE_JOURNAL\""
+
+# Case b: a registered box-only pending check exists -> `up` consumes it
+# (the registration file is removed), a receipt is written, and the
+# receipt's own PRD/reality bookkeeping runs — proving this is the REAL
+# reality-check.sh, not a stub, wired end to end. The named PRD file does
+# not exist, exercising do_pending_run's own "parent PRD no longer exists —
+# receipt still recorded" tolerance rather than needing a real git repo.
+fresh_env
+REEN_14B_SRC="$T/fake-autobuilder-src-14b"; mkdir -p "$REEN_14B_SRC"
+cat > "$REEN_14B_SRC/autobuilder" <<'EOF'
+#!/usr/bin/env bash
+echo "autobuilder 9.9.9"
+EOF
+chmod +x "$REEN_14B_SRC/autobuilder"
+export BURST_LANE_AUTOBUILDER_BIN="$REEN_14B_SRC/autobuilder"
+mkdir -p "$REALITY_CHECK_PENDING_DIR"
+cat > "$REALITY_CHECK_PENDING_DIR/reenable-ac14-ac9.json" <<JSON
+{"prd": "$T/no-such-prd.md", "slug": "reenable-ac14", "ac": 9, "command": "true", "registered_at": "2026-09-14T00:00:00Z", "probes": [], "alarmed": false}
+JSON
+"$BL" up >/dev/null 2>&1
+expect "reenable AC14b: the pending registration was consumed (file removed)" \
+  "[ ! -f \"$REALITY_CHECK_PENDING_DIR/reenable-ac14-ac9.json\" ]"
+expect "reenable AC14b: a reality receipt was written for it" \
+  "ls \"$BUILD_RECEIPTS_DIR\"/*-reenable-ac14-ac9-reality-boxrun.txt >/dev/null 2>&1"
+expect "reenable AC14b: reality-check's own journal records the verdict (tier=box)" \
+  "grep -q 'reality  reenable-ac14  ok  (lane=.*tier=box ac=9' \"$BUILD_JOURNAL_DIR/$(date -u +%F).md\""
+expect "reenable AC14b: burst-lane's own up journals pending-reality-run (rc=0) too" \
+  "grep -q 'burst-lane  up  pending-reality-run  (rc=0)' \"$BURST_LANE_JOURNAL\""
+
+# Case c: gate_ready=false (same deterministic missing+install-fail setup
+# bursttdl AC4/gatetools AC2/AC3 use) -> the pending-run is never even
+# attempted; a registration sits untouched until a later gate-ready boot.
+fresh_env
+mkdir -p "$REALITY_CHECK_PENDING_DIR"
+cat > "$REALITY_CHECK_PENDING_DIR/reenable-ac14c-ac1.json" <<JSON
+{"prd": "$T/no-such-prd.md", "slug": "reenable-ac14c", "ac": 1, "command": "true", "registered_at": "2026-09-14T00:00:00Z", "probes": [], "alarmed": false}
+JSON
+export FAKE_SSH_GATE_TOOLS_MISSING="autobuilder"
+export FAKE_SSH_GATE_TOOLS_INSTALL_FAIL=1
+"$BL" up >/dev/null 2>&1
+expect "reenable AC14c setup: session is gate_ready=false" \
+  "grep -q '\"gate_ready\":\"false\"' \"$BURST_LANE_STATE_DIR/session.json\""
+expect "reenable AC14c: no pending-reality-run was journaled while gate_ready=false" \
+  "! grep -q 'burst-lane  up  pending-reality-run' \"$BURST_LANE_JOURNAL\""
+expect "reenable AC14c: the pending registration is left untouched" \
+  "[ -f \"$REALITY_CHECK_PENDING_DIR/reenable-ac14c-ac1.json\" ]"
+unset FAKE_SSH_GATE_TOOLS_MISSING FAKE_SSH_GATE_TOOLS_INSTALL_FAIL
 
 expect_block_green "reenable" "reenable: every reenable case above ran green"
 
