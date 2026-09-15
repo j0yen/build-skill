@@ -19,7 +19,14 @@
 # receipt (target/autobuilder/last-verdict.json) under a `phases` key.
 # `--phases-json` is a read-only mode: prints that cached `{phases,
 # wall_s, head}` for <build_into>'s last gate and exits 0 — no producer
-# runs, no lock taken, nothing journaled.
+# runs, no lock taken, nothing journaled. `--print-verdict-path`
+# (PRD-build-gate-before-land requirement 3) is the same read-only class:
+# resolves and prints the verdict-cache path (the exact
+# target/autobuilder/last-verdict.json a real run at <build_into> would
+# read/write, honoring --project-root / find_cargo_root the same way) and
+# exits 0 — the rebase-and-regate loop's way of locating the file to pass
+# as `worktree-extend.sh land --verdict <path>` without duplicating the
+# project-root search.
 #
 # On a clean main checkout, at HEAD, in this order:
 #   scripts/audit.sh                         (if the crate has one)
@@ -310,7 +317,8 @@ usage() {
   cat <<'EOF'
 usage: extend-gate.sh <build_into> [--base <tag>] [--head <sha>] [--dry-run]
                        [--parallelism N] [--record-baseline] [--force]
-                       [--phases-json] [--scope main|branch --slug <slug>]
+                       [--phases-json] [--print-verdict-path]
+                       [--scope main|branch --slug <slug>]
 EOF
 }
 
@@ -340,6 +348,7 @@ record_baseline=false
 force=false
 project_root_override=""
 phases_json_mode=false
+print_verdict_path_mode=false
 # PRD-build-gate-before-land requirement 1 (P0): a branch-scoped gate runs
 # the full producer sequence inside a worktree, under a per-branch lock,
 # instead of the shared per-crate `autobuilder-integrate.lock` — so N
@@ -359,6 +368,7 @@ while [ $# -gt 0 ]; do
     --force)            force=true; shift ;;
     --project-root)     project_root_override="${2:?extend-gate: --project-root needs a value}"; shift 2 ;;
     --phases-json)      phases_json_mode=true; shift ;;
+    --print-verdict-path) print_verdict_path_mode=true; shift ;;
     --scope)            scope="${2:?extend-gate: --scope needs a value}"; shift 2 ;;
     --slug)             slug="${2:?extend-gate: --slug needs a value}"; shift 2 ;;
     *) die 1 "unknown argument: $1 (see --help)" ;;
@@ -551,6 +561,19 @@ if $phases_json_mode; then
   else
     echo '{"phases":{},"wall_s":null,"head":null}'
   fi
+  exit 0
+fi
+
+# --- --print-verdict-path (PRD-build-gate-before-land requirement 3) -----
+# Prints the resolved verdict-cache path (target/autobuilder/last-verdict.json
+# under the SAME project-root resolution a real run would use — repo root,
+# or the --project-root override, or find_cargo_root's search) for <repo>
+# and exits 0. Read-only, same class as --phases-json: no producer, no
+# lock, no journal. Lets a caller (the rebase-and-regate loop) locate the
+# exact file to pass as `land --verdict <path>` without re-implementing
+# find_cargo_root's search itself.
+if $print_verdict_path_mode; then
+  echo "$project_abs/target/autobuilder/last-verdict.json"
   exit 0
 fi
 
