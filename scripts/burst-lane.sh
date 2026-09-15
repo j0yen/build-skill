@@ -2671,7 +2671,7 @@ cmd_prove() {
           # consulted here or anywhere below — it is diagnostic-only
           # (prove_assert_diag_json), and both sides of this comparison are
           # plain on-disk mtimes rsync -a preserved from the box's own clock.
-          if [ ! -f "$remote_marker" ] || ! find -L "$local_target" -type f ! -name '.burst-run-marker' -newer "$remote_marker" 2>/dev/null | grep -q .; then
+          if [ ! -f "$remote_marker" ] || ! find -L "$local_target" -type f ! -name '.burst-run-marker' -newer "$remote_marker" -print -quit 2>/dev/null | grep -q .; then
             cause="no-fresh-artifact"
             # Requirement 12: capture the diagnosis right here, before
             # anything below has a chance to change local_target/marker
