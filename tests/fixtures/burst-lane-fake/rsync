@@ -22,6 +22,35 @@ if [ "${FAKE_RSYNC_FAIL:-0}" = "1" ]; then
   exit "${FAKE_RSYNC_FAIL_RC:-23}"
 fi
 
+# PRD-build-burst-pull-remote-target-missing AC2/AC7: the SOURCE-side
+# target/ dir itself never existed on the box (a routed run that produced
+# no artifacts) — real rsync's own "change_dir ... failed: No such file or
+# directory (2)" text at rc23, verbatim from this PRD's own 2026-09-15
+# grounding (burst-lane.log 12:00-13:10Z). $FAKE_RSYNC_TARGET_MISSING names
+# the exact remote dir rsync should claim it couldn't change into (the
+# fixture doesn't otherwise know what remote_target the caller resolved).
+if [ -n "${FAKE_RSYNC_TARGET_MISSING:-}" ]; then
+  echo "rsync: [sender] change_dir \"$FAKE_RSYNC_TARGET_MISSING\" failed: No such file or directory (2)" >&2
+  echo "rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1338) [Receiver=3.2.7]" >&2
+  exit 23
+fi
+
+# PRD-build-burst-pull-remote-target-missing AC3: the box itself refused
+# the connection (rc255) — a genuine, retryable transport failure this PRD
+# must classify as cause=ssh-failed, never remote-target-missing. The
+# caller's own err= field is documented as "the last non-empty stderr
+# line" (requirement 2) — the actual root cause (ssh's own connect
+# refusal) is put LAST here, same as a real openssh client's own output
+# order against a refused TCP connect (rsync's own generic "unexplained
+# error" summary line prints first, before ssh's specific one reaches
+# stderr).
+if [ "${FAKE_RSYNC_CONN_REFUSED:-0}" = "1" ]; then
+  echo "rsync: connection unexpectedly closed (0 bytes received so far) [Receiver]" >&2
+  echo "rsync error: unexplained error (code 255) at io.c(228) [Receiver=3.2.7]" >&2
+  echo "ssh: connect to host ${FAKE_RSYNC_CONN_REFUSED_HOST:-1.2.3.4} port 22: Connection refused" >&2
+  exit 255
+fi
+
 # PRD-build-burst-session-hygiene AC1: one line per rsync invocation, same
 # shape as the fake ssh's own FAKE_SSH_KH_LOG — this is what proves an
 # rsync call's own `-e "$SSH_BIN -o UserKnownHostsFile=... -o

@@ -527,6 +527,18 @@ BURST_VOLUME_EUR_PER_GB_MONTH="${BURST_VOLUME_EUR_PER_GB_MONTH:-0.0476}"
 # as 87 GB — see the 2026-09-11 08:55Z 0-bytes-free incident in the PRD).
 BURST_LOCAL_DISK_FLOOR_GB="${BURST_LOCAL_DISK_FLOOR_GB:-60}"
 
+# ---- pull retry/backoff (PRD-build-burst-pull-remote-target-missing) -------
+# A genuine rsync-down failure (box up, dir there, transfer itself failed) is
+# retried by `local-read` at 30s, 60s, 120s ... doubling, capped at 900s
+# (15 min) — never at the 09-15 storm's ~7s cadence. After
+# BURST_PULL_MAX_ATTEMPTS consecutive failures the marker is left dirty with
+# stuck=true and `local-read` stops trying it at all until a new routed run
+# rewrites the marker (mark_dirty overwrites the whole file, so attempts/
+# stuck/next_retry_epoch/last_err all implicitly reset to absent = 0/false).
+BURST_PULL_BACKOFF_BASE_S="${BURST_PULL_BACKOFF_BASE_S:-30}"
+BURST_PULL_BACKOFF_CAP_S="${BURST_PULL_BACKOFF_CAP_S:-900}"
+BURST_PULL_MAX_ATTEMPTS="${BURST_PULL_MAX_ATTEMPTS:-8}"
+
 # ---- prove failure-evidence preservation (PRD-build-burst-prove-evidence-
 # preservation) -------------------------------------------------------------
 # Requirement 6: the evidence dir must live on the SAME filesystem as the
@@ -3948,6 +3960,14 @@ for f in sorted(glob.glob(sys.argv[2] + "/*.json")):
     except Exception:
         marked_epoch = now
     d["age_seconds"] = max(0, now - marked_epoch)
+    # PRD-build-burst-pull-remote-target-missing requirement 6: always
+    # present, even for a marker that has never failed yet (migration note —
+    # "old markers without these read as 0/false") rather than only showing
+    # up once a failure has actually written them.
+    d.setdefault("attempts", 0)
+    d.setdefault("next_retry_epoch", 0)
+    d.setdefault("stuck", False)
+    d.setdefault("last_err", "")
     rows.append(d)
 print(json.dumps(rows))
 ' "$(now_epoch)" "$DIRTY_DIR")"
@@ -4332,8 +4352,8 @@ cargo_target_dir_for() {  # $1=worktree -> stdout: absolute override, or ""
 # own pull-back and the standalone `sync-back` subcommand go through this one
 # `rsync --delete --stats` path so already-synced bytes on the box (warm from
 # a prior run on the same worktree) don't get re-counted or re-copied.
-pull_target_incremental() {  # $1=worktree $2=ip [$3=remote_path] -> stdout: bytes transferred; rc 0/1
-  local worktree="$1" ip="$2" remote_path stats local_target remote_target override
+pull_target_incremental() {  # $1=worktree $2=ip [$3=remote_path] -> stdout: bytes transferred; rc 0=ok 1=real failure 2=remote target missing (cold, prints REMOTE_TARGET_MISSING)
+  local worktree="$1" ip="$2" remote_path stats local_target remote_target override rc
   # PRD-build-burst-path-deps-workspaces requirement 1: a workspace member's
   # remote_path is keyed by its SYNC ROOT, not the worktree itself (see
   # cmd_run) — recomputing remote_path_for(worktree) fresh here would look
@@ -4360,13 +4380,66 @@ pull_target_incremental() {  # $1=worktree $2=ip [$3=remote_path] -> stdout: byt
   # --exclude autobuilder: gate receipts/verdicts live at target/autobuilder/
   # LOCALLY ONLY (producers run here; the box only runs cargo) — without this,
   # --delete erased the gate's own evidence on every routed shared-checkout run.
-  if ! stats="$("$RSYNC_BIN" -az --delete --stats --exclude autobuilder -e "$SSH_BIN $(ssh_kh_args) -i $SSH_KEY" \
-        "$REMOTE_USER@$ip:$remote_target/" "$local_target/" 2>&1)"; then
+  stats="$("$RSYNC_BIN" -az --delete --stats --exclude autobuilder -e "$SSH_BIN $(ssh_kh_args) -i $SSH_KEY" \
+        "$REMOTE_USER@$ip:$remote_target/" "$local_target/" 2>&1)"; rc=$?
+  if [ "$rc" -ne 0 ]; then
+    # requirement 1/7: rsync's rc 23 (occasionally 12) carrying its own
+    # "change_dir ... failed: No such file or directory" text is raised both
+    # when the SOURCE directory (remote_target) never existed at all (a
+    # routed run that produced no target/ — this PRD's whole grounding) and,
+    # in principle, by any other vanished-subpath partial-transfer error —
+    # so, ordered AFTER the one rsync attempt (Technical considerations:
+    # keep the happy path at one round trip — AC9), confirm directly
+    # against the box before ever calling this "nothing was built" rather
+    # than a retryable failure.
+    case "$rc" in
+      23|12)
+        if printf '%s\n' "$stats" | grep -qE 'change_dir ".*" failed: No such file or directory' \
+            && ! remote_dir_exists "$ip" "$remote_target"; then
+          echo "REMOTE_TARGET_MISSING"
+          return 2
+        fi
+        ;;
+    esac
+    # A caller invoked through command substitution (do_marker_pull below)
+    # runs this whole function in a SUBSHELL — a plain global variable
+    # assignment here would never escape it, so the rc + full stderr ride
+    # back the one channel that DOES survive `$(...)`: stdout itself,
+    # rc on its own first line, the rest verbatim. cmd_sync_back's older
+    # caller only ever checks `! bytes=$(...)` for failure and never reads
+    # this payload, so it is unaffected either way.
+    printf '%s\n' "$rc"
+    printf '%s\n' "$stats"
     return 1
   fi
   local bytes; bytes="$(echo "$stats" | grep -oE 'Total transferred file size: [0-9,]+' | grep -oE '[0-9,]+' | tr -d ',')"
   echo "${bytes:-0}"
   return 0
+}
+
+# rc-classified cause for a real (non-cold) rsync-down failure's journal line
+# (requirement 7). 23/12 paired with "change_dir ... No such file" is
+# resolved to remote-target-missing INSIDE pull_target_incremental (rc2,
+# never reaches here) — anything landing here is a genuine transfer failure.
+rsync_failure_cause() {  # $1=rc -> stdout cause
+  case "$1" in
+    255) echo "ssh-failed" ;;
+    30) echo "timeout" ;;
+    12) echo "protocol" ;;
+    *) echo "rsync-failed" ;;
+  esac
+}
+
+# Exponential backoff schedule for `local-read` pull retries (requirement 3):
+# base * 2^(attempts-1), capped. attempts is the count AFTER the failure
+# that's about to be journaled (first failure -> attempts=1 -> base delay).
+pull_backoff_delay_s() {  # $1=attempts(>=1) -> stdout delay seconds
+  local attempts="${1:-1}" base cap delay
+  case "$attempts" in ''|*[!0-9]*) attempts=1 ;; esac
+  base="$BURST_PULL_BACKOFF_BASE_S"; cap="$BURST_PULL_BACKOFF_CAP_S"
+  delay=$(( base * (1 << (attempts - 1)) ))
+  [ "$delay" -gt "$cap" ] && delay="$cap"
+  printf '%s\n' "$delay"
 }
 
 # ---- shared incremental .pybuilder/ pull (requirement 12) --------------------
@@ -4769,11 +4842,47 @@ try:
     d = json.load(open(path))
 except Exception:
     sys.exit(1)
-print(d.get(key, ""))
+v = d.get(key, "")
+# PRD-build-burst-pull-remote-target-missing requirement 4: `stuck` (and any
+# future boolean field) must read back as the shell-comparable "true"/
+# "false" JSON spells it as — plain print() of a python bool prints
+# "True"/"False" (str()s capitalization), which a caller comparing against
+# the literal "true" would silently never match.
+if isinstance(v, bool):
+    print("true" if v else "false")
+else:
+    print(v)
 ' "$f" "$2"
 }
 
 clear_dirty() { rm -f "$(dirty_marker_file "$1")"; }  # $1=worktree
+
+# Merge a JSON object's keys into an existing dirty marker in place — used by
+# the pull-retry/backoff bookkeeping (attempts, next_retry_epoch, stuck,
+# last_err, backoff_logged_epoch) below, which only ever ADD/OVERWRITE
+# fields, never replace the whole row the way mark_dirty's fresh write does.
+# A no-op (never creates a marker) when the marker is already gone — a race
+# with a concurrent clear_dirty is not this helper's problem to fix.
+dirty_merge_fields() {  # $1=worktree $2=json object fragment
+  local f; f="$(dirty_marker_file "$1")"
+  [ -s "$f" ] || return 0
+  python3 -c '
+import json, sys
+path, frag = sys.argv[1:3]
+try:
+    d = json.load(open(path))
+except Exception:
+    d = {}
+try:
+    patch = json.loads(frag)
+    if isinstance(patch, dict):
+        d.update(patch)
+except Exception:
+    pass
+with open(path, "w") as fh:
+    fh.write(json.dumps(d))
+' "$f" "$2"
+}
 
 # Last ACTUAL pull's byte count for a worktree — the "last observed pull
 # size" the PRD's requirement 1 wants a skipped pull's bytes_saved estimated
@@ -4863,6 +4972,39 @@ do_marker_pull() {  # $1=worktree $2=trigger(local-read|explicit|teardown) -> rc
   sid="$(dirty_field "$worktree" session_id)"
   remote_path="$(dirty_field "$worktree" remote_path)"
   kind="$(dirty_field "$worktree" kind)"
+
+  # PRD-build-burst-pull-remote-target-missing requirements 3/4/5: the
+  # retry/backoff gate. `local-read` is the only trigger this throttles — a
+  # local cargo shim's own retry-on-every-read is exactly the 246-line-per-
+  # hour storm this PRD exists to fix. `explicit` (an operator's own `pull`)
+  # and `teardown` (a box about to die) always try once regardless of
+  # backoff or stuck state (requirement 5), but still record the attempt
+  # below on failure. Checked BEFORE the disk-floor guard (whose payload
+  # probe branch makes its own ssh call) so a backed-off/stuck local-read
+  # truly makes zero network calls (AC4/AC5's "no ssh call is made").
+  local pr_attempts pr_next_retry pr_stuck
+  pr_attempts="$(dirty_field "$worktree" attempts)"; case "$pr_attempts" in ''|*[!0-9]*) pr_attempts=0 ;; esac
+  pr_next_retry="$(dirty_field "$worktree" next_retry_epoch)"; case "$pr_next_retry" in ''|*[!0-9]*) pr_next_retry=0 ;; esac
+  pr_stuck="$(dirty_field "$worktree" stuck)"
+  if [ "$trigger" = "local-read" ]; then
+    if [ "$pr_stuck" = "true" ]; then
+      PULL_OUTCOME="stuck"
+      return 0
+    fi
+    if [ "$pr_attempts" -gt 0 ] && [ "$(now_epoch)" -lt "$pr_next_retry" ]; then
+      # requirement 3: "at most one pull backoff line per marker per backoff
+      # window" — dedupe on next_retry_epoch itself (a fresh value every
+      # time a new failure reschedules the window) rather than journaling
+      # once per skipped call.
+      local pr_logged; pr_logged="$(dirty_field "$worktree" backoff_logged_epoch)"
+      if [ "$pr_logged" != "$pr_next_retry" ]; then
+        dirty_merge_fields "$worktree" "{\"backoff_logged_epoch\": $pr_next_retry}"
+        journal_line "$(now_iso)  burst-lane  pull  backoff  (worktree=$worktree trigger=$trigger attempts=$pr_attempts next_retry_s=$((pr_next_retry - $(now_epoch))))"
+      fi
+      PULL_OUTCOME="deferred-backoff"
+      return 0
+    fi
+  fi
 
   # PRD-build-burst-persistent-volume requirement 9: the pull-back
   # DESTINATION guard, checked before every other reason to give up or
@@ -4966,17 +5108,79 @@ do_marker_pull() {  # $1=worktree $2=trigger(local-read|explicit|teardown) -> rc
   local t0 t1 bytes prc=0
   t0="$(now_fractional)"
   if [ "$kind" = "pybuilder" ]; then
-    bytes="$(pull_pybuilder_incremental "$worktree" "$ip")" || prc=1
+    bytes="$(pull_pybuilder_incremental "$worktree" "$ip")"; prc=$?
   else
     # PRD-build-burst-path-deps-workspaces requirement 1: pass the marker's
     # own $remote_path (read above) straight through — a workspace member's
     # actual sync destination, which remote_path_for(worktree) alone can no
     # longer reliably recompute.
-    bytes="$(pull_target_incremental "$worktree" "$ip" "$remote_path")" || prc=1
+    bytes="$(pull_target_incremental "$worktree" "$ip" "$remote_path")"; prc=$?
   fi
   t1="$(now_fractional)"
+
+  # requirement 1: pull_target_incremental's rc2 — the remote target dir
+  # itself never existed (a routed run that built nothing) — is a cold
+  # outcome, not a failure: clear the marker in one pass, never retried.
+  if [ "$prc" -eq 2 ]; then
+    clear_dirty "$worktree"
+    journal_line "$(now_iso)  burst-lane  pull  cold  (worktree=$worktree session_id=$sid remote_path=$remote_path trigger=$trigger cause=remote-target-missing — nothing was built on the box for this marker)"
+    PULL_OUTCOME="cold"
+    return 0
+  fi
+
   if [ "$prc" -ne 0 ]; then
-    journal_line "$(now_iso)  burst-lane  pull  fallback  (cause=rsync-failed worktree=$worktree trigger=$trigger — marker left dirty for retry)"
+    # requirements 2/3/4: a genuine rsync-down failure. Keep the stderr this
+    # PRD's own grounding shows the old fallback branch discarded — written
+    # to its own kept (never rm -f'd) log, with the last non-empty line
+    # riding the journal line itself — then advance the backoff/stuck
+    # bookkeeping so the NEXT local-read (if any) waits instead of hammering.
+    # pull_target_incremental (kind=target) ran inside THIS command
+    # substitution's own subshell — a plain global assignment there would
+    # never have escaped it, so it rides the rc + full stderr back on
+    # stdout itself instead: $bytes here is "<rc>\n<stats...>", rc on its
+    # own first line. pull_pybuilder_incremental (non-goal: sharing only
+    # the backoff/stuck helpers, not full stderr capture) has no such
+    # payload — $bytes is empty on its failure, so pf_rc/pf_stats fall back
+    # to a bare "1"/empty.
+    local pf_wkey pf_log pf_rc pf_stats pf_err pf_cause pf_new_attempts pf_delay pf_next_epoch pf_stuck
+    if [ "$kind" = "pybuilder" ]; then
+      pf_rc=1
+      pf_stats=""
+    else
+      pf_rc="$(printf '%s\n' "$bytes" | head -n1)"
+      case "$pf_rc" in ''|*[!0-9]*) pf_rc=1 ;; esac
+      pf_stats="$(printf '%s\n' "$bytes" | tail -n +2)"
+    fi
+    pf_wkey="$(printf '%s' "$worktree" | sha1sum | cut -c1-8)"
+    mkdir -p "$STATE_DIR/logs" 2>/dev/null || true
+    pf_log="$STATE_DIR/logs/pull-fail.$pf_wkey.$(now_epoch).log"
+    printf '%s\n' "$pf_stats" > "$pf_log" 2>/dev/null || true
+    pf_err="$(printf '%s\n' "$pf_stats" | awk 'NF{l=$0} END{print l}')"
+    pf_err="${pf_err:0:160}"
+    pf_cause="$(rsync_failure_cause "$pf_rc")"
+
+    pf_new_attempts=$((pr_attempts + 1))
+    pf_delay="$(pull_backoff_delay_s "$pf_new_attempts")"
+    pf_next_epoch=$(( $(now_epoch) + pf_delay ))
+    pf_stuck=false
+    [ "$pf_new_attempts" -ge "$BURST_PULL_MAX_ATTEMPTS" ] && pf_stuck=true
+
+    dirty_merge_fields "$worktree" "$(python3 -c '
+import json, sys
+attempts, next_retry_epoch, stuck, last_err = sys.argv[1:5]
+print(json.dumps({
+    "attempts": int(attempts),
+    "next_retry_epoch": int(next_retry_epoch),
+    "stuck": stuck == "true",
+    "last_err": last_err,
+}))
+' "$pf_new_attempts" "$pf_next_epoch" "$pf_stuck" "$pf_err")"
+
+    if [ "$pf_stuck" = "true" ]; then
+      journal_line "$(now_iso)  burst-lane  pull  stuck  (worktree=$worktree trigger=$trigger cause=$pf_cause rc=$pf_rc err=\"$pf_err\" attempts=$pf_new_attempts — marker left dirty; needs a new routed run to reset)"
+    else
+      journal_line "$(now_iso)  burst-lane  pull  fallback  (cause=$pf_cause rc=$pf_rc err=\"$pf_err\" attempts=$pf_new_attempts next_retry_s=$pf_delay worktree=$worktree trigger=$trigger)"
+    fi
     PULL_OUTCOME="failed"
     return 1
   fi
@@ -7215,6 +7419,40 @@ reap_orphan_processes() {
   echo "orphan-processes-killed=$killed"
 }
 
+# PRD-build-burst-pull-remote-target-missing requirement 8: a marker
+# `local-read` gave up on (stuck=true, 8 straight failures) is only ever
+# cleared by a NEW routed run rewriting it (mark_dirty's fresh overwrite) —
+# but the session that would run one may itself be gone (crashed, torn
+# down without a sweep). Rather than leave a stuck marker dirty forever
+# with nobody left to un-stick it, `reap` clears it once its own
+# session_id no longer matches the current active session (or there is no
+# active session at all) — same "no active session = stale, safe to drop"
+# doctrine do_marker_pull's own cold path already uses.
+reap_stuck_markers() {  # -> stdout "stuck-markers-reaped=N"
+  mkdir -p "$DIRTY_DIR" 2>/dev/null || true
+  local n=0 f row stuck wt sid cur_sid=""
+  if state_active; then cur_sid="$(state_read server_id)"; fi
+  for f in "$DIRTY_DIR"/*.json; do
+    [ -e "$f" ] || continue
+    row="$(python3 -c '
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    d = {}
+print("%s\t%s\t%s" % (str(bool(d.get("stuck", False))).lower(), d.get("worktree", ""), d.get("session_id", "")))
+' "$f" 2>/dev/null)"
+    IFS=$'\t' read -r stuck wt sid <<<"$row"
+    [ "$stuck" = "true" ] || continue
+    if [ -z "$cur_sid" ] || [ "$sid" != "$cur_sid" ]; then
+      rm -f "$f"
+      n=$((n + 1))
+      journal_line "$(now_iso)  burst-lane  reap  marker-stuck-cleared  (worktree=$wt session_id=$sid)"
+    fi
+  done
+  echo "stuck-markers-reaped=$n"
+}
+
 cmd_reap() {
   if [ "${1:-}" = "--volumes" ]; then
     reap_volumes
@@ -7224,7 +7462,8 @@ cmd_reap() {
   local out; out="$(reap_orphans)"
   local prove_out; prove_out="$(reap_prove_logs)"
   local evidence_out; evidence_out="$(reap_evidence)"
-  printf '%s\n%s\n%s\n%s\n' "$proc_out" "$out" "$prove_out" "$evidence_out"
+  local stuck_out; stuck_out="$(reap_stuck_markers)"
+  printf '%s\n%s\n%s\n%s\n%s\n' "$proc_out" "$out" "$prove_out" "$evidence_out" "$stuck_out"
   exit 0
 }
 

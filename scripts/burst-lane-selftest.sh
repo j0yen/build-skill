@@ -3445,7 +3445,15 @@ expect "pullback AC5: stdout reports the fallback, never claims 'pulled'" \
   "[ \"$ac5pull_out\" = 'fallback: pull failed' ]"
 expect "pullback AC5: the marker is left dirty for a later retry" "dirty_has \"$WT_AC5PULL\""
 expect "pullback AC5: journal names the rsync failure cause" \
-  "grep -q 'burst-lane  pull  fallback  (cause=rsync-failed worktree=$WT_AC5PULL trigger=explicit' \"$BURST_LANE_JOURNAL\""
+  "grep -q 'burst-lane  pull  fallback  (cause=rsync-failed' \"$BURST_LANE_JOURNAL\""
+# PRD-build-burst-pull-remote-target-missing requirement 2: the fallback
+# line now carries rc/err/attempts/next_retry_s BETWEEN cause= and
+# worktree= (Migration/compatibility: cause=rsync-failed itself stays
+# first, for exactly this kind of older grep) — proven as its own case
+# rather than folded into the line above, so a future regression here
+# fails with a label naming which half broke.
+expect "pullmiss: pullback AC5's failure carries rc/err/attempts/next_retry_s too" \
+  "grep -qF 'burst-lane  pull  fallback  (cause=rsync-failed rc=11 err=\"rsync: fake pull-down failure\" attempts=1 next_retry_s=30 worktree=$WT_AC5PULL trigger=explicit' \"$BURST_LANE_JOURNAL\""
 
 # ---- pullback AC12 (PRD-build-burst-pull-back-restore, Joe's 2026-09-13
 # decision): need_gb follows a bounded remote payload probe when it
@@ -5643,8 +5651,11 @@ export FAKE_RSYNC_FAIL=1
 r8c_out="$("$BL" pull "$WT8C" 2>&1)"; r8c_rc=$?
 unset FAKE_RSYNC_FAIL
 expect "reenable AC8c: pull exits 3 when the rsync-down fails" "[ $r8c_rc -eq 3 ]"
+# PRD-build-burst-pull-remote-target-missing requirement 2: rc/err/
+# attempts/next_retry_s now ride between cause= and worktree= — this is
+# still the same fresh (attempt 1) marker, default FAKE_RSYNC_FAIL rc/msg.
 expect "reenable AC8c: journal has pull fallback (cause=rsync-failed worktree=$WT8C)" \
-  "grep -qF \"burst-lane  pull  fallback  (cause=rsync-failed worktree=$WT8C\" \"$BURST_LANE_JOURNAL\""
+  "grep -qF \"burst-lane  pull  fallback  (cause=rsync-failed rc=23 err=\\\"rsync: fake failure injected\\\" attempts=1 next_retry_s=30 worktree=$WT8C\" \"$BURST_LANE_JOURNAL\""
 
 # ---- reenable AC9: auto-disable fires on either trigger — two sessions
 # within 24h both zero-run (cause=zero-run-sessions), or a day's deleted-box
