@@ -396,16 +396,18 @@ print_burst_lane_path_reminder() {
 # mechanics, "does not redesign them"; touching cmd_integrate's internals
 # risks the rust-extend shared-target path this PRD must not regress.
 cmd_land() {
-  local no_rebase=""
+  local no_rebase="" gated_at="" verdict_path=""
   local -a pos=()
   while [ $# -gt 0 ]; do
     case "${1:-}" in
       --no-rebase) no_rebase=1; shift ;;
+      --gated-at)  gated_at="${2:?worktree-extend: --gated-at needs a value}"; shift 2 ;;
+      --verdict)   verdict_path="${2:?worktree-extend: --verdict needs a value}"; shift 2 ;;
       *) pos+=("${1:-}"); shift ;;
     esac
   done
   local repo="${pos[0]:-}" slug="${pos[1]:-}"
-  need "$repo" "usage: land [--no-rebase] <repo> <slug>"; need "$slug" "missing slug"
+  need "$repo" "usage: land [--no-rebase] [--gated-at <main sha> --verdict <path>] <repo> <slug>"; need "$slug" "missing slug"
   local branch="autobuilder/$slug"
   local wt; wt="$(wt_path "$repo" "$slug")"
   # PRD-build-worktree-default-branch AC2: resolve the repo's REAL default
@@ -415,9 +417,39 @@ cmd_land() {
   # Same per-repo integration lock file as cmd_integrate: land and integrate
   # against the same repo are mutually exclusive, language-agnostic.
   # PRD-extend-gate-lock-cloexec convention: no cargo is invoked in this
-  # function, so no fd-9 close is needed here (unlike cmd_integrate).
+  # function, so no fd-9 close is needed here (unlike cmd_integrate) — EXCEPT
+  # now the --gated-at path below explicitly closes it once the merge+commit
+  # is done, per PRD-build-gate-before-land requirement 2 ("the lock is held
+  # only across the HEAD check, the merge, ... and the commit").
   exec 9>"$repo/.git/autobuilder-integrate.lock"
   flock -w 120 9 || die 5 "could not acquire integration lock for $repo"
+  local lock_t0; lock_t0="$(date +%s)"
+
+  # PRD-build-gate-before-land requirement 2 (P0): land-if-unchanged. A
+  # branch gated at `--gated-at <main sha>` with a `--verdict <path>` may
+  # only land while main is STILL at that sha (otherwise a sibling landed
+  # first and this branch's gate no longer reflects what it would merge
+  # onto) and only when that verdict is pass/delta-pass (a blocked branch
+  # is never merged). Checked FIRST, under the lock, before the dirty-tree
+  # refusal below, so a stale-base or ungated land never even inspects the
+  # working tree. Omitting --gated-at reproduces today's behavior exactly
+  # (no check, no journal line) — see this script's Migration note.
+  if [ -n "$gated_at" ]; then
+    local main_now; main_now="$(git -C "$repo" rev-parse "$default" 2>/dev/null)"
+    if [ "$main_now" != "$gated_at" ]; then
+      exec 9>&-
+      die 6 "land-stale-base (gated_at=$gated_at main=$main_now)"
+    fi
+    local verdict_val=""
+    if [ -n "$verdict_path" ] && [ -f "$verdict_path" ]; then
+      verdict_val="$(jq -r '.verdict // empty' "$verdict_path" 2>/dev/null)"
+    fi
+    case "$verdict_val" in
+      pass|delta-pass) : ;;
+      "") exec 9>&-; die 7 "land-ungated (verdict=missing)" ;;
+      *)  exec 9>&-; die 7 "land-ungated (verdict=$verdict_val)" ;;
+    esac
+  fi
 
   # Fail closed (AC3): never merge into a dirty main tree. Mirrors SKILL.md's
   # `wm-buildtree land` exit-4-on-dirty contract; deliberately a DIFFERENT
@@ -461,6 +493,27 @@ cmd_land() {
     echo "worktree-extend: $slug: rebase-retry succeeded (land)" >&2
   fi
   [ -x "$SERIAL_FALLBACK" ] && "$SERIAL_FALLBACK" streak-reset "$repo" >&2 || true
+  # PRD-build-gate-before-land requirement 2 (P0, AC3): the merge + commit
+  # (nothing else in `land`) is what needed the lock; release it here,
+  # BEFORE cmd_cleanup (worktree/target removal, no producer but can be
+  # slow on a large target dir) so a sibling waiting on this same repo's
+  # lock is never blocked by cleanup. Journaled only for a gated land —
+  # an ungated call (no --gated-at) keeps today's silent behavior exactly.
+  if [ -n "$gated_at" ]; then
+    local lock_hold=$(( $(date +%s) - lock_t0 ))
+    exec 9>&-
+    local journal="${WORKTREE_EXTEND_JOURNAL:-$HOME/brain/journal/build/$(date -u +%Y-%m-%d).md}"
+    if [ -r "$(dirname "$0")/isolation-guard.sh" ]; then
+      # shellcheck source=isolation-guard.sh
+      source "$(dirname "$0")/isolation-guard.sh"
+      isolation_guard_path "$journal" "worktree-extend.sh"
+    fi
+    mkdir -p "$(dirname "$journal")"
+    printf '%s  land  %s  (gated_at=%s main=%s lock_hold=%ss)\n' \
+      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$slug" "$gated_at" "$main_now" "$lock_hold" >>"$journal"
+  else
+    exec 9>&-
+  fi
   # Land is complete: free the worktree now, same reasoning as integrate
   # (PRD-build-worktree-targets-off-root) — keep the branch (no --drop-branch)
   # so the caller's own cleanup/--drop-branch decision stays theirs.
@@ -470,23 +523,28 @@ cmd_land() {
 }
 
 cmd_integrate() {
-  local no_rebase="" ensure_main="" project_root=""
+  local no_rebase="" ensure_main="" project_root="" gated_at="" verdict_path=""
   # --no-rebase: skip rebase-retry, reproduce old abort-immediately behaviour.
   # --ensure-main: if main branch is absent, create it from the default branch HEAD.
   # --project-root <rel>: nested crate root, passed through to extend-handler.sh
   # (see the subcommand doc comment above).
+  # --gated-at / --verdict: PRD-build-gate-before-land requirement 2 — same
+  # land-if-unchanged precondition cmd_land enforces, see there for the
+  # rationale; omitted reproduces today's behavior exactly.
   while true; do
     case "${1:-}" in
       --no-rebase)    no_rebase=1; shift ;;
       --ensure-main)  ensure_main=1; shift ;;
       --project-root) project_root="${2:?worktree-extend: --project-root needs a value}"; shift 2 ;;
+      --gated-at)     gated_at="${2:?worktree-extend: --gated-at needs a value}"; shift 2 ;;
+      --verdict)      verdict_path="${2:?worktree-extend: --verdict needs a value}"; shift 2 ;;
       *) break ;;
     esac
   done
   local -a project_root_args=()
   [ -n "$project_root" ] && project_root_args=(--project-root "$project_root")
   local repo="${1:-}" slug="${2:-}" bump="${3:-minor}" tldr="${4:-}"
-  need "$repo" "usage: integrate [--no-rebase] [--ensure-main] [--project-root <rel>] <repo> <slug> <bump> <tldr-file>"; need "$slug" "missing slug"
+  need "$repo" "usage: integrate [--no-rebase] [--ensure-main] [--project-root <rel>] [--gated-at <main sha> --verdict <path>] <repo> <slug> <bump> <tldr-file>"; need "$slug" "missing slug"
   local branch="autobuilder/$slug"
   local wt; wt="$(wt_path "$repo" "$slug")"
   # PRD-build-worktree-default-branch AC3: resolve the repo's REAL default
@@ -500,6 +558,27 @@ cmd_integrate() {
   # past this script's exit. Same convention as extend-gate.sh.
   exec 9>"$repo/.git/autobuilder-integrate.lock"
   flock -w 120 9 || die 5 "could not acquire integration lock for $repo"
+  local lock_t0; lock_t0="$(date +%s)"
+
+  # PRD-build-gate-before-land requirement 2 (P0): land-if-unchanged, same
+  # check cmd_land performs — see there for the full rationale. Checked
+  # before --ensure-main and the dirty-tree refusal below.
+  if [ -n "$gated_at" ]; then
+    local main_now; main_now="$(git -C "$repo" rev-parse "$default" 2>/dev/null)"
+    if [ "$main_now" != "$gated_at" ]; then
+      exec 9>&-
+      die 6 "land-stale-base (gated_at=$gated_at main=$main_now)"
+    fi
+    local verdict_val=""
+    if [ -n "$verdict_path" ] && [ -f "$verdict_path" ]; then
+      verdict_val="$(jq -r '.verdict // empty' "$verdict_path" 2>/dev/null)"
+    fi
+    case "$verdict_val" in
+      pass|delta-pass) : ;;
+      "") exec 9>&-; die 7 "land-ungated (verdict=missing)" ;;
+      *)  exec 9>&-; die 7 "land-ungated (verdict=$verdict_val)" ;;
+    esac
+  fi
 
   # --ensure-main: create the resolved default branch from HEAD if it does
   # not exist (flag name kept for back-compat; it no longer assumes the
@@ -610,6 +689,25 @@ cmd_integrate() {
   fi
   # Clean integrate: reset conflict streak for this repo so parallel fan-out resumes.
   [ -x "$SERIAL_FALLBACK" ] && "$SERIAL_FALLBACK" streak-reset "$repo" >&2 || true
+  # PRD-build-gate-before-land requirement 2 (P0, AC3): release the lock
+  # here — merge, version bump, changelog, lock regen, and the bump commit
+  # are all done; only cmd_cleanup (no producer, but can be slow) remains.
+  # Journaled only for a gated integrate; see cmd_land's identical comment.
+  if [ -n "$gated_at" ]; then
+    local lock_hold=$(( $(date +%s) - lock_t0 ))
+    exec 9>&-
+    local journal="${WORKTREE_EXTEND_JOURNAL:-$HOME/brain/journal/build/$(date -u +%Y-%m-%d).md}"
+    if [ -r "$(dirname "$0")/isolation-guard.sh" ]; then
+      # shellcheck source=isolation-guard.sh
+      source "$(dirname "$0")/isolation-guard.sh"
+      isolation_guard_path "$journal" "worktree-extend.sh"
+    fi
+    mkdir -p "$(dirname "$journal")"
+    printf '%s  land  %s  (gated_at=%s main=%s lock_hold=%ss)\n' \
+      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$slug" "$gated_at" "$main_now" "$lock_hold" >>"$journal"
+  else
+    exec 9>&-
+  fi
   # PRD-build-worktree-targets-off-root: the branch is merged, its worktree
   # (and 50G+ cargo target) has served its purpose — free it now rather than
   # waiting on a caller-remembered `cleanup` or a later `prune-landed` sweep.
