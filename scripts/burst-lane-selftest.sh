@@ -5423,6 +5423,107 @@ expect "reenable AC7f: the drop-in no longer exists" "[ ! -f \"$BURST_LANE_SYSTE
 expect "reenable AC7f: journal has disable done (cause=operator)" \
   "grep -q 'burst-lane  disable  done  (cause=operator)' \"$BURST_LANE_JOURNAL\""
 
+# ---- reenable AC9: auto-disable fires on either trigger — two sessions
+# within 24h both zero-run (cause=zero-run-sessions), or a day's deleted-box
+# cost reaching BURST_AUTO_DISABLE_EUR_PER_DAY with no routed run
+# (cause=eur-ceiling). Production-wired at the end of teardown_and_delete
+# (every down/watchdog/idle-guard teardown) and cmd_up's own
+# ssh-unreachable-before-boot fallback. Exercised here as a direct unit
+# test of check_auto_disable() — same "source $BL in a subshell" idiom the
+# cargo_target_dir_for unit test above uses — since reaching this point
+# twice via a full fake up->run->down cycle would only re-prove machinery
+# already covered by the AC1/AC8/AC13 fixtures elsewhere in this file; what
+# is new here is check_auto_disable's own decision logic over
+# $BURST_LANE_COST_LEDGER rows, which a hand-written ledger exercises
+# directly and deterministically.
+
+# Case a: a single zero-run session within 24h -> no trigger (only the
+# SECOND such session fires it).
+fresh_env
+mkdir -p "$(dirname "$BURST_LANE_SYSTEMD_DROPIN")"
+printf '[Service]\nEnvironment=BUILD_BURST_ENABLED=1\n' > "$BURST_LANE_SYSTEMD_DROPIN"
+cat > "$BURST_LANE_COST_LEDGER" <<'JSON'
+{"date": "2026-09-15T01:00:00Z", "hours": 1.0, "eur": 0.05, "prds": [], "session_id": "s1"}
+JSON
+export BURST_LANE_NOW="$(date -u -d '2026-09-15T01:30:00Z' +%s)"
+r9a_err="$T/r9a.err"
+( source "$BL"; check_auto_disable ) 2>"$r9a_err"
+expect "reenable AC9a: one zero-run session alone does not auto-disable" "[ -f \"$BURST_LANE_SYSTEMD_DROPIN\" ]"
+expect "reenable AC9a: nothing printed to stderr" "[ ! -s \"$r9a_err\" ]"
+expect "reenable AC9a: no auto-disabled line journaled" "! grep -q 'auto-disabled' \"$BURST_LANE_JOURNAL\""
+
+# Case b: a SECOND zero-run session within 24h of the first -> auto-disable
+# fires, naming both session ids, drop-in removed, printed to stderr too
+# (continues case a's ledger/drop-in state — this IS "the second" session).
+cat >> "$BURST_LANE_COST_LEDGER" <<'JSON'
+{"date": "2026-09-15T02:00:00Z", "hours": 1.0, "eur": 0.05, "prds": [], "session_id": "s2"}
+JSON
+export BURST_LANE_NOW="$(date -u -d '2026-09-15T02:15:00Z' +%s)"
+r9b_err="$T/r9b.err"
+( source "$BL"; check_auto_disable ) 2>"$r9b_err"
+expect "reenable AC9b: the drop-in is removed" "[ ! -f \"$BURST_LANE_SYSTEMD_DROPIN\" ]"
+expect "reenable AC9b: journal carries auto-disabled (cause=zero-run-sessions sessions=s1,s2)" \
+  "grep -q 'burst-lane  auto-disabled  (cause=zero-run-sessions sessions=s1,s2)' \"$BURST_LANE_JOURNAL\""
+expect "reenable AC9b: the same line was printed to stderr" \
+  "grep -q 'burst-lane  auto-disabled  (cause=zero-run-sessions sessions=s1,s2)' \"$r9b_err\""
+
+# Case c: two sessions within 24h, but one of them served a routed run ->
+# no trigger (both must be zero-run; one PRD served is enough to block it).
+fresh_env
+mkdir -p "$(dirname "$BURST_LANE_SYSTEMD_DROPIN")"
+printf '[Service]\nEnvironment=BUILD_BURST_ENABLED=1\n' > "$BURST_LANE_SYSTEMD_DROPIN"
+cat > "$BURST_LANE_COST_LEDGER" <<'JSON'
+{"date": "2026-09-15T01:00:00Z", "hours": 1.0, "eur": 0.05, "prds": ["fake-prd"], "session_id": "s3"}
+{"date": "2026-09-15T02:00:00Z", "hours": 1.0, "eur": 0.05, "prds": [], "session_id": "s4"}
+JSON
+export BURST_LANE_NOW="$(date -u -d '2026-09-15T02:15:00Z' +%s)"
+( source "$BL"; check_auto_disable ) 2>/dev/null
+expect "reenable AC9c: a served session in the pair blocks zero-run-sessions" "[ -f \"$BURST_LANE_SYSTEMD_DROPIN\" ]"
+
+# Case d: a single session alone reaches BURST_AUTO_DISABLE_EUR_PER_DAY
+# (default 2.00) with no routed run -> auto-disable fires cause=eur-ceiling.
+# Only ONE session exists today, so trigger (a)'s "two sessions" can never
+# apply here — this isolates the eur-ceiling trigger from the zero-run one.
+fresh_env
+mkdir -p "$(dirname "$BURST_LANE_SYSTEMD_DROPIN")"
+printf '[Service]\nEnvironment=BUILD_BURST_ENABLED=1\n' > "$BURST_LANE_SYSTEMD_DROPIN"
+cat > "$BURST_LANE_COST_LEDGER" <<'JSON'
+{"date": "2026-09-15T04:00:00Z", "hours": 2.0, "eur": 2.5000, "prds": [], "session_id": "s5"}
+JSON
+export BURST_LANE_NOW="$(date -u -d '2026-09-15T05:00:00Z' +%s)"
+r9d_err="$T/r9d.err"
+( source "$BL"; check_auto_disable ) 2>"$r9d_err"
+expect "reenable AC9d: the drop-in is removed" "[ ! -f \"$BURST_LANE_SYSTEMD_DROPIN\" ]"
+expect "reenable AC9d: journal carries auto-disabled (cause=eur-ceiling eur=2.5000)" \
+  "grep -q 'burst-lane  auto-disabled  (cause=eur-ceiling eur=2.5000)' \"$BURST_LANE_JOURNAL\""
+expect "reenable AC9d: the same line was printed to stderr" \
+  "grep -q 'cause=eur-ceiling eur=2.5000' \"$r9d_err\""
+
+# Case e: a day's total under the ceiling -> no trigger.
+fresh_env
+mkdir -p "$(dirname "$BURST_LANE_SYSTEMD_DROPIN")"
+printf '[Service]\nEnvironment=BUILD_BURST_ENABLED=1\n' > "$BURST_LANE_SYSTEMD_DROPIN"
+cat > "$BURST_LANE_COST_LEDGER" <<'JSON'
+{"date": "2026-09-15T04:00:00Z", "hours": 0.5, "eur": 0.6000, "prds": [], "session_id": "s6"}
+JSON
+export BURST_LANE_NOW="$(date -u -d '2026-09-15T05:00:00Z' +%s)"
+( source "$BL"; check_auto_disable ) 2>/dev/null
+expect "reenable AC9e: under the eur ceiling does not auto-disable" "[ -f \"$BURST_LANE_SYSTEMD_DROPIN\" ]"
+
+# Case f: no drop-in present (lane already disabled) -> check_auto_disable
+# is a silent no-op even when the ledger alone would otherwise trigger —
+# nothing to disable, matching "Re-enabling is only ever enable".
+fresh_env
+cat > "$BURST_LANE_COST_LEDGER" <<'JSON'
+{"date": "2026-09-15T01:00:00Z", "hours": 1.0, "eur": 5.0, "prds": [], "session_id": "s7"}
+{"date": "2026-09-15T02:00:00Z", "hours": 1.0, "eur": 5.0, "prds": [], "session_id": "s8"}
+JSON
+export BURST_LANE_NOW="$(date -u -d '2026-09-15T02:15:00Z' +%s)"
+r9f_err="$T/r9f.err"
+( source "$BL"; check_auto_disable ) 2>"$r9f_err"
+expect "reenable AC9f: no drop-in to remove -> no journal line, no stderr" \
+  "! grep -q 'auto-disabled' \"$BURST_LANE_JOURNAL\" && [ ! -s \"$r9f_err\" ]"
+
 # ---- reenable AC12: status (text and --json) reports image_id,
 # image_source, bake_age_h, proof_age_h, proof_routed, enabled — session-
 # independent, so this holds with no active session too.

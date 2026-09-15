@@ -258,6 +258,11 @@ PROOF_STATE_FILE="$STATE_DIR/proof.json"
 PARITY_BASELINE_IMAGE_FILE="$STATE_DIR/parity-baseline-image"
 SYSTEMD_DROPIN="${BURST_LANE_SYSTEMD_DROPIN:-$HOME/.config/systemd/user/claude-build.service.d/burst.conf}"
 COST_LEDGER="${BURST_LANE_COST_LEDGER:-$STATE_DIR/cost.jsonl}"
+# PRD-build-burst-dispatch-reenable requirement 5 (auto-disable, trigger b):
+# the €/day ceiling on deleted-box cost with no routed run this day — read
+# by check_auto_disable() below, never by cmd_enable (enable only ever
+# consults proof.json, per requirement 4).
+BURST_AUTO_DISABLE_EUR_PER_DAY="${BURST_AUTO_DISABLE_EUR_PER_DAY:-2.00}"
 # Requirement 13: which PRD slugs this session served, one per line,
 # deduped. Reset on a fresh boot/adopt (alongside runs_served=0), appended
 # to (deduped) by every routed `run`, read into the cost-ledger row at
@@ -3118,17 +3123,118 @@ print("allow", ts, proof.get("image_id", ""))
   exit 0
 }
 
-cmd_disable() {
-  # $1 optional cause — defaults to "operator" (a manual `disable` call);
-  # the auto-disable trigger (requirement 5, a LATER step of this PRD) will
-  # pass its own cause (zero-run-sessions|eur-ceiling) through this same
-  # function rather than duplicating the drop-in removal.
-  local cause="${1:-operator}"
+# Shared by cmd_disable (operator-invoked, journals "disable done") and
+# check_auto_disable (autonomous, journals "auto-disabled" — a distinct
+# event name because AC9's journal text differs from AC7's and, unlike
+# cmd_disable, auto-disable fires mid-teardown and must never `exit` its
+# caller). Idempotent: safe to call with no drop-in present.
+remove_burst_dropin() {
   rm -f "$SYSTEMD_DROPIN"
   systemctl --user daemon-reload >/dev/null 2>&1 || true
+}
+
+cmd_disable() {
+  # $1 optional cause — defaults to "operator" (a manual `disable` call).
+  local cause="${1:-operator}"
+  remove_burst_dropin
   journal_line "$(now_iso)  burst-lane  disable  done  (cause=$cause)"
   echo "disable done (cause=$cause)"
   exit 0
+}
+
+# ---- auto-disable (PRD-build-burst-dispatch-reenable requirement 5) --------
+# Called at the end of every autonomous teardown (down/watchdog/idle-guard,
+# from inside teardown_and_delete, right after that session's own row lands
+# in $COST_LEDGER) so both triggers always see the just-finished session.
+# No-op when the lane isn't currently enabled (nothing to disable, and a
+# disabled lane can't have "served" anything the triggers care about).
+#
+# Trigger (a) zero-run-sessions: this session-total ledger row (ledger_append
+# — no "kind" key, unlike the per-slug proration rows check_auto_disable
+# must skip) and the ledger's own PRECEDING session-total row, when both
+# fall within the last 24h AND both have an empty "prds" array (equivalent
+# to that session's runs_served==0 — SERVED_FILE always gets a non-empty
+# entry from ANY routed run, requirement 13), trigger on the second.
+#
+# Trigger (b) eur-ceiling: sum of today's (UTC calendar date, matching
+# maybe_daily_rollup's own convention) session-total rows' eur reaches
+# BURST_AUTO_DISABLE_EUR_PER_DAY with NONE of today's sessions having served
+# a routed run (non-empty prds) — a lane that spent the ceiling but proved
+# nothing today, not just one expensive proven session.
+check_auto_disable() {
+  [ -f "$SYSTEMD_DROPIN" ] || return 0
+  [ -f "$COST_LEDGER" ] || return 0
+
+  local today; today="$(date -u -d "@$(now_epoch)" +%Y-%m-%d 2>/dev/null || date -u +%Y-%m-%d)"
+  local decision
+  decision="$(python3 -c '
+import json, sys, time, calendar
+
+now_epoch, path, threshold, today = float(sys.argv[1]), sys.argv[2], float(sys.argv[3]), sys.argv[4]
+
+def epoch_of(ts):
+    try:
+        return calendar.timegm(time.strptime(ts, "%Y-%m-%dT%H:%M:%SZ"))
+    except Exception:
+        return None
+
+rows = []
+try:
+    with open(path) as f:
+        for ln in f:
+            ln = ln.strip()
+            if not ln:
+                continue
+            try:
+                d = json.loads(ln)
+            except ValueError:
+                continue
+            # Session-total rows only (ledger_append) — per-slug proration
+            # rows (prorate_attribution, kind="slug") are a different shape
+            # and would double-count both triggers.
+            if d.get("kind") == "slug" or "session_id" not in d:
+                continue
+            rows.append(d)
+except OSError:
+    print("trigger=none")
+    sys.exit(0)
+
+rows.sort(key=lambda r: r.get("date", ""))
+
+recent = [r for r in rows if (ep := epoch_of(r.get("date", ""))) is not None and (now_epoch - ep) <= 86400]
+last_two = recent[-2:]
+if len(last_two) == 2 and all(not r.get("prds") for r in last_two):
+    ids = ",".join(str(r.get("session_id", "?")) for r in last_two)
+    print("trigger=zero-run-sessions sessions=%s" % ids)
+    sys.exit(0)
+
+today_rows = [r for r in rows if str(r.get("date", "")).startswith(today)]
+total_eur = sum(float(r.get("eur", 0) or 0) for r in today_rows)
+any_served = any(r.get("prds") for r in today_rows)
+if today_rows and total_eur >= threshold and not any_served:
+    print("trigger=eur-ceiling eur=%.4f" % total_eur)
+    sys.exit(0)
+
+print("trigger=none")
+' "$(now_epoch)" "$COST_LEDGER" "$BURST_AUTO_DISABLE_EUR_PER_DAY" "$today")"
+
+  case "$decision" in
+    "trigger=zero-run-sessions "*)
+      local sessions="${decision#trigger=zero-run-sessions sessions=}"
+      remove_burst_dropin
+      local line; line="$(now_iso)  burst-lane  auto-disabled  (cause=zero-run-sessions sessions=$sessions)"
+      journal_line "$line"
+      echo "$line" >&2
+      ;;
+    "trigger=eur-ceiling "*)
+      local eur="${decision#trigger=eur-ceiling eur=}"
+      remove_burst_dropin
+      local line; line="$(now_iso)  burst-lane  auto-disabled  (cause=eur-ceiling eur=$eur)"
+      journal_line "$line"
+      echo "$line" >&2
+      ;;
+    *) : ;;
+  esac
 }
 
 # ---- up-lock holder attribution (PRD-build-burst-prove-forensics req 4) --
@@ -3380,6 +3486,7 @@ print(d.get("id",""), d.get("public_net",{}).get("ipv4",{}).get("ip",""))
     "$HCLOUD" server delete "$id" >/dev/null 2>&1 || true
     journal_line "$(now_iso)  burst-lane  down  decision=deleted  (server_id=$id cause=ssh-unreachable-before-boot minutes=$pf_minutes cost_eur=$pf_eur prds=none)"
     ledger_append "$(awk -v m="$pf_minutes" 'BEGIN{printf "%.4f", m/60.0}')" "$pf_eur" "$id"
+    check_auto_disable
     echo "fallback: ssh never became reachable on $ip after 30s"
     exit 3
   fi
@@ -7330,6 +7437,12 @@ teardown_and_delete() {  # $1=id $2=caller_tag(down|watchdog|idle-guard)
       esac
     done <<<"$prorate_out"
     ledger_append "$hrs" "$eur" "$id"
+    # Requirement 5, auto-disable: checked after every autonomous teardown's
+    # own ledger row lands, so both triggers always see the just-finished
+    # session. Stderr only (never stdout) — this function's stdout is the
+    # pipe-delimited hrs|eur|served|alive tuple every caller parses
+    # positionally via `$(...)`.
+    check_auto_disable
     printf '%s|%s|%s|%s\n' "$hrs" "$eur" "${served:-none}" "$alive"
     return 0
   fi
