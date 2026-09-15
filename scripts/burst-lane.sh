@@ -502,6 +502,23 @@ BURST_VOLUME_EUR_PER_GB_MONTH="${BURST_VOLUME_EUR_PER_GB_MONTH:-0.0476}"
 # 40, sized a bit higher since a single gate pull has been observed as large
 # as 87 GB — see the 2026-09-11 08:55Z 0-bytes-free incident in the PRD).
 BURST_LOCAL_DISK_FLOOR_GB="${BURST_LOCAL_DISK_FLOOR_GB:-60}"
+
+# ---- prove failure-evidence preservation (PRD-build-burst-prove-evidence-
+# preservation) -------------------------------------------------------------
+# Requirement 6: the evidence dir must live on the SAME filesystem as the
+# disposable worktree's target/ (today under $TMPDIR, /mnt/data/jsy/tmp) so
+# preserving a failed assert's pulled target is a `mv` (rename), never a
+# `cp` of what can be several GB — $STATE_DIR itself is on a different
+# filesystem (/, not /mnt/data) on RedBaron, so the real storage lives under
+# BURST_PROVE_TMP and $STATE_DIR/evidence is kept as a symlink to it, giving
+# every existing STATE_DIR-relative reader (status/reap/evidence-ls/tests)
+# the conventional `state/burst-lane/evidence/<ts>-<server_id>/` path from
+# the PRD's acceptance criteria without actually storing bytes there.
+BURST_PROVE_TMP="${BURST_PROVE_TMP:-${TMPDIR:-/mnt/data/jsy/tmp}}"
+EVIDENCE_ROOT="${BURST_EVIDENCE_ROOT:-$BURST_PROVE_TMP/burst-lane-evidence}"
+EVIDENCE_DIR="$STATE_DIR/evidence"
+# Requirement 3: how many evidence sets `reap` keeps, newest first.
+BURST_EVIDENCE_KEEP="${BURST_EVIDENCE_KEEP:-3}"
 # Persistent across sessions (NOT cleared by state_clear/`down`'s delete —
 # the volume, and the fact that its last detach failed, outlive the box that
 # was attached to it). volume_state_write's own key=value convention mirrors
@@ -2010,6 +2027,13 @@ except Exception:
 
 enabled = os.path.isfile(dropin_path)
 
+# PRD-build-burst-prove-evidence-preservation requirement 4: session-
+# independent, straight off disk (evidence_status_json), same as every
+# other field above — merged in here rather than via status_json_with_extras
+# so text mode (status_extra_fields_line) gets it from this one JSON object
+# too, not a second script invocation.
+evidence = json.loads(sys.argv[7]) if len(sys.argv) > 7 and sys.argv[7] else {"count": 0, "bytes": 0, "newest_ts": None}
+
 print(json.dumps({
     "image_id": img_id,
     "image_source": img_source,
@@ -2018,12 +2042,15 @@ print(json.dumps({
     "proof_routed": proof_routed,
     "enabled": enabled,
     "prove_last": prove_last,
+    "evidence": evidence,
 }))
-' "$img_id" "$img_source" "$SNAPSHOT_STATE_FILE" "$PROOF_STATE_FILE" "$SYSTEMD_DROPIN" "$STATE_DIR/logs"
+' "$img_id" "$img_source" "$SNAPSHOT_STATE_FILE" "$PROOF_STATE_FILE" "$SYSTEMD_DROPIN" "$STATE_DIR/logs" "$(evidence_status_json "$EVIDENCE_DIR")"
 }
 
 # Same fields, one text-mode summary line (requirement 6: "text and --json").
-status_extra_fields_line() {  # stdout: one "image: ..." line
+status_extra_fields_line() {  # stdout: one "image: ..." line -- requirement
+  # 4 adds a second "evidence: ..." line right after it (own line, easier to
+  # grep than packing byte counts onto the image: line).
   python3 -c '
 import json, sys
 d = json.loads(sys.argv[1])
@@ -2032,6 +2059,9 @@ def s(v):
 print("image: id=%s source=%s bake_age_h=%s proof_age_h=%s proof_routed=%s enabled=%s" % (
     s(d["image_id"]), s(d["image_source"]), s(d["bake_age_h"]), s(d["proof_age_h"]),
     s(d["proof_routed"]), str(d["enabled"]).lower()))
+ev = d.get("evidence") or {"count": 0, "bytes": 0, "newest_ts": None}
+gb = (ev.get("bytes") or 0) / 1e9
+print("evidence: %s sets, %.2f GB, newest %s" % (ev.get("count", 0), gb, s(ev.get("newest_ts"))))
 ' "$(status_extra_fields_json)"
 }
 
@@ -2476,6 +2506,223 @@ json.dump(d, open(out_path, "w"), indent=2, sort_keys=True)
 ' "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9" "${10}" "${11}" "$PROOF_STATE_FILE" "$(now_iso)" "${12:-}" "${BURST_LANE_AUTHZ:-}"
 }
 
+# ---- evidence preservation (PRD-build-burst-prove-evidence-preservation) --
+# A failed assert used to `reap` its own disposable worktree at exit, taking
+# the pulled target, proof.json's own diagnosis, and the step logs with it —
+# the exact evidence a `no-fresh-artifact` diagnosis needs was destroyed
+# three times (2026-09-14/15, see the PRD problem statement) before anyone
+# thought to point a run at a persistent `--worktree` by hand. This block
+# gives every assert-step failure its own durable evidence set instead.
+
+# Requirement 6: idempotent — creates the real (same-filesystem-as-target)
+# storage dir and points $EVIDENCE_DIR at it via a symlink so every other
+# reader in this file (reap/status/evidence-ls) only ever has to know the
+# one conventional STATE_DIR-relative path. Never clobbers a real directory
+# that might already be sitting at $EVIDENCE_DIR (pre-migration, or a test
+# fixture that made it a plain dir on purpose) — evidence just accumulates
+# there directly in that case, still correct, just not guaranteed to be a
+# same-filesystem rename.
+evidence_link_ensure() {
+  mkdir -p "$EVIDENCE_ROOT" 2>/dev/null || true
+  if [ -e "$EVIDENCE_DIR" ] && [ ! -L "$EVIDENCE_DIR" ]; then
+    return 0
+  fi
+  ln -sfn "$EVIDENCE_ROOT" "$EVIDENCE_DIR" 2>/dev/null || true
+}
+
+# Requirement 2: the exact freshness check `assert` ran, with paths expanded
+# into the evidence dir's own copy of the target, `set -uo pipefail`, and an
+# `echo verdict=$?` line so the operator's re-run reports the same 0/1 assert
+# ac319ac's own fix depends on (find -L, ! -name marker, -newer, -print
+# -quit piped to `grep -q .` — this must stay byte-for-byte the same
+# invocation as the one in cmd_prove's assert step above, or a re-run could
+# disagree with the verdict it's supposed to reproduce).
+prove_write_expression_sh() {  # $1=evidence_dir $2=target-subdir-name
+  local dir="$1" tgt="${2:-target}"
+  cat > "$dir/expression.sh" <<EOF
+#!/usr/bin/env bash
+# Generated by burst-lane.sh prove (PRD-build-burst-prove-evidence-
+# preservation requirement 2). Reproduces the exact freshness verdict
+# assert saw on this evidence set's own preserved target/ — no box needed.
+set -uo pipefail
+find -L "$dir/$tgt" -type f ! -name '.burst-run-marker' -newer "$dir/$tgt/.burst-run-marker" -print -quit 2>/dev/null | grep -q .
+echo "verdict=\$?"
+EOF
+  chmod +x "$dir/expression.sh" 2>/dev/null || true
+}
+
+# Requirement 1/5/6: preserves everything a `no-fresh-artifact` (or any
+# other assert-step) diagnosis needs to be re-run offline. Called from
+# cmd_prove's own normal failure tail (assert-step failures never abort —
+# they fall through to the ordinary end-of-function proof.json write) AND
+# from prove_exit_trap (defensive: an assert step that itself crashes/aborts
+# mid-check). $1=cause $2=local_target $3=remote_marker_path (may not exist)
+# $4=server_id $5=disposable(true/false — true means prove owns $local_target
+# and it is about to be `git worktree remove --force`'d anyway, so a `mv` is
+# safe; false means an operator supplied --worktree and keeps ownership of
+# it, so this copies instead) $6=journal verb (evidence-preserved |
+# evidence-kept, per requirement 5's exact wording for the --keep-worktree
+# case) $7=extra "k=v" tokens appended verbatim to the journal line's parens
+# (requirement 5 needs `reason=operator` there). Never fails prove itself —
+# every step is best-effort.
+prove_preserve_evidence() {
+  local cause="$1" local_target="$2" remote_marker="$3" server_id="$4" disposable="$5" verb="${6:-evidence-preserved}" extra="${7:-}"
+  evidence_link_ensure
+  local ts; ts="$(date -u -d "@$(now_epoch)" +%Y%m%dT%H%M%SZ 2>/dev/null || date -u +%Y%m%dT%H%M%SZ)"
+  local dir="$EVIDENCE_DIR/${ts}-${server_id:-unknown}"
+  mkdir -p "$dir" 2>/dev/null || { echo "prove-evidence-mkdir-failed dir=$dir" >&2; return 1; }
+
+  # Requirement 6: the local disk floor check runs BEFORE the move — a
+  # breach trims the set to logs + proof.json + expression.sh (no target/)
+  # rather than let a multi-GB `mv`/`cp` push RedBaron itself below the
+  # floor `run`'s own pull-back guard exists to protect.
+  local trimmed=false
+  local free_gb; free_gb="$(local_disk_free_gb "$EVIDENCE_ROOT")"
+  case "$free_gb" in
+    ''|*[!0-9]*) : ;;
+    *) [ "$free_gb" -lt "$BURST_LOCAL_DISK_FLOOR_GB" ] && trimmed=true ;;
+  esac
+
+  if [ "$trimmed" = true ]; then
+    journal_line "$(now_iso)  burst-lane  prove  evidence-trimmed  (reason=disk-floor dir=$dir free_gb=${free_gb:-unknown} floor_gb=$BURST_LOCAL_DISK_FLOOR_GB)"
+  elif [ -d "$local_target" ]; then
+    if [ "$disposable" = true ]; then
+      mv "$local_target" "$dir/target" 2>/dev/null || cp -a "$local_target" "$dir/target" 2>/dev/null || true
+    else
+      cp -a "$local_target" "$dir/target" 2>/dev/null || true
+    fi
+  fi
+  # Requirement 2/6: expression.sh is written REGARDLESS of whether target/
+  # itself survived the disk-floor trim above — req 7/AC7 requires it
+  # present even in the trimmed case (a stale-forever verdict against a
+  # target/ that isn't there is still useful signal: "this evidence set was
+  # trimmed, re-run prove for a fresh one"), so this is never conditioned on
+  # `[ -d "$dir/target" ]`.
+  prove_write_expression_sh "$dir" "target"
+
+  # Step logs (requirement 1) — copy, never move, so prove's own
+  # in-progress reads of these paths are unaffected.
+  mkdir -p "$dir/logs" 2>/dev/null || true
+  local f
+  for f in "$STATE_DIR"/logs/prove."${PROVE_START_EPOCH:-0}".*.log; do
+    [ -f "$f" ] && cp -p "$f" "$dir/logs/" 2>/dev/null
+  done
+  [ -f "$PROOF_STATE_FILE" ] && cp -p "$PROOF_STATE_FILE" "$dir/proof.json" 2>/dev/null
+  local remote_date_f; remote_date_f="$(prove_remote_date_path)"
+  [ -f "$remote_date_f" ] && cp -p "$remote_date_f" "$dir/remote-date" 2>/dev/null
+  [ -f "$STATE_FILE" ] && cp -p "$STATE_FILE" "$dir/session.json" 2>/dev/null
+
+  local bytes; bytes="$(du -sb "$dir" 2>/dev/null | cut -f1)"; bytes="${bytes:-0}"
+  journal_line "$(now_iso)  burst-lane  prove  $verb  (dir=$dir cause=${cause:-none} bytes=$bytes trimmed=$trimmed${extra:+ $extra})"
+  printf '%s' "$dir"
+}
+
+# Requirement 4: session-independent evidence roll-up read by both
+# status_extra_fields_json (--json) and status_extra_fields_line (text) —
+# {count, bytes, newest_ts}, computed straight off the evidence dirs on
+# disk (never a cached counter) so it can never disagree with `reap` or
+# `evidence ls`. Best-effort: an unreadable/missing evidence dir reads as
+# {"count":0,"bytes":0,"newest_ts":null}, never a script failure.
+evidence_status_json() {
+  python3 -c '
+import glob, json, os, sys, time
+d = sys.argv[1]
+dirs = [p for p in sorted(glob.glob(os.path.join(d, "*"))) if os.path.isdir(p)]
+total = 0
+newest_mtime = None
+for p in dirs:
+    for root, _dirs, names in os.walk(p):
+        for n in names:
+            fp = os.path.join(root, n)
+            try:
+                total += os.path.getsize(fp)
+            except OSError:
+                pass
+    try:
+        mt = os.path.getmtime(p)
+    except OSError:
+        continue
+    if newest_mtime is None or mt > newest_mtime:
+        newest_mtime = mt
+newest_ts = None
+if newest_mtime is not None:
+    newest_ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(newest_mtime))
+print(json.dumps({"count": len(dirs), "bytes": total, "newest_ts": newest_ts}))
+' "$1" 2>/dev/null || echo '{"count":0,"bytes":0,"newest_ts":null}'
+}
+
+# Requirement 3: keeps at most BURST_EVIDENCE_KEEP evidence dirs, newest
+# first (the `<ts>-<server_id>` naming sorts lexicographically ==
+# chronologically), journaling one `evidence-deleted` line per removal. A
+# set younger than 24h is deleted exactly like any other once the count cap
+# requires it — the cap, not age, is the only protection this gives (req 3's
+# "unless the count cap forces it" clause).
+reap_evidence() {  # -> stdout "evidence-reaped=N"
+  [ -d "$EVIDENCE_DIR" ] || { echo "evidence-reaped=0"; return 0; }
+  local keep="${BURST_EVIDENCE_KEEP:-3}"
+  local n=0 i=0 d
+  while IFS= read -r d; do
+    [ -n "$d" ] || continue
+    i=$((i+1))
+    [ "$i" -le "$keep" ] && continue
+    local bytes age_h mtime
+    bytes="$(du -sb "$d" 2>/dev/null | cut -f1)"; bytes="${bytes:-0}"
+    mtime="$(stat -c %Y "$d" 2>/dev/null || echo "$(now_epoch)")"
+    age_h=$(( ( $(now_epoch) - mtime ) / 3600 ))
+    if rm -rf "$d" 2>/dev/null; then
+      journal_line "$(now_iso)  burst-lane  reap  evidence-deleted  (dir=$d bytes=$bytes age_h=$age_h)"
+      n=$((n+1))
+    fi
+  # `-L`: $EVIDENCE_DIR is a symlink to EVIDENCE_ROOT (see evidence_link_
+  # ensure) -- plain `find <symlink>` (no -L, no trailing slash) refuses to
+  # descend into a symlink given as its OWN top-level argument and reports
+  # only the link node itself, silently yielding zero results here.
+  done < <(find -L "$EVIDENCE_DIR" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort -r)
+  echo "evidence-reaped=$n"
+}
+
+# Requirement 7: `burst-lane.sh evidence ls` — one line per set, cause/
+# server_id read back from that set's own copy of proof.json (falling back
+# to the id parsed from the dirname if proof.json is missing/unreadable).
+cmd_evidence() {
+  case "${1:-}" in
+    ls|'')
+      python3 -c '
+import glob, json, os, sys, time
+d = sys.argv[1]
+now = time.time()
+for p in sorted(glob.glob(os.path.join(d, "*"))):
+    if not os.path.isdir(p):
+        continue
+    name = os.path.basename(p)
+    server_id = name.rsplit("-", 1)[-1] if "-" in name else "unknown"
+    cause = None
+    try:
+        proof = json.load(open(os.path.join(p, "proof.json")))
+        cause = proof.get("cause")
+        server_id = proof.get("server_id") or server_id
+    except Exception:
+        pass
+    sz = 0
+    for root, _dirs, names in os.walk(p):
+        for n in names:
+            fp = os.path.join(root, n)
+            try:
+                sz += os.path.getsize(fp)
+            except OSError:
+                pass
+    try:
+        age_h = round((now - os.path.getmtime(p)) / 3600.0, 1)
+    except OSError:
+        age_h = None
+    print("evidence: %s cause=%s server_id=%s bytes=%s age_h=%s" % (name, cause, server_id, sz, age_h))
+' "$EVIDENCE_DIR"
+      ;;
+    *) echo "usage: burst-lane.sh evidence ls" >&2; exit 2 ;;
+  esac
+  exit 0
+}
+
 # Requirement 1: the EXIT trap armed at the top of cmd_prove, for the whole
 # life of the process. The normal success/failure tails set
 # PROVE_FINISHED=true immediately before their own `exit` — this trap's
@@ -2513,10 +2760,15 @@ prove_exit_trap() {
 cmd_prove() {
   local -x BUILD_BURST_ENABLED=1
   local worktree="" disposable_repo="" cleanup_worktree=""
+  # Requirement 5: preserve the evidence set on a SUCCESSFUL prove too, not
+  # only a failed one — an operator debugging a fixture wants the same set
+  # a failure would have produced, without forcing a fake failure to get it.
+  local keep_worktree=false
   while [ $# -gt 0 ]; do
     case "$1" in
       --worktree) worktree="${2:?prove: --worktree needs a value}"; shift 2 ;;
-      *) echo "usage: burst-lane.sh prove [--worktree <path>]" >&2; exit 2 ;;
+      --keep-worktree) keep_worktree=true; shift ;;
+      *) echo "usage: burst-lane.sh prove [--worktree <path>] [--keep-worktree]" >&2; exit 2 ;;
     esac
   done
 
@@ -2655,6 +2907,17 @@ cmd_prove() {
           remote_marker="$local_target/.burst-run-marker"
           remote_date=""
           [ -f "$(prove_remote_date_path)" ] && remote_date="$(cat "$(prove_remote_date_path)" 2>/dev/null)"
+          # PRD-build-burst-prove-evidence-preservation AC8: a real box's
+          # own artifacts are naturally fresh, so proving evidence
+          # preservation against a real, reachable box needs a way to
+          # force the no-fresh-artifact verdict deterministically without
+          # actually reproducing a staleness bug — this test-only hook
+          # (grep the tree: no real caller ever sets it, same doctrine as
+          # BURST_PROVE_TEST_ABORT above) bumps the pulled marker's own
+          # mtime to now, after every real artifact the pull just landed.
+          if [ "${BURST_PROVE_TEST_FORCE_STALE:-0}" = "1" ] && [ -f "$remote_marker" ]; then
+            touch "$remote_marker" 2>/dev/null || true
+          fi
           # PRD-build-burst-prove-forensics requirement 11 regression (real
           # run 2026-09-15T05:08:20Z, RedBaron, commit 778dd2a): a genuinely
           # fresher artifact (newest_mtime 82s after marker_mtime) still
@@ -2710,6 +2973,22 @@ cmd_prove() {
   local image_id; image_id="$(resolve_boot_image | awk '{print $1}')"
   local exit_code=1; [ "$routed" = true ] && exit_code=0
   prove_write_proof_json "$image_id" "${id:-}" "$worktree" "$sha" "$routed" "$bytes" "$secs_remote" "$cause" "$exit_code" "$PROVE_STEP" "" "$PROVE_ASSERT_DIAG_JSON"
+
+  # PRD-build-burst-prove-evidence-preservation requirement 1/5: preserve
+  # the pulled target + diagnostics BEFORE `down`/worktree cleanup below —
+  # either an assert-step failure (routed=false, the case this PRD exists
+  # for) or an operator's explicit --keep-worktree on a successful run
+  # (requirement 5). session.json/logs/proof.json must still be live on
+  # disk here, which is why this runs ahead of cmd_down, not after.
+  local evidence_disposable=false
+  [ -n "$cleanup_worktree" ] && evidence_disposable=true
+  if [ "$routed" = true ] && [ "$keep_worktree" = true ]; then
+    prove_preserve_evidence "$cause" "${PROVE_LOCAL_TARGET:-}" "${remote_marker:-}" "${id:-}" "$evidence_disposable" \
+      "evidence-kept" "reason=operator" >/dev/null
+  elif [ "$routed" != true ] && [ "$PROVE_STEP" = "assert" ]; then
+    prove_preserve_evidence "$cause" "${PROVE_LOCAL_TARGET:-}" "${remote_marker:-}" "${id:-}" "$evidence_disposable" \
+      "evidence-preserved" "" >/dev/null
+  fi
 
   # `prove` always ends with `down`, success or failure — never leaves a
   # box up just because the proof itself failed a check. Requirement 5:
@@ -6410,7 +6689,8 @@ cmd_reap() {
   local proc_out; proc_out="$(reap_orphan_processes)"
   local out; out="$(reap_orphans)"
   local prove_out; prove_out="$(reap_prove_logs)"
-  printf '%s\n%s\n%s\n' "$proc_out" "$out" "$prove_out"
+  local evidence_out; evidence_out="$(reap_evidence)"
+  printf '%s\n%s\n%s\n%s\n' "$proc_out" "$out" "$prove_out" "$evidence_out"
   exit 0
 }
 
@@ -7550,6 +7830,7 @@ main() {
     gate)      cmd_gate "$@" ;;
     bake)      cmd_bake "$@" ;;
     prove)     cmd_prove "$@" ;;
+    evidence)  cmd_evidence "$@" ;;
     enable)    cmd_enable "$@" ;;
     disable)   cmd_disable "$@" ;;
     # Undocumented/hidden — PRD-build-burst-unprivileged-user requirement 1:

@@ -313,6 +313,11 @@ fresh_env() {
   export BURST_LANE_TEST=1
   export BURST_LANE_STATE_DIR="$T/state"; mkdir -p "$BURST_LANE_STATE_DIR"
   export BURST_LANE_JOURNAL="$T/journal.log"
+  # PRD-build-burst-prove-evidence-preservation requirement 6: the real
+  # BURST_PROVE_TMP default is /mnt/data/jsy/tmp — scope it under $T like
+  # every other path here, or every provekeep fixture below would mv/cp
+  # real bytes onto the actual host's disk instead of this sandbox.
+  export BURST_PROVE_TMP="$T/prove-tmp"; mkdir -p "$BURST_PROVE_TMP"
   # isolation-guard.sh's OWN refusal record (a deliberate exception to
   # "everything under the sentinel is sandboxed" — see its header) defaults
   # to the real live journal; point it at this fixture's journal too so
@@ -5077,6 +5082,136 @@ expect "provefx AC17: proof.json routed=true, not no-fresh-artifact" \
   "python3 -c \"import json; d=json.load(open('$BURST_LANE_STATE_DIR/proof.json')); assert d['routed'] is True, d\""
 
 expect_block_green "provefx" "provefx: every provefx case above ran green"
+
+# ---- provekeep block (PRD-build-burst-prove-evidence-preservation) --------
+# 2026-09-14/15: prove's own reap-at-exit destroyed the pulled target,
+# proof.json's diagnosis, and the step logs a no-fresh-artifact verdict
+# needed to be re-diagnosed offline — three times — before anyone thought to
+# point a run at a persistent --worktree by hand (problem statement: ~90
+# operator-minutes and a wrong root cause that shipped a fix for a different
+# hazard, 778dd2a). AC1-4/AC7 reuse provefx AC15's own no-fresh-artifact
+# fixture (empty target/, assert fails); AC5/AC6 reuse the reenable AC5/AC6
+# successful-prove fixture (REEN_PROVE_CARGO/REEN_PROVE_AB_SRC, both still
+# valid tmpdirs from earlier in this same process). AC8 (real box) and AC9
+# (whole-suite green) are covered by their own tests/provekeep_ac8/ac9
+# wrappers, not here — this block is the offline fixture half only.
+block_start "provekeep"
+
+PK_CARGO="$T/fakebin-provekeep-cargo"; mkdir -p "$PK_CARGO"
+cat > "$PK_CARGO/cargo" <<'EOF'
+#!/usr/bin/env bash
+if [ "${1:-}" = "--version" ]; then
+  echo "cargo 1.85.0-fake"
+  exit 0
+fi
+mkdir -p target
+exit 0
+EOF
+chmod +x "$PK_CARGO/cargo"
+
+# ---- provekeep AC1/AC2 (P0, requirement 1/2) -------------------------------
+# Deliberately NOT --worktree here (unlike provefx's own fixtures) — AC1
+# requires checking that prove's AUTO-CREATED disposable worktree is gone
+# after a failed assert, which only exists on the no-`--worktree` path
+# (an operator-supplied --worktree is never removed by prove at all, see
+# cmd_prove's own cleanup_worktree gating). A tiny throwaway git repo
+# stands in for the real $HOME/wintermute/mcphost default.
+fresh_env
+export BURST_LANE_AUTOBUILDER_BIN="$REEN_PROVE_AB_SRC/autobuilder"
+PK1_REPO="$T/fake-mcphost-repo"; mkdir -p "$PK1_REPO"
+git -C "$PK1_REPO" init -q
+git -C "$PK1_REPO" -c user.name=t -c user.email=t@t commit -q --allow-empty -m init
+export BURST_PROVE_MCPHOST_REPO="$PK1_REPO"
+pk1_out="$(PATH="$PK_CARGO:$PATH" FAKE_SSH_HOSTNAME=wm-burst-lane-fake-box FAKE_SSH_REMOTE_DATE="2026-09-15T06:00:00Z" "$BL" prove 2>&1)"; pk1_rc=$?
+expect "provekeep AC1: prove exits 1 on the no-fresh-artifact fixture" "[ $pk1_rc -eq 1 ]"
+pk1_dir="$(find -L "$BURST_LANE_STATE_DIR/evidence" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort | tail -1)"
+expect "provekeep AC1: exactly one evidence dir was created" \
+  "[ -n \"$pk1_dir\" ] && [ -d \"$pk1_dir\" ]"
+expect "provekeep AC1: evidence dir holds target/, proof.json, expression.sh, and a step log" \
+  "[ -d \"$pk1_dir/target\" ] && [ -f \"$pk1_dir/proof.json\" ] && [ -f \"$pk1_dir/expression.sh\" ] && [ -n \"\$(find \"$pk1_dir/logs\" -type f -name 'prove.*.log' 2>/dev/null)\" ]"
+pk1_wt="$(grep -oE 'burst-lane  run  routed  \(server_id=[^ ]* worktree=[^ ]*' "$BURST_LANE_JOURNAL" | tail -1 | sed -E 's/.*worktree=//')"
+expect "provekeep AC1: the disposable worktree is gone" \
+  "[ -n \"$pk1_wt\" ] && [ ! -d \"$pk1_wt\" ]"
+unset BURST_PROVE_MCPHOST_REPO
+
+expect "provekeep AC2: expression.sh prints verdict=1 against the still-stale preserved target" \
+  "[ \"\$(bash \"$pk1_dir/expression.sh\" 2>/dev/null)\" = 'verdict=1' ]"
+touch "$pk1_dir/target/fresh.o"
+expect "provekeep AC2: expression.sh prints verdict=0 after touching one file under target/" \
+  "[ \"\$(bash \"$pk1_dir/expression.sh\" 2>/dev/null)\" = 'verdict=0' ]"
+
+# ---- provekeep AC3 (P0, requirement 3) -------------------------------------
+fresh_env
+export BURST_LANE_AUTOBUILDER_BIN="$REEN_PROVE_AB_SRC/autobuilder"
+export BURST_EVIDENCE_KEEP=3
+pk3_base=1789500000
+for pk3_i in 1 2 3 4; do
+  WT_PK3="$T/provekeep-ac3-$pk3_i"; mkdir -p "$WT_PK3"
+  export BURST_LANE_NOW=$((pk3_base + pk3_i * 100))
+  PATH="$PK_CARGO:$PATH" FAKE_SSH_HOSTNAME=wm-burst-lane-fake-box "$BL" prove --worktree "$WT_PK3" >/dev/null 2>&1
+done
+unset BURST_LANE_NOW
+pk3_before="$(find -L "$BURST_LANE_STATE_DIR/evidence" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)"
+expect "provekeep AC3 setup: four evidence dirs exist before reap" "[ \"$pk3_before\" -eq 4 ]"
+pk3_oldest="$(find -L "$BURST_LANE_STATE_DIR/evidence" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort | head -1)"
+"$BL" reap >/dev/null 2>&1
+pk3_after="$(find -L "$BURST_LANE_STATE_DIR/evidence" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)"
+expect "provekeep AC3: exactly three evidence dirs remain after reap" "[ \"$pk3_after\" -eq 3 ]"
+expect "provekeep AC3: the oldest evidence dir was removed" "[ -n \"$pk3_oldest\" ] && [ ! -d \"$pk3_oldest\" ]"
+expect "provekeep AC3: the journal has exactly one reap evidence-deleted line" \
+  "[ \"\$(grep -c 'burst-lane  reap  evidence-deleted' \"$BURST_LANE_JOURNAL\")\" -eq 1 ]"
+
+# ---- provekeep AC4 (P0, requirement 4) — reuses AC3's post-reap state -----
+pk4_json="$("$BL" status --json 2>/dev/null)"
+pk4_count="$(python3 -c "import json,sys; print(json.loads(sys.argv[1])['evidence']['count'])" "$pk4_json" 2>/dev/null)"
+pk4_bytes="$(python3 -c "import json,sys; print(json.loads(sys.argv[1])['evidence']['bytes'])" "$pk4_json" 2>/dev/null)"
+pk4_du="$(du -sbL "$BURST_LANE_STATE_DIR/evidence" 2>/dev/null | cut -f1)"
+expect "provekeep AC4: status --json evidence.count=3" "[ \"$pk4_count\" = 3 ]"
+expect "provekeep AC4: status --json evidence.bytes matches du -sb within 1%" \
+  "python3 -c \"a=int('$pk4_bytes'); b=int('${pk4_du:-0}'); assert b == 0 or abs(a-b)/max(b,1) <= 0.01, (a,b)\""
+expect "provekeep AC4: status (text) prints one evidence: N sets, X GB, newest <ts> line" \
+  "\"$BL\" status | grep -qE '^evidence: 3 sets, [0-9.]+ GB, newest [0-9TZ:-]+$'"
+
+# ---- provekeep AC5 (P0, requirement 1 non-goal / requirement 5 baseline) ---
+fresh_env
+export BURST_LANE_AUTOBUILDER_BIN="$REEN_PROVE_AB_SRC/autobuilder"
+WT_PK5="$T/provekeep-ac5"; mkdir -p "$WT_PK5"
+pk5_out="$(PATH="$REEN_PROVE_CARGO:$PATH" FAKE_SSH_HOSTNAME=wm-burst-lane-fake-box "$BL" prove --worktree "$WT_PK5" 2>&1)"; pk5_rc=$?
+expect "provekeep AC5 setup: the fixture prove succeeded (routed=true)" "[ $pk5_rc -eq 0 ]"
+expect "provekeep AC5: no evidence directory is created for a successful prove without --keep-worktree" \
+  "[ ! -e \"$BURST_LANE_STATE_DIR/evidence\" ] || [ -z \"\$(find \"$BURST_LANE_STATE_DIR/evidence\" -mindepth 1 -maxdepth 1 2>/dev/null)\" ]"
+
+# ---- provekeep AC6 (P1, requirement 5) -------------------------------------
+fresh_env
+export BURST_LANE_AUTOBUILDER_BIN="$REEN_PROVE_AB_SRC/autobuilder"
+WT_PK6="$T/provekeep-ac6"; mkdir -p "$WT_PK6"
+pk6_out="$(PATH="$REEN_PROVE_CARGO:$PATH" FAKE_SSH_HOSTNAME=wm-burst-lane-fake-box "$BL" prove --worktree "$WT_PK6" --keep-worktree 2>&1)"; pk6_rc=$?
+expect "provekeep AC6 setup: the fixture prove succeeded (routed=true)" "[ $pk6_rc -eq 0 ]"
+pk6_dir="$(find -L "$BURST_LANE_STATE_DIR/evidence" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort | tail -1)"
+expect "provekeep AC6: --keep-worktree preserves an evidence set on a successful prove" \
+  "[ -n \"$pk6_dir\" ] && [ -d \"$pk6_dir/target\" ]"
+expect "provekeep AC6: journal has prove evidence-kept (reason=operator)" \
+  "grep -qE 'burst-lane  prove  evidence-kept  \\(.*reason=operator' \"$BURST_LANE_JOURNAL\""
+expect "provekeep AC6: the operator-supplied worktree itself is untouched (copied, not moved)" \
+  "[ -d \"$WT_PK6/target\" ]"
+
+# ---- provekeep AC7 (P1, requirement 6) -------------------------------------
+fresh_env
+export BURST_LANE_AUTOBUILDER_BIN="$REEN_PROVE_AB_SRC/autobuilder"
+WT_PK7="$T/provekeep-ac7"; mkdir -p "$WT_PK7"
+export FAKE_SSH_PULL_PROBE_BYTES=1048576
+export BURST_LANE_LOCAL_FREE_GB=5
+export BURST_LOCAL_DISK_FLOOR_GB=999999
+pk7_out="$(PATH="$PK_CARGO:$PATH" FAKE_SSH_HOSTNAME=wm-burst-lane-fake-box "$BL" prove --worktree "$WT_PK7" 2>&1)"; pk7_rc=$?
+unset FAKE_SSH_PULL_PROBE_BYTES BURST_LANE_LOCAL_FREE_GB BURST_LOCAL_DISK_FLOOR_GB
+expect "provekeep AC7: prove still fails at assert (no-fresh-artifact) under the inflated floor" "[ $pk7_rc -eq 1 ]"
+pk7_dir="$(find -L "$BURST_LANE_STATE_DIR/evidence" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort | tail -1)"
+expect "provekeep AC7: the evidence set holds logs/proof.json/expression.sh but no target/" \
+  "[ -n \"$pk7_dir\" ] && [ -f \"$pk7_dir/proof.json\" ] && [ -f \"$pk7_dir/expression.sh\" ] && [ -n \"\$(find \"$pk7_dir/logs\" -type f 2>/dev/null)\" ] && [ ! -d \"$pk7_dir/target\" ]"
+expect "provekeep AC7: journal has prove evidence-trimmed (reason=disk-floor)" \
+  "grep -qE 'burst-lane  prove  evidence-trimmed  \\(reason=disk-floor' \"$BURST_LANE_JOURNAL\""
+
+expect_block_green "provekeep" "provekeep: every provekeep case above ran green"
 
 # ---- proveguard block (PRD-build-burst-prove-inflight-guard) ---------------
 # 2026-09-15: box 165981910 was deleted by a concurrent `down` between
