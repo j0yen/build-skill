@@ -323,7 +323,16 @@ while IFS= read -r heal_json; do
     path="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("path") or "")' "$heal_json")"
     slug="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["slug"])' "$heal_json")"
     if [ -n "$path" ] && [ -f "$path" ] && "$PRD_LINT" "$path" >/dev/null 2>&1; then
-      if requeue_out="$("$REQUEUE_PRD" "$path" "lint now passes (needs-classification-lint-pass heal)" 2>&1)"; then
+      if [ "$report_mode" = true ]; then
+        # --report is documented read-only: predict the patch a real pass
+        # would apply, but never actually call requeue-prd.sh (it commits
+        # + pushes) or touch the file. See manifest-inv_ac7_report_mode_
+        # read_only.sh.
+        heal_json="$(python3 -c 'import json,sys
+h=json.loads(sys.argv[1])
+h["patch"]={"status":"queued","needs_classification_reason":""}
+print(json.dumps(h))' "$heal_json")"
+      elif requeue_out="$("$REQUEUE_PRD" "$path" "lint now passes (needs-classification-lint-pass heal)" 2>&1)"; then
         heal_json="$(python3 -c 'import json,sys
 h=json.loads(sys.argv[1])
 h["patch"]={"status":"queued","needs_classification_reason":""}
