@@ -340,8 +340,19 @@ fresh_env() {
   # real `cargo --version`/`cargo test` the fake ssh eval's for real.
   # Pointing them at THIS machine's own real toolchain instead exercises the
   # exact same code path (an env override, read-only) without a real /root.
-  export BURST_LANE_ROOT_RUSTUP_HOME="$HOME/.rustup"
-  export BURST_LANE_ROOT_CARGO_HOME="$HOME/.cargo"
+  # PRD-build-burst-dispatch-reenable AC8c root cause: under
+  # run-selftests.sh isolation, $HOME is redirected to an empty
+  # $BUILD_TEST_ROOT/home with no real rustup/cargo install, so pointing
+  # these at $HOME (as before) silently pointed `cargo --version` at a
+  # toolchain-less HOME and every real remote-cargo/uv/python3 verify
+  # check failed (3 vfail lines), making `run` fall back local and never
+  # mark the worktree dirty — the exact AC8c symptom (pull saw a clean
+  # worktree, exited 0, never reached the rsync-failure path at all).
+  # isolation.sh exports BUILD_TEST_REAL_HOME for exactly this: the
+  # pre-override real $HOME, which actually has the toolchain. Falls back
+  # to plain $HOME for a bare (non-isolated) invocation, unchanged.
+  export BURST_LANE_ROOT_RUSTUP_HOME="${BUILD_TEST_REAL_HOME:-$HOME}/.rustup"
+  export BURST_LANE_ROOT_CARGO_HOME="${BUILD_TEST_REAL_HOME:-$HOME}/.cargo"
   export BURST_LANE_PRD_DIR="$T/prds"; mkdir -p "$BURST_LANE_PRD_DIR/build-queue"
   export FAKE_HCLOUD_STATE="$T/hcloud.state"
   export FAKE_HCLOUD_CALLLOG="$T/hcloud.calls"; : > "$FAKE_HCLOUD_CALLLOG"
@@ -5541,7 +5552,7 @@ expect "reenable AC7a: the drop-in exists with Environment=BUILD_BURST_ENABLED=1
 expect "reenable AC7a: journal has enable done (proof_ts=... image_id=555777)" \
   "grep -q \"burst-lane  enable  done  (proof_ts=$r7a_now image_id=555777)\" \"$BURST_LANE_JOURNAL\""
 expect "reenable AC7a: burst_configured() reads true in a fresh shell sourcing the drop-in's Environment= line" \
-  "bash -c 'set -a; source <(grep ^Environment= \"$BURST_LANE_SYSTEMD_DROPIN\"); set +a; source \"$HOME/wintermute/build-skill/scripts/lib/burst-configured.sh\"; burst_configured'"
+  "bash -c 'set -a; source <(grep ^Environment= \"$BURST_LANE_SYSTEMD_DROPIN\"); set +a; source \"$HERE/lib/burst-configured.sh\"; burst_configured'"
 
 # Case b: no proof.json at all -> refused, no drop-in.
 fresh_env
@@ -5933,8 +5944,19 @@ expect "reenable AC14b: the pending registration was consumed (file removed)" \
   "[ ! -f \"$REALITY_CHECK_PENDING_DIR/reenable-ac14-ac9.json\" ]"
 expect "reenable AC14b: a reality receipt was written for it" \
   "ls \"$BUILD_RECEIPTS_DIR\"/*-reenable-ac14-ac9-reality-boxrun.txt >/dev/null 2>&1"
+# PRD-build-burst-dispatch-reenable AC14b root cause: reality-check.sh's
+# box-tier verdict line goes through the shared scripts/lib/journal.sh
+# journal_line() (no --file), whose journal_root() honors BUILD_JOURNAL_ROOT
+# outright once it's set — and run-selftests.sh's isolation.sh always sets
+# it — ahead of BUILD_JOURNAL_DIR (only a legacy alias, consulted when
+# BUILD_JOURNAL_ROOT is unset). This fixture's own $BUILD_JOURNAL_DIR
+# override above is therefore never where the verdict actually lands once
+# isolated; read from wherever journal_line() really wrote (BUILD_JOURNAL_ROOT
+# when isolation set it, else the fixture's own BUILD_JOURNAL_DIR for a bare,
+# non-isolated invocation of this file).
+reen_14b_journal_dir="${BUILD_JOURNAL_ROOT:-$BUILD_JOURNAL_DIR}"
 expect "reenable AC14b: reality-check's own journal records the verdict (tier=box)" \
-  "grep -q 'reality  reenable-ac14  ok  (lane=.*tier=box ac=9' \"$BUILD_JOURNAL_DIR/$(date -u +%F).md\""
+  "grep -q 'reality  reenable-ac14  ok  (lane=.*tier=box ac=9' \"$reen_14b_journal_dir/$(date -u +%F).md\""
 expect "reenable AC14b: burst-lane's own up journals pending-reality-run (rc=0) too" \
   "grep -q 'burst-lane  up  pending-reality-run  (rc=0)' \"$BURST_LANE_JOURNAL\""
 
