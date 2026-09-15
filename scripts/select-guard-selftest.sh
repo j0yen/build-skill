@@ -214,7 +214,13 @@ for slug in alpha beta gamma; do
       ;;
     beta)
       [ "$rc" -eq 1 ] || { echo "FAIL: expected beta blocked, got rc=$rc: $out"; exit 1; }
-      [ "$out" = "blocked: beta: same-target: /tmp/select-guard-distinct-repo-a already selected this tick (BUILD_DISTINCT_TARGETS=1)" ] \
+      # PRD-build-gate-before-land requirement 5: the binary distinct-target
+      # message is replaced by the same-target-cap message (cap=1 here,
+      # since BUILD_DISTINCT_TARGETS=1 still forces the compat cap of 1).
+      # $out is 2>&1-combined, so it also carries the stderr
+      # `select same-target cap=...` diagnostic line requirement 5 adds —
+      # match on containment, not full equality.
+      echo "$out" | grep -qF "blocked: beta: same-target: /tmp/select-guard-distinct-repo-a already at cap=1 (source=local, 1 admitted this tick)" \
         || { echo "FAIL: same-target message mismatch: $out"; exit 1; }
       ;;
     gamma)

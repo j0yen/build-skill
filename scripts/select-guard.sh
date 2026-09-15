@@ -31,20 +31,37 @@
 # branch-count already meets or exceeds the cap is blocked with reason
 # "cap: ...", independent of lane-predicate's busy/cargo-free checks.
 #
-# Distinct-target rule (PRD-build-distinct-targets-per-tick, 2026-09-11):
-# journal-confirmed (mcphost-schedules + mcphost-tests-host-independence,
-# same build_into, 2026-09-11 tick): pairing two PRDs that share a
-# build_into contended the integrate lock (gate deferred-lock-contended)
-# while the other starved on cargo-budget slots (wait slot timeout after
-# 1200s) — the session returned, cgroup cleanup reaped the half-done gate,
-# the claim went stale, and neither shipped. The same gate ran clean
-# (1258s, lock_wait=0) as the only branch on that target. BUILD_DISTINCT_
-# TARGETS (default 1 = ON) blocks a candidate whose build_into matches any
-# target already in `admitted-targets` this tick, independent of
-# lane-predicate's busy/cargo-free checks and of BUILD_MAX_BRANCHES. Set
-# to 0 to disable (falls back to the pre-existing worktree-isolation/sub-
-# cap behavior in SKILL.md's Selection rules). Only matters once more than
-# one PRD can be admitted a tick; a missing build_into is never blocked on.
+# Same-target cap (PRD-build-gate-before-land requirement 5, 2026-09-14,
+# superseding the binary distinct-target rule below): originally
+# PRD-build-distinct-targets-per-tick, 2026-09-11 — journal-confirmed
+# (mcphost-schedules + mcphost-tests-host-independence, same build_into,
+# 2026-09-11 tick): pairing two PRDs that share a build_into contended the
+# integrate lock (gate deferred-lock-contended) while the other starved on
+# cargo-budget slots (wait slot timeout after 1200s) — the session
+# returned, cgroup cleanup reaped the half-done gate, the claim went stale,
+# and neither shipped. The same gate ran clean (1258s, lock_wait=0) as the
+# only branch on that target. That incident was land-before-gate holding
+# the crate lock for the gate's whole run (see PRD-build-gate-before-land);
+# with requirement 1's branch-scoped gate removing that lock contention,
+# the binary "1 per target" rule can widen to a real cap:
+#
+# BUILD_SAME_TARGET_CAP (default 1 — reproduces the old always-1 outcome
+# exactly) caps how many candidates sharing one build_into this tick may
+# admit. BUILD_DISTINCT_TARGETS=1, EXPLICITLY set, still forces the cap to
+# 1 (the old compat knob keeps working for anyone still setting it) — it no
+# longer defaults to ON, since BUILD_SAME_TARGET_CAP's own default already
+# reproduces the old default outcome with nothing set. When a burst-lane
+# session reports `gate_ready=true` (via BURST_LANE_SH, default
+# $HERE/burst-lane.sh), the cap for `build_target: rust-extend` candidates
+# widens to min(BUILD_SAME_TARGET_CAP_BURST (default 4), the box's own
+# reported `width`) — unless the BUILD_DISTINCT_TARGETS=1 compat knob
+# already pinned it to 1. Every candidate this script is asked about
+# prints `select same-target cap=<n> source=local|burst target=<build_into>
+# admitted=<k>` to stderr; deduping that to one line per target per tick
+# (requirement 5's own wording) is the tick parent's job, same as the
+# lane-health/resumed= folding SKILL.md's Phase 2 already documents for a
+# different per-tick summary line. Only matters once more than one PRD can
+# be admitted a tick; a missing build_into is never blocked on.
 #
 # Exit 0 + "ok: <slug>: <reason>"      dispatch may proceed.
 # Exit 1 + "blocked: <slug>: <reason>" dispatch MUST NOT happen this tick —
@@ -94,20 +111,74 @@ main() {
     exit 1
   fi
 
-  # BUILD_DISTINCT_TARGETS: unset/invalid -> 1 (ON). Only "0" disables.
-  local distinct_targets="${BUILD_DISTINCT_TARGETS:-1}"
-  case "$distinct_targets" in 0) distinct_targets=0 ;; *) distinct_targets=1 ;; esac
-  if [ "$distinct_targets" -eq 1 ] && [ -n "$admitted_targets" ]; then
-    local bi; bi=$(read_field "$prd" build_into)
-    if [ -n "$bi" ]; then
-      local t
-      local IFS=','
-      for t in $admitted_targets; do
-        if [ "$t" = "$bi" ]; then
-          echo "blocked: $slug: same-target: $bi already selected this tick (BUILD_DISTINCT_TARGETS=1)"
-          exit 1
+  # Same-target cap (PRD-build-gate-before-land requirement 5, replacing the
+  # old binary BUILD_DISTINCT_TARGETS check): BUILD_SAME_TARGET_CAP (default
+  # 1 — today's behavior exactly) caps how many candidates sharing one
+  # build_into this tick may admit. BUILD_DISTINCT_TARGETS=1, EXPLICITLY set,
+  # still forces the cap to 1 for anyone relying on the old compat knob
+  # (AC8) — it no longer defaults to ON, since BUILD_SAME_TARGET_CAP's own
+  # default already reproduces the old default outcome.
+  # BUILD_DISTINCT_TARGETS=0, EXPLICITLY set, is ALSO preserved for back-
+  # compat with its old "disable the check" meaning — a same-target cap
+  # effectively unbounded within this tick (BUILD_MAX_BRANCHES above is
+  # still the real ceiling, exactly as when the old binary check was off).
+  local same_target_cap="${BUILD_SAME_TARGET_CAP:-1}"
+  case "$same_target_cap" in ''|*[!0-9]*|0) same_target_cap=1 ;; esac
+  local distinct_targets_forced=0
+  case "${BUILD_DISTINCT_TARGETS:-}" in
+    1) distinct_targets_forced=1; same_target_cap=1 ;;
+    0) same_target_cap=999999 ;;
+  esac
+  [ "$distinct_targets_forced" -eq 1 ] && same_target_cap=1
+
+  local bi; bi=$(read_field "$prd" build_into)
+  local cap_source="local"
+  # Burst-aware widening (AC9): only for rust-extend targets, only when a
+  # burst-lane session reports gate_ready=true, and only when the compat
+  # knob above hasn't already pinned the cap to 1. Cap = min(
+  # BUILD_SAME_TARGET_CAP_BURST (default 4), the box's own reported width).
+  # BURST_LANE_SH overridable so a selftest can point at a fake toolchain
+  # (same convention extend-gate.sh/lane-claim.sh already use) without a
+  # real Hetzner box.
+  if [ "$distinct_targets_forced" -ne 1 ] && [ -n "$bi" ]; then
+    local build_target_field; build_target_field=$(read_field "$prd" build_target)
+    if [ "$build_target_field" = "rust-extend" ]; then
+      local burst_bin="${BURST_LANE_SH:-$HERE/burst-lane.sh}"
+      if [ -x "$burst_bin" ]; then
+        local bstatus gate_ready width cap_burst
+        bstatus="$("$burst_bin" status --json 2>/dev/null || true)"
+        gate_ready="$(printf '%s' "$bstatus" | jq -r '.gate_ready // empty' 2>/dev/null || true)"
+        if [ "$gate_ready" = "true" ]; then
+          width="$(printf '%s' "$bstatus" | jq -r '.width // empty' 2>/dev/null || true)"
+          case "$width" in ''|*[!0-9]*) width="" ;; esac
+          if [ -n "$width" ]; then
+            cap_burst="${BUILD_SAME_TARGET_CAP_BURST:-4}"
+            case "$cap_burst" in ''|*[!0-9]*|0) cap_burst=4 ;; esac
+            if [ "$width" -lt "$cap_burst" ]; then same_target_cap="$width"; else same_target_cap="$cap_burst"; fi
+            cap_source="burst"
+          fi
         fi
-      done
+      fi
+    fi
+  fi
+
+  local same_target_count=0
+  if [ -n "$bi" ] && [ -n "$admitted_targets" ]; then
+    local t
+    local IFS=','
+    for t in $admitted_targets; do
+      [ "$t" = "$bi" ] && same_target_count=$((same_target_count + 1))
+    done
+  fi
+  # Journaled once per select-guard call (the caller — the tick parent —
+  # owns deduping this to "once per target per tick" if it wants a single
+  # summary line per requirement 5's own wording; this script only knows
+  # about the one candidate it was asked about).
+  if [ -n "$bi" ]; then
+    echo "select same-target cap=$same_target_cap source=$cap_source target=$bi admitted=$((same_target_count + 1))" >&2
+    if [ "$same_target_count" -ge "$same_target_cap" ]; then
+      echo "blocked: $slug: same-target: $bi already at cap=$same_target_cap (source=$cap_source, $same_target_count admitted this tick)"
+      exit 1
     fi
   fi
 
