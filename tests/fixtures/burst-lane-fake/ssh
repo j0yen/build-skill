@@ -241,6 +241,28 @@ case "$cmd" in
     fi
     exit 0
     ;;
+  *MemTotal*)
+    # PRD-build-burst-run-slots-from-box requirement 1/Technical
+    # considerations: probe_box_specs' boot-time fingerprint (nproc/
+    # MemTotal/df), a distinct fixture case from *MemAvailable* above (that
+    # one answers probe_remote_capacity's live per-call reading; this one
+    # answers cmd_up's once-per-session box probe). FAKE_BOX_CORES/
+    # FAKE_BOX_MEM_GB/FAKE_BOX_DISK_GB name the box's own numbers per the
+    # PRD's own naming; FAKE_BOX_PROBE_FAIL=1 simulates AC5's failed probe.
+    [ "${FAKE_BOX_PROBE_FAIL:-0}" = "1" ] && exit 1
+    if [ -z "${FAKE_BOX_CORES:-}${FAKE_BOX_MEM_GB:-}${FAKE_BOX_DISK_GB:-}" ]; then
+      # No boxslots-specific knob was set for this call — every test written
+      # before this PRD exercises `up` with no notion of a box probe at
+      # all; failing here (rather than inventing a plausible box) keeps
+      # every pre-existing test's box_cores/box_mem_gb/box_disk_gb empty
+      # and its run_slot_cap() at source=default (cap 4), byte-for-byte the
+      # same as before this PRD shipped (AC9: no previously green case
+      # turns red).
+      exit 1
+    fi
+    echo "${FAKE_BOX_CORES:-32} ${FAKE_BOX_MEM_GB:-128} ${FAKE_BOX_DISK_GB:-600}"
+    exit 0
+    ;;
   *-printf*)
     [ "${FAKE_SSH_REAP_FAIL:-0}" != "0" ] && exit "${FAKE_SSH_REAP_FAIL}"
     eval "$cmd"
@@ -356,4 +378,11 @@ case "$cmd" in
     ;;
 esac
 if [ "${FAKE_SSH_REMOTE_FAIL:-0}" != "0" ]; then exit "${FAKE_SSH_REMOTE_FAIL}"; fi
+# PRD-build-burst-run-slots-from-box boxslots AC2: an opt-in delay on the
+# actual remote build exec ONLY (every other case above returns above this
+# point) — every other test in this suite runs with this unset and is
+# unaffected. Needed to force real overlap between concurrently-launched
+# `run` invocations for the ≤cap proof, the same reason burstpar-
+# selftest.sh's own dedicated fake ssh sleeps in its exec case.
+[ -n "${FAKE_SSH_RUN_DELAY_S:-}" ] && sleep "$FAKE_SSH_RUN_DELAY_S"
 eval "$cmd"
