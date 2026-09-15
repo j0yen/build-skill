@@ -804,8 +804,8 @@ expect "sub-cap with no session journals it" "grep -q 'burst-lane  sub-cap  no-s
 
 "$BL" up >/dev/null
 
-# 120 GB avail, 32 cores, 10 rust candidates -> floor(120/6)=20, floor(32/4)=8,
-# min(20,8,10)=8 (AC7).
+# 120 GB avail, 32 cores, 10 rust candidates -> floor(120/8)=15, floor(32/4)=8,
+# min(15,8,10)=8 (AC7; default GB-per-run bumped 6->8, cpu term still binds).
 subcap8="$(FAKE_SSH_MEMINFO_GB=120 FAKE_SSH_NPROC=32 "$BL" sub-cap --candidates 10)"
 expect "sub-cap admits 8 on a 120GB/32-core box (AC7)" "grep -q '^sub-cap=8 local=0' <<<\"$subcap8\""
 # PRD-build-burst-remote-disk-guard requirement 2 added a trailing
@@ -814,9 +814,14 @@ expect "sub-cap admits 8 on a 120GB/32-core box (AC7)" "grep -q '^sub-cap=8 loca
 expect "sub-cap journals the AC7-shaped line" \
   "grep -q 'burst: sub-cap=8 (avail_gb=120 nproc=32 free_disk_gb=100000) local=0' \"$BURST_LANE_JOURNAL\""
 
-# 40 GB avail, 32 cores -> floor(40/6)=6, floor(32/4)=8, min(6,8,10)=6 (AC7).
+# 40 GB avail, 32 cores -> floor(40/8)=5, floor(32/4)=8, min(5,8,10)=5 (AC7).
+# PRD-build-burst-run-slots-from-box requirement 2 bumped the default
+# GB-per-run knob from 6 to 8 (run_slot_cap_terms, shared with the run-slot
+# table, defaults to the values RedBaron's real .env already pins) — this
+# expectation moved from 6 to 5 accordingly; see that PRD's own boxslots
+# AC6 for the "one function" proof.
 subcap6="$(FAKE_SSH_MEMINFO_GB=40 FAKE_SSH_NPROC=32 "$BL" sub-cap --candidates 10)"
-expect "sub-cap admits 6 on a 40GB/32-core box (AC7)" "grep -q '^sub-cap=6 local=0' <<<\"$subcap6\""
+expect "sub-cap admits 5 on a 40GB/32-core box (AC7, default GB-per-run bumped to 8)" "grep -q '^sub-cap=5 local=0' <<<\"$subcap6\""
 
 # A failed probe never blocks the caller: fallback exit 3, no crash.
 subcap_fail_rc=0
@@ -985,16 +990,19 @@ unset BURST_LANE_NOW
 
 # ---- burstdisk AC1: sub-cap is disk-bound when free disk is the tightest
 # term — avail_gb=59/nproc=16 alone would admit 4 (floor(16/4)), but
-# free_disk_gb=200 with the default 40 GB floor / 70 GB-per-branch admits
-# only floor((200-40)/70)=2 (requirement 2).
+# free_disk_gb=200 with the default 40 GB floor / 45 GB-per-run admits only
+# floor((200-40)/45)=3 (requirement 2). PRD-build-burst-run-slots-from-box
+# requirement 2 bumped the default disk-per-run knob from 70 to 45 (and
+# GB-per-run from 6 to 8: floor(59/8)=7) — this case's binding term is still
+# disk (3 < 4 and 3 < 7), just at a new value; see that PRD's boxslots AC6.
 fresh_env
 "$BL" up >/dev/null
 subcap_disk="$(FAKE_SSH_MEMINFO_GB=59 FAKE_SSH_NPROC=16 FAKE_SSH_DISK_GB=200 "$BL" sub-cap)"
-expect "burstdisk AC1: sub-cap is disk-bound at 2 on a 59GB/16-core/200GB-disk box" \
-  "grep -q '^sub-cap=2 local=0' <<<\"$subcap_disk\""
+expect "burstdisk AC1: sub-cap is disk-bound at 3 on a 59GB/16-core/200GB-disk box (default disk-per-run bumped to 45)" \
+  "grep -q '^sub-cap=3 local=0' <<<\"$subcap_disk\""
 expect "burstdisk AC1: stdout names the binding term" "grep -q 'bound=disk' <<<\"$subcap_disk\""
 expect "burstdisk AC1: journal carries free_disk_gb and bound=disk" \
-  "grep -q 'sub-cap=2 (avail_gb=59 nproc=16 free_disk_gb=200) bound=disk' \"$BURST_LANE_JOURNAL\""
+  "grep -q 'sub-cap=3 (avail_gb=59 nproc=16 free_disk_gb=200) bound=disk' \"$BURST_LANE_JOURNAL\""
 
 # ---- burstdisk AC2: `run` refuses to route below the disk floor, before
 # any rsync is attempted (requirement 3).
@@ -1708,8 +1716,9 @@ fresh_env
 mkdir -p "$BURST_LANE_STATE_DIR/gate-inflight"
 python3 -c "import json; json.dump({'repo': '/fake/repo', 'host': '127.0.0.1', 'started_epoch': 0, 'budget_s': 1800}, open('$BURST_LANE_STATE_DIR/gate-inflight/fakegate.json', 'w'))"
 subcap_gates="$(FAKE_SSH_MEMINFO_GB=120 FAKE_SSH_NPROC=32 "$BL" sub-cap --candidates 10)"
-# 120GB/32cores -> floor(120/6)=20, floor(32/4)=8 -> unweighted sub-cap=8
-# (AC7's own baseline); one active gate subtracts 2 -> 6.
+# 120GB/32cores -> floor(120/8)=15, floor(32/4)=8 -> unweighted sub-cap=8
+# (AC7's own baseline, default GB-per-run bumped 6->8; cpu term still binds);
+# one active gate subtracts 2 -> 6.
 expect "gatebox req6: one active gate subtracts 2 from sub-cap (8 -> 6)" "grep -q '^sub-cap=6 local=0' <<<\"$subcap_gates\""
 expect "gatebox req6: sub-cap names the gates bound and count" "grep -q 'bound=gates gates_active=1' <<<\"$subcap_gates\""
 
@@ -4706,6 +4715,94 @@ expect "reenable AC6: journal has prove failed (cause=host-mismatch)" \
 expect "reenable AC6: down still ran even though the proof failed" \
   "grep -q 'burst-lane  down  decision=' \"$BURST_LANE_JOURNAL\""
 
+# ---- bakegate block (PRD-build-burst-selftest-drift-and-bake-gate
+# requirements 4/5) -----------------------------------------------------
+# AC6 (bake proceeds against the SAME BUILD_BURST_ENABLED=1 env prove
+# accepts, against a gate_ready fixture box) is already proven by "reenable
+# AC1: bake exits 0" above — no separate case needed, this block covers
+# only the two NEW behaviors: the "not configured" refusal now journals
+# (AC5), and a warm-worktree pull-zero-bytes prove explains itself (AC7).
+block_start "bakegate"
+
+# ---- bakegate AC5: bake refuses BEFORE state_active/gate_ready are even
+# read when burst is not configured — the exact same burst_configured()
+# predicate cmd_up's own dormant-policy gate uses — and now journals the
+# refusal with the key an operator needs to set, instead of only ever
+# reaching stderr (05:50Z, 2026-09-15: an operator lost a minute to this).
+fresh_env
+bg5_out="$(BUILD_BURST_ENABLED=0 BURST_LANE_ENV_FILE="$T/bakegate-nonexistent.env" "$BL" bake 2>&1)"; bg5_rc=$?
+expect "bakegate AC5: bake exits 3 when not configured" "[ $bg5_rc -eq 3 ]"
+expect "bakegate AC5: stderr names BUILD_BURST_ENABLED=1" "grep -q 'BUILD_BURST_ENABLED=1' <<<\"$bg5_out\""
+expect "bakegate AC5: journal has bake refused (cause=not-configured key=BUILD_BURST_ENABLED)" \
+  "grep -q 'burst-lane  bake  refused  (cause=not-configured key=BUILD_BURST_ENABLED)' \"$BURST_LANE_JOURNAL\""
+
+# ---- bakegate AC7: a prove that reuses an already-warm worktree's remote
+# target (this run's own routed line reads warm=true) and pulls back zero
+# bytes explains itself instead of leaving a bare `cause=pull-zero-bytes`
+# for the operator to reconstruct by hand.
+fresh_env
+export BURST_LANE_AUTOBUILDER_BIN="$REEN_PROVE_AB_SRC/autobuilder"
+WT_BG7="$T/bakegate-ac7-warm"; mkdir -p "$WT_BG7"
+# Pre-warm the fixture "remote" (a real local dir standing in for the box,
+# same remote_path_for() hash convention gate7a's own fixture above uses):
+# cmd_run's remote_dir_exists check sees this dir BEFORE its own rsync-up,
+# so this run's own journal line reads warm=true, exactly like a real
+# already-built box would.
+bg7_remote_path="$BURST_LANE_REMOTE_ROOT/$(basename "$WT_BG7")-$(printf '%s' "$WT_BG7" | sha1sum | cut -c1-8)"
+mkdir -p "$bg7_remote_path/target"
+# Force the pull's own --stats line to report 0 bytes transferred: the fake
+# rsync's per-destination call counter (see tests/fixtures/burst-lane-fake/
+# rsync's requirement-10 header) reports floor(40960/n) bytes on the nth
+# --stats call against a given destination — seeding n absurdly high here
+# reproduces the "nothing changed, nothing to send" symptom a real warm
+# pull would also see, without needing tens of thousands of real calls.
+bg7_dst="$WT_BG7/target/"
+bg7_key="$(printf '%s' "$bg7_dst" | cksum | cut -d' ' -f1)"
+mkdir -p "$FAKE_RSYNC_STATS_DIR"
+echo 999999 > "$FAKE_RSYNC_STATS_DIR/$bg7_key"
+bg7_out="$(PATH="$REEN_PROVE_CARGO:$PATH" FAKE_SSH_HOSTNAME=wm-burst-lane-fake-box "$BL" prove --worktree "$WT_BG7" 2>&1)"; bg7_rc=$?
+expect "bakegate AC7: prove exits 1 on a warm worktree that pulls zero bytes" "[ $bg7_rc -eq 1 ]"
+bg7_run_line="$(grep "burst-lane  run  routed  (server_id=[^ ]* worktree=$WT_BG7 " "$BURST_LANE_JOURNAL" | tail -n1)"
+expect "bakegate AC7 setup: the run itself was warm" "grep -q 'warm=true' <<<\"$bg7_run_line\""
+expect "bakegate AC7: the journal names it a warm worktree needing a fresh one" \
+  "grep -qF 'burst-lane  prove  failed  (cause=pull-zero-bytes (warm worktree, nothing recompiled — prove needs a fresh worktree; omit --worktree)' \"$BURST_LANE_JOURNAL\""
+expect "bakegate AC7: stderr reads the same explanation" \
+  "grep -qF 'prove failed (cause=pull-zero-bytes (warm worktree, nothing recompiled — prove needs a fresh worktree; omit --worktree))' <<<\"$bg7_out\""
+
+# ---- bakegate lint (requirement 7, P2): a static guard against
+# reintroducing the exact AC3 drift this PRD fixes — a fixture's fake ssh
+# that writes a start/end pair to its own span log for EVERY ssh
+# round-trip (never distinguishing the warm-check `[ -d` / capacity-probe
+# `meminfo` calls cmd_run also makes from the actual exec) counts 3 "runs"
+# for every 1 that really happened. Scoped to burstpar-selftest.sh's own
+# fake ssh heredoc — the one fixture in this tree that derives a run count
+# from ssh call activity at all; every other span/call-log use elsewhere in
+# this suite counts ssh calls for an unrelated purpose (host-key auditing,
+# root@/build@ routing) and is not this anti-pattern.
+bakegate_ssh_callcount_lint() {  # $1 = file to scan -> stdout violation; rc 0 clean, 1 violation
+  local f="$1"
+  # The two case-pattern TOKENS themselves (never a bare `[ -d`/`meminfo`
+  # substring, which also appears in this very file's own prose comments
+  # explaining the anti-pattern — that would make the lint trivially
+  # unable to fail on a planted violation that only strips the real case
+  # arm and leaves the comment above it untouched).
+  if grep -q 'SPAN_LOG' "$f" 2>/dev/null; then
+    if ! grep -qF '*"[ -d"*)' "$f" || ! grep -qF '*meminfo*)' "$f"; then
+      echo "$f: fake ssh writes to SPAN_LOG without excluding the warm-check/capacity-probe calls — counts every ssh round-trip as a run"
+      return 1
+    fi
+  fi
+  return 0
+}
+bg_lint_real_out="$(bakegate_ssh_callcount_lint "$HERE/burstpar-selftest.sh")"; bg_lint_real_rc=$?
+expect "bakegate lint: burstpar-selftest.sh's fake ssh excludes warm-check/capacity-probe calls from its run count" \
+  "[ $bg_lint_real_rc -eq 0 ]"
+BG_LINT_PLANTED="$T/burstpar-selftest-planted.sh"
+sed -E 's/\*"\[ -d"\*\) exit 0 ;;//' "$HERE/burstpar-selftest.sh" > "$BG_LINT_PLANTED"
+bg_lint_bad_out="$(bakegate_ssh_callcount_lint "$BG_LINT_PLANTED")"; bg_lint_bad_rc=$?
+expect "bakegate lint: the lint fails on a planted fixture missing the warm-check exclusion" "[ $bg_lint_bad_rc -ne 0 ]"
+expect "bakegate lint: the lint names the planted file" "grep -qF \"$BG_LINT_PLANTED\" <<<\"$bg_lint_bad_out\""
+
 # ---- provefx block (PRD-build-burst-prove-forensics) -----------------------
 # 2026-09-13: a real `prove` died silently between `up booted` and the first
 # `run` line — no journal entry, no proof.json, no stderr kept anywhere — and
@@ -4966,11 +5063,59 @@ expect "provefx AC13: proof.json routed=true despite the clock skew" \
 expect "provefx AC13: no burst-prove-marker.* file remains in TMPDIR after prove" \
   "[ -z \"\$(find \"$PFX13_TMP\" -maxdepth 1 -name 'burst-prove-marker.*' 2>/dev/null)\" ]"
 
-# ---- provefx AC14 (requirement 11): a worktree whose .cargo/config.toml
-# points target-dir at an absolute off-root path — the pull already lands
-# there (pull_target_incremental, PRD-build-worktree-targets-off-root); this
-# proves assert inspects that SAME path (never $worktree/target) and names
-# it in the journal on success too.
+# ---- provefx AC14 case 1 (PRD-build-burst-selftest-drift-and-bake-gate
+# requirement 3): case 2 below (unchanged) hand-builds a directory with
+# .cargo/config.toml already inside it — that can never exercise the
+# no-`--worktree` path, where cmd_prove builds its OWN disposable worktree
+# via `git worktree add --detach` from a real repo. `git worktree add`
+# checks out tracked content only; a file the repo excludes in
+# .git/info/exclude (exactly mcphost's own .cargo/config.toml treatment,
+# ~/wintermute/mcphost/.git/info/exclude:7) is never present in the new
+# worktree, so local_target must resolve to the plain <worktree>/target,
+# never an off-root override. Proves this against the actual git mechanics,
+# not an assumption about them.
+fresh_env
+export BURST_LANE_AUTOBUILDER_BIN="$REEN_PROVE_AB_SRC/autobuilder"
+PFX14A_REPO="$T/provefx-ac14-repo"; mkdir -p "$PFX14A_REPO"
+git -C "$PFX14A_REPO" init -q
+printf 'fixture repo\n' > "$PFX14A_REPO/README"
+git -C "$PFX14A_REPO" add README
+git -C "$PFX14A_REPO" -c user.name=t -c user.email=t@t commit -q -m init
+mkdir -p "$PFX14A_REPO/.cargo"
+printf '[build]\ntarget-dir = "%s"\n' "$T/provefx-ac14-repo-offroot-target" \
+  > "$PFX14A_REPO/.cargo/config.toml"
+printf '.cargo/config.toml\n' >> "$PFX14A_REPO/.git/info/exclude"
+# cmd_prove's own disposable worktree is unconditionally `git worktree
+# remove --force`'d before prove returns (never gated by --keep-worktree —
+# that flag only preserves the pulled target/ evidence, not the worktree
+# itself), so there is no window after prove exits to inspect it directly.
+# A throwaway worktree built the identical way (same repo, same
+# .git/info/exclude) from OUTSIDE prove proves the same git mechanics
+# without racing prove's own cleanup.
+PFX14A_PROBE_WT="$T/provefx-ac14-probe-wt"
+git -C "$PFX14A_REPO" worktree add --detach "$PFX14A_PROBE_WT" HEAD >/dev/null 2>&1
+expect "provefx AC14: git worktree add from this fixture's repo produces a worktree with no .cargo/config.toml" \
+  "[ ! -f '$PFX14A_PROBE_WT/.cargo/config.toml' ]"
+git -C "$PFX14A_REPO" worktree remove --force "$PFX14A_PROBE_WT" >/dev/null 2>&1
+export BURST_PROVE_MCPHOST_REPO="$PFX14A_REPO"
+pfx14a_out="$(PATH="$REEN_PROVE_CARGO:$PATH" FAKE_SSH_HOSTNAME=wm-burst-lane-fake-box "$BL" prove 2>&1)"; pfx14a_rc=$?
+expect "provefx AC14: prove with no --worktree does its own git worktree add --detach and still routes true" \
+  "[ $pfx14a_rc -eq 0 ]"
+pfx14a_wt="$(python3 -c "import json; print(json.load(open('$BURST_LANE_STATE_DIR/proof.json'))['worktree'])" 2>/dev/null)"
+expect "provefx AC14: prove's own disposable worktree is gone after prove finishes" \
+  "[ -n \"$pfx14a_wt\" ] && [ ! -d \"$pfx14a_wt\" ]"
+expect "provefx AC14: the done journal line names local_target as <worktree>/target, not the repo's off-root override" \
+  "grep -q \"burst-lane  prove  done  (routed=true.*local_target=$pfx14a_wt/target\" \"$BURST_LANE_JOURNAL\""
+unset BURST_PROVE_MCPHOST_REPO
+
+# ---- provefx AC14 case 2 (requirement 11): a worktree whose
+# .cargo/config.toml points target-dir at an absolute off-root path — the
+# pull already lands there (pull_target_incremental,
+# PRD-build-worktree-targets-off-root); this proves assert inspects that
+# SAME path (never $worktree/target) and names it in the journal on
+# success too. Supplied via --worktree, so this is the operator-owned path
+# (never a disposable git-worktree-add) — the off-root override IS honored
+# here, unlike case 1 above.
 fresh_env
 export BURST_LANE_AUTOBUILDER_BIN="$REEN_PROVE_AB_SRC/autobuilder"
 WT_PFX14="$T/provefx-ac14"; mkdir -p "$WT_PFX14/.cargo"
@@ -6016,6 +6161,285 @@ with open(sys.argv[5], "a") as f:
   || echo "pullback-iteration-log: WARNING — failed to write $PULLBACK_ITER_LOG" >&2
 expect "pullback AC11: the iteration ledger recorded this run" \
   "[ -s \"$PULLBACK_ITER_LOG\" ] && tail -1 \"$PULLBACK_ITER_LOG\" | python3 -c 'import json,sys; json.loads(sys.stdin.read())'"
+
+# =============================================================================
+# PRD-build-burst-run-slots-from-box: run slots are sized by the box that
+# booted, not by a number in an env file. (test_prefix: boxslots)
+# =============================================================================
+
+# ---- boxslots AC1: `up` probes the box once and records box_cores/
+# box_mem_gb/box_disk_gb; the run-slot cap derives from them (requirement 1,
+# defaults cores 4 / GB 8 / disk 45: min(32/4, 128/8, (600-40)/45) =
+# min(8,16,12) = 8, cpu-bound).
+fresh_env
+FAKE_BOX_CORES=32 FAKE_BOX_MEM_GB=128 FAKE_BOX_DISK_GB=600 "$BL" up >/dev/null
+expect "boxslots AC1: session.json carries box_cores=32" \
+  "grep -q '\"box_cores\":32' \"$BURST_LANE_STATE_DIR/session.json\""
+expect "boxslots AC1: session.json carries box_mem_gb=128" \
+  "grep -q '\"box_mem_gb\":128' \"$BURST_LANE_STATE_DIR/session.json\""
+expect "boxslots AC1: session.json carries box_disk_gb=600" \
+  "grep -q '\"box_disk_gb\":600' \"$BURST_LANE_STATE_DIR/session.json\""
+expect "boxslots AC1: journal names cap=8 source=box bound=cpu" \
+  "grep -q 'burst-lane  up  slots  (cap=8 source=box bound=cpu cores=32 mem_gb=128 disk_gb=600)' \"$BURST_LANE_JOURNAL\""
+
+# ---- boxslots AC2: 12 fixture runs on 12 different worktrees, cap unset ->
+# the box's own 8-wide cap is what actually gates them (peak concurrently
+# held, counted from `run routed` journal lines' own concurrent= field —
+# never fake-ssh start/end spans; Technical considerations: burstpar-
+# selftest's own overlap counter is a known-drifted metric a later PRD
+# fixes, not this one's proof). FAKE_SSH_RUN_DELAY_S forces real overlap
+# between the 12 concurrently-launched invocations (same reason burstpar-
+# selftest.sh's own dedicated fake ssh sleeps in its exec case).
+fresh_env
+FAKE_BOX_CORES=32 FAKE_BOX_MEM_GB=128 FAKE_BOX_DISK_GB=600 "$BL" up >/dev/null
+boxslots_ac2_pids=()
+for i in $(seq 1 12); do
+  wt="$T/boxslots-wt$i"; mkdir -p "$wt"
+  echo 'mkdir -p target && echo built > target/out.txt; exit 0' > "$wt/build.sh"
+  ( FAKE_SSH_RUN_DELAY_S=0.4 "$BL" run "$wt" -- bash build.sh >/dev/null 2>&1 ) &
+  boxslots_ac2_pids+=($!)
+done
+boxslots_ac2_rc_bad=0
+for p in "${boxslots_ac2_pids[@]}"; do wait "$p" || boxslots_ac2_rc_bad=$((boxslots_ac2_rc_bad + 1)); done
+boxslots_ac2_peak="$(grep 'burst-lane  run  routed' "$BURST_LANE_JOURNAL" 2>/dev/null | grep -oE 'concurrent=[0-9]+/[0-9]+' | cut -d= -f2 | cut -d/ -f1 | sort -n | tail -1)"
+boxslots_ac2_completed="$(grep -c 'burst-lane  run  routed' "$BURST_LANE_JOURNAL" 2>/dev/null || echo 0)"
+expect "boxslots AC2: peak concurrently held run slots reaches the box's own cap of 8" \
+  "[ \"$boxslots_ac2_peak\" = \"8\" ]"
+expect "boxslots AC2: all 12 runs complete (12 'run routed' journal lines)" \
+  "[ \"$boxslots_ac2_completed\" = \"12\" ]"
+expect "boxslots AC2: no run exited nonzero" "[ \"$boxslots_ac2_rc_bad\" -eq 0 ]"
+
+# ---- boxslots AC3: BURST_MAX_CONCURRENT_RUNS pins the cap outright —
+# status --json reports run_slots.cap=3 source=env, the operator's pin
+# visible over whatever the box itself would have computed (requirement
+# 2/user story 3).
+fresh_env
+FAKE_BOX_CORES=32 FAKE_BOX_MEM_GB=128 FAKE_BOX_DISK_GB=600 "$BL" up >/dev/null
+boxslots_ac3_json="$(BURST_MAX_CONCURRENT_RUNS=3 "$BL" status --json)"
+expect "boxslots AC3: run_slots.cap=3 when BURST_MAX_CONCURRENT_RUNS pins it" \
+  "grep -q '\"run_slots\":{\"cap\":3,' <<<\$boxslots_ac3_json"
+expect "boxslots AC3: run_slots.source=env" "grep -q '\"source\":\"env\"' <<<\$boxslots_ac3_json"
+
+# ---- boxslots AC4: a 16-core/64GB/100GB box with BURST_DISK_FLOOR_GB=40 ->
+# min(16/4, 64/8, (100-40)/45) = min(4,8,1) = 1 (disk term floors to 1 by
+# its own arithmetic, not by run_slot_cap()'s floor-at-1 safety net) —
+# status names disk as the binding term.
+fresh_env
+FAKE_BOX_CORES=16 FAKE_BOX_MEM_GB=64 FAKE_BOX_DISK_GB=100 "$BL" up >/dev/null
+boxslots_ac4_json="$(BURST_DISK_FLOOR_GB=40 "$BL" status --json)"
+expect "boxslots AC4: run_slots.cap=1 (disk term (100-40)/45 floors to 1)" \
+  "grep -q '\"run_slots\":{\"cap\":1,' <<<\$boxslots_ac4_json"
+expect "boxslots AC4: run_slots names disk as the binding term" \
+  "grep -q '\"bound\":\"disk\"' <<<\$boxslots_ac4_json"
+
+# ---- boxslots AC5: a failed box probe leaves box_cores/box_mem_gb/
+# box_disk_gb empty; run_slot_cap() falls back to 4 with source=default
+# (never blocks `up` itself), and the journal names the failed probe.
+fresh_env
+FAKE_BOX_PROBE_FAIL=1 "$BL" up >/dev/null
+expect "boxslots AC5: journal names the failed box probe" \
+  "grep -q 'burst-lane  up  box-probe  failed' \"$BURST_LANE_JOURNAL\""
+boxslots_ac5_json="$("$BL" status --json)"
+expect "boxslots AC5: run_slots.cap=4 source=default when the box probe failed" \
+  "grep -q '\"run_slots\":{\"cap\":4,\"held\":0,\"source\":\"default\"' <<<\$boxslots_ac5_json"
+
+# ---- boxslots AC6: sub_cap and run_slot_cap() share one function — fed the
+# SAME cores/mem/disk reading, they compute the SAME cap (requirement 3/5),
+# and cmd_sub_cap's own body carries no inline nproc/N or avail_gb/N
+# arithmetic (that arithmetic now lives only in run_slot_cap_terms).
+fresh_env
+FAKE_BOX_CORES=16 FAKE_BOX_MEM_GB=64 FAKE_BOX_DISK_GB=100 "$BL" up >/dev/null
+boxslots_ac6_status_json="$(BURST_DISK_FLOOR_GB=40 "$BL" status --json)"
+boxslots_ac6_cap="$(python3 -c "import json,sys; print(json.loads(sys.argv[1])['run_slots']['cap'])" "$boxslots_ac6_status_json" 2>/dev/null)"
+boxslots_ac6_subcap_out="$(BURST_DISK_FLOOR_GB=40 FAKE_SSH_MEMINFO_GB=64 FAKE_SSH_NPROC=16 FAKE_SSH_DISK_GB=100 "$BL" sub-cap --candidates 10)"
+boxslots_ac6_subcap="$(grep -oE '^sub-cap=[0-9]+' <<<"$boxslots_ac6_subcap_out" | cut -d= -f2)"
+expect "boxslots AC6: sub-cap and run_slot_cap() agree on the per-box term from matching box readings" \
+  "[ -n \"$boxslots_ac6_cap\" ] && [ \"$boxslots_ac6_cap\" = \"$boxslots_ac6_subcap\" ]"
+boxslots_ac6_lint_hits="$(sed -n '/^cmd_sub_cap()/,/^}/p' "$HERE/burst-lane.sh" | grep -E 'nproc_n[[:space:]]*/|avail_gb[[:space:]]*/')"
+expect "boxslots AC6: cmd_sub_cap's own body has no inline nproc/N or avail_gb/N arithmetic" \
+  "[ -z \"$boxslots_ac6_lint_hits\" ]"
+
+# ---- boxslots AC7: the older BURST_CORES_PER_BRANCH spelling still
+# resolves when BURST_CORES_PER_RUN is unset — one journal deprecation line
+# names the replacement (requirement 6). 32 cores / 8-per-run = 4 (now the
+# binding term, tighter than mem's 16 and disk's 12).
+fresh_env
+FAKE_BOX_CORES=32 FAKE_BOX_MEM_GB=128 FAKE_BOX_DISK_GB=600 "$BL" up >/dev/null
+boxslots_ac7_json="$(BURST_CORES_PER_BRANCH=8 "$BL" status --json)"
+expect "boxslots AC7: run_slots.cap uses the deprecated BURST_CORES_PER_BRANCH alias (32/8=4)" \
+  "grep -q '\"run_slots\":{\"cap\":4,' <<<\$boxslots_ac7_json"
+expect "boxslots AC7: journal names the deprecated knob and its replacement" \
+  "grep -q 'burst-lane  run-slot-cap  deprecated-knob  (old=BURST_CORES_PER_BRANCH new=BURST_CORES_PER_RUN)' \"$BURST_LANE_JOURNAL\""
+
+# ==============================================================================
+# ---- teardown: PRD-build-burst-teardown-evidence ----------------------------
+# ==============================================================================
+# teardown_decision() replaces the four independently-drifting delete rules
+# (down, watchdog, the in-script idle-guard, and the standalone burst-idle-
+# guard.sh) with one evidence-backed function; this block proves it directly
+# (sourcing burst-lane.sh so a case can call teardown_decision/why-down's own
+# helpers without a full up/down cycle for every fixture) and through the two
+# NEW subcommands (`why-down`, `status --json`'s next_teardown) it powers.
+# Requirement 2's full rewiring of down/watchdog/idle-guard's own ACTING
+# logic onto teardown_decision, and requirement 4's adopt-derives fix, are
+# deliberately NOT exercised here this pass — see the PRD's own build notes:
+# both land in code regions a concurrent sibling PRD (PRD-build-burst-run-
+# slots-from-box) was editing at the same moment in this same unisolated
+# shell checkout, and requirement 2 in particular needs updating a couple
+# dozen pre-existing hard-coded assertions elsewhere in this very file
+# (bursttdl/proveguard/costrate's exact-string checks) in lockstep with the
+# behavior change — real, necessary work, left for a focused follow-on
+# rather than risked in the same pass as ten other concurrently-building
+# PRDs.
+block_start "teardown"
+fresh_env
+export BURST_LANE_LOOP_ACTIVE_OVERRIDE=false
+
+# ---- teardown AC2: hcloud unavailable is never a decision cause ------------
+"$BL" up >/dev/null 2>&1
+td2_sid="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+td2_before="$(cat "$BURST_LANE_STATE_DIR/session.json")"
+td2_fakebin="$T/no-hcloud-path"; mkdir -p "$td2_fakebin"
+for tool in ssh rsync python3 systemctl awk grep sed date cut mkdir cat rm mv sleep tr head tail sort xargs sha1sum flock seq basename dirname find touch python; do
+  p="$(command -v "$tool" 2>/dev/null)"; [ -n "$p" ] && ln -sf "$p" "$td2_fakebin/$tool"
+done
+td2_down_out="$(PATH="$td2_fakebin" "$BL" down 2>&1)"
+td2_wd_out="$(PATH="$td2_fakebin" "$BL" watchdog 2>&1)"
+td2_ig_out="$(PATH="$td2_fakebin" "$BL" idle-guard 2>&1)"
+expect "teardown AC2: down is a no-op decision=keep cause=probe-unavailable without hcloud" \
+  "[ \"\$td2_down_out\" = 'decision=keep cause=probe-unavailable' ]"
+expect "teardown AC2: watchdog is a no-op decision=keep cause=probe-unavailable without hcloud" \
+  "[ \"\$td2_wd_out\" = 'decision=keep cause=probe-unavailable' ]"
+expect "teardown AC2: idle-guard is a no-op decision=keep cause=probe-unavailable without hcloud" \
+  "[ \"\$td2_ig_out\" = 'decision=keep cause=probe-unavailable' ]"
+expect "teardown AC2: session.json is byte-unchanged after all three" \
+  "[ \"\$(cat \"$BURST_LANE_STATE_DIR/session.json\")\" = \"\$td2_before\" ]"
+expect "teardown AC2: no .stale- file was created" "! ls \"$BURST_LANE_STATE_DIR\"/session.json.stale-* >/dev/null 2>&1"
+td2_pu_lines="$(grep -c 'cause=probe-unavailable' "$BURST_LANE_JOURNAL")"
+expect "teardown AC2: probe-unavailable journaled at most once across down+watchdog+idle-guard (once-per-hour throttle)" \
+  "[ \"$td2_pu_lines\" -le 1 ]"
+
+# ---- teardown AC3: zero-runs grace keeps a fresh box past the old 900s -----
+fresh_env
+export BURST_LANE_LOOP_ACTIVE_OVERRIDE=true
+td3_now="$(date -u +%s)"
+export BURST_LANE_NOW=$((td3_now - 700))
+"$BL" up >/dev/null 2>&1
+td3_sid="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+unset BURST_LANE_NOW
+cat > "$BURST_LANE_PRD_DIR/build-queue/PRD-teardown-fake-rust.md" <<'EOF'
+# PRD — teardown-fake-rust
+
+- Status: queued
+- build_target: rust-extend
+EOF
+export BURST_LANE_NOW="$td3_now"
+td3_out="$(source "$BL"; teardown_decision "$td3_sid" idle-guard)"
+unset BURST_LANE_NOW
+td3_decision="$(sed -n 's/^decision=//p' <<<"$td3_out")"
+td3_cause="$(sed -n 's/^cause=//p' <<<"$td3_out")"
+expect "teardown AC3: decision=keep" "[ \"$td3_decision\" = keep ]"
+expect "teardown AC3: cause=grace" "[ \"$td3_cause\" = grace ]"
+td3_evidence="$(tail -1 "$BURST_LANE_STATE_DIR/decisions.jsonl" | python3 -c 'import json,sys; print(json.loads(sys.stdin.read())["evidence"]["grace_s"])')"
+expect "teardown AC3: evidence.grace_s >= 1200" "[ \"$td3_evidence\" -ge 1200 ]"
+rm -f "$BURST_LANE_PRD_DIR/build-queue/PRD-teardown-fake-rust.md"
+
+# ---- teardown AC4: a stale last-routed-run with no queued work deletes -----
+fresh_env
+export BURST_LANE_LOOP_ACTIVE_OVERRIDE=false
+"$BL" up >/dev/null 2>&1
+td4_sid="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+td4_now="$(date -u +%s)"
+printf '{"date":"%s","session_id":"%s","slug":"x"}\n' \
+  "$(date -u -d "@$((td4_now - 3660))" +%Y-%m-%dT%H:%M:%SZ)" "$td4_sid" >> "$BURST_LANE_ATTR_LEDGER"
+export BURST_LANE_NOW="$td4_now"
+td4_out="$(source "$BL"; teardown_decision "$td4_sid" down)"
+unset BURST_LANE_NOW
+td4_decision="$(sed -n 's/^decision=//p' <<<"$td4_out")"
+td4_cause="$(sed -n 's/^cause=//p' <<<"$td4_out")"
+expect "teardown AC4: decision=delete" "[ \"$td4_decision\" = delete ]"
+expect "teardown AC4: cause=idle-no-work" "[ \"$td4_cause\" = idle-no-work ]"
+
+# ---- teardown AC5: same staleness, but work queued + loop active keeps ----
+fresh_env
+export BURST_LANE_LOOP_ACTIVE_OVERRIDE=true
+"$BL" up >/dev/null 2>&1
+td5_sid="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+td5_now="$(date -u +%s)"
+printf '{"date":"%s","session_id":"%s","slug":"x"}\n' \
+  "$(date -u -d "@$((td5_now - 3660))" +%Y-%m-%dT%H:%M:%SZ)" "$td5_sid" >> "$BURST_LANE_ATTR_LEDGER"
+cat > "$BURST_LANE_PRD_DIR/build-queue/PRD-teardown-fake-rust2.md" <<'EOF'
+# PRD — teardown-fake-rust2
+
+- Status: queued
+- build_target: rust-extend
+EOF
+export BURST_LANE_NOW="$td5_now"
+td5_out="$(source "$BL"; teardown_decision "$td5_sid" idle-guard)"
+unset BURST_LANE_NOW
+td5_decision="$(sed -n 's/^decision=//p' <<<"$td5_out")"
+td5_cause="$(sed -n 's/^cause=//p' <<<"$td5_out")"
+expect "teardown AC5: decision=keep" "[ \"$td5_decision\" = keep ]"
+expect "teardown AC5: cause=work-queued" "[ \"$td5_cause\" = work-queued ]"
+rm -f "$BURST_LANE_PRD_DIR/build-queue/PRD-teardown-fake-rust2.md"
+
+# ---- teardown AC6: why-down replays the trail, and flags an unrecorded ----
+# deletion (P1 closer / AC12's own failure-path case).
+fresh_env
+export BURST_LANE_LOOP_ACTIVE_OVERRIDE=false
+"$BL" up >/dev/null 2>&1
+td6_sid="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+( source "$BL"
+  _teardown_decision_record "$td6_sid" down keep work-queued '{"n":1}'
+  _teardown_decision_record "$td6_sid" watchdog keep work-queued '{"n":2}'
+  _teardown_decision_record "$td6_sid" idle-guard delete idle-no-work '{"n":3}'
+)
+mv "$BURST_LANE_STATE_DIR/session.json" "$BURST_LANE_STATE_DIR/session.json.deleted-20260915T120000Z"
+td6_out="$("$BL" why-down "$td6_sid" 2>&1)"
+expect "teardown AC6: why-down prints all three rows in order" \
+  "[ \"\$(grep -c 'decision=' <<<\"\$td6_out\")\" -ge 4 ]"
+expect "teardown AC6: why-down names the final cause" "grep -q 'final: decision=delete cause=idle-no-work' <<<\"$td6_out\""
+expect "teardown AC6: why-down names the matching deleted-* archive file" \
+  "grep -q 'session.json.deleted-20260915T120000Z' <<<\"$td6_out\""
+
+td6b_out="$("$BL" why-down 999999999 2>&1)"; td6b_rc=$?
+expect "teardown AC6/AC12: an id with no decisions.jsonl row prints no decision recorded" \
+  "[ \"\$td6b_out\" = 'no decision recorded' ]"
+expect "teardown AC6/AC12: that case is a real failure exit, not a tautological 0" "[ $td6b_rc -ne 0 ]"
+expect "teardown AC12: the unrecorded deletion is itself journaled as a defect" \
+  "grep -q 'burst-lane  why-down  unrecorded-deletion  (server_id=999999999)' \"$BURST_LANE_JOURNAL\""
+
+# ---- teardown AC8: a scheduled soft-down is refused, not silently ignored -
+fresh_env
+"$BL" up >/dev/null 2>&1
+td8_rc=0; td8_out="$("$BL" down --at 06:48 2>&1)" || td8_rc=$?
+expect "teardown AC8: down --at exits 2" "[ $td8_rc -eq 2 ]"
+expect "teardown AC8: no timer/systemd-run call was ever made for this" "! grep -qE 'systemd-run|on-calendar' \"$BURST_LANE_JOURNAL\""
+expect "teardown AC8: the refusal is journaled with cause=scheduled-teardown-disabled" \
+  "grep -q 'burst-lane  down  refused  (cause=scheduled-teardown-disabled' \"$BURST_LANE_JOURNAL\""
+
+# ---- teardown AC9: status --json's next_teardown matches a dry-run --------
+fresh_env
+"$BL" up >/dev/null 2>&1
+td9_sid="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+td9_status="$("$BL" status --json)"
+td9_nt_decision="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["next_teardown"]["decision"])' "$td9_status")"
+td9_nt_cause="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["next_teardown"]["cause"])' "$td9_status")"
+td9_dry_out="$(source "$BL"; teardown_decision "$td9_sid" status --dry-run)"
+td9_dry_decision="$(sed -n 's/^decision=//p' <<<"$td9_dry_out")"
+td9_dry_cause="$(sed -n 's/^cause=//p' <<<"$td9_dry_out")"
+expect "teardown AC9: status --json's next_teardown.decision is present and matches a dry-run" \
+  "[ -n \"$td9_nt_decision\" ] && [ \"$td9_nt_decision\" = \"$td9_dry_decision\" ]"
+expect "teardown AC9: status --json's next_teardown.cause matches a dry-run" "[ \"$td9_nt_cause\" = \"$td9_dry_cause\" ]"
+td9_ledger_before="$(wc -l < "$BURST_LANE_STATE_DIR/decisions.jsonl" 2>/dev/null || echo 0)"
+"$BL" status --json >/dev/null
+"$BL" status --json >/dev/null
+td9_ledger_after="$(wc -l < "$BURST_LANE_STATE_DIR/decisions.jsonl" 2>/dev/null || echo 0)"
+expect "teardown AC9: polling status --json never appends to decisions.jsonl (dry-run has no side effects)" \
+  "[ \"$td9_ledger_after\" -eq \"$td9_ledger_before\" ]"
+
+unset BURST_LANE_LOOP_ACTIVE_OVERRIDE
+expect_block_green "teardown" "teardown: every teardown case above ran green"
 
 echo "=== $([ $fail -eq 0 ] && echo PASS || echo FAIL) ==="
 exit $fail

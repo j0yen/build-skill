@@ -163,10 +163,13 @@
 #       Requirement 7's formula. No session -> prints "sub-cap=0 local=3
 #       (no session — local cap applies)" and journals a no-session line.
 #       Session up -> probes the box's MemAvailable_gb and nproc over ssh,
-#       computes min(floor(avail_gb/BURST_GB_PER_BRANCH),
-#       floor(nproc/BURST_CORES_PER_BRANCH)[, candidates]) (defaults 6 GB
-#       and 4 cores per branch), prints "sub-cap=<n> local=0
-#       (avail_gb=<n> nproc=<n>)" and journals
+#       feeds them (with free disk) through run_slot_cap_terms — the same
+#       formula run_slot_cap() uses for the run-slot table, PRD-build-burst-
+#       run-slots-from-box requirement 3 — computing min(floor(avail_gb/
+#       BURST_GB_PER_RUN), floor(nproc/BURST_CORES_PER_RUN)[, candidates])
+#       (defaults 8 GB and 4 cores per run; BURST_GB_PER_BRANCH/
+#       BURST_CORES_PER_BRANCH still resolve as deprecated aliases), prints
+#       "sub-cap=<n> local=0 (avail_gb=<n> nproc=<n>)" and journals
 #       "burst: sub-cap=<n> (avail_gb=<n> nproc=<n>)" (AC7). A failed probe
 #       exits 3 with "fallback: ...", never blocking the caller.
 #   burst-lane.sh reap
@@ -274,6 +277,15 @@ SERVED_FILE="$STATE_DIR/prds_served"
 # there never reaches the parent shell that reads it back afterward. A file
 # survives that boundary the same way $SERVED_FILE etc. already do.
 TEARDOWN_CAUSE_FILE="$STATE_DIR/.last-teardown-cause"
+# PRD-build-burst-teardown-evidence requirement 1: the append-only decision
+# trail teardown_decision() writes one row to on every call (ts, server_id,
+# caller, decision, cause, evidence) — this is what `why-down` replays.
+# Requirement 3: the once-per-hour journal throttle for cause=probe-
+# unavailable is tracked separately, in its own tiny mtime-style marker file,
+# so a probe outage that lasts all day journals once, not once per caller
+# invocation.
+DECISIONS_LEDGER="${BURST_LANE_DECISIONS_LEDGER:-$STATE_DIR/decisions.jsonl}"
+PROBE_UNAVAILABLE_MARK_FILE="$STATE_DIR/.probe-unavailable-last"
 ENV_FILE="${BURST_LANE_ENV_FILE:-$HOME/.config/wm-burst/.env}"
 JOURNAL="${BURST_LANE_JOURNAL:-$HOME/brain/journal/build/burst-lane.log}"
 PRD_DIR="${BURST_LANE_PRD_DIR:-$HOME/Documents/PRDs}"
@@ -551,7 +563,7 @@ BURST_SETUP_GRACE_MIN="${BURST_SETUP_GRACE_MIN:-30}"
 BURST_VOLUME_KEEP_MIN_PCT="${BURST_VOLUME_KEEP_MIN_PCT:-5}"
 
 die() { echo "burst-lane: $*" >&2; exit "${2:-1}"; }
-usage() { echo "usage: burst-lane.sh {up|status|run|sync-back|pull|ensure-fresh|down|watchdog|idle-guard|cost|sub-cap|verify|provision|reap|box-isolation-check|route-check|parity|gate|bake} ..." >&2; exit 2; }
+usage() { echo "usage: burst-lane.sh {up|status|run|sync-back|pull|ensure-fresh|down|watchdog|idle-guard|why-down|cost|sub-cap|verify|provision|reap|box-isolation-check|route-check|parity|gate|bake} ..." >&2; exit 2; }
 
 now_epoch() { echo "${BURST_LANE_NOW:-$(date -u +%s)}"; }
 now_iso()   { date -u -d "@$(now_epoch)" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ; }
@@ -2111,7 +2123,17 @@ print(json.dumps(base, separators=(",", ":")))
 # and `up`'s image resolution — requirement 2 — are separate, later steps of
 # this PRD); this is the standalone, operator/tick-invoked command.
 cmd_bake() {
+  # PRD-build-burst-selftest-drift-and-bake-gate requirement 4: the same
+  # burst_configured() predicate cmd_up/cmd_prove's own dormant-policy gate
+  # uses (prove itself forces BUILD_BURST_ENABLED=1 for the duration of its
+  # own run — its real gate is authz_refuse_if_missing below, not this one
+  # — so an operator who just ran `prove` successfully never sees this
+  # check fail; a bare `bake` in a shell that never exported the var does).
+  # Unlike the OTHER refusals below in this function, this one used to be
+  # silent to the journal — an operator (05:50Z, 2026-09-15) lost a minute
+  # to a refusal that never named the key it needed to set.
   if ! burst_configured; then
+    journal_line "$(now_iso)  burst-lane  bake  refused  (cause=not-configured key=BUILD_BURST_ENABLED)"
     echo "burst: refused — not configured (RedBaron-local policy); set BUILD_BURST_ENABLED=1 to allow" >&2
     exit 3
   fi
@@ -2864,7 +2886,7 @@ cmd_prove() {
   local sha; sha="$(git -C "$worktree" rev-parse HEAD 2>/dev/null || echo unknown)"
   PROVE_SHA="$sha"
 
-  local routed=false bytes=0 cause="" id="" secs_remote=0
+  local routed=false bytes=0 cause="" id="" secs_remote=0 cause_hint=""
 
   # PRD-build-burst-prove-inflight-guard requirement 1: written before `up`
   # so down/idle-guard/watchdog see this prove as live before the box it's
@@ -2915,6 +2937,18 @@ cmd_prove() {
         case "$bytes" in ''|*[!0-9]*) bytes=0 ;; esac
         if [ "$bytes" -le 0 ]; then
           cause="pull-zero-bytes"
+          # PRD-build-burst-selftest-drift-and-bake-gate requirement 5: a
+          # WARM worktree (this run's own routed line already says
+          # warm=true — its target existed on the box before this run's
+          # rsync-up) pulling zero bytes back is not a mystery: nothing
+          # needed recompiling, so there was nothing for the pull to send.
+          # Name that explicitly instead of leaving the operator to
+          # reconstruct "warm" from the run line themselves.
+          case "$run_line" in
+            *"warm=true"*)
+              cause_hint=" (warm worktree, nothing recompiled — prove needs a fresh worktree; omit --worktree)"
+              ;;
+          esac
         else
           # Requirement 11: the reference is the marker `run` touched INSIDE
           # the remote target dir immediately before cargo started — it rode
@@ -3045,14 +3079,14 @@ cmd_prove() {
     echo "prove done: routed=true image_id=$image_id bytes=$bytes"
     exit 0
   fi
-  local fail_msg="cause=$cause image_id=$image_id server_id=${id:-none} local_target=${PROVE_LOCAL_TARGET:-none}"
+  local fail_msg="cause=$cause$cause_hint image_id=$image_id server_id=${id:-none} local_target=${PROVE_LOCAL_TARGET:-none}"
   [ -n "$PROVE_FAIL_TAIL" ] && fail_msg="$fail_msg tail=\"$PROVE_FAIL_TAIL\""
   # Requirement 12/AC15: a no-fresh-artifact verdict carries its own
   # diagnosis (files/newest_mtime/marker_mtime/remote_date/skew_s) right in
   # the journal line, same fields as proof.json.
   [ -n "$PROVE_ASSERT_DIAG_JSON" ] && fail_msg="$fail_msg $(prove_diag_tail "$PROVE_ASSERT_DIAG_JSON")"
   journal_line "$(now_iso)  burst-lane  prove  failed  ($fail_msg)$(authz_journal_suffix)"
-  echo "prove failed (cause=$cause)" >&2
+  echo "prove failed (cause=$cause$cause_hint)" >&2
   exit 1
 }
 
@@ -3382,6 +3416,16 @@ cmd_up() {
     place_gate_credential "$aip"
     run_pending_reality_check_if_gate_ready
     : > "$SERVED_FILE"
+    # PRD-build-burst-run-slots-from-box requirement 1: probe once, right
+    # after gate tools are ready, same as the fresh-boot path below — an
+    # adopted box (session.json lost, server still alive) gets its run-slot
+    # cap sized from its own hardware exactly like a freshly-booted one.
+    local box_cores="" box_mem_gb="" box_disk_gb="" box_probe_out
+    if box_probe_out="$(probe_box_specs "$aip")"; then
+      read -r box_cores box_mem_gb box_disk_gb <<<"$box_probe_out"
+    else
+      journal_line "$(now_iso)  burst-lane  up  box-probe  failed  (server_id=$aid)"
+    fi
     # Requirement 9: no `server create` happened on this path (the box
     # already existed), so its true creation moment is unknown here — no
     # create_epoch is written and session_create_epoch()'s own fallback to
@@ -3394,8 +3438,13 @@ cmd_up() {
       "hard_ttl_hours=$HARD_TTL_HOURS" "runs_served=0" "sandbox_ok=$sbx" \
       "teardown_scheduled=false" "teardown_epoch=" "remote_user=$REMOTE_USER" \
       "gate_ready=$GATE_READY" "gate_tools_missing=$GATE_TOOLS_MISSING" \
+      "box_cores=$box_cores" "box_mem_gb=$box_mem_gb" "box_disk_gb=$box_disk_gb" \
       "phase=setup" "phase_epoch=$(now_epoch)"
     journal_line "$(now_iso)  burst-lane  up  adopted  (server_id=$aid ip=$aip sandbox_ok=$sbx gate_ready=$GATE_READY)$(authz_journal_suffix)"
+    # requirement 5: the slot-cap derivation, journaled once per session so
+    # it's auditable without a separate `status` call.
+    run_slot_cap
+    journal_line "$(now_iso)  burst-lane  up  slots  (cap=$RUN_SLOT_CAP source=$RUN_SLOT_SOURCE bound=${RUN_SLOT_BOUND:-} cores=${box_cores:-} mem_gb=${box_mem_gb:-} disk_gb=${box_disk_gb:-})"
     ( cmd_verify >/dev/null 2>&1 ) || journal_line "$(now_iso)  burst-lane  up  verify-failed-after-adopt  (lane unverified — run falls back local)"
     local _adopt_image_id; read -r _adopt_image_id _ <<<"$(resolve_boot_image)"
     refresh_parity_baseline_on_image_change "$_adopt_image_id"
@@ -3498,14 +3547,31 @@ print(d.get("id",""), d.get("public_net",{}).get("ipv4",{}).get("ip",""))
   place_gate_credential "$ip"
   run_pending_reality_check_if_gate_ready
   : > "$SERVED_FILE"
+  # PRD-build-burst-run-slots-from-box requirement 1: probe the box's own
+  # cores/mem/disk once here (after gate tools are ready, over the same
+  # bounded ssh helper the gate-tools probe uses) so run_slot_cap() can size
+  # the run-slot table from what THIS box actually is, not a number in
+  # .env. A failed probe leaves the three fields empty (run_slot_cap() then
+  # falls back to source=default) rather than blocking `up` itself.
+  local box_cores="" box_mem_gb="" box_disk_gb="" box_probe_out
+  if box_probe_out="$(probe_box_specs "$ip")"; then
+    read -r box_cores box_mem_gb box_disk_gb <<<"$box_probe_out"
+  else
+    journal_line "$(now_iso)  burst-lane  up  box-probe  failed  (server_id=$id)"
+  fi
   state_write "server_id=$id" "ip=$ip" "server_type=$SERVER_TYPE" \
     "boot_ts=$(now_iso)" "boot_epoch=$(now_epoch)" "create_epoch=$create_epoch" \
     "ttl_hours=$DEFAULT_TTL_HOURS" \
     "hard_ttl_hours=$HARD_TTL_HOURS" "runs_served=0" "sandbox_ok=$sbx" \
     "teardown_scheduled=false" "teardown_epoch=" "remote_user=$REMOTE_USER" \
     "gate_ready=$GATE_READY" "gate_tools_missing=$GATE_TOOLS_MISSING" \
+    "box_cores=$box_cores" "box_mem_gb=$box_mem_gb" "box_disk_gb=$box_disk_gb" \
     "phase=setup" "phase_epoch=$(now_epoch)"
   journal_line "$(now_iso)  burst-lane  up  booted  (server_id=$id ip=$ip type=$SERVER_TYPE sandbox_ok=$sbx gate_ready=$GATE_READY remote_user=$REMOTE_USER)$(authz_journal_suffix)"
+  # requirement 5: the slot-cap derivation, journaled once per session so
+  # it's auditable without a separate `status` call.
+  run_slot_cap
+  journal_line "$(now_iso)  burst-lane  up  slots  (cap=$RUN_SLOT_CAP source=$RUN_SLOT_SOURCE bound=${RUN_SLOT_BOUND:-} cores=${box_cores:-} mem_gb=${box_mem_gb:-} disk_gb=${box_disk_gb:-})"
   ( cmd_verify >/dev/null 2>&1 ) || journal_line "$(now_iso)  burst-lane  up  verify-failed-after-boot  (lane unverified — run falls back local)"
   if [ "$sbx" = false ]; then
     journal_line "$(now_iso)  burst-lane  up  sandbox-unavailable  (server_id=$id — rust selection falls back to local cap for python-kind sandboxed tests this tick)"
@@ -3617,6 +3683,8 @@ cmd_verify() {
     "teardown_scheduled=$(state_read teardown_scheduled)" "teardown_epoch=$(state_read teardown_epoch)" \
     "remote_user=$(state_read remote_user)" \
     "gate_ready=$gt_ready" "gate_tools_missing=$gt_missing" \
+    "box_cores=$(state_read box_cores)" "box_mem_gb=$(state_read box_mem_gb)" \
+    "box_disk_gb=$(state_read box_disk_gb)" \
     "verified=true" "phase=$(state_read_phase)" "phase_epoch=$(state_read phase_epoch)"
   probe_emit burst-verify clean "rsync+cargo+uv+python3+sandbox all real" >/dev/null
   journal_line "$(now_iso)  burst-lane  verify  ok  (rsync+cargo+uv+python3+sandbox all real)"
@@ -3765,6 +3833,8 @@ cmd_provision() {
     "teardown_scheduled=$(state_read teardown_scheduled)" "teardown_epoch=$(state_read teardown_epoch)" \
     "verified=$(state_read verified)" "remote_user=$REMOTE_USER" \
     "gate_ready=$GATE_READY" "gate_tools_missing=$GATE_TOOLS_MISSING" \
+    "box_cores=$(state_read box_cores)" "box_mem_gb=$(state_read box_mem_gb)" \
+    "box_disk_gb=$(state_read box_disk_gb)" \
     "phase=$new_phase" "phase_epoch=$(now_epoch)"
   journal_line "$(now_iso)  burst-lane  provision  done  (server_id=$(state_read server_id) gate_ready=$GATE_READY gate_tools_missing=${GATE_TOOLS_MISSING:-none} remote_user=$REMOTE_USER per_tool_rc=\"${GATE_TOOLS_RC_SUMMARY:-}\" phase=$new_phase)"
   echo "provision: gate_ready=$GATE_READY missing=${GATE_TOOLS_MISSING:-} per_tool_rc=\"${GATE_TOOLS_RC_SUMMARY:-}\""
@@ -3998,10 +4068,39 @@ for name in repos:
 print(json.dumps(out))
 ' "$ATTR_REPOS_DIR" "$BURST_PARITY_REPOS")"
 
+  # PRD-build-burst-run-slots-from-box requirement 4: run_slots.cap/source
+  # straight from the same run_slot_cap() acquire_run_slot and cmd_sub_cap
+  # use — held is $conc's own numerator (count_held_slots already calls
+  # run_slot_cap() itself, so the two can never disagree about the cap).
+  run_slot_cap
+  local run_slots_held="${conc%%/*}"
+  case "$run_slots_held" in ''|*[!0-9]*) run_slots_held=0 ;; esac
+  # AC4: "bound" (which term won the min — mem/cpu/disk, empty for
+  # source=env|default where no box arithmetic ran) is additive to
+  # requirement 4's own {cap, held, source, box_cores, box_mem_gb,
+  # box_disk_gb} shape — it's how a caller reads "the disk term as the
+  # binding one" from `status` without re-deriving the formula itself.
+  local run_slots_json
+  run_slots_json="$(printf '{"cap":%s,"held":%s,"source":"%s","bound":"%s","box_cores":%s,"box_mem_gb":%s,"box_disk_gb":%s}' \
+    "$RUN_SLOT_CAP" "$run_slots_held" "$RUN_SLOT_SOURCE" "$RUN_SLOT_BOUND" \
+    "${RUN_SLOT_BOX_CORES:-null}" "${RUN_SLOT_BOX_MEM_GB:-null}" "${RUN_SLOT_BOX_DISK_GB:-null}")"
+
+  # PRD-build-burst-teardown-evidence requirement 8/AC9: next_teardown is a
+  # pure preview — teardown_decision's own --dry-run mode, which writes
+  # neither decisions.jsonl nor the journal, so polling `status` never spams
+  # either trail.
+  local nt_out nt_decision nt_cause nt_eta
+  nt_out="$(teardown_decision "$id" status --dry-run)"
+  nt_decision="$(sed -n 's/^decision=//p' <<<"$nt_out")"
+  nt_cause="$(sed -n 's/^cause=//p' <<<"$nt_out")"
+  nt_eta="$(sed -n 's/^eta_s=//p' <<<"$nt_out")"
+  local next_teardown_json
+  next_teardown_json="$(printf '{"decision":"%s","cause":"%s","eta_s":%s}' "$nt_decision" "$nt_cause" "${nt_eta:-null}")"
+
   if [ "$json" -eq 1 ]; then
     local status_base
-    status_base="$(printf '{"active":true,"server_verified":true,"server_id":"%s","ip":"%s","minutes_alive":%s,"ttl_hours":"%s","sandbox_ok":"%s","concurrent":"%s","free_disk_gb":%s,"disk_state":"%s","dirty":%s,"gates":%s,"gate_ready":"%s","gate_tools_missing":"%s","volume":%s,"volume_verified":%s,"redbaron_free_gb":%s,"parity":%s}' \
-      "$id" "$ip" "$alive" "$ttl" "$sbx" "$conc" "$free_disk_gb" "$disk_state" "$dirty_json" "$gates_json" "$(state_read gate_ready)" "$(state_read gate_tools_missing)" "$vol_json" "$volume_verified" "$redbaron_free_gb" "$parity_json")"
+    status_base="$(printf '{"active":true,"server_verified":true,"server_id":"%s","ip":"%s","minutes_alive":%s,"ttl_hours":"%s","sandbox_ok":"%s","concurrent":"%s","run_slots":%s,"free_disk_gb":%s,"disk_state":"%s","dirty":%s,"gates":%s,"gate_ready":"%s","gate_tools_missing":"%s","volume":%s,"volume_verified":%s,"redbaron_free_gb":%s,"parity":%s,"next_teardown":%s}' \
+      "$id" "$ip" "$alive" "$ttl" "$sbx" "$conc" "$run_slots_json" "$free_disk_gb" "$disk_state" "$dirty_json" "$gates_json" "$(state_read gate_ready)" "$(state_read gate_tools_missing)" "$vol_json" "$volume_verified" "$redbaron_free_gb" "$parity_json" "$next_teardown_json")"
     status_json_with_extras "$status_base"
   else
     local gate_count; gate_count="$(python3 -c 'import json,sys; print(len(json.loads(sys.argv[1])))' "$gates_json")"
@@ -4788,6 +4887,102 @@ do_marker_pull() {  # $1=worktree $2=trigger(local-read|explicit|teardown) -> rc
   return 0
 }
 
+# PRD-build-burst-run-slots-from-box requirement 2/3: the one arithmetic
+# formula both run_slot_cap() (the run-slot table, fed the box's own boot-
+# time cores/mem/disk) and cmd_sub_cap (fed a fresh live probe of the same
+# three quantities) call — so the two can never independently drift, per
+# Goal 2 ("one formula, shared by sub_cap and the slot table"). Pure
+# function: no state, no ssh, just min(cores/cores_per, mem_gb/gb_per,
+# (disk_gb-disk_floor)/disk_per), each term integer-divided, the disk term
+# clamped at >=0 before the min (a box below its own floor contributes 0,
+# never a negative number that would falsely win the min against a small
+# cpu/mem term). NOT floored at 1 here — cmd_sub_cap legitimately wants 0
+# (refuse every new candidate); run_slot_cap() applies its own floor-at-1
+# after calling this, per requirement 2.
+#
+# Requirement 6: BURST_CORES_PER_RUN/BURST_GB_PER_RUN/BURST_GB_DISK_PER_RUN
+# are the current names; the older *_PER_BRANCH spellings still resolve (one
+# journal deprecation line per call that falls back to one) so an
+# unmigrated ~/.config/wm-burst/.env keeps working. Defaults (4 cores / 8 GB
+# / 45 GB-per-run) match the values RedBaron's real .env already pins for
+# BURST_CORES_PER_BRANCH/BURST_GB_PER_BRANCH/BURST_GB_DISK_PER_BRANCH today
+# (requirement 2) — NOT cmd_sub_cap's old built-in fallback of 6 GB / 70 GB
+# (those only ever applied when the env knobs were unset, i.e. this
+# selftest's own fixtures; production always pinned them explicitly, so
+# real behavior is unchanged by this default bump).
+run_slot_cap_terms() {  # $1=cores $2=mem_gb $3=disk_gb -> stdout "<cap> <bound>"
+  local cores="$1" mem_gb="$2" disk_gb="$3"
+  local cores_per gb_per disk_per
+  if [ -n "${BURST_CORES_PER_RUN:-}" ]; then
+    cores_per="$BURST_CORES_PER_RUN"
+  elif [ -n "${BURST_CORES_PER_BRANCH:-}" ]; then
+    cores_per="$BURST_CORES_PER_BRANCH"
+    journal_line "$(now_iso)  burst-lane  run-slot-cap  deprecated-knob  (old=BURST_CORES_PER_BRANCH new=BURST_CORES_PER_RUN)"
+  else
+    cores_per=4
+  fi
+  if [ -n "${BURST_GB_PER_RUN:-}" ]; then
+    gb_per="$BURST_GB_PER_RUN"
+  elif [ -n "${BURST_GB_PER_BRANCH:-}" ]; then
+    gb_per="$BURST_GB_PER_BRANCH"
+    journal_line "$(now_iso)  burst-lane  run-slot-cap  deprecated-knob  (old=BURST_GB_PER_BRANCH new=BURST_GB_PER_RUN)"
+  else
+    gb_per=8
+  fi
+  if [ -n "${BURST_GB_DISK_PER_RUN:-}" ]; then
+    disk_per="$BURST_GB_DISK_PER_RUN"
+  elif [ -n "${BURST_GB_DISK_PER_BRANCH:-}" ]; then
+    disk_per="$BURST_GB_DISK_PER_BRANCH"
+    journal_line "$(now_iso)  burst-lane  run-slot-cap  deprecated-knob  (old=BURST_GB_DISK_PER_BRANCH new=BURST_GB_DISK_PER_RUN)"
+  else
+    disk_per=45
+  fi
+  local disk_floor="${BURST_DISK_FLOOR_GB:-40}"
+  local by_cpu=$(( cores / cores_per ))
+  local by_mem=$(( mem_gb / gb_per ))
+  local by_disk=$(( (disk_gb - disk_floor) / disk_per ))
+  [ "$by_disk" -lt 0 ] && by_disk=0
+  local cap=$by_mem bound="mem"
+  if [ "$by_cpu" -lt "$cap" ]; then cap=$by_cpu; bound="cpu"; fi
+  if [ "$by_disk" -lt "$cap" ]; then cap=$by_disk; bound="disk"; fi
+  printf '%s %s\n' "$cap" "$bound"
+}
+
+# PRD-build-burst-run-slots-from-box requirement 2: the run-slot cap the box
+# that booted actually supports, sized from session.json's box_cores/
+# box_mem_gb/box_disk_gb (written once by `up`'s box probe — see cmd_up).
+# MUST be called directly (never via `$(...)` — same subshell-loses-globals
+# hazard acquire_run_slot's own header documents), since it reports through
+# the RUN_SLOT_* globals below, not stdout. BURST_MAX_CONCURRENT_RUNS, when
+# set, pins the cap outright (source=env) — the operator escape hatch
+# (Requirement 2/user story 3). No box fields on the session (a probe
+# failure, or a pre-this-PRD session — Migration/compatibility) falls back
+# to 4 (source=default). Otherwise the box's own numbers feed
+# run_slot_cap_terms, floored at 1 (source=box) — a session is never sized
+# down to zero concurrent runs by its own box.
+RUN_SLOT_CAP=""
+RUN_SLOT_SOURCE=""
+RUN_SLOT_BOUND=""
+RUN_SLOT_BOX_CORES=""
+RUN_SLOT_BOX_MEM_GB=""
+RUN_SLOT_BOX_DISK_GB=""
+run_slot_cap() {
+  RUN_SLOT_BOX_CORES="$(state_read box_cores)"
+  RUN_SLOT_BOX_MEM_GB="$(state_read box_mem_gb)"
+  RUN_SLOT_BOX_DISK_GB="$(state_read box_disk_gb)"
+  if [ -n "${BURST_MAX_CONCURRENT_RUNS:-}" ]; then
+    RUN_SLOT_CAP="$BURST_MAX_CONCURRENT_RUNS"; RUN_SLOT_SOURCE="env"; RUN_SLOT_BOUND=""
+    return 0
+  fi
+  case "$RUN_SLOT_BOX_CORES" in ''|*[!0-9]*) RUN_SLOT_CAP=4; RUN_SLOT_SOURCE="default"; RUN_SLOT_BOUND=""; return 0 ;; esac
+  case "$RUN_SLOT_BOX_MEM_GB" in ''|*[!0-9]*) RUN_SLOT_CAP=4; RUN_SLOT_SOURCE="default"; RUN_SLOT_BOUND=""; return 0 ;; esac
+  case "$RUN_SLOT_BOX_DISK_GB" in ''|*[!0-9]*) RUN_SLOT_CAP=4; RUN_SLOT_SOURCE="default"; RUN_SLOT_BOUND=""; return 0 ;; esac
+  local cap bound
+  read -r cap bound <<<"$(run_slot_cap_terms "$RUN_SLOT_BOX_CORES" "$RUN_SLOT_BOX_MEM_GB" "$RUN_SLOT_BOX_DISK_GB")"
+  [ "$cap" -lt 1 ] && cap=1
+  RUN_SLOT_CAP="$cap"; RUN_SLOT_SOURCE="box"; RUN_SLOT_BOUND="$bound"
+}
+
 # PRD-build-burst-parallel-runs AC6: non-blocking peek at how many run slots
 # are currently held, for `status` to report `concurrent=<held>/<cap>`. Never
 # acquires a slot itself (a peek that took one would lie about capacity to
@@ -4795,7 +4990,8 @@ do_marker_pull() {  # $1=worktree $2=trigger(local-read|explicit|teardown) -> rc
 # acquire_run_slot already uses to count the OTHER held slots once it has
 # taken its own.
 count_held_slots() {  # -> stdout "<held>/<cap>"
-  local cap="${BURST_MAX_CONCURRENT_RUNS:-4}" held=0 j
+  run_slot_cap
+  local cap="$RUN_SLOT_CAP" held=0 j
   mkdir -p "$STATE_DIR/slots" 2>/dev/null || true
   for j in $(seq 1 "$cap"); do
     ( exec 211>"$STATE_DIR/slots/$j.lock"; flock -n 211 ) 2>/dev/null || held=$((held+1))
@@ -4814,8 +5010,31 @@ count_held_slots() {  # -> stdout "<held>/<cap>"
 SLOT_HELD=""
 SLOT_INDEX=""
 acquire_run_slot() {
-  local cap="${BURST_MAX_CONCURRENT_RUNS:-4}" i waited=0
+  # PRD-build-burst-run-slots-from-box requirement 3: sized from
+  # run_slot_cap() at each acquisition — a session that gained box fields
+  # (or an operator's env pin) since the LAST acquisition is honored on the
+  # very next one; a table that shrinks never forces an already-held slot
+  # to release (this loop only ever offers 1..cap, it never touches a slot
+  # index above cap that some earlier, wider-cap acquisition still holds).
+  run_slot_cap
+  local cap="$RUN_SLOT_CAP" i waited=0
   mkdir -p "$STATE_DIR/slots" 2>/dev/null || true
+  # PRD-build-burst-selftest-drift-and-bake-gate requirement 2: a test-only
+  # escape hatch so burstpar-selftest.sh can prove its own peak-overlap
+  # counter actually fails when the concurrency contract is violated,
+  # instead of only ever exercising the path where the cap holds. Gated on
+  # BURST_LANE_TEST=1 (never a bare env check) so a stray
+  # BURSTPAR_TEST_BREAK_SLOTS in a real operator's environment can never
+  # silently blow the real cap — each call grants its own never-contended
+  # lock file, so concurrent callers all "acquire" at once with no
+  # serialization at all.
+  if [ "${BURST_LANE_TEST:-}" = 1 ] && [ "${BURSTPAR_TEST_BREAK_SLOTS:-}" = 1 ]; then
+    exec 202>"$STATE_DIR/slots/broken-$$.lock"
+    flock 202
+    SLOT_HELD="broken/$cap"
+    SLOT_INDEX="broken-$$"
+    return 0
+  fi
   while :; do
     for i in $(seq 1 "$cap"); do
       exec 202>"$STATE_DIR/slots/$i.lock"
@@ -5242,6 +5461,8 @@ cmd_run() {
     "teardown_scheduled=$(state_read teardown_scheduled)" "teardown_epoch=$(state_read teardown_epoch)" "verified=$(state_read verified)" \
     "remote_user=$(state_read remote_user)" \
     "gate_ready=$(state_read gate_ready)" "gate_tools_missing=$(state_read gate_tools_missing)" \
+    "box_cores=$(state_read box_cores)" "box_mem_gb=$(state_read box_mem_gb)" \
+    "box_disk_gb=$(state_read box_disk_gb)" \
     "phase=$(state_read_phase)" "phase_epoch=$(state_read phase_epoch)"
 
   # PRD-build-burst-teardown-lifecycle requirement 5: a run that actually
@@ -7012,6 +7233,316 @@ rust_work_remains() {
   return 1
 }
 
+# ---- teardown_decision (PRD-build-burst-teardown-evidence) ------------------
+# Requirement 1: one pure(ish) decision function reading only evidence the box
+# and its own ledgers provide — hcloud's own idea of the server (existence,
+# `created`), the last routed run for this server id from attribution.jsonl,
+# how much rust/python work is queued, whether the loop is active, and the
+# TTL/zero-runs-grace knobs — never local session-state writes a prior `up`
+# happened to make (the 2026-09-15 incident: adopt reset runs_served to 0,
+# and idle-guard trusted that reset number instead of asking the ledger).
+#
+# hcloud_probe_status: distinguishes "alive" (with hcloud's own `created`),
+# "gone" (hcloud positively says so), and "unavailable" (the probe itself
+# could not answer — absent binary, auth failure, API error) — the three-way
+# split requirement 3 needs, since only the middle one is real evidence a box
+# is actually gone.
+hcloud_probe_status() {  # $1 = server id -> stdout "alive <created_iso>"|"gone"|"unavailable"
+  local id="$1"
+  command -v "$HCLOUD" >/dev/null 2>&1 || { echo "unavailable"; return 0; }
+  local out rc
+  out="$("$HCLOUD" server describe "$id" -o json 2>&1)"; rc=$?
+  if [ "$rc" -eq 0 ]; then
+    local created
+    created="$(python3 -c '
+import json, sys
+try:
+    d = json.loads(sys.argv[1])
+    d = d.get("server", d)
+    print(d.get("created",""))
+except Exception:
+    print("")
+' "$out" 2>/dev/null)"
+    echo "alive $created"
+    return 0
+  fi
+  case "$out" in
+    *"not found"*|*"not exist"*) echo "gone"; return 0 ;;
+  esac
+  # Ambiguous failure (auth error, network blip, rate limit) — confirm with a
+  # second, cheaper call before ever calling it "gone"; fail OPEN to
+  # "unavailable" (never a deletion cause, requirement 3) rather than assume
+  # the worse of the two readings.
+  if "$HCLOUD" server list -o noheader -o columns=id >/dev/null 2>&1; then
+    echo "gone"
+  else
+    echo "unavailable"
+  fi
+}
+
+# attribution_stats_for: how many attribution.jsonl rows this server id has
+# actually served, and the newest row's own date — the two numbers adopt
+# should have been deriving all along (requirement 4) and the two numbers
+# teardown_decision's own idle-vs-work-queued split (requirement 5, AC4/AC5)
+# reads instead of the locally-writable runs_served field.
+attribution_stats_for() {  # $1 = server id -> stdout "<count> <last_iso_or_->"
+  local id="$1"
+  [ -f "$ATTR_LEDGER" ] || { echo "0 -"; return 0; }
+  python3 -c '
+import json, sys
+sid, path = sys.argv[1], sys.argv[2]
+count = 0
+last = ""
+for line in open(path):
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        d = json.loads(line)
+    except Exception:
+        continue
+    if str(d.get("session_id")) != sid:
+        continue
+    count += 1
+    dt = d.get("date","")
+    if dt > last:
+        last = dt
+print(count, last or "-")
+' "$id" "$ATTR_LEDGER"
+}
+
+# queued_work_count: how many build-queue/ PRDs are queued/building/
+# in_progress rust-*/python-* work right now — same predicate rust_work_
+# remains() already uses, counted instead of short-circuited on the first
+# match, so teardown_decision's evidence object can show the actual count.
+queued_work_count() {  # -> stdout: integer count
+  local dir="$PRD_DIR/build-queue" n=0
+  if [ -d "$dir" ]; then
+    local f bt st
+    for f in "$dir"/PRD-*.md; do
+      [ -f "$f" ] || continue
+      bt="$(grep -m1 -oE '^-[[:space:]]*build_target:[[:space:]]*[A-Za-z0-9_-]+' "$f" 2>/dev/null | sed -E 's/^-[[:space:]]*build_target:[[:space:]]*//')"
+      case "$bt" in rust-cli|rust-lib|rust-extend|python-cli|python-lib|python-agent) ;; *) continue ;; esac
+      st="$(grep -m1 -oE '^-[[:space:]]*Status:[[:space:]]*[A-Za-z0-9_-]+' "$f" 2>/dev/null | sed -E 's/^-[[:space:]]*Status:[[:space:]]*//')"
+      case "$st" in queued|building|in_progress) n=$((n+1)) ;; esac
+    done
+  fi
+  echo "$n"
+}
+
+# loop_active: is claude-build.path (the tick's own path unit) active right
+# now — same probe cmd_status's sweep_dirty_worktrees already makes
+# (systemctl --user is-active claude-build.path). BURST_LANE_LOOP_ACTIVE_
+# OVERRIDE lets the selftest pin true/false without a real systemd user
+# session; production never sets it.
+loop_active() {  # rc0 = active
+  case "${BURST_LANE_LOOP_ACTIVE_OVERRIDE:-}" in
+    true) return 0 ;;
+    false) return 1 ;;
+  esac
+  [ "$(systemctl --user is-active claude-build.path 2>/dev/null)" = "active" ]
+}
+
+# seconds_to_next_tick / median_first_run_latency: the two terms requirement
+# 5's grace formula needs beyond the existing BURST_IDLE_GUARD_ZERO_RUNS_AGE_S
+# floor. The lane is event-driven (a DirectoryNotEmpty path unit, not a fixed-
+# interval timer — project_build_timer_removed_actively_managed), so neither
+# term has a true, always-on measurement to read: seconds_to_next_tick has no
+# schedule to consult (env override, default 300s, a conservative guess at
+# "how long until a queue change could plausibly fire the path unit"), and
+# median_first_run_latency would need a persistent per-session up-> first-
+# attribution-row latency log this codebase does not keep yet (adding one is
+# out of this PRD's scope — see Non-goals). Both are documented, overridable
+# fallbacks; the formula's own max() against BURST_IDLE_GUARD_ZERO_RUNS_AGE_S
+# still holds correctly with these fallbacks (AC3's grace_s >= 1200 is
+# satisfied by the fallback alone: 300 + 2*1200 = 2700).
+seconds_to_next_tick() { echo "${BURST_LANE_TICK_INTERVAL_S:-300}"; }
+median_first_run_latency() { echo "${BURST_LANE_MEDIAN_FIRST_RUN_LATENCY_S:-1200}"; }
+
+# _teardown_decision_record: append one row to decisions.jsonl and journal
+# one line — requirement 1's own "appends ... and journals" contract.
+# Requirement 3: a cause=probe-unavailable journal line is throttled to once
+# per hour (tracked in $PROBE_UNAVAILABLE_MARK_FILE) so an outage that lasts
+# all day journals once, not once per caller invocation; the decisions.jsonl
+# row itself is still appended every call (why-down's own trail).
+_teardown_decision_record() {  # $1=id $2=caller $3=decision $4=cause $5=evidence_json
+  local id="${1:-none}" caller="$2" decision="$3" cause="$4" evidence="$5"
+  mkdir -p "$STATE_DIR" 2>/dev/null || true
+  python3 -c '
+import json, sys
+row = {"ts": sys.argv[1], "server_id": sys.argv[2], "caller": sys.argv[3],
+       "decision": sys.argv[4], "cause": sys.argv[5], "evidence": json.loads(sys.argv[6])}
+with open(sys.argv[7], "a") as fh:
+    fh.write(json.dumps(row) + "\n")
+' "$(now_iso)" "$id" "$caller" "$decision" "$cause" "$evidence" "$DECISIONS_LEDGER" 2>/dev/null || true
+  if [ "$cause" = "probe-unavailable" ]; then
+    local last; last="$(cat "$PROBE_UNAVAILABLE_MARK_FILE" 2>/dev/null || echo 0)"
+    case "$last" in ''|*[!0-9]*) last=0 ;; esac
+    if [ $(( $(now_epoch) - last )) -lt 3600 ]; then
+      return 0
+    fi
+    echo "$(now_epoch)" > "$PROBE_UNAVAILABLE_MARK_FILE" 2>/dev/null || true
+  fi
+  journal_line "$(now_iso)  burst-lane  $caller  decision=$decision  (server_id=$id cause=$cause evidence=$evidence)"
+}
+
+# teardown_decision: the single evidence-backed answer requirement 1 wants.
+# $1=server_id $2=caller(down|watchdog|idle-guard|status|why-down-preview)
+# $3=--dry-run (optional) — a dry-run NEVER writes decisions.jsonl or the
+# journal (status --json's next_teardown preview calls this every poll; a
+# ledger row per poll would spam the trail with nothing an operator asked
+# for). Stdout, always three lines: decision=<keep|delete>, cause=<c>,
+# eta_s=<n|null> (0 when decision=delete, the remaining grace when the cause
+# is "grace", null otherwise — requirement 8's own next_teardown.eta_s).
+teardown_decision() {
+  local id="$1" caller="$2" dry_run=0
+  [ "${3:-}" = "--dry-run" ] && dry_run=1
+
+  local probe created_iso=""
+  read -r probe created_iso <<<"$(hcloud_probe_status "$id")"
+
+  local decision cause evidence eta_s="null"
+  if [ "$probe" = "unavailable" ]; then
+    decision=keep; cause=probe-unavailable
+    evidence='{"probe":"unavailable"}'
+    [ "$dry_run" -eq 1 ] || _teardown_decision_record "$id" "$caller" "$decision" "$cause" "$evidence"
+    printf 'decision=%s\ncause=%s\neta_s=%s\n' "$decision" "$cause" "$eta_s"
+    return 0
+  fi
+  if [ "$probe" = "gone" ]; then
+    decision=keep; cause=already-gone
+    evidence='{"probe":"gone"}'
+    [ "$dry_run" -eq 1 ] || _teardown_decision_record "$id" "$caller" "$decision" "$cause" "$evidence"
+    printf 'decision=%s\ncause=%s\neta_s=%s\n' "$decision" "$cause" "$eta_s"
+    return 0
+  fi
+
+  local now; now="$(now_epoch)"
+  local server_created_epoch=""
+  [ -n "$created_iso" ] && server_created_epoch="$(date -u -d "$created_iso" +%s 2>/dev/null || true)"
+  [ -n "$server_created_epoch" ] || server_created_epoch="$(session_create_epoch)"
+  local age=$(( now - server_created_epoch ))
+
+  local attr_count attr_last
+  read -r attr_count attr_last <<<"$(attribution_stats_for "$id")"
+
+  local queued; queued="$(queued_work_count)"
+  local active=false; loop_active && active=true
+
+  local zero_runs_age_s="${BURST_IDLE_GUARD_ZERO_RUNS_AGE_S:-900}"
+  local tick_s median_s formula_s grace_s
+  tick_s="$(seconds_to_next_tick)"; median_s="$(median_first_run_latency)"
+  formula_s=$(( tick_s + 2 * median_s ))
+  grace_s=$zero_runs_age_s
+  [ "$formula_s" -gt "$grace_s" ] && grace_s=$formula_s
+
+  local last_age=-1
+  if [ "$attr_last" != "-" ] && [ -n "$attr_last" ]; then
+    local last_epoch; last_epoch="$(date -u -d "$attr_last" +%s 2>/dev/null || true)"
+    [ -n "$last_epoch" ] && last_age=$(( now - last_epoch ))
+  fi
+
+  # Requirement 5 / AC3: a box that has never served a single run stays
+  # inside its evidence-derived grace window regardless of age past the old
+  # static 900s floor — this is the direct fix for the 2026-09-15 incident
+  # (a box adopted 4s into a tick, zero runs, deleted at 977s by the old
+  # hardcoded rule).
+  if [ "$attr_count" -eq 0 ] && [ "$age" -lt "$grace_s" ]; then
+    decision=keep; cause=grace
+  # AC4: a box with a real run history whose last routed run is over an hour
+  # stale, with nothing queued to route next, has earned nothing further —
+  # delete now rather than waiting out a billed-hour boundary that buys
+  # nothing (the hour is already paid for either way).
+  elif [ "$last_age" -ge 3600 ] && [ "$queued" -eq 0 ]; then
+    decision=delete; cause=idle-no-work
+  # AC5: same staleness, but real work is queued and the loop is still
+  # running to route it — keep.
+  elif [ "$last_age" -ge 3600 ] && [ "$queued" -gt 0 ] && [ "$active" = true ]; then
+    decision=keep; cause=work-queued
+  # Grace expired with zero runs ever served and nothing queued — the
+  # existing idle-guard zero-runs-lifetime cause, now grace-formula-gated
+  # instead of a bare 900s constant.
+  elif [ "$attr_count" -eq 0 ] && [ "$age" -ge "$grace_s" ] && [ "$queued" -eq 0 ]; then
+    decision=delete; cause=idle-guard:zero-runs-lifetime
+  else
+    decision=keep; cause=work-queued
+  fi
+
+  if [ "$decision" = "delete" ]; then
+    eta_s=0
+  elif [ "$cause" = "grace" ]; then
+    eta_s=$(( grace_s - age ))
+  fi
+
+  evidence="$(python3 -c '
+import json, sys
+print(json.dumps({
+    "server_created_epoch": int(sys.argv[1]), "age_s": int(sys.argv[2]),
+    "attribution_count": int(sys.argv[3]), "last_routed_run": (sys.argv[4] if sys.argv[4] != "-" else None),
+    "last_age_s": int(sys.argv[5]), "queued_prds": int(sys.argv[6]), "loop_active": sys.argv[7] == "true",
+    "grace_s": int(sys.argv[8]),
+}))
+' "$server_created_epoch" "$age" "$attr_count" "$attr_last" "$last_age" "$queued" "$active" "$grace_s")"
+
+  [ "$dry_run" -eq 1 ] || _teardown_decision_record "$id" "$caller" "$decision" "$cause" "$evidence"
+  printf 'decision=%s\ncause=%s\neta_s=%s\n' "$decision" "$cause" "$eta_s"
+}
+
+# cmd_why_down: requirement 6 — replay decisions.jsonl for one server id, in
+# order, then the final decision and the matching session.json.deleted-*/
+# .stale-* archive file (if any). "no decision recorded" (a real, non-zero
+# exit, journaled) when the id has no rows at all — a defect in its own
+# right (something deleted this box without ever consulting
+# teardown_decision), never silently swallowed as "nothing to show".
+cmd_why_down() {
+  local id="${1:-}"
+  [ -n "$id" ] || { echo "usage: burst-lane.sh why-down <server_id>" >&2; exit 2; }
+  if [ ! -f "$DECISIONS_LEDGER" ] || ! grep -q "\"server_id\": *\"$id\"" "$DECISIONS_LEDGER" 2>/dev/null; then
+    echo "no decision recorded"
+    journal_line "$(now_iso)  burst-lane  why-down  unrecorded-deletion  (server_id=$id)"
+    exit 1
+  fi
+  python3 -c '
+import json, sys
+sid, path = sys.argv[1], sys.argv[2]
+rows = []
+for line in open(path):
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        d = json.loads(line)
+    except Exception:
+        continue
+    if str(d.get("server_id")) == sid:
+        rows.append(d)
+for r in rows:
+    print("%s  %s  decision=%s cause=%s evidence=%s" % (r.get("ts"), r.get("caller"), r.get("decision"), r.get("cause"), json.dumps(r.get("evidence"))))
+if rows:
+    print("final: decision=%s cause=%s" % (rows[-1].get("decision"), rows[-1].get("cause")))
+' "$id" "$DECISIONS_LEDGER"
+  local archive; archive="$(ls -1 "$STATE_FILE".deleted-* "$STATE_FILE".stale-* 2>/dev/null | tail -1)"
+  if [ -n "$archive" ]; then
+    echo "archive: $archive"
+  fi
+  exit 0
+}
+
+# teardown_probe_unavailable_guard: the shared early-exit requirement 3/AC2
+# wants in down/watchdog/idle-guard — when hcloud itself cannot answer,
+# these three autonomous-ish callers must change nothing (no delete, no
+# session_reconcile-driven archive) rather than treat silence as evidence of
+# anything. Returns 0 (caller should return/exit immediately) when the probe
+# is unavailable; 1 otherwise (proceed as normal). Journals via the same
+# once-per-hour throttle teardown_decision's own probe-unavailable path uses.
+teardown_probe_unavailable_guard() {  # $1=caller $2=server_id
+  local caller="$1" id="${2:-none}"
+  command -v "$HCLOUD" >/dev/null 2>&1 && return 1
+  _teardown_decision_record "$id" "$caller" keep probe-unavailable '{"probe":"unavailable"}'
+  echo "decision=keep cause=probe-unavailable"
+  return 0
+}
+
 # ---- teardown (shared by down + watchdog) ------------------------------------
 destroy_verify() {  # $1 = server id -> 0 on verified-gone, 1 on still-present after retries
   # AC14: `server delete` alone is the whole teardown — no separate
@@ -7537,6 +8068,16 @@ cmd_down() {
   if [ "${1:-}" = "--force" ]; then
     cmd_down_force
   fi
+  # PRD-build-burst-teardown-evidence requirement 7/AC8: a scheduled soft-
+  # down is refused outright — the 2026-09-15 incident's `burst-soft-down-
+  # 0648` one-shot timer deleted a box 3 minutes into its own adoption.
+  # Operators who want a delayed teardown use the TTL; this lane never
+  # schedules its own delete via an external timer again.
+  if [ "${1:-}" = "--at" ]; then
+    journal_line "$(now_iso)  burst-lane  down  refused  (cause=scheduled-teardown-disabled requested_at=${2:-})"
+    echo "refused: scheduled soft-down is disabled — use the TTL instead" >&2
+    exit 2
+  fi
   [ "${1:-}" = "--more-work-queued" ] && more_work=1
 
   # PRD-build-cost-attribution requirement 4: cursor-guarded, so this is a
@@ -7551,6 +8092,15 @@ cmd_down() {
   fi
 
   local id boot_epoch; id="$(state_read server_id)"; boot_epoch="$(state_read boot_epoch)"
+
+  # PRD-build-burst-teardown-evidence requirement 3/AC2: hcloud itself must
+  # be reachable before this autonomous-ish path changes anything at all —
+  # an absent/unauthenticated probe is never a deletion (or keep-vs-delete
+  # bookkeeping) cause.
+  if teardown_probe_unavailable_guard down "$id" >/dev/null; then
+    echo "decision=keep cause=probe-unavailable"
+    exit 0
+  fi
 
   # requirement 2: a live prove owns this box — never delete/schedule out
   # from under it. Checked before the reap sweep below too.
@@ -7589,6 +8139,8 @@ cmd_down() {
           "sandbox_ok=$(state_read sandbox_ok)" "teardown_scheduled=false" "teardown_epoch=" "verified=$(state_read verified)" \
           "remote_user=$(state_read remote_user)" \
           "gate_ready=$(state_read gate_ready)" "gate_tools_missing=$(state_read gate_tools_missing)" \
+          "box_cores=$(state_read box_cores)" "box_mem_gb=$(state_read box_mem_gb)" \
+          "box_disk_gb=$(state_read box_disk_gb)" \
           "phase=$(state_read_phase)" "phase_epoch=$(state_read phase_epoch)"
         journal_line "$(now_iso)  burst-lane  down  decision=keep  (server_id=$id cause=rust-work-arrived, schedule cancelled)"
       else
@@ -7644,6 +8196,8 @@ cmd_down() {
     "sandbox_ok=$(state_read sandbox_ok)" "teardown_scheduled=true" "teardown_epoch=$window_start" "verified=$(state_read verified)" \
     "remote_user=$(state_read remote_user)" \
     "gate_ready=$(state_read gate_ready)" "gate_tools_missing=$(state_read gate_tools_missing)" \
+    "box_cores=$(state_read box_cores)" "box_mem_gb=$(state_read box_mem_gb)" \
+    "box_disk_gb=$(state_read box_disk_gb)" \
     "phase=$(state_read_phase)" "phase_epoch=$(state_read phase_epoch)"
   journal_line "$(now_iso)  burst-lane  down  decision=scheduled  (server_id=$id teardown_at=$(date -u -d "@$window_start" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "$window_start"))"
   echo "decision=scheduled"
@@ -7657,6 +8211,12 @@ cmd_down() {
 cmd_watchdog() {
   if ! state_active; then
     echo "no-active-session"
+    exit 0
+  fi
+  # PRD-build-burst-teardown-evidence requirement 3/AC2: same guard as
+  # `down` — a probe that cannot answer changes nothing.
+  if teardown_probe_unavailable_guard watchdog "$(state_read server_id)" >/dev/null; then
+    echo "decision=keep cause=probe-unavailable"
     exit 0
   fi
   # PRD-build-burst-remote-disk-guard requirement 6: same as `down` — reap
@@ -7737,6 +8297,12 @@ cmd_idle_guard() {
     echo "no-active-session"
     exit 0
   fi
+  # PRD-build-burst-teardown-evidence requirement 3/AC2: same guard as
+  # `down`/`watchdog` — a probe that cannot answer changes nothing.
+  if teardown_probe_unavailable_guard idle-guard "$(state_read server_id)" >/dev/null; then
+    echo "decision=keep cause=probe-unavailable"
+    exit 0
+  fi
   reap_orphans >/dev/null 2>&1 || true
 
   local id runs_served create_epoch now age
@@ -7804,6 +8370,25 @@ probe_remote_capacity() {  # $1 = ip -> stdout "avail_gb nproc free_disk_gb"; rc
   echo "$out"
 }
 
+# PRD-build-burst-run-slots-from-box requirement 1: the box's own total
+# capacity, probed exactly once at `up` (after gate tools are ready) and
+# recorded into session.json — deliberately MemTotal (the box's whole RAM)
+# and not probe_remote_capacity's live MemAvailable, since this is a boot-
+# time fingerprint of what the box IS, not a live reading of what's free
+# right now (that's what probe_remote_capacity, cmd_status's disk_state,
+# and cmd_run's own disk-floor check are for — untouched by this PRD). Same
+# bounded ConnectTimeout=8 ssh helper the gate-tools probe uses, so this
+# adds no more than one extra round trip (well under the 5s budget the
+# Technical considerations section sets).
+probe_box_specs() {  # $1 = ip -> stdout "cores mem_total_gb disk_avail_gb"; rc 1 on failure
+  local ip="$1" out
+  local remote_cmd='c=$(nproc); mt=$(grep MemTotal /proc/meminfo | awk "{print \$2}"); dg=$(df -BG --output=avail '"$REMOTE_ROOT"' 2>/dev/null | tail -n1 | tr -dc "0-9"); echo $c $((mt/1024/1024)) ${dg:-}'
+  out="$("$SSH_BIN" $(ssh_kh_args) -o ConnectTimeout=8 -i "$SSH_KEY" \
+        "$REMOTE_USER@$ip" "$remote_cmd" 2>/dev/null)" || return 1
+  [ -n "$out" ] || return 1
+  echo "$out"
+}
+
 cmd_sub_cap() {
   local candidates=0
   while [ $# -gt 0 ]; do
@@ -7851,19 +8436,17 @@ cmd_sub_cap() {
   # mem/cpu field — never a silently-skipped disk check.
   case "$free_disk_gb" in ''|*[!0-9]*) probe_emit burst-subcap could-not-check "bad probe output: $probe" >/dev/null; journal_line "$(now_iso)  burst-lane  sub-cap  fallback  (cause=bad-probe-output out=$probe)"; echo "fallback: bad probe output"; exit 3 ;; esac
 
-  local gb_per="${BURST_GB_PER_BRANCH:-6}" cores_per="${BURST_CORES_PER_BRANCH:-4}"
-  # PRD-build-burst-remote-disk-guard requirement 2: disk floor folded into
-  # the same min() the memory/cpu terms already go through — a box below
-  # BURST_DISK_FLOOR_GB (default 40, headroom below which sccache/rustc
-  # scratch and the next few branches' pulls have nowhere to land) admits
-  # zero more branches, same effective width as a bad/no-session probe.
-  local disk_floor="${BURST_DISK_FLOOR_GB:-40}" disk_per="${BURST_GB_DISK_PER_BRANCH:-70}"
-  local by_mem=$(( avail_gb / gb_per )) by_cpu=$(( nproc_n / cores_per ))
-  local by_disk=$(( (free_disk_gb - disk_floor) / disk_per ))
-  [ "$by_disk" -lt 0 ] && by_disk=0
-  local subcap=$by_mem bound="mem"
-  if [ "$by_cpu" -lt "$subcap" ]; then subcap=$by_cpu; bound="cpu"; fi
-  if [ "$by_disk" -lt "$subcap" ]; then subcap=$by_disk; bound="disk"; fi
+  # PRD-build-burst-run-slots-from-box requirement 3: the exact same
+  # min(cores,mem,disk) arithmetic run_slot_cap() uses for the run-slot
+  # table (Goal 2 — "one formula, shared by sub_cap and the slot table, so
+  # the two never disagree"), fed THIS call's live-probed numbers rather
+  # than the box's boot-time snapshot — sub-cap's whole reason to exist is
+  # admitting new candidates against capacity as it stands right now, not
+  # as it stood at `up`. (PRD-build-burst-remote-disk-guard requirement 2's
+  # disk-floor folding lives inside run_slot_cap_terms now, not inline
+  # here.)
+  local subcap bound
+  read -r subcap bound <<<"$(run_slot_cap_terms "$nproc_n" "$avail_gb" "$free_disk_gb")"
 
   # PRD-build-gate-on-casper requirement 6: a running remote gate is
   # heavier than a plain branch's cargo run (cargo test --workspace, the
@@ -8037,6 +8620,7 @@ main() {
     reap)      cmd_reap "$@" ;;
     box-isolation-check) cmd_box_isolation_check "$@" ;;
     route-check) cmd_route_check "$@" ;;
+    why-down)  cmd_why_down "$@" ;;
     parity)    cmd_parity "$@" ;;
     gate)      cmd_gate "$@" ;;
     bake)      cmd_bake "$@" ;;

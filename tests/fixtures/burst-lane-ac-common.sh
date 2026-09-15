@@ -48,3 +48,35 @@ run_suite_and_expect_labels() {  # $@ = exact "ok  <label>" lines required
   done
   return $fail
 }
+
+# run_burstpar_and_expect_labels — PRD-build-burst-selftest-drift-and-bake-
+# gate requirement 6: the tests/bdrift_ac*.sh wrappers need BOTH suites
+# (burst-lane-selftest.sh above, and burstpar-selftest.sh's own dedicated
+# concurrency-contract proof) from ONE sourced fixtures file, so a single
+# wrapper never has to source two different *-ac-common.sh files depending
+# on which suite its AC happens to live in. Same exact-label-subset
+# contract as run_suite_and_expect_labels above (mirrors
+# tests/fixtures/burstpar-ac-common.sh's own run_suite_and_expect_labels
+# byte-for-byte, deliberately — see that file's header for why there is no
+# separate, hand-duplicated per-AC test body here either).
+run_burstpar_and_expect_labels() {  # $@ = exact "ok  <label>" lines required
+  local here suite out rc fail=0 want
+  here="$(cd "$(dirname "${BASH_SOURCE[1]}")" && pwd)"
+  suite="$here/../scripts/burstpar-selftest.sh"
+  [ -x "$suite" ] || { echo "FAIL: $suite not executable" >&2; return 2; }
+  out="$(BURST_LANE_TEST=1 BUILD_BURST_ENABLED=1 bash "$suite" 2>&1)"; rc=$?
+  if [ "$rc" -ne 0 ]; then
+    echo "FAIL: burstpar-selftest.sh exited $rc" >&2
+    echo "$out" | tail -20 >&2
+    return 1
+  fi
+  for want in "$@"; do
+    if grep -qF "$want" <<<"$out"; then
+      echo "ok  $want"
+    else
+      echo "FAIL: expected label missing from burstpar-selftest.sh: $want" >&2
+      fail=1
+    fi
+  done
+  return $fail
+}

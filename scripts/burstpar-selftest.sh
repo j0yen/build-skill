@@ -33,7 +33,18 @@ cat > "$T/state/session.json" <<'JSON'
 JSON
 cat > "$T/ssh" <<'EOF2'
 #!/usr/bin/env bash
-# last arg is the remote command; simulate a build
+# cmd_run makes THREE ssh round-trips per run now: a warm-check
+# (`remote_dir_exists`, command text `[ -d`), a capacity probe
+# (`probe_remote_capacity`, command text `meminfo`), and the actual exec.
+# PRD-build-burst-selftest-drift-and-bake-gate requirement 1: only the exec
+# is a "run" for this suite's start/end counting — the other two are
+# answered and pass through SILENTLY (no SPAN_LOG write), detected by
+# their command text (last arg = the full remote command).
+cmd="${!#}"
+case "$cmd" in
+  *"[ -d"*) exit 0 ;;      # warm check: dir present (warm=true), no journal footprint
+  *meminfo*) exit 0 ;;     # capacity probe: no stdout -> probe unavailable, disk-floor check skipped
+esac
 echo "start $$ $(date +%s.%N)" >> "$SPAN_LOG"
 sleep 0.8
 echo "end $$ $(date +%s.%N)" >> "$SPAN_LOG"
@@ -44,15 +55,25 @@ cat > "$T/rsync" <<'EOF2'
 echo "Total transferred file size: 100"
 exit 0
 EOF2
-# PRD-build-burst-selftest-isolation: BURST_LANE_HCLOUD_BIN is never
-# actually invoked by this suite (the fixture session.json above is
-# planted, not `up`-created), but burst-lane.sh's top-of-script isolation
-# guard resolves+checks it unconditionally under BURST_LANE_TEST=1
-# regardless of which subcommand runs — an unset override here would
-# resolve to this machine's REAL hcloud (/home/jsy/.local/bin/hcloud) and
-# trip the guard. A stub that's never called is enough.
+# PRD-build-burst-selftest-isolation: BURST_LANE_HCLOUD_BIN is resolved+
+# checked unconditionally by burst-lane.sh's top-of-script isolation guard
+# under BURST_LANE_TEST=1 regardless of which subcommand runs — an unset
+# override here would resolve to this machine's REAL hcloud
+# (/home/jsy/.local/bin/hcloud) and trip the guard. It IS now actually
+# invoked, though: `status` reaches session_reconcile -> server_alive,
+# which calls `hcloud server describe <id> -o json`
+# (PRD-build-burst-selftest-drift-and-bake-gate requirement 1) — answer it
+# with the fixture session's own server_id/ip in the shape server_alive's
+# sibling parsers use (`{"id":...,"public_net":{"ipv4":{"ip":...}}}`) so
+# session_reconcile sees the session as alive instead of archiving it.
 cat > "$T/hcloud" <<'EOF2'
 #!/usr/bin/env bash
+case "$*" in
+  *"server describe"*)
+    echo '{"id":1,"public_net":{"ipv4":{"ip":"127.0.0.1"}}}'
+    exit 0
+    ;;
+esac
 echo "hcloud: not used by burstpar-selftest.sh" >&2
 exit 1
 EOF2
