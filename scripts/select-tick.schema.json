@@ -4,7 +4,7 @@
   "title": "select-tick.sh --format json output",
   "description": "PRD-build-select-tick-deterministic requirement 1/6. One call's whole pool-to-admitted transformation: the admitted set (dispatched verbatim by the coordinator) and every non-admission with a machine-readable reason.",
   "type": "object",
-  "required": ["admitted", "skipped", "counts"],
+  "required": ["admitted", "skipped", "pinned", "counts"],
   "additionalProperties": false,
   "properties": {
     "admitted": {
@@ -15,12 +15,17 @@
       "type": "array",
       "items": { "$ref": "#/definitions/skipped_entry" }
     },
+    "pinned": {
+      "type": "array",
+      "description": "PRD-build-select-tick-run-pin requirement 1: the --pin slugs that were admitted, in pin order.",
+      "items": { "type": "string" }
+    },
     "counts": { "$ref": "#/definitions/counts" }
   },
   "definitions": {
     "admitted_entry": {
       "type": "object",
-      "required": ["slug", "path", "build_target", "build_priority", "build_into", "continuation", "shared_target", "model"],
+      "required": ["slug", "path", "build_target", "build_priority", "build_into", "continuation", "shared_target", "model", "pinned"],
       "additionalProperties": false,
       "properties": {
         "slug": { "type": "string" },
@@ -30,12 +35,13 @@
         "build_into": { "type": ["string", "null"] },
         "continuation": { "type": "boolean" },
         "shared_target": { "type": "boolean" },
-        "model": { "type": "string", "enum": ["sonnet", "opus"] }
+        "model": { "type": "string", "enum": ["sonnet", "opus"] },
+        "pinned": { "type": "boolean" }
       }
     },
     "skipped_entry": {
       "type": "object",
-      "required": ["slug", "reason", "detail"],
+      "required": ["slug", "reason", "detail", "pinned"],
       "additionalProperties": false,
       "properties": {
         "slug": { "type": "string" },
@@ -47,7 +53,8 @@
             "busy", "cargo-bound", "blocked", "error"
           ]
         },
-        "detail": { "type": "string" }
+        "detail": { "type": "string" },
+        "pinned": { "type": "boolean" }
       }
     },
     "counts": {

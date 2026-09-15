@@ -45,7 +45,15 @@
 #   TICK_RUN_BOOT_ID_FILE  boot id source (default /proc/sys/kernel/random/boot_id;
 #                     tests override this to a fixture file)
 #   CLAUDE_BIN        coordinator binary (default ~/.local/bin/claude)
-#   BUILD_TICK_ARGS   forwarded into the default coordinator's /build arg
+#   BUILD_TICK_ARGS   forwarded into the default coordinator's /build arg,
+#                     UNLESS it starts with "run <slugs>" (space- or
+#                     comma-separated) -- PRD-build-select-tick-run-pin:
+#                     that form is derived into SELECT_TICK_PIN (exported,
+#                     comma-joined) instead, and the coordinator's own
+#                     /build arg gets no slug list at all. select-tick.sh
+#                     reads SELECT_TICK_PIN as its --pin default, so the
+#                     coordinator's one Phase 2 call is already pinned
+#                     without ever seeing the slugs itself.
 #
 # Exit: 0 coordinator ran and exited 0 | <n> the coordinator's own exit
 #       code (this script `exec`s it, so its exit code IS this script's) |
@@ -141,7 +149,34 @@ main() {
   elif [ $# -gt 0 ]; then
     usage
   else
-    coord_cmd=("$CLAUDE_BIN" -p "/build${BUILD_TICK_ARGS:+ $BUILD_TICK_ARGS}" --model sonnet --dangerously-skip-permissions --output-format text)
+    # PRD-build-select-tick-run-pin requirement 2: `BUILD_TICK_ARGS="run
+    # <slugs>"` is a pin consumed by select-tick.sh, not slug text handed
+    # to the coordinator's own /build prompt -- the 2026-09-15 07:11Z/
+    # 22:23:55Z incidents this PRD is grounded in both trace back to the
+    # coordinator (an LLM) improvising on that text instead. Derive the
+    # pin here, export it so select-tick.sh's own default (SELECT_TICK_PIN)
+    # picks it up the moment the coordinator makes its one Phase 2 call,
+    # and strip the slug list from the /build arg entirely. Any other
+    # BUILD_TICK_ARGS value (e.g. "status") passes through unchanged.
+    local build_args="${BUILD_TICK_ARGS:-}"
+    local pin_arg=""
+    case "$build_args" in
+      run\ *)
+        local raw="${build_args#run }"
+        local -a _slugs=()
+        IFS=', ' read -r -a _slugs <<<"$raw"
+        local _s
+        for _s in "${_slugs[@]}"; do
+          [ -n "$_s" ] || continue
+          pin_arg="${pin_arg:+$pin_arg,}$_s"
+        done
+        build_args=""
+        ;;
+    esac
+    if [ -n "$pin_arg" ]; then
+      export SELECT_TICK_PIN="$pin_arg"
+    fi
+    coord_cmd=("$CLAUDE_BIN" -p "/build${build_args:+ $build_args}" --model sonnet --dangerously-skip-permissions --output-format text)
   fi
 
   mkdir -p "$STATE_DIR"
