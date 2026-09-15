@@ -37,12 +37,19 @@ EOF
 printf '{"prds":{},"built_at":"2020-01-01T00:00:00Z"}\n' > "$T/state/manifest.json"
 
 # The real pre-fix prd-lint.sh, straight from this repo's own git history
-# (the commit this dispatch started from) -- never a hand-reconstructed
-# string, which risks silently testing a strawman instead of the real
-# defect.
+# -- never a hand-reconstructed string, which risks silently testing a
+# strawman instead of the real defect. Pinned via the fix commit's own
+# message (not HEAD, which drifts forward as soon as this commit lands on
+# main -- HEAD:scripts/prd-lint.sh would then be the FIXED file, silently
+# turning this into a no-op comparison).
+fix_commit="$(git -C "$HERE/.." log --format='%H' --grep='PRD-build-prd-lint-deferred-reasons-key' -- scripts/prd-lint.sh | tail -1)"
+if [ -z "$fix_commit" ]; then
+  echo "ac9: skip -- can't find this PRD's own fix commit in git history"
+  exit 0
+fi
 LINT_OLD="$T/prd-lint-old.sh"
-git -C "$HERE/.." show HEAD:scripts/prd-lint.sh > "$LINT_OLD" 2>/dev/null || {
-  echo "ac9: skip -- can't read HEAD:scripts/prd-lint.sh (not a git checkout, or first commit)"
+git -C "$HERE/.." show "${fix_commit}^:scripts/prd-lint.sh" > "$LINT_OLD" 2>/dev/null || {
+  echo "ac9: skip -- can't read the pre-fix prd-lint.sh (${fix_commit}^)"
   exit 0
 }
 chmod +x "$LINT_OLD"
