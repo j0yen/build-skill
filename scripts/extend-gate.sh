@@ -179,6 +179,8 @@
 # read as green; the next tick reruns this script from the start.
 set -uo pipefail
 BUILD_SCRIPTS="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=lib/probe.sh
+source "$BUILD_SCRIPTS/lib/probe.sh"
 
 # --- PATH order guard (P0 requirement 1, PRD-build-gate-cargo-route-attest;
 #     rewritten under PRD-build-cargo-route-precedence) -------------------
@@ -829,6 +831,16 @@ fi
 # miss once — the first fresh run rewrites the file with the tree key.
 self_hash="$(sha256sum "$0" 2>/dev/null | awk '{print $1}')"
 cache_file="$project_abs/target/autobuilder/last-verdict.json"
+if ! $record_baseline && ! $force && [ -f "$cache_file" ] && ! jq -e . "$cache_file" >/dev/null 2>&1; then
+  # PRD-build-fail-loud-evidence-kept AC7: a genuinely CORRUPTED cache
+  # (invalid JSON) is journaled and removed explicitly instead of falling
+  # through the tree/hash checks below as an ordinary, silent miss — the
+  # gate below still runs fresh either way, but now with a named cause
+  # instead of an empty-verdict path nobody can explain afterward.
+  printf '%s  gate  %s  verdict-cache  corrupt  (path=%s)\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(basename "$repo")" "$cache_file" >>"$journal"
+  rm -f "$cache_file" 2>/dev/null || true
+fi
 if ! $record_baseline && ! $force && [ -f "$cache_file" ]; then
   cached_tree="$(jq -r '.tree_sha // empty' "$cache_file" 2>/dev/null || true)"
   cached_hash="$(jq -r '.script_sha256 // empty' "$cache_file" 2>/dev/null || true)"
@@ -881,14 +893,27 @@ export BURST_LANE_PRD_SLUG="gate-$crate_name"
 route_intended="local"
 route_host="local"
 if [ -x "$BURST_LANE_SH" ]; then
-  route_status_json="$("$BURST_LANE_SH" status --json 2>/dev/null || true)"
-  case "$route_status_json" in
-    *'"active":true'*)
-      route_intended="burst"
-      route_host="$(printf '%s' "$route_status_json" | sed -n 's/.*"ip":"\([^"]*\)".*/\1/p')"
-      [ -n "$route_host" ] || route_host="unknown"
-      ;;
-  esac
+  # PRD-build-fail-loud-evidence-kept AC3: probe_run keeps this probe's
+  # stderr (was /dev/null) and journals `probe failed (name=burst-status
+  # rc=... err=... log=...)` on failure. A FAILED probe is distinct from a
+  # genuinely absent session: route_intended becomes "unknown" (never
+  # silently "local", which downstream reads as "no burst session exists"
+  # rather than "could not tell") and the routing decision itself is ALSO
+  # journaled explicitly below, not just inferred from an empty var.
+  if route_status_json="$(probe_run burst-status -- "$BURST_LANE_SH" status --json)"; then
+    case "$route_status_json" in
+      *'"active":true'*)
+        route_intended="burst"
+        route_host="$(printf '%s' "$route_status_json" | sed -n 's/.*"ip":"\([^"]*\)".*/\1/p')"
+        [ -n "$route_host" ] || route_host="unknown"
+        ;;
+    esac
+  else
+    route_intended="unknown"
+    route_host="unknown"
+    printf '%s  gate  %s  route  unknown  (cause=probe-failed)\n' \
+      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$crate_name" >>"$journal"
+  fi
   # Structural check (ties requirement 1's PATH guard to requirement 4's
   # postcondition): does a `cargo` call under THIS process's own $PATH
   # actually reach the shim right now? Seeds $BURST_ROUTE_LOG with a
@@ -1145,6 +1170,17 @@ else
 fi
 printf '%s\n' "$gate_out"
 summary="$(printf '%s\n' "$gate_out" | grep -m1 '^gate: ' || true)"
+if [ -z "$summary" ]; then
+  # PRD-build-fail-loud-evidence-kept requirement 2: a missing `gate: `
+  # summary line used to fall silently into the
+  # "${summary:-gate: no-summary-line}" placeholder below with no other
+  # record of it — this journals the fact explicitly, naming the gate's
+  # own rc and the last non-blank line of its output, before that
+  # placeholder is ever substituted in.
+  _gs_err_line="$(printf '%s\n' "$gate_out" | grep -v '^[[:space:]]*$' | tail -n1 | cut -c1-160)"
+  printf '%s  gate  %s  gate-summary  missing  (rc=%s err="%s")\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(basename "$repo")" "$gate_rc" "$_gs_err_line" >>"$journal"
+fi
 
 # --- cargo-route postcondition (P0 requirement 4, AC4) --------------------
 # Route log fields (requirement 2): <ts> <pid> <subcommand> <decision>

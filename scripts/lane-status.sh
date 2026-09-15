@@ -110,6 +110,46 @@ gate_inflight_stats() {
   printf '%s %s\n' "$inflight" "$lost"
 }
 
+# probe_failed_24h_stats — PRD-build-fail-loud-evidence-kept requirement 5:
+# scans the journal sources a probe-failure line can land in (the current
+# tick's own journal file, yesterday's file for the day-boundary edge, and
+# burst-lane.sh's own named journal — the three targets scripts/lib/
+# probe.sh's _probe_journal resolves to for the in-scope callers) for
+# `probe  failed  (name=...)` lines whose timestamp falls within the last
+# 24h, and prints "<n> <top-name>:<top-count>" (top fields empty when
+# n=0). PROBE_STATUS_SOURCES overrides the file list for a selftest.
+probe_failed_24h_stats() {
+  local journal="$1"
+  local -a sources=()
+  if [ -n "${PROBE_STATUS_SOURCES:-}" ]; then
+    IFS=':' read -ra sources <<<"$PROBE_STATUS_SOURCES"
+  else
+    sources=("$journal" \
+      "$(dirname "$journal")/$(date -u -d "-1 day" +%F 2>/dev/null || date -u -v-1d +%F 2>/dev/null).md" \
+      "$HOME/brain/journal/build/burst-lane.log")
+  fi
+  local cutoff; cutoff="$(date -u -d "-24 hours" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -v-24H +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)"
+  local n=0
+  local -A by_name=()
+  local f line ts name
+  for f in "${sources[@]}"; do
+    [ -n "$f" ] && [ -f "$f" ] || continue
+    while IFS= read -r line; do
+      ts="${line%%  *}"
+      [ -n "$cutoff" ] && [[ "$ts" < "$cutoff" ]] && continue
+      name="$(sed -n 's/.*name=\([^ ]*\).*/\1/p' <<<"$line")"
+      [ -n "$name" ] || name="unknown"
+      n=$((n + 1))
+      by_name["$name"]=$(( ${by_name["$name"]:-0} + 1 ))
+    done < <(grep '  probe  failed  (name=' "$f" 2>/dev/null)
+  done
+  local top_name="" top_count=0
+  for name in "${!by_name[@]}"; do
+    if [ "${by_name[$name]}" -gt "$top_count" ]; then top_name="$name"; top_count="${by_name[$name]}"; fi
+  done
+  printf '%s %s %s\n' "$n" "${top_name:-none}" "$top_count"
+}
+
 cmd_tick_summary() {
   local lane="$1" claimed="$2" skipped="$3"
   local journal="${4:-$HOME/brain/journal/build/$(date -u +%F).md}"
@@ -128,6 +168,18 @@ cmd_tick_summary() {
   read -r gate_inflight gate_lost < <(gate_inflight_stats)
   printf '%s  lane-health  gate  inflight=%s lost=%s\n' \
     "$(now_iso)" "$gate_inflight" "$gate_lost" >> "$journal"
+  # PRD-build-fail-loud-evidence-kept requirement 5: PROBES: line, plus
+  # requirement 3's retention prune hooked into this same existing tick
+  # cadence rather than a timer of its own.
+  local probes_n probes_top_name probes_top_count
+  read -r probes_n probes_top_name probes_top_count < <(probe_failed_24h_stats "$journal")
+  printf '%s  lane-health  PROBES: failed_24h=%s top=%s:%s\n' \
+    "$(now_iso)" "$probes_n" "$probes_top_name" "$probes_top_count" >> "$journal"
+  if [ -r "$HERE/lib/probe.sh" ]; then
+    # shellcheck source=lib/probe.sh
+    source "$HERE/lib/probe.sh"
+    probe_prune_logs >/dev/null 2>&1 || true
+  fi
   echo "appended: $journal"
 }
 

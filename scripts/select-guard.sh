@@ -85,6 +85,8 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LANE_PREDICATE="$HERE/lane-predicate.sh"
 # shellcheck source=lib/depends-gate.sh
 source "$HERE/lib/depends-gate.sh"
+# shellcheck source=lib/probe.sh
+source "$HERE/lib/probe.sh"
 
 die() { echo "select-guard: $*" >&2; exit "${2:-4}"; }
 usage() { echo "usage: select-guard.sh <slug> [lane-name] [prd-dir] [branch-count] [admitted-targets]" >&2; exit 4; }
@@ -217,8 +219,19 @@ main() {
       local burst_bin="${BURST_LANE_SH:-$HERE/burst-lane.sh}"
       if [ -x "$burst_bin" ]; then
         local bstatus gate_ready width cap_burst
-        bstatus="$("$burst_bin" status --json 2>/dev/null || true)"
-        gate_ready="$(printf '%s' "$bstatus" | jq -r '.gate_ready // empty' 2>/dev/null || true)"
+        # PRD-build-fail-loud-evidence-kept AC3/requirement 2: probe_run
+        # keeps this probe's stderr (was /dev/null) and journals rc/err/log
+        # on failure. Before this, a failed status probe left bstatus empty,
+        # gate_ready empty, and the cap silently stayed "local" with no line
+        # at all — the caller could not tell "no burst session" from "could
+        # not ask". A failed probe now journals its own explicit
+        # `cap local (cause=probe-failed)` decision.
+        if bstatus="$(probe_run burst-status -- "$burst_bin" status --json)"; then
+          gate_ready="$(printf '%s' "$bstatus" | jq -r '.gate_ready // empty' 2>/dev/null || true)"
+        else
+          gate_ready=""
+          select_guard_journal_line "$slug" cap-local "cause=probe-failed"
+        fi
         if [ "$gate_ready" = "true" ]; then
           width="$(printf '%s' "$bstatus" | jq -r '.width // empty' 2>/dev/null || true)"
           case "$width" in ''|*[!0-9]*) width="" ;; esac

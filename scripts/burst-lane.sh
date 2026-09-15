@@ -231,6 +231,8 @@ SKILL_DIR="$(cd "$HERE/.." && pwd)"
 
 # shellcheck source=lib/journal.sh
 source "$HERE/lib/journal.sh"
+# shellcheck source=lib/probe.sh
+source "$HERE/lib/probe.sh"
 
 STATE_DIR="${BURST_LANE_STATE_DIR:-$SKILL_DIR/state/burst-lane}"
 STATE_FILE="$STATE_DIR/session.json"
@@ -2808,7 +2810,15 @@ prove_exit_trap() {
   journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  prove  aborted  (step=$step line=${PROVE_ERR_LINE:-none} rc=$rc${tail:+ tail=\"$tail\"})$(authz_journal_suffix)"
 
   prove_snapshot_cost
-  ( cmd_down >/dev/null 2>&1 ) || true
+  # PRD-build-fail-loud-evidence-kept AC5: probe_run keeps cmd_down's
+  # stderr (was /dev/null) and journals rc/err/log on failure; the explicit
+  # `down-failed` line below is this caller's own branch on that failure —
+  # cmd_down itself already leaves the session file uncleared on a failed
+  # teardown (state_clear only runs on its success path), so a failed
+  # `down` here correctly does not clear it either.
+  if ! probe_run down -- cmd_down >/dev/null 2>&1; then
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  prove  down-failed  (cause=teardown-failed step=$step)"
+  fi
   prove_journal_cost aborted
 
   if [ -n "$PROVE_CLEANUP_WORKTREE" ]; then
@@ -3076,7 +3086,12 @@ cmd_prove() {
   # watchdog). The trap below (prove_exit_trap) also removes it unconditionally
   # on every exit path, so this is a no-op if reached twice.
   rm -f "$PROVE_INFLIGHT_FILE" 2>/dev/null || true
-  ( cmd_down >/dev/null 2>&1 ) || true
+  # PRD-build-fail-loud-evidence-kept AC5: same probe_run conversion as
+  # prove_exit_trap's own down call above — kept stderr + explicit
+  # down-failed branch instead of a bare `|| true`.
+  if ! probe_run down -- cmd_down >/dev/null 2>&1; then
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  prove  down-failed  (cause=teardown-failed step=finish)"
+  fi
   if [ "$routed" = true ]; then
     prove_journal_cost done
   else
@@ -3462,7 +3477,11 @@ cmd_up() {
     # it's auditable without a separate `status` call.
     run_slot_cap
     journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  up  slots  (cap=$RUN_SLOT_CAP source=$RUN_SLOT_SOURCE bound=${RUN_SLOT_BOUND:-} cores=${box_cores:-} mem_gb=${box_mem_gb:-} disk_gb=${box_disk_gb:-})"
-    ( cmd_verify >/dev/null 2>&1 ) || journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  up  verify-failed-after-adopt  (lane unverified — run falls back local)"
+    # PRD-build-fail-loud-evidence-kept AC4: probe_run keeps cmd_verify's
+    # stderr (was /dev/null); the verify-failed-after-adopt line below is
+    # still this caller's own explicit branch (unchanged shape), now
+    # alongside probe.sh's own additive `probe failed` line naming rc/err/log.
+    probe_run verify -- cmd_verify >/dev/null 2>&1 || journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  up  verify-failed-after-adopt  (lane unverified — run falls back local)"
     local _adopt_image_id; read -r _adopt_image_id _ <<<"$(resolve_boot_image)"
     refresh_parity_baseline_on_image_change "$_adopt_image_id"
     schedule_session_parity "$aid"
@@ -3589,7 +3608,9 @@ print(d.get("id",""), d.get("public_net",{}).get("ipv4",{}).get("ip",""))
   # it's auditable without a separate `status` call.
   run_slot_cap
   journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  up  slots  (cap=$RUN_SLOT_CAP source=$RUN_SLOT_SOURCE bound=${RUN_SLOT_BOUND:-} cores=${box_cores:-} mem_gb=${box_mem_gb:-} disk_gb=${box_disk_gb:-})"
-  ( cmd_verify >/dev/null 2>&1 ) || journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  up  verify-failed-after-boot  (lane unverified — run falls back local)"
+  # PRD-build-fail-loud-evidence-kept AC4: same probe_run conversion as
+  # the adopt path above.
+  probe_run verify -- cmd_verify >/dev/null 2>&1 || journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  up  verify-failed-after-boot  (lane unverified — run falls back local)"
   if [ "$sbx" = false ]; then
     journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  up  sandbox-unavailable  (server_id=$id — rust selection falls back to local cap for python-kind sandboxed tests this tick)"
   fi
@@ -3616,7 +3637,13 @@ cmd_verify() {
 
   local fx; fx="$(mktemp -d)"; echo ok > "$fx/probe.txt"
   local rpath="$REMOTE_ROOT/.verify-fixture"
-  "$RSYNC_BIN" -az --delete --rsync-path="mkdir -p '$rpath' && rsync" \
+  # PRD-build-fail-loud-evidence-kept AC4: this rsync roundtrip's own
+  # stderr used to be discarded to /dev/null before `vfail` ever saw it —
+  # the "verify-failed" journal lines named zero cause. probe_run keeps
+  # rsync's real stderr under a kept log and journals it by name; `vfail`
+  # still runs unconditionally on failure so the existing fails-count/exit
+  # contract is unchanged.
+  probe_run verify-rsync -- "$RSYNC_BIN" -az --delete --rsync-path="mkdir -p '$rpath' && rsync" \
       -e "$SSH_BIN $(ssh_kh_args) -i $SSH_KEY" \
       "$fx/" "$REMOTE_USER@$ip:$rpath/" >/dev/null 2>&1 || vfail "rsync roundtrip (user=$REMOTE_USER)"
   rm -rf "$fx"
@@ -5439,7 +5466,10 @@ cmd_run() {
 
   local id ip; id="$(state_read server_id)"; ip="$(state_read ip)"
   if [ "$(state_read verified)" != "true" ]; then
-    ( cmd_verify >/dev/null 2>&1 ) || true
+    # PRD-build-fail-loud-evidence-kept AC4: this was the truly silent
+    # run-path verify — probe_run now keeps stderr and journals rc/err/log
+    # on failure instead of discarding it outright.
+    probe_run verify -- cmd_verify >/dev/null 2>&1 || true
     if [ "$(state_read verified)" != "true" ]; then
       # AC8: cause=verify-failed, same fallback shape as up-failed above
       # (formerly journaled as a bespoke "lane-unverified" event with no
@@ -6310,7 +6340,12 @@ schedule_session_parity() {  # $1=session_id
     # two that hold 221 today — `flock -u` is not needed in the child; a
     # close on the fd it inherited is sufficient (see Technical
     # considerations in the PRD).
-    ( cmd_parity "$repo" 220>&- 221>&- 201>&- 203>&- >/dev/null 2>&1 & disown ) 2>/dev/null || true
+    # PRD-build-fail-loud-evidence-kept: scripts/lib/probe.sh's probe_bg
+    # replaces the bare `( ... & disown )` — the fd closes are preserved
+    # via --close-fds, and the child's eventual exit code now reaches the
+    # journal (`probe bg-exit`) instead of dying unseen the way the
+    # 2026-09-13 incident this comment describes did.
+    probe_bg parity --close-fds 220,221,201,203 -- cmd_parity "$repo"
   done
 }
 
@@ -6761,7 +6796,11 @@ cmd_gate() {
     # Subshell: cmd_parity ends every path with an `exit`, correct for a
     # top-level dispatch but fatal to the calling process if invoked as a
     # plain function call — `( ... )` scopes that exit to the subshell only.
-    ( cmd_parity "$repo" ) >/dev/null 2>&1 || true
+    # PRD-build-fail-loud-evidence-kept: probe_run keeps the reproof's
+    # stderr (was /dev/null) and journals rc/err/log on failure; the
+    # `gate fallback (cause=...)` line right below still fires as before —
+    # this is additive evidence, not a replacement for it.
+    ( probe_run parity-reproof -- cmd_parity "$repo" ) >/dev/null 2>&1 || true
     cause="$(check_parity_receipt "$repo")"
   fi
   if [ -n "$cause" ]; then
@@ -8303,6 +8342,43 @@ print(sum(1 for v in first_warm.values() if v))
 # Prints "hrs|eur|served|alive" on stdout and returns 0 on a confirmed
 # destroy; prints nothing and returns 1 on a LEAK-FLAG (still present after
 # destroy_verify's 3 retries) — caller owns the decision/journal line.
+# ---- auto-bake at down (PRD-build-burst-dispatch-reenable requirement 1,
+# AC15) -----------------------------------------------------------------
+# The bake this session earned: if provisioning had to install at least one
+# gate tool this session (the box was booted from a stale or non-existent
+# image) AND the session still reached gate_ready=true, the NEXT boot
+# should not pay that cost again. Scoped to caller="down" only (an explicit
+# operator/tick teardown) — watchdog and idle-guard are autonomous safety
+# nets, not the place to spend the extra minute an image freeze costs.
+# Never blocks or delays the delete that follows: bake runs in a subshell
+# (cmd_bake calls `exit`, not `return`) and any refusal (not configured, no
+# authorization, run-in-flight, hcloud failure) is swallowed here — the box
+# is deleted either way, baked or not. Counting install-starts via the
+# journal (rather than a new state field) avoids touching every one of
+# state_write's many full-rewrite call sites just to carry one more flag.
+auto_bake_before_delete() {  # $1=id $2=caller
+  local id="$1" caller="$2"
+  [ "$caller" = "down" ] || return 0
+  [ "$(state_read gate_ready)" = "true" ] || return 0
+  # `create_epoch` (stamped right after `server create`, before
+  # box_bootstrap/provision_gate_tools ever run — see cmd_up) is the
+  # correct lower bound, not `boot_ts` (stamped only once provisioning has
+  # already finished): an install-start line always lands strictly BETWEEN
+  # the two, so filtering from boot_ts undercounts every session to zero.
+  local create_epoch since_iso
+  create_epoch="$(state_read create_epoch)"
+  case "$create_epoch" in ''|*[!0-9]*) return 0 ;; esac
+  since_iso="$(date -u -d "@$create_epoch" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)"
+  [ -n "$since_iso" ] || return 0
+  local n
+  n="$(awk -v since="$since_iso" '$1 >= since' "$JOURNAL" 2>/dev/null | \
+    grep -c 'burst-lane  gate-tools  install-start' 2>/dev/null)"
+  case "$n" in ''|*[!0-9]*) n=0 ;; esac
+  [ "$n" -gt 0 ] || return 0
+  journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  down  auto-bake  (cause=install-start-count=$n server_id=$id)"
+  ( cmd_bake >/dev/null 2>&1 ) || true
+}
+
 teardown_and_delete() {  # $1=id $2=caller_tag(down|watchdog|idle-guard)
   local id="$1" caller="$2" ip alive
   ip="$(state_read ip)"; alive="$(minutes_alive)"
@@ -8345,6 +8421,7 @@ teardown_and_delete() {  # $1=id $2=caller_tag(down|watchdog|idle-guard)
     fi
   fi
 
+  auto_bake_before_delete "$id" "$caller"
   sweep_dirty_worktrees "$caller"
   gate_wait_for_inflight "$caller"
   shred_gate_credential "$ip" "$caller"
