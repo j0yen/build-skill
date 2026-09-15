@@ -633,7 +633,29 @@ if ! "$BUILD_SCRIPTS/ship-postconditions.sh" "$repo" --project-root "$project_re
 fi
 
 head_now="$(git -C "$repo" rev-parse HEAD 2>/dev/null)"
+# PRD-build-gate-before-land requirement 4 (P0): the verdict cache below is
+# keyed on the TREE, not the commit sha — a branch merged onto an unchanged
+# main yields a new commit (merge or fast-forward) whose tree is identical
+# to what the branch already gated, so `land` can transfer a branch verdict
+# onto main's cache and have the post-land main-scope run replay it.
+tree_now="$(git -C "$repo" rev-parse "$head_now^{tree}" 2>/dev/null)"
 base_ref="$(resolve_base)"
+
+# Journal path + selftest isolation guard, hoisted here (was computed just
+# before the first journal write, far below) so the verdict-cache-hit path
+# below — which now journals a `(cached tree=... from=...)` line instead of
+# silently exiting — can use the exact same journal file and default-deny
+# isolation guard a full run uses. Nothing between the old and new location
+# reads $journal, so this is a pure reorder.
+journal="${EXTEND_GATE_JOURNAL:-$HOME/brain/journal/build/$(date -u +%Y-%m-%d).md}"
+if [ -r "$BUILD_SCRIPTS/isolation-guard.sh" ]; then
+  # shellcheck source=isolation-guard.sh
+  source "$BUILD_SCRIPTS/isolation-guard.sh"
+else
+  isolation_guard_path() { :; }
+fi
+isolation_guard_path "$journal" "extend-gate.sh"
+mkdir -p "$(dirname "$journal")"
 
 # PRD-build-gate-before-land requirement 1 (P0, AC1): for `--scope branch`
 # the journal's `base=` field names main's own HEAD at gate start (not the
@@ -738,26 +760,51 @@ if [ -n "$head_want" ] && [ "$head_want" != "$head_now" ]; then
   die 5 "refusing — HEAD is $head_now, --head asked for $head_want"
 fi
 
-# --- verdict cache (PRD-build-gate-delta-baseline P1) --------------------
-# Keyed on (HEAD sha, this script's own sha256) so an edit to extend-gate.sh
-# itself (a new producer, a bugfix) always invalidates a stale cached
-# verdict even at an unchanged HEAD. `--record-baseline` always runs the
-# full sequence (a recording must reflect a fresh run, never a cache);
-# `--force` always bypasses the cache. A cache hit never regenerates
-# receipts and never re-takes the integration lock's expensive path —
-# checked here, after the (cheap) dirty-tree/head-mismatch refusals above,
-# so those refusals still apply to a would-be cache hit exactly as they do
-# to a full run.
+# --- verdict cache (PRD-build-gate-delta-baseline P1; TREE-keyed since
+#     PRD-build-gate-before-land requirement 4) --------------------------
+# Keyed on (TREE sha, this script's own sha256) rather than the commit sha
+# — a branch merged onto an unchanged main produces a NEW commit (a
+# `--no-ff` merge commit, or a fast-forward) whose TREE is identical to
+# what the branch already gated at, so `land`/`integrate` (below) can copy
+# the branch's last-verdict.json onto main's cache file under the same
+# tree key and have the post-land main-scope run replay it as a cache hit
+# instead of re-running all 25 producers. A sibling that landed in between
+# gives a genuinely different tree, so that case is correctly a miss, not
+# a regression. An edit to extend-gate.sh itself (a new producer, a
+# bugfix) still always invalidates a stale cached verdict via
+# script_sha256, unchanged. `--record-baseline` always runs the full
+# sequence; `--force` always bypasses the cache. Checked here, after the
+# (cheap) dirty-tree/head-mismatch refusals above, so those refusals still
+# apply to a would-be cache hit exactly as they do to a full run.
+# Migration: a last-verdict.json written before this PRD has no
+# `tree_sha` key, so `cached_tree` reads empty and this is correctly a
+# miss once — the first fresh run rewrites the file with the tree key.
 self_hash="$(sha256sum "$0" 2>/dev/null | awk '{print $1}')"
 cache_file="$project_abs/target/autobuilder/last-verdict.json"
 if ! $record_baseline && ! $force && [ -f "$cache_file" ]; then
-  cached_head="$(jq -r '.head_sha // empty' "$cache_file" 2>/dev/null || true)"
+  cached_tree="$(jq -r '.tree_sha // empty' "$cache_file" 2>/dev/null || true)"
   cached_hash="$(jq -r '.script_sha256 // empty' "$cache_file" 2>/dev/null || true)"
-  if [ -n "$cached_head" ] && [ "$cached_head" = "$head_now" ] && [ -n "$cached_hash" ] && [ "$cached_hash" = "$self_hash" ]; then
+  if [ -n "$cached_tree" ] && [ "$cached_tree" = "$tree_now" ] && [ -n "$cached_hash" ] && [ "$cached_hash" = "$self_hash" ]; then
     cached_verdict="$(jq -r '.verdict // empty' "$cache_file" 2>/dev/null || true)"
     cached_rc="$(jq -r '.exit_code // empty' "$cache_file" 2>/dev/null || true)"
     if [ -n "$cached_verdict" ] && [ -n "$cached_rc" ]; then
       echo "extend-gate: verdict=$cached_verdict (cached)"
+      # AC7: a cache hit journals `(cached tree=... from=...)` — `from`
+      # names which scope actually produced this verdict (main, or a
+      # branch's slug when `land` transferred it here), read back from
+      # the cache entry's own `scope`/`slug` fields (requirement-4 write
+      # below always sets them; a pre-this-PRD cache never gets here at
+      # all since it has no tree_sha to match on).
+      cached_from_scope="$(jq -r '.scope // "main"' "$cache_file" 2>/dev/null || echo main)"
+      cached_from_slug="$(jq -r '.slug // empty' "$cache_file" 2>/dev/null || true)"
+      _cache_crate_name="$(basename "$repo")"
+      if [ -n "$cached_from_slug" ]; then
+        printf '%s  gate  %s  %s  (cached tree=%s from=%s slug=%s)\n' \
+          "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$_cache_crate_name" "$cached_verdict" "$tree_now" "$cached_from_scope" "$cached_from_slug" >>"$journal"
+      else
+        printf '%s  gate  %s  %s  (cached tree=%s from=%s)\n' \
+          "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$_cache_crate_name" "$cached_verdict" "$tree_now" "$cached_from_scope" >>"$journal"
+      fi
       exit "$cached_rc"
     fi
   fi
@@ -1123,19 +1170,11 @@ if [ "${#blocking_notes[@]}" -gt 0 ] && [ -x "$GATE_ATTRIBUTION" ]; then
   fi
   rm -f "$attr_notes_file"
 fi
-# Overridable so tests/ never writes into the real journal (default unchanged).
-journal="${EXTEND_GATE_JOURNAL:-$HOME/brain/journal/build/$(date -u +%Y-%m-%d).md}"
-# PRD-build-burst-selftest-isolation: default-deny under BURST_LANE_TEST=1 —
-# same sentinel + shared guard burst-lane.sh/gate-burst.sh use. A test that
-# forgot EXTEND_GATE_JOURNAL now fails closed instead of appending into the
-# real shared tick journal every other script here also writes to.
-if [ -r "$BUILD_SCRIPTS/isolation-guard.sh" ]; then
-  # shellcheck source=isolation-guard.sh
-  source "$BUILD_SCRIPTS/isolation-guard.sh"
-else
-  isolation_guard_path() { :; }
-fi
-isolation_guard_path "$journal" "extend-gate.sh"
+# $journal was resolved (and the selftest isolation guard applied) right
+# after $head_now above, PRD-build-gate-before-land requirement 4 — the
+# verdict-cache-hit early-exit needs it too now, so it moved earlier
+# instead of being duplicated. Kept as a no-op here (mkdir -p is
+# idempotent) in case a future edit reorders things again.
 mkdir -p "$(dirname "$journal")"
 
 # --- record-baseline: write agent/gate-baseline.json from THIS run's
@@ -1240,16 +1279,18 @@ phases_json='{}'
 for _pi in "${!phase_names[@]}"; do
   phases_json="$(jq -c --arg k "${phase_names[$_pi]}" --arg v "${phase_vals[$_pi]}" '. + {($k): $v}' <<<"$phases_json")"
 done
-jq -n --arg head "$head_now" --arg hash "$self_hash" --arg verdict "$cache_verdict_val" \
+jq -n --arg head "$head_now" --arg tree "$tree_now" --arg hash "$self_hash" --arg verdict "$cache_verdict_val" \
      --argjson rc "$final_rc" --arg new "$new_blocks" --arg inh "$inherited_blocks" \
      --arg intended "$route_intended" --argjson burst "$route_burst_n" \
      --argjson local "$route_local_n" --argjson passthrough "$route_passthrough_n" \
      --arg host "$route_host" --argjson attribution "$attribution_for_cache" \
      --argjson phases "$phases_json" --argjson wall_s "$wall" \
+     --arg scope "$scope" --arg slug "$slug" \
      --argjson over "$phase_over_tolerance" --argjson unattr "$phase_unattributed" '
   {
     head_sha: $head,
     head: $head,
+    tree_sha: $tree,
     script_sha256: $hash,
     verdict: $verdict,
     exit_code: $rc,
@@ -1259,7 +1300,9 @@ jq -n --arg head "$head_now" --arg hash "$self_hash" --arg verdict "$cache_verdi
     blocks: $attribution.blocks,
     attribution: {in_scope: $attribution.in_scope, inherited: $attribution.inherited},
     phases: $phases,
-    wall_s: $wall_s
+    wall_s: $wall_s,
+    scope: $scope,
+    slug: $slug
   } + (if $over then {unattributed_s: $unattr} else {} end)
 ' > "$cache_file" 2>/dev/null || true
 

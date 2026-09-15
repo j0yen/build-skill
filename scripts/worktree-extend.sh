@@ -292,6 +292,56 @@ lock_regen() {
   return 7
 }
 
+# gate_cache_transfer — PRD-build-gate-before-land requirement 4 (P0): after
+# a gated land/integrate, copy the branch's last-verdict.json onto main's
+# verdict cache so the post-land `extend-gate.sh <build_into> --head
+# <landed sha>` call sees a cache hit (same tree, requirement 4's whole
+# point) instead of re-running all 25 producers. Best-effort ONLY — this is
+# a performance optimization (success metric: "≥90% of lands"), never a
+# correctness gate: any failure to resolve the project root or write the
+# cache file is silently swallowed, exactly like the release-receipt merge
+# and prune-landed steps elsewhere in this pipeline. Never called for an
+# ungated land/integrate (no --verdict path to transfer).
+#
+# Project-root resolution here is a deliberately SIMPLER subset of
+# extend-gate.sh's own `find_cargo_root` (explicit --project-root, else
+# repo-root Cargo.toml, else a unique depth-1 Cargo.toml) — it skips that
+# function's ambiguous-candidate self-match disambiguation and depth-2
+# fallback. An ambiguous/absent root here just skips the transfer (the
+# post-land main gate falls back to a full run, correct, just slower) —
+# never worth duplicating the full search for a best-effort cache warm.
+gate_cache_transfer() {
+  local repo="$1" slug="$2" verdict_path="$3" project_root="${4:-}" landed_sha="$5"
+  [ -n "$verdict_path" ] && [ -f "$verdict_path" ] || return 0
+  command -v jq >/dev/null 2>&1 || return 0
+  local root="$repo"
+  if [ -n "$project_root" ]; then
+    root="$repo/$project_root"
+  elif [ ! -f "$repo/Cargo.toml" ]; then
+    local d found="" count=0
+    for d in "$repo"/*/; do
+      [ -d "$d" ] || continue
+      case "$(basename "$d")" in target|.git) continue ;; esac
+      [ -f "$d/Cargo.toml" ] || continue
+      found="${d%/}"; count=$((count + 1))
+    done
+    [ "$count" -eq 1 ] || return 0   # none or ambiguous: skip, not fatal
+    root="$found"
+  fi
+  [ -f "$root/Cargo.toml" ] || return 0   # not a cargo repo at all: no-op (e.g. python land)
+  local cache_file="$root/target/autobuilder/last-verdict.json"
+  mkdir -p "$(dirname "$cache_file")" 2>/dev/null || return 0
+  # Carries every field the branch's own gate run wrote (tree_sha, scope,
+  # slug, verdict, exit_code, cargo_route, attribution, phases, ...)
+  # unchanged EXCEPT head_sha/head, which are refreshed to the landed sha
+  # so the cache file's own bookkeeping fields describe main truthfully —
+  # the cache LOOKUP itself only ever compares tree_sha (extend-gate.sh),
+  # so this refresh is cosmetic, never load-bearing.
+  jq --arg head "$landed_sha" '.head_sha = $head | .head = $head' \
+    "$verdict_path" > "$cache_file.tmp.$$" 2>/dev/null && mv "$cache_file.tmp.$$" "$cache_file" || rm -f "$cache_file.tmp.$$"
+  return 0
+}
+
 cmd_add() {
   local repo="${1:-}" slug="${2:-}"; need "$repo" "usage: add <repo> <slug>"; need "$slug" "missing slug"
   [ -d "$repo/.git" ] || git -C "$repo" rev-parse --git-dir >/dev/null 2>&1 || die 2 "not a git repo: $repo"
@@ -514,12 +564,19 @@ cmd_land() {
   else
     exec 9>&-
   fi
+  # PRD-build-gate-before-land requirement 4 (P0): transfer the branch's
+  # verdict onto main's cache, tree-keyed, so the caller's follow-up
+  # `extend-gate.sh <repo> --head <this HEAD>` is a cache hit. Best-effort;
+  # never blocks land. Must run BEFORE cmd_cleanup below, which frees the
+  # worktree $verdict_path may live under.
+  local landed_sha; landed_sha="$(git -C "$repo" rev-parse HEAD)"
+  [ -n "$gated_at" ] && gate_cache_transfer "$repo" "$slug" "$verdict_path" "" "$landed_sha"
   # Land is complete: free the worktree now, same reasoning as integrate
   # (PRD-build-worktree-targets-off-root) — keep the branch (no --drop-branch)
   # so the caller's own cleanup/--drop-branch decision stays theirs.
   local cleanup_out; cleanup_out="$(cmd_cleanup "$repo" "$slug")"
   echo "worktree-extend: $slug: land: $cleanup_out" >&2
-  git -C "$repo" rev-parse HEAD
+  printf '%s\n' "$landed_sha"
 }
 
 cmd_integrate() {
@@ -708,6 +765,11 @@ cmd_integrate() {
   else
     exec 9>&-
   fi
+  # PRD-build-gate-before-land requirement 4 (P0): same best-effort verdict
+  # transfer cmd_land performs — see there for the rationale. Must run
+  # BEFORE cmd_cleanup below, which frees the worktree $verdict_path lives
+  # under.
+  [ -n "$gated_at" ] && gate_cache_transfer "$repo" "$slug" "$verdict_path" "$project_root" "$(git -C "$repo" rev-parse HEAD)"
   # PRD-build-worktree-targets-off-root: the branch is merged, its worktree
   # (and 50G+ cargo target) has served its purpose — free it now rather than
   # waiting on a caller-remembered `cleanup` or a later `prune-landed` sweep.
