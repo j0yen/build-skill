@@ -1,0 +1,13 @@
+[Unit]
+Description=One dream-governor decision (check gates; fire /dream on all-green)
+
+[Service]
+Type=oneshot
+Environment=HOME=/home/jsy
+Environment=PATH=/home/jsy/.local/bin:/home/jsy/.cargo/bin:/home/jsy/.npm-global/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/home/jsy/.claude/skills/build/scripts/dream-governor.sh run
+# A fired /dream run is itself launched under its own systemd-run
+# --wait/RuntimeMaxSec transient unit (see dream-governor.sh), so this
+# oneshot's own budget only needs to cover that plus gate-evaluation
+# overhead, not run indefinitely.
+TimeoutStartSec=4200

@@ -157,7 +157,7 @@ ledger_weighted_for() {
 }
 
 # compute_line <date> -> sets globals: L_DRAFTED L_SHIPPED L_BLOCKED
-# L_QUEUED L_RUNWAY L_WTOK
+# L_QUEUED L_RUNWAY L_WTOK L_WEIGHTED
 compute_line() {
   local d="$1" i di ships_week=0 w
   L_DRAFTED="$(count_added "$d" "build-queue")"
@@ -178,10 +178,13 @@ compute_line() {
   w="$(ledger_weighted_for "$d")"
   if [ "$w" = "__NO_LEDGER__" ]; then
     L_WTOK="na:no-ledger"
+    L_WEIGHTED="na:no-ledger"
   elif [ "$L_SHIPPED" -eq 0 ]; then
     L_WTOK="na:no-ships"
+    L_WEIGHTED="$w"
   else
     L_WTOK="$(awk -v w="$w" -v s="$L_SHIPPED" 'BEGIN{printf "%.0f", w/s}')"
+    L_WEIGHTED="$w"
   fi
 }
 
@@ -201,7 +204,7 @@ write_json() {
   mkdir -p "$out_dir"
   out="$out_dir/$d.json"
   tmp="$(mktemp "$out_dir/.tmp.XXXXXX")" || die "mktemp failed for $out_dir"
-  python3 - "$d" "$L_DRAFTED" "$L_SHIPPED" "$L_BLOCKED" "$L_QUEUED" "$L_RUNWAY" "$L_WTOK" > "$tmp" <<'PY'
+  python3 - "$d" "$L_DRAFTED" "$L_SHIPPED" "$L_BLOCKED" "$L_QUEUED" "$L_RUNWAY" "$L_WTOK" "$L_WEIGHTED" > "$tmp" <<'PY'
 import json, sys, datetime
 
 def num_or_str(v):
@@ -212,7 +215,7 @@ def num_or_str(v):
     except ValueError:
         return float(v)
 
-d, drafted, shipped, blocked, queued, runway, wtok = sys.argv[1:8]
+d, drafted, shipped, blocked, queued, runway, wtok, weighted = sys.argv[1:9]
 obj = {
     "date": d,
     "drafted": int(drafted),
@@ -221,6 +224,12 @@ obj = {
     "queued": int(queued),
     "runway_h": num_or_str(runway),
     "wtok_per_ship": num_or_str(wtok),
+    # Raw day-total weighted tokens (PRD-dream-depth-governor's headroom
+    # gate): unlike wtok_per_ship, never divided by shipped, so a day
+    # with real ledger activity but zero ships still reports its true
+    # weighted total instead of "na:no-ships". "na:no-ledger" means the
+    # token-ledger has no row for this date at all.
+    "weighted": num_or_str(weighted),
     "generated": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
 }
 json.dump(obj, sys.stdout, indent=2, sort_keys=True)

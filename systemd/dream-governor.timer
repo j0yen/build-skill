@@ -1,0 +1,12 @@
+[Unit]
+Description=Run dream-governor every hour (fires /dream when the queue thins and budget allows)
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=1h
+AccuracySec=1min
+Persistent=true
+Unit=dream-governor.service
+
+[Install]
+WantedBy=timers.target

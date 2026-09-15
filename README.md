@@ -53,6 +53,34 @@ isn't appropriate for general distribution). To wire up the 5-min cadence
 yourself, create a user unit that runs `claude` with a one-shot
 `/build` prompt and a 5-minute `OnUnitActiveSec`.
 
+### Dream governor (drafting side)
+
+`scripts/dream-governor.sh` is the drafting-side counterpart:
+`claude-build.timer` self-fires `/build` when the queue is non-empty;
+`dream-governor.timer` self-fires one headless `/dream` run when the
+queue is thin, seeds are pending, and the day's weighted-token headroom
+allows it (`scripts/dream-governor.sh check|run|status`; full contract in
+the script's own header comment).
+
+The unit ships **disabled** (per PRD-dream-depth-governor: no thresholds
+are set yet — `Joe owns DEPTH_MIN/HEADROOM_MAX`). It also refuses on
+every fire path until a config file exists at
+`state/dream-governor/config` with both set, e.g.:
+
+```
+DEPTH_MIN=8
+HEADROOM_MAX=500000
+```
+
+Once thresholds are set, install and enable with:
+
+```sh
+ln -sf ~/.claude/skills/build/systemd/dream-governor.service ~/.config/systemd/user/dream-governor.service
+ln -sf ~/.claude/skills/build/systemd/dream-governor.timer ~/.config/systemd/user/dream-governor.timer
+systemctl --user daemon-reload
+systemctl --user enable --now dream-governor.timer
+```
+
 ## See also
 
 - [j0yen/dream-skill](https://github.com/j0yen/dream-skill) — the generative
