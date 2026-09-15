@@ -79,7 +79,10 @@ out1="$(PRD_DIR="$D1/prds" "$MNC" "$D1/prds/build-queue/PRD-clean1.md" "$REASON1
 expect "AC1: exits 0"                                        "[ $rc1 -eq 0 ]"
 expect "AC1: prints the committed journal line"              "grep -q '^needs-classification-committed: clean1 ' <<<\"\$out1\""
 expect "AC1: Status is needs_classification"                 "grep -qxe '- Status: needs_classification' '$D1/prds/build-queue/PRD-clean1.md'"
-expect "AC1: iter_log line carries the reason text"          "grep -q \"iter_log: .* needs_classification: \$REASON1\\\$\" '$D1/prds/build-queue/PRD-clean1.md'"
+# PRD-build-classification-durable-heal req 1: a reason naming no lint id
+# (this one names none) is committed as before but with a trailing
+# " lint_rc=<rc>" the claim-reproduction gate appends to the iter_log line.
+expect "AC1: iter_log line carries the reason text"          "grep -qE \"iter_log: .* needs_classification: \${REASON1} lint_rc=[0-9]+\\\$\" '$D1/prds/build-queue/PRD-clean1.md'"
 expect "AC1: commit identity is Joe Yen"                     "[ \"\$(git -C '$D1/prds' log -1 --format='%an <%ae>')\" = 'Joe Yen <jyen.tech@gmail.com>' ]"
 expect "AC1: working tree is clean"                          "[ -z \"\$(git -C '$D1/prds' status --porcelain)\" ]"
 expect "AC1: local HEAD matches origin (nothing left unpushed)" \
@@ -157,6 +160,45 @@ expect "AC4: the decoy commit made it into A"                "[ -f '$D4/A/build-
 expect "AC4: origin carries exactly 3 commits"               "[ \"\$(git -C '$D4/origin.git' log --oneline \"$DEFBR4\" | wc -l)\" -eq 3 ]"
 expect "AC4: origin's tip is our commit, rebased on top of the decoy" \
   "git -C '$D4/origin.git' log -1 --format=%s \"$DEFBR4\" | grep -q 'race: needs_classification'"
+
+# ======================================================================
+# GATE — claim-reproduction gate (PRD-build-classification-durable-heal
+# requirement 1): a reason naming a lint id must be reproduced by
+# prd-lint.sh right now, or the script refuses instead of committing.
+# ======================================================================
+DG="$T/gate"; mkdir -p "$DG"
+DEFBRG="$(new_prd_fixture "$DG")"
+JOURNAL_G="$DG/journal.md"
+
+# gate-refuse: the fixture PRD has a valid `build_target: shell`, so
+# "build-target-unknown" is a lint id prd-lint.sh does NOT fail on right
+# now -- the claim is unreproduced and the script must refuse.
+add_queued_prd "$DG" "gaterefuse" "$DEFBRG"
+head_g0="$(git -C "$DG/prds" rev-parse HEAD)"
+out_gr="$(PRD_DIR="$DG/prds" JOURNAL="$JOURNAL_G" "$MNC" "$DG/prds/build-queue/PRD-gaterefuse.md" "build-target-unknown" 2>&1)"; rc_gr=$?
+head_g1="$(git -C "$DG/prds" rev-parse HEAD)"
+expect "gate-refuse: exits 3"                                 "[ $rc_gr -eq 3 ]"
+expect "gate-refuse: prints the refused line"                 "grep -q '^needs-classification-refused: gaterefuse ' <<<\"\$out_gr\""
+expect "gate-refuse: journals cause=claim-not-reproduced"     "grep -q 'needs_classification  refused  (cause=claim-not-reproduced lint_id=build-target-unknown' '$JOURNAL_G'"
+expect "gate-refuse: no new commit"                           "[ '$head_g0' = '$head_g1' ]"
+expect "gate-refuse: file unchanged (still queued)"           "grep -qxe '- Status: queued' '$DG/prds/build-queue/PRD-gaterefuse.md'"
+
+# gate-reproduce: the same shape of fixture has no `Vision:` line, so
+# "vision-missing" IS a lint id prd-lint.sh fails on right now -- the
+# claim is reproduced and the transition commits, with lint_rc appended.
+add_queued_prd "$DG" "gaterepro" "$DEFBRG"
+out_gp="$(PRD_DIR="$DG/prds" JOURNAL="$JOURNAL_G" "$MNC" "$DG/prds/build-queue/PRD-gaterepro.md" "vision-missing" 2>&1)"; rc_gp=$?
+expect "gate-reproduce: exits 0"                              "[ $rc_gp -eq 0 ]"
+expect "gate-reproduce: Status is needs_classification"       "grep -qxe '- Status: needs_classification' '$DG/prds/build-queue/PRD-gaterepro.md'"
+expect "gate-reproduce: iter_log ends with lint_rc=1"          "grep -qE 'iter_log: .* needs_classification: vision-missing lint_rc=1\$' '$DG/prds/build-queue/PRD-gaterepro.md'"
+
+# gate-force: an operator can bypass a refusal with --force; the bypass
+# itself is journaled rather than silent.
+add_queued_prd "$DG" "gateforce" "$DEFBRG"
+out_gf="$(PRD_DIR="$DG/prds" JOURNAL="$JOURNAL_G" "$MNC" "$DG/prds/build-queue/PRD-gateforce.md" "build-target-unknown" --force 2>&1)"; rc_gf=$?
+expect "gate-force: exits 0"                                  "[ $rc_gf -eq 0 ]"
+expect "gate-force: Status is needs_classification"           "grep -qxe '- Status: needs_classification' '$DG/prds/build-queue/PRD-gateforce.md'"
+expect "gate-force: journals the bypass"                      "grep -q 'needs_classification  forced  (cause=claim-not-reproduced lint_id=build-target-unknown' '$JOURNAL_G'"
 
 # ======================================================================
 # Smoke: --dry-run mutates nothing

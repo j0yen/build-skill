@@ -47,26 +47,49 @@
 #      than silently reporting success with the transition undelivered.
 #   6. On success, prints `needs-classification-committed: <slug> <sha>`.
 #
+# Claim-reproduction gate (PRD-build-classification-durable-heal req 1):
+# before writing, this script runs prd-lint.sh against the PRD. If
+# <reason-text> names one of prd-lint.sh's own FAIL ids as an exact token
+# (e.g. "depends-on-missing", "build-target-unknown", "vision-missing",
+# "build-into-substrate-mismatch") and prd-lint.sh does NOT fail with that
+# id on this file right now, the claim is unreproduced: the script refuses
+# (exit 3), journals the refusal, and writes nothing. A reason-text that
+# names no lint id at all (an agent's own judgment call, not tied to a
+# lint check) is committed exactly as before, except the iter_log line
+# gains a trailing ` lint_rc=<rc>` so a later audit can see whether
+# prd-lint.sh was clean or failing at the time. `--force` (meant for an
+# operator, not a branch agent) bypasses a refusal, journaling the bypass
+# instead of silently overriding it. This closes the trap the 2026-09-13
+# mcphost-agent-consent incident (see the file header above) exposed: a
+# wrong claim used to become just as durable as a right one.
+#
 # Usage:
-#   mark-needs-classification.sh <prd-path-or-slug> <reason-text> [--dry-run]
+#   mark-needs-classification.sh <prd-path-or-slug> <reason-text> [--dry-run] [--force]
 #
 # Env:
 #   PRD_DIR   Shared PRDs checkout root, used only to resolve a bare slug
 #             argument (default: ~/Documents/PRDs). Ignored when
 #             <prd-path> is already an existing file path.
+#   PRD_LINT  Path to prd-lint.sh (default: alongside this script).
+#   JOURNAL   Journal file appended to for refusals/bypasses (default:
+#             ~/brain/journal/build/<UTC-date>.md).
 #
 # Options:
 #   --dry-run   Print the Status/iter_log line that would be written (or
 #               report the idempotent no-op) and exit 0; mutates nothing,
-#               takes no lock, does not pull.
+#               takes no lock, does not pull. Does not run the lint gate.
+#   --force     Operator override: bypass a claim-not-reproduced refusal
+#               and commit anyway. Always journaled.
 #
 # Exit codes:
 #   0   committed+pushed, or idempotent no-op (already needs_classification
 #       with this exact reason-text)
 #   2   usage error
 #   3   not-found (<prd-path> doesn't resolve to a file under a
-#       build-queue/ directory in a git repo) or push-failed (commit
-#       landed locally; rebase+retry-once still couldn't push)
+#       build-queue/ directory in a git repo), refused (reason names a
+#       lint id prd-lint.sh does not currently FAIL on, and --force was
+#       not given), or push-failed (commit landed locally;
+#       rebase+retry-once still couldn't push)
 #   4   local git error: pull hit a real rebase conflict, or the header
 #       write/`git add`/`git commit` step failed — working tree state is
 #       whatever git left it in for that failure (see stderr)
@@ -75,21 +98,33 @@
 #   needs-classification-committed: <slug> <sha>
 # Stdout on idempotent no-op:
 #   needs-classification-noop: <slug> (unchanged)
+# Stdout on refusal:
+#   needs-classification-refused: <slug> (cause=claim-not-reproduced lint_id=<id> lint_rc=<rc>)
 
 set -uo pipefail
 
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GIT_ID=(-c user.email=jyen.tech@gmail.com -c user.name="Joe Yen")
 PRD_DIR="${PRD_DIR:-$HOME/Documents/PRDs}"
+PRD_LINT="${PRD_LINT:-$HERE/prd-lint.sh}"
+JOURNAL="${JOURNAL:-$HOME/brain/journal/build/$(date -u +%F).md}"
 
 die() { printf '%s\n' "mark-needs-classification: $*" >&2; exit "${2:-4}"; }
 
+journal_line() {
+  mkdir -p "$(dirname "$JOURNAL")" 2>/dev/null || true
+  printf '%s\n' "$1" >> "$JOURNAL"
+}
+
 # ---- args ---------------------------------------------------------------
 dry_run=false
+force=false
 prd_arg=""
 reason=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --dry-run) dry_run=true; shift ;;
+    --force) force=true; shift ;;
     -h|--help) sed -n '2,58p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
     --) shift; break ;;
     -*) die "unknown flag $1" 2 ;;
@@ -181,9 +216,14 @@ read_last_iter_log() {
 # (`<ts> needs_classification: <reason>`); empty otherwise (foreign-shaped
 # or absent iter_log line never counts as a match for the no-op check).
 existing_reason_of() {
-  local last_iter="$1"
+  local last_iter="$1" r
   if [[ "$last_iter" =~ ^[^[:space:]]+[[:space:]]+needs_classification:[[:space:]](.*)$ ]]; then
-    printf '%s\n' "${BASH_REMATCH[1]}"
+    r="${BASH_REMATCH[1]}"
+    # Requirement 1 appends " lint_rc=<rc>" to committed lines; strip it
+    # back off before comparing, so a fresh call with the bare reason-text
+    # still recognizes an unchanged claim as idempotent.
+    r="$(printf '%s' "$r" | sed -E 's/ lint_rc=[0-9]+$//')"
+    printf '%s\n' "$r"
   fi
 }
 
@@ -282,9 +322,56 @@ if [ "$current_status" = "needs_classification" ] && [ "$existing_reason" = "$re
   exit 0
 fi
 
+# ---- claim-reproduction gate (requirement 1) -------------------------------
+# Known FAIL ids are read straight off prd-lint.sh's own fail(...) call
+# sites rather than hardcoded here, so a new lint id is covered without
+# touching this script.
+known_lint_ids="$(grep -oE 'fail\("[a-z0-9-]+"' "$PRD_LINT" 2>/dev/null \
+  | sed -E 's/^fail\("//; s/"$//' | sort -u)"
+
+lint_json="$("$PRD_LINT" "$prd_path" --format json 2>/dev/null)"
+lint_rc=$?
+[ -n "$lint_json" ] || lint_json='[]'
+
+lint_decision="$(python3 -c '
+import json, re, sys
+known_ids = set(sys.argv[1].split())
+reason = sys.argv[2]
+try:
+    results = json.loads(sys.argv[3])
+except Exception:
+    results = []
+fail_ids = set()
+for r in results:
+    for f in r.get("failures", []):
+        fail_ids.add(f.get("id", ""))
+tokens = re.split(r"[^a-z0-9-]+", reason.lower())
+matched = ""
+for tok in tokens:
+    if tok in known_ids:
+        matched = tok
+        break
+reproduced = (matched in fail_ids) if matched else True
+print(json.dumps({"matched_id": matched, "reproduced": reproduced}))
+' "$known_lint_ids" "$reason" "$lint_json")"
+
+matched_id="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["matched_id"])' "$lint_decision")"
+reproduced="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["reproduced"])' "$lint_decision")"
+
+if [ -n "$matched_id" ] && [ "$reproduced" != "True" ]; then
+  if $force; then
+    journal_line "$(date -u +%Y-%m-%dT%H:%M:%SZ)  $slug  needs_classification  forced  (cause=claim-not-reproduced lint_id=$matched_id lint_rc=$lint_rc lane=$(hostname))"
+  else
+    journal_line "$(date -u +%Y-%m-%dT%H:%M:%SZ)  $slug  needs_classification  refused  (cause=claim-not-reproduced lint_id=$matched_id lint_rc=$lint_rc)"
+    echo "needs-classification-refused: $slug (cause=claim-not-reproduced lint_id=$matched_id lint_rc=$lint_rc)"
+    exit 3
+  fi
+fi
+
 # ---- write + commit --------------------------------------------------------
 iso_ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-write_needs_classification "$prd_path" "needs_classification" "$iso_ts" "$reason" \
+write_reason="$reason lint_rc=$lint_rc"
+write_needs_classification "$prd_path" "needs_classification" "$iso_ts" "$write_reason" \
   || die "write: failed writing Status/iter_log into $prd_rel" 4
 
 git -C "$root" add -- "$prd_rel" || die "add: git add failed for $prd_rel" 4
