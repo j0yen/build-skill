@@ -150,6 +150,78 @@ cap_skips=$(printf '%s' "$out" | "$JQ" '[.skipped[] | select(.reason == "cap")] 
 [ "$FAILED" -eq 0 ] && pass "AC4"
 
 # ============================================================================
+# PRD-build-select-tick-run-pin fixtures (requirement 8 / that PRD's own
+# ACs 1-4). test_prefix `pin` also has dedicated tests/pin_ac*.sh cases for
+# the tick-run.sh / SKILL.md legs (that PRD's ACs 5-7); these four exercise
+# select-tick.sh's own --pin behavior directly, reusing this file's
+# write_prd/run_select_tick/clear_queue fixtures per requirement 8.
+echo "== run-pin AC1: 8 candidates cap 5, --pin low1,low2 admits them first in order =="
+clear_queue
+for i in 1 2 3 4 5 6; do
+  write_prd "prio$i" shell "/tmp/select-tick-pin-repo-$i"
+done
+write_prd low1 shell /tmp/select-tick-pin-repo-low1
+write_prd low2 shell /tmp/select-tick-pin-repo-low2
+out=$(BUILD_MAX_BRANCHES=5 run_select_tick --format json --pin low1,low2)
+first_two=$(printf '%s' "$out" | "$JQ" -r '.admitted[0].slug + "," + .admitted[1].slug')
+[ "$first_two" = "low1,low2" ] || fail "run-pin AC1: expected low1,low2 admitted first, got: $first_two"
+low1_pinned=$(printf '%s' "$out" | "$JQ" -r '.admitted[] | select(.slug=="low1") | .pinned')
+low2_pinned=$(printf '%s' "$out" | "$JQ" -r '.admitted[] | select(.slug=="low2") | .pinned')
+[ "$low1_pinned" = "true" ] && [ "$low2_pinned" = "true" ] || fail "run-pin AC1: expected pinned:true on low1/low2"
+pinned_arr=$(printf '%s' "$out" | "$JQ" -c '.pinned')
+[ "$pinned_arr" = '["low1","low2"]' ] || fail "run-pin AC1: expected top-level pinned==[low1,low2], got $pinned_arr"
+admitted_n=$(printf '%s' "$out" | "$JQ" '.counts.admitted')
+[ "$admitted_n" -eq 5 ] || fail "run-pin AC1: expected 5 admitted (cap), got $admitted_n"
+[ "$FAILED" -eq 0 ] && pass "run-pin AC1"
+
+# ============================================================================
+echo "== run-pin AC2: cap 2, --pin a,b,c -> a,b admitted, c pin-over-cap =="
+clear_queue
+write_prd a shell /tmp/select-tick-pin-repo-a
+write_prd b shell /tmp/select-tick-pin-repo-b
+write_prd c shell /tmp/select-tick-pin-repo-c
+: > "$JOURNAL"
+out=$(BUILD_MAX_BRANCHES=2 run_select_tick --format json --pin a,b,c)
+admitted_slugs=$(printf '%s' "$out" | "$JQ" -c '[.admitted[].slug]')
+[ "$admitted_slugs" = '["a","b"]' ] || fail "run-pin AC2: expected [a,b] admitted, got $admitted_slugs"
+c_entry=$(printf '%s' "$out" | "$JQ" -c '.skipped[] | select(.slug=="c")')
+printf '%s' "$c_entry" | "$JQ" -e '.pinned == true' >/dev/null || fail "run-pin AC2: expected c skipped with pinned:true, got $c_entry"
+grep -qE 'select-tick  pin-over-cap  \(slug=c cap=2\)' "$JOURNAL" \
+  || fail "run-pin AC2: journal missing pin-over-cap line: $(cat "$JOURNAL")"
+[ "$FAILED" -eq 0 ] && pass "run-pin AC2"
+
+# ============================================================================
+echo "== run-pin AC3: --pin ghost (no such PRD) -> pin-unknown journaled, others proceed =="
+clear_queue
+write_prd normalcand shell /tmp/select-tick-pin-repo-normal
+: > "$JOURNAL"
+out=$(run_select_tick --format json --pin ghost)
+rc=$?
+[ "$rc" -eq 0 ] || fail "run-pin AC3: expected exit 0, got $rc"
+grep -qE 'select-tick  pin-unknown  \(slug=ghost\)' "$JOURNAL" \
+  || fail "run-pin AC3: journal missing pin-unknown line: $(cat "$JOURNAL")"
+printf '%s' "$out" | "$JQ" -e '.admitted[] | select(.slug=="normalcand")' >/dev/null \
+  || fail "run-pin AC3: expected normalcand admitted normally"
+[ "$FAILED" -eq 0 ] && pass "run-pin AC3"
+
+# ============================================================================
+echo "== run-pin AC4: pinned slug with unmet Depends-on -> pin-refused cause=depends-on-unmet =="
+clear_queue
+write_prd waited2 shell /tmp/select-tick-pin-waited-repo
+write_prd waiter2 shell /tmp/select-tick-pin-waiter-repo PRD-waited2.md
+: > "$JOURNAL"
+out=$(run_select_tick --format json --pin waiter2)
+skip_entry=$(printf '%s' "$out" | "$JQ" -c '.skipped[] | select(.slug=="waiter2")')
+printf '%s' "$skip_entry" | "$JQ" -e '.pinned == true' >/dev/null \
+  || fail "run-pin AC4: expected waiter2 skipped with pinned:true, got $skip_entry"
+grep -qE 'select-tick  pin-refused  \(slug=waiter2 cause=depends-on-unmet\)' "$JOURNAL" \
+  || fail "run-pin AC4: journal missing pin-refused depends-on-unmet line: $(cat "$JOURNAL")"
+explain_out=$(run_select_tick --explain waiter2 --pin waiter2 2>&1)
+echo "$explain_out" | grep -q '^pinned: yes$' || fail "run-pin AC4: --explain missing 'pinned: yes': $explain_out"
+echo "$explain_out" | grep -q '^pinned-cause: depends-on-unmet$' || fail "run-pin AC4: --explain missing pinned-cause: $explain_out"
+[ "$FAILED" -eq 0 ] && pass "run-pin AC4"
+
+# ============================================================================
 echo "== AC6: exactly one select-tick journal line per run + schema-valid JSON =="
 clear_queue
 write_prd solo shell /tmp/select-tick-solo-repo

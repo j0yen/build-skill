@@ -16,13 +16,29 @@
 #
 # Usage:
 #   select-tick.sh [--prd-dir <dir>] [--lane <host>] [--format json|text]
-#                   [--explain <slug>] [--dry-run]
+#                   [--explain <slug>] [--dry-run] [--pin <slug>[,<slug>...]]
 #
 # --format json (default): one JSON object on stdout (jq -S, stable order):
 #   {"admitted":[{slug,path,build_target,build_into,build_priority,
-#                 continuation,shared_target,model}],
-#    "skipped":[{slug,reason,detail}],
+#                 continuation,shared_target,model,pinned}],
+#    "skipped":[{slug,reason,detail,pinned}],
+#    "pinned":[<slug>...],
 #    "counts":{pool,admitted,skipped,cap,distinct_targets,burst_session,sub_cap}}
+#
+# --pin <slug>[,<slug>...] (repeatable; PRD-build-select-tick-run-pin):
+# `BUILD_TICK_ARGS="run <slugs>"` is a pin, not a coordinator improvisation
+# -- tick-run.sh derives this flag's value from that argv and threads it
+# through as the SELECT_TICK_PIN env var (read below when --pin is absent
+# on the command line, since the coordinator's own /build invocation never
+# sees the slug list once tick-run.sh strips it). A pinned slug that
+# survives the hard pre-filter and Depends-on gate is admitted first, in
+# pin order, ahead of continuations and the priority sort -- it still goes
+# through select-guard.sh (cap/same-target/lane-predicate) like any other
+# candidate; a pin skips the queue, never the safety checks. Every pin's
+# fate is journaled (`pin-over-cap`, `pin-refused cause=...`,
+# `pin-unknown`) and each admitted/skipped entry above carries its own
+# `pinned` boolean so `--explain` and a status sweep never have to
+# recompute it from the pin list themselves.
 #
 # --format text: same JSON, followed by one `skip <slug> <reason> <detail>`
 # line per skipped entry (requirement 2 — skips are listed one per line
@@ -79,7 +95,7 @@ BURST_LANE_SH="${BURST_LANE_SH:-$HERE/burst-lane.sh}"
 
 die() { echo "select-tick: $*" >&2; exit "${2:-4}"; }
 usage() {
-  echo "usage: select-tick.sh [--prd-dir <dir>] [--lane <host>] [--format json|text] [--explain <slug>] [--dry-run]" >&2
+  echo "usage: select-tick.sh [--prd-dir <dir>] [--lane <host>] [--format json|text] [--explain <slug>] [--dry-run] [--pin <slug>[,<slug>...]]" >&2
   exit 4
 }
 
@@ -93,6 +109,7 @@ LANE_ARG="$(hostname)"
 FORMAT="json"
 EXPLAIN_SLUG=""
 DRY_RUN=false
+PIN_ARGS=()
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -101,11 +118,49 @@ while [ $# -gt 0 ]; do
     --format) [ $# -ge 2 ] || usage; FORMAT="$2"; shift 2 ;;
     --explain) [ $# -ge 2 ] || usage; EXPLAIN_SLUG="$2"; shift 2 ;;
     --dry-run) DRY_RUN=true; shift ;;
+    --pin) [ $# -ge 2 ] || usage; PIN_ARGS+=("$2"); shift 2 ;;
     -h|--help) usage ;;
     *) usage ;;
   esac
 done
 case "$FORMAT" in json|text) ;; *) usage ;; esac
+
+# --pin resolution (PRD-build-select-tick-run-pin requirement 2): an
+# explicit --pin (repeatable, and/or comma-separated within one occurrence)
+# always wins; SELECT_TICK_PIN is only a fallback default for the case the
+# coordinator never passes --pin at all (tick-run.sh's own env handoff).
+# Both "run a b" and "run a,b" resolve identically (AC5) -- split on comma
+# OR whitespace, drop empties, dedupe preserving first-seen order.
+declare -a PIN_SLUGS=()
+_pin_source=""
+if [ "${#PIN_ARGS[@]}" -gt 0 ]; then
+  _pin_source="${PIN_ARGS[*]}"
+elif [ -n "${SELECT_TICK_PIN:-}" ]; then
+  _pin_source="$SELECT_TICK_PIN"
+fi
+if [ -n "$_pin_source" ]; then
+  declare -a _pin_raw=()
+  IFS=', ' read -r -a _pin_raw <<<"$_pin_source"
+  for _p in "${_pin_raw[@]}"; do
+    [ -n "$_p" ] || continue
+    _dup=false
+    for _q in "${PIN_SLUGS[@]}"; do [ "$_q" = "$_p" ] && _dup=true && break; done
+    $_dup || PIN_SLUGS+=("$_p")
+  done
+fi
+
+if [ "${#PIN_SLUGS[@]}" -gt 0 ]; then
+  pin_slugs_json="$(printf '%s\n' "${PIN_SLUGS[@]}" | "$JQ" -R . | "$JQ" -s -c .)"
+else
+  pin_slugs_json='[]'
+fi
+
+explain_is_pinned=false
+if [ -n "$EXPLAIN_SLUG" ]; then
+  for _p in "${PIN_SLUGS[@]}"; do
+    [ "$_p" = "$EXPLAIN_SLUG" ] && explain_is_pinned=true && break
+  done
+fi
 
 STATE_DIR="${BUILD_STATE_DIR:-$SKILL_DIR/state}"
 MANIFEST="${BUILD_MANIFEST:-$STATE_DIR/manifest.json}"
@@ -270,6 +325,21 @@ survivors_json="$(printf '%s' "$staged_json" | "$JQ" -c '.survivors')"
 prefiltered_json="$(printf '%s' "$staged_json" | "$JQ" -c '.prefiltered')"
 depwait_json="$(printf '%s' "$staged_json" | "$JQ" -c '.depwait')"
 
+# Pin ordering (requirement 1): pinned survivors move to the front, in pin
+# order, ahead of continuations and the priority sort. A pin naming a slug
+# that never reached survivors (hard-prefiltered, depends-on-waiting, or
+# unknown to this tick's pool entirely) simply matches nothing here --
+# resolved into a journal line further below, once admitted/skipped are final.
+if [ "${#PIN_SLUGS[@]}" -gt 0 ]; then
+  survivors_json="$(printf '%s' "$survivors_json" | "$JQ" -c --argjson pins "$pin_slugs_json" '
+    . as $all
+    | ( [ $pins[] as $p | ($all[] | select(.slug == $p)) ] ) as $pinned
+    | ($pinned | map(.slug)) as $pinned_slugs
+    | ($all | map(select(.slug as $s | ($pinned_slugs | index($s)) == null))) as $rest
+    | $pinned + $rest
+  ')"
+fi
+
 pool_count="$(printf '%s' "$queue_json" | "$JQ" 'length')"
 
 # Effective caps, computed identically to select-guard.sh's own resolution
@@ -324,16 +394,38 @@ while [ "$i" -lt "$n" ]; do
   out="$("$SELECT_GUARD" "$slug" "$LANE_ARG" "$PRD_DIR_ARG" "$branch_count" "$admitted_targets" 2>/dev/null)"
   rc=$?
 
+  # Computed here (once, before the explain block below needs it too --
+  # requirement 6's "pinned-cause" line needs the same mapping the skipped
+  # entry below uses) rather than re-derived twice from $out.
+  reason=""
+  if [ "$rc" -ne 0 ]; then
+    reason="blocked"
+    case "$out" in
+      *"cap: "*) reason="cap" ;;
+      *"same-target: "*) reason="same-target" ;;
+      *"busy: "*) reason="busy" ;;
+      *"cargo-bound"*) reason="cargo-bound" ;;
+    esac
+  fi
+
   if [ -n "$EXPLAIN_SLUG" ] && [ "$slug" = "$EXPLAIN_SLUG" ]; then
     explain_lines+=("passed: scan")
     explain_lines+=("passed: hard-prefilter")
     explain_lines+=("passed: depends-on")
+    if [ "$explain_is_pinned" = true ]; then explain_lines+=("pinned: yes"); else explain_lines+=("pinned: no"); fi
     if [ "$rc" -eq 0 ]; then
       explain_lines+=("guard: $out")
       explain_lines+=("result: admitted")
     else
       explain_lines+=("guard (first failure): $out")
       explain_lines+=("result: skipped")
+      if [ "$explain_is_pinned" = true ]; then
+        if [ "$reason" = "cap" ]; then
+          explain_lines+=("pinned-cause: over-cap")
+        else
+          explain_lines+=("pinned-cause: $reason")
+        fi
+      fi
     fi
   fi
 
@@ -364,13 +456,6 @@ while [ "$i" -lt "$n" ]; do
       admitted_targets="${admitted_targets:+$admitted_targets,}$bi_bare"
     fi
   else
-    reason="blocked"
-    case "$out" in
-      *"cap: "*) reason="cap" ;;
-      *"same-target: "*) reason="same-target" ;;
-      *"busy: "*) reason="busy" ;;
-      *"cargo-bound"*) reason="cargo-bound" ;;
-    esac
     detail="${out#*: *: }"
     [ -n "$detail" ] || detail="$out"
     skipped_entries+=("$("$JQ" -n --arg slug "$slug" --arg reason "$reason" --arg detail "$detail" '{slug:$slug, reason:$reason, detail:$detail}')")
@@ -387,14 +472,18 @@ if [ -n "$EXPLAIN_SLUG" ] && [ "${#explain_lines[@]}" -eq 0 ]; then
     reason="$(printf '%s' "$pf" | "$JQ" -r '.reason')"
     detail="$(printf '%s' "$pf" | "$JQ" -r '.detail')"
     explain_lines+=("passed: scan")
+    if [ "$explain_is_pinned" = true ]; then explain_lines+=("pinned: yes"); else explain_lines+=("pinned: no"); fi
     explain_lines+=("failed: hard-prefilter -- $detail")
     explain_lines+=("result: skipped ($reason)")
+    if [ "$explain_is_pinned" = true ]; then explain_lines+=("pinned-cause: $reason"); fi
   elif [ -n "$dw" ]; then
     detail="$(printf '%s' "$dw" | "$JQ" -r '.detail')"
     explain_lines+=("passed: scan")
     explain_lines+=("passed: hard-prefilter")
+    if [ "$explain_is_pinned" = true ]; then explain_lines+=("pinned: yes"); else explain_lines+=("pinned: no"); fi
     explain_lines+=("failed: depends-on -- waiting on $detail")
     explain_lines+=("result: skipped (waiting-on)")
+    if [ "$explain_is_pinned" = true ]; then explain_lines+=("pinned-cause: depends-on-unmet"); fi
   fi
 fi
 
@@ -450,9 +539,50 @@ admitted_json="$(printf '%s' "$admitted_json" | "$JQ" -c '
 admitted_count="$(printf '%s' "$admitted_json" | "$JQ" 'length')"
 skipped_count="$(printf '%s' "$skipped_json" | "$JQ" 'length')"
 
+# --- Pin stamping + outcome journaling (PRD-build-select-tick-run-pin
+# requirements 1, 3, 4, 5). Runs unconditionally (pin_slugs_json is "[]"
+# when no --pin/SELECT_TICK_PIN was given) so every admitted/skipped entry
+# carries a "pinned" boolean regardless -- only the per-slug journal lines
+# below are gated on there being any pins at all, and on --dry-run
+# (requirement 7 of PRD-build-select-tick-deterministic: --dry-run never
+# journals). -----------------------------------------------------------------
+admitted_json="$(printf '%s' "$admitted_json" | "$JQ" -c --argjson pins "$pin_slugs_json" \
+  'map(. + {pinned: ((.slug as $s | $pins | index($s)) != null)})')"
+skipped_json="$(printf '%s' "$skipped_json" | "$JQ" -c --argjson pins "$pin_slugs_json" \
+  'map(. + {pinned: ((.slug as $s | $pins | index($s)) != null)})')"
+pinned_json="$("$JQ" -n --argjson pins "$pin_slugs_json" --argjson adm "$admitted_json" \
+  '[$pins[] as $p | select($adm | any(.slug == $p)) | $p]')"
+pinned_count="$(printf '%s' "$pinned_json" | "$JQ" 'length')"
+
+if [ "$DRY_RUN" = false ]; then
+  for _p in "${PIN_SLUGS[@]}"; do
+    if printf '%s' "$admitted_json" | "$JQ" -e --arg s "$_p" 'any(.[]; .slug == $s)' >/dev/null 2>&1; then
+      continue
+    fi
+    skip_entry="$(printf '%s' "$skipped_json" | "$JQ" -c --arg s "$_p" '[.[] | select(.slug == $s)][0] // empty')"
+    if [ -z "$skip_entry" ]; then
+      journal_line --file "$JOURNAL" "$(date -u +%Y-%m-%dT%H:%M:%SZ)  select-tick  pin-unknown  (slug=$_p)"
+      continue
+    fi
+    pin_reason="$(printf '%s' "$skip_entry" | "$JQ" -r '.reason')"
+    case "$pin_reason" in
+      cap)
+        journal_line --file "$JOURNAL" "$(date -u +%Y-%m-%dT%H:%M:%SZ)  select-tick  pin-over-cap  (slug=$_p cap=$limit)"
+        ;;
+      waiting-on)
+        journal_line --file "$JOURNAL" "$(date -u +%Y-%m-%dT%H:%M:%SZ)  select-tick  pin-refused  (slug=$_p cause=depends-on-unmet)"
+        ;;
+      *)
+        journal_line --file "$JOURNAL" "$(date -u +%Y-%m-%dT%H:%M:%SZ)  select-tick  pin-refused  (slug=$_p cause=$pin_reason)"
+        ;;
+    esac
+  done
+fi
+
 result_json="$("$JQ" -n \
   --argjson admitted "$admitted_json" \
   --argjson skipped "$skipped_json" \
+  --argjson pinned "$pinned_json" \
   --argjson pool "$pool_count" \
   --argjson admitted_n "$admitted_count" \
   --argjson skipped_n "$skipped_count" \
@@ -460,7 +590,7 @@ result_json="$("$JQ" -n \
   --argjson distinct_targets "$distinct_targets" \
   --argjson burst_session "$burst_session" \
   --argjson sub_cap "$same_target_cap" \
-  '{admitted:$admitted, skipped:$skipped,
+  '{admitted:$admitted, skipped:$skipped, pinned:$pinned,
     counts:{pool:$pool, admitted:$admitted_n, skipped:$skipped_n, cap:$cap,
             distinct_targets:$distinct_targets, burst_session:$burst_session, sub_cap:$sub_cap}}')"
 
@@ -472,7 +602,7 @@ if [ "$FORMAT" = "text" ]; then
 fi
 
 if [ "$DRY_RUN" = false ]; then
-  journal_line --file "$JOURNAL" "$(date -u +%Y-%m-%dT%H:%M:%SZ)  select-tick  admitted=$admitted_count skipped=$skipped_count pool=$pool_count cap=$limit distinct_targets=$distinct_targets burst_session=$burst_session sub_cap=$same_target_cap lane=$LANE_ARG"
+  journal_line --file "$JOURNAL" "$(date -u +%Y-%m-%dT%H:%M:%SZ)  select-tick  admitted=$admitted_count skipped=$skipped_count pool=$pool_count cap=$limit distinct_targets=$distinct_targets burst_session=$burst_session sub_cap=$same_target_cap pinned=$pinned_count lane=$LANE_ARG"
 fi
 
 exit 0
