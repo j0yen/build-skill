@@ -20,6 +20,10 @@ echo "$out" | grep -q "^appended: $JOURNAL" || { echo "FAIL: $out"; exit 1; }
 grep -q 'lane-health  tick  claimed=3 skipped=1  (lane=RedBaron)' "$JOURNAL" || { echo "FAIL journal content"; cat "$JOURNAL"; exit 1; }
 echo ok
 
+echo "== tick-summary appends a JOURNAL: fixture_lines_today= line =="
+grep -qE 'lane-health  JOURNAL: fixture_lines_today=[0-9]+' "$JOURNAL" || { echo "FAIL: no JOURNAL: fixture_lines_today= line"; cat "$JOURNAL"; exit 1; }
+echo ok
+
 echo "== second lane's line also appended, both surface in report =="
 "$LS" tick-summary carbon 2 0 "$JOURNAL" >/dev/null
 

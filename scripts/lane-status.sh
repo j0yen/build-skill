@@ -150,6 +150,19 @@ probe_failed_24h_stats() {
   printf '%s %s %s\n' "$n" "${top_name:-none}" "$top_count"
 }
 
+# fixture_lines_today_stat — PRD-build-test-isolation-by-default
+# requirement 8 (P2): today's fixture-shaped-line count in the production
+# journal, via lint-journal-fixtures.sh --corpus (requirement 7's corpus
+# lint, already built and covered by tests/isodefault_ac3 — this is a
+# read-only display of that same count, never a gate). Prints "<n>" on
+# stdout; "0" if the lint script is missing (never fatal — a health line).
+fixture_lines_today_stat() {
+  local lint="$HERE/lint-journal-fixtures.sh" n
+  [ -x "$lint" ] || { printf '0\n'; return; }
+  n="$("$lint" --corpus 2>/dev/null | sed -n 's/.*fixture-lines-total=\([0-9]*\).*/\1/p' | tail -n1)"
+  printf '%s\n' "${n:-0}"
+}
+
 cmd_tick_summary() {
   local lane="$1" claimed="$2" skipped="$3"
   local journal="${4:-$HOME/brain/journal/build/$(date -u +%F).md}"
@@ -180,6 +193,13 @@ cmd_tick_summary() {
     source "$HERE/lib/probe.sh"
     probe_prune_logs >/dev/null 2>&1 || true
   fi
+  # PRD-build-test-isolation-by-default requirement 8 (P2): surface
+  # requirement 7's corpus-lint count on the same standing health line
+  # this tick already writes, rather than leaving it something only
+  # `lint-journal-fixtures.sh --corpus` by hand would show.
+  local fixture_lines_today; fixture_lines_today="$(fixture_lines_today_stat)"
+  printf '%s  lane-health  JOURNAL: fixture_lines_today=%s\n' \
+    "$(now_iso)" "$fixture_lines_today" >> "$journal"
   echo "appended: $journal"
 }
 

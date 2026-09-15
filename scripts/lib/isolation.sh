@@ -75,6 +75,31 @@ isolation_apply() {
     cp "$src" "$dst" 2>/dev/null || true
   done
 
+  # Fallback git identity — HOME moving means $HOME/.gitconfig (global
+  # user.name/user.email) is gone, so ANY git operation under test that
+  # needs to author a commit WITHOUT its own explicit `-c user.name=...
+  # -c user.email=...` on that exact invocation dies with "unable to
+  # auto-detect email address". Most fixture helpers pass -c explicitly
+  # (archive-commit-selftest.sh's gc(), requeue-prd.sh's real Joe Yen
+  # identity), but `git pull --rebase --autostash` creates its own
+  # intermediate autostash-pop commit with no caller-supplied -c at all —
+  # root-caused via a direct repro: archive-commit-selftest.sh's
+  # MANBACKFILL AC7 fixture failed deterministically (3/3, not
+  # intermittently as first suspected) under run-selftests.sh with
+  # "Committer identity unknown" from exactly that rebase step, not from
+  # any push/rebase timing race. Written as a plain global .gitconfig
+  # (lowest git config precedence) rather than GIT_AUTHOR_*/GIT_COMMITTER_*
+  # env vars — env vars WIN OVER a caller's own `-c user.name=...` (verified
+  # directly: `git -c user.name="Config Name" commit` still authors as the
+  # env var's name when GIT_AUTHOR_NAME is set), which silently broke
+  # requeue-prd-selftest.sh's own "commit identity is Joe Yen" assertion
+  # when tried. A .gitconfig only supplies the fallback a caller with no
+  # identity opinion of its own falls through to; -c always still wins.
+  if [ ! -f "$BUILD_TEST_ROOT/home/.gitconfig" ]; then
+    git config --file "$BUILD_TEST_ROOT/home/.gitconfig" user.name "build-skill-test" 2>/dev/null || true
+    git config --file "$BUILD_TEST_ROOT/home/.gitconfig" user.email "build-skill-test@localhost" 2>/dev/null || true
+  fi
+
   export HOME="$BUILD_TEST_ROOT/home"
   export BUILD_JOURNAL_ROOT="$BUILD_TEST_ROOT/journal"
   export BUILD_STATE_DIR="$BUILD_TEST_ROOT/state"
