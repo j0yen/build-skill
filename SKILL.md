@@ -1442,6 +1442,22 @@ line — no separate script invocation needed. `scripts/lane-status.sh
 report` shows the last 5 raw ledger rows alongside the lane health/claims
 sections. See "Parallelism" below for the two-tick rule this line feeds.
 
+**Serialization summary line (P1, PRD-build-gate-before-land requirement
+7).** Once all branches for this tick have returned, the parent also runs
+`scripts/serialization-digest.sh` (no arguments — reads today's shared
+journal, the same one every line above already landed in) and appends its
+one-line output verbatim to the journal:
+`serialization: same-target waits=<n> land_lock_hold_max=<s> gates
+branch=<n> main=<n> cached=<n>`. `waits` counts how many candidates
+`select-guard.sh`'s same-target cap (requirement 5) turned away this run;
+`land_lock_hold_max` is the longest `lock_hold=` any gated `land`/
+`integrate` reported (target: comfortably under 30s); `gates branch=`/
+`main=` count real (non-cached) gate runs by scope; `cached=` counts
+post-land main-scope gates that were a verdict-cache hit (requirement 4) —
+this is the number the PRD's own "≥90% of lands" success metric reads.
+Read-only and journal-only: this script never mutates state, so it is safe
+to call even on a tick that admitted nothing (every field reads 0/0s).
+
 **Parent step (after all branches return, before releasing `tick.lock`):**
 - Run `scripts/manifest-set.sh --replay-orphans`. For every
   `state/intent/*.json` whose patch is not yet reflected in the manifest

@@ -80,6 +80,26 @@ LANE_PREDICATE="$HERE/lane-predicate.sh"
 die() { echo "select-guard: $*" >&2; exit "${2:-4}"; }
 usage() { echo "usage: select-guard.sh <slug> [lane-name] [prd-dir] [branch-count] [admitted-targets]" >&2; exit 4; }
 
+# select_guard_journal_line — PRD-build-gate-before-land requirement 7:
+# durable record of a same-target admit/block decision, so a post-tick
+# digest (scripts/serialization-digest.sh) can compute `waits=<n>` from
+# the shared journal alone, the same way it reads extend-gate.sh's and
+# worktree-extend.sh's own journal lines for the gate/land counters.
+# Same override + isolation-guard.sh default-deny convention every other
+# build script's journal write uses (EXTEND_GATE_JOURNAL,
+# WORKTREE_EXTEND_JOURNAL, ...); best-effort — never blocks selection.
+select_guard_journal_line() {
+  local slug="$1" outcome="$2" detail="$3"
+  local journal="${SELECT_GUARD_JOURNAL:-$HOME/brain/journal/build/$(date -u +%Y-%m-%d).md}"
+  if [ -r "$HERE/isolation-guard.sh" ]; then
+    # shellcheck source=isolation-guard.sh
+    source "$HERE/isolation-guard.sh"
+    isolation_guard_path "$journal" "select-guard.sh"
+  fi
+  mkdir -p "$(dirname "$journal")" 2>/dev/null || return 0
+  printf '%s  select  %s  %s  (%s)\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$slug" "$outcome" "$detail" >>"$journal" 2>/dev/null || true
+}
+
 # Same build_into parser as lane-predicate.sh's read_field (PRD-build-
 # second-lane-carbon) — duplicated rather than sourced so this script's
 # own die/usage/main definitions never collide with lane-predicate.sh's.
@@ -177,9 +197,17 @@ main() {
   if [ -n "$bi" ]; then
     echo "select same-target cap=$same_target_cap source=$cap_source target=$bi admitted=$((same_target_count + 1))" >&2
     if [ "$same_target_count" -ge "$same_target_cap" ]; then
+      # PRD-build-gate-before-land requirement 7 (P1): a same-target-cap
+      # block is a "wait" for the tick's `serialization:` summary line
+      # (scripts/serialization-digest.sh) — the only place that number can
+      # come from, since select-guard.sh's stderr above is per-invocation,
+      # not durable. Written to the SAME shared journal every other build
+      # script uses, same isolation-guard.sh default-deny convention.
+      select_guard_journal_line "$slug" same-target-blocked "target=$bi cap=$same_target_cap source=$cap_source admitted_this_tick=$same_target_count"
       echo "blocked: $slug: same-target: $bi already at cap=$same_target_cap (source=$cap_source, $same_target_count admitted this tick)"
       exit 1
     fi
+    select_guard_journal_line "$slug" same-target-admit "target=$bi cap=$same_target_cap source=$cap_source admitted_this_tick=$((same_target_count + 1))"
   fi
 
   local out rc

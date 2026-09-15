@@ -1082,7 +1082,13 @@ if [ "${#blocking_notes[@]}" -eq 0 ]; then
   fi
 else
   echo "extend-gate: reviewer skipped — ${#blocking_notes[@]} block(s) already recorded (no Sonnet spend on a red gate)"
-  echo "$(date -u +%FT%TZ)  gate  ${repo##*/}  reviewer-skipped  (blocks=${#blocking_notes[@]} head=${head_now:0:7})" >> "$HOME/brain/journal/build/$(date -u +%F).md"
+  # Was a hardcoded ~/brain/journal path, ignoring EXTEND_GATE_JOURNAL and
+  # the isolation-guard.sh default-deny sentinel every OTHER journal write
+  # in this file already honors — the one write in this script that could
+  # (and did) leak selftest fixture lines into the real shared journal.
+  # Fixed in passing (PRD-build-gate-before-land requirement 7 found it via
+  # the same isolation gap it was closing for select-guard.sh).
+  echo "$(date -u +%FT%TZ)  gate  ${repo##*/}  reviewer-skipped  (blocks=${#blocking_notes[@]} head=${head_now:0:7})" >> "$journal"
   record_phase reviewer 0 skip
 fi
 _phase_t0=$(date +%s)

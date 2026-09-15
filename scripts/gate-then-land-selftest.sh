@@ -126,7 +126,7 @@ JOURNAL_A="$T/journal-a.md"
 echo 2 > "$T/counter-a"
 out_a="$T/out-a.log"
 env GATE_THEN_LAND_EXTEND_GATE="$T/fake-extend-gate.sh" \
-    GATE_THEN_LAND_JOURNAL="$JOURNAL_A" \
+    GATE_THEN_LAND_JOURNAL="$JOURNAL_A" WORKTREE_EXTEND_JOURNAL="$JOURNAL_A" \
     FAKE_GATE_ADVANCE_MAIN_REPO="$REPO_A" FAKE_GATE_ADVANCE_COUNTER="$T/counter-a" \
     "$GTL" "$REPO_A" scenA-slug minor /dev/null >"$out_a" 2>"$out_a.err"
 rc_a=$?
@@ -146,7 +146,7 @@ JOURNAL_B="$T/journal-b.md"
 echo 3 > "$T/counter-b"
 out_b="$T/out-b.log"
 env GATE_THEN_LAND_EXTEND_GATE="$T/fake-extend-gate.sh" \
-    GATE_THEN_LAND_JOURNAL="$JOURNAL_B" \
+    GATE_THEN_LAND_JOURNAL="$JOURNAL_B" WORKTREE_EXTEND_JOURNAL="$JOURNAL_B" \
     FAKE_GATE_ADVANCE_MAIN_REPO="$REPO_B" FAKE_GATE_ADVANCE_COUNTER="$T/counter-b" \
     "$GTL" "$REPO_B" scenB-slug minor /dev/null --max-retries 3 >"$out_b" 2>"$out_b.err"
 rc_b=$?
@@ -169,7 +169,7 @@ MAIN_BEFORE_C="$(git -C "$REPO_C" rev-parse HEAD)"
 JOURNAL_C="$T/journal-c.md"
 out_c="$T/out-c.log"
 env GATE_THEN_LAND_EXTEND_GATE="$T/fake-extend-gate.sh" \
-    GATE_THEN_LAND_JOURNAL="$JOURNAL_C" FAKE_GATE_VERDICT=block \
+    GATE_THEN_LAND_JOURNAL="$JOURNAL_C" WORKTREE_EXTEND_JOURNAL="$JOURNAL_C" FAKE_GATE_VERDICT=block \
     "$GTL" "$REPO_C" scenC-slug minor /dev/null >"$out_c" 2>"$out_c.err"
 rc_c=$?
 cat "$out_c" "$out_c.err" >&2

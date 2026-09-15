@@ -31,6 +31,11 @@ expect() {
 
 T="$(mktemp -d "${TMPDIR:-/tmp}/select-guard-satcap-selftest.XXXXXX")"
 trap '[ -n "${SELECT_GUARD_SATCAP_KEEP:-}" ] || rm -rf "$T"' EXIT
+# PRD-build-gate-before-land requirement 7: select-guard.sh now journals
+# every same-target admit/block decision — isolate it, or every run of
+# this selftest (five candidates x N sub-scenarios) pollutes the real
+# shared journal.
+export SELECT_GUARD_JOURNAL="$T/select-guard-journal.md"
 
 git init -q --bare "$T/origin.git"
 git clone -q "$T/origin.git" "$T/clone" >/dev/null 2>&1

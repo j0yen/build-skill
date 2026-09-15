@@ -54,6 +54,11 @@ export BUILD_WT_ROOT="$T/build-worktrees"
 GIT_ID=(-c user.email=test@gate-tree-cache-selftest.local -c user.name="gate-tree-cache-selftest")
 JOURNAL="$T/journal.md"
 export EXTEND_GATE_JOURNAL="$JOURNAL"
+# worktree-extend.sh land (called below) writes its OWN journal line
+# (`land ... lock_hold=...`) independently of EXTEND_GATE_JOURNAL above —
+# isolate it too, or it leaks this selftest's fixture slug into the real
+# shared journal.
+export WORKTREE_EXTEND_JOURNAL="$JOURNAL"
 trap '[ -n "${GATE_TREE_CACHE_SELFTEST_KEEP:-}" ] || rm -rf "$T"' EXIT
 
 SELF_HASH="$(sha256sum "$EXTEND_GATE" | awk '{print $1}')"

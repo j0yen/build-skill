@@ -21,6 +21,10 @@ trap 'rm -rf "$ROOT"' EXIT
 # would false-positive this selftest's stale-claim fixtures below.
 export JOURNAL_DIR="$ROOT/journal"
 mkdir -p "$JOURNAL_DIR"
+# PRD-build-gate-before-land requirement 7: select-guard.sh now journals
+# every same-target admit/block decision — isolate it same as JOURNAL_DIR
+# above, or every run of this selftest pollutes the real shared journal.
+export SELECT_GUARD_JOURNAL="$ROOT/select-guard-journal.md"
 
 git init -q --bare "$ROOT/origin.git"
 git clone -q "$ROOT/origin.git" "$ROOT/clone"

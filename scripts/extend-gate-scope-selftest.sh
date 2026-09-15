@@ -193,7 +193,15 @@ expect "AC1a: receipts exist under the worktree's resolved (off-root) target dir
 expect "AC1a: last-verdict.json exists under the worktree's resolved (off-root) target dir" \
   "[ -f \"$EXPECTED_TDIR/autobuilder/last-verdict.json\" ]"
 
-journal_line="$(grep -m1 "  gate  " "$JOURNAL" 2>/dev/null || true)"
+
+# extend-gate.sh's own "reviewer skipped" line (written earlier than the
+# final verdict, when the run already has blocking notes) shares the
+# `  gate  ` marker — grep it out so this picks the actual verdict line,
+# not whichever "  gate  " line comes first. (Before PRD-build-gate-
+# before-land requirement 7's drive-by fix, "reviewer-skipped" bypassed
+# EXTEND_GATE_JOURNAL entirely and never appeared in $JOURNAL at all,
+# which is why this selector never needed to care before.)
+journal_line="$(grep "  gate  " "$JOURNAL" 2>/dev/null | grep -v reviewer-skipped | head -1 || true)"
 expect "AC1c: a gate journal line was written" "[ -n \"$journal_line\" ]"
 expect "AC1c: journal line carries scope=branch slug=$SLUG" "printf '%s' \"$journal_line\" | grep -q 'scope=branch slug=$SLUG '"
 expect "AC1c: journal line's base= names the ADVANCED main HEAD" "printf '%s' \"$journal_line\" | grep -q \"base=$MAIN_SHA_AT_GATE_START \""
