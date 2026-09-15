@@ -5379,6 +5379,130 @@ expect "opauth AC7: the bake-done journal line carries authz=" \
 
 expect_block_green "opauth" "opauth: every opauth case above ran green"
 
+# ---- costrate block (PRD-build-burst-cost-rate-by-type) --------------------
+# 2026-09-15: COST_PER_HOUR_EUR was hardcoded to 0.47 (the old ccx53
+# estimate) while the fleet actually ran ccx43 (real 0.522/h) and was about
+# to move to ccx53 (real 1.009/h) — every cost line, cost.jsonl row and
+# per-slug proration under-reported. cost_rate_eur() now prices by the
+# SESSION's own recorded server_type (state_read, written at up/adopt time
+# and carried forward unchanged by every later state_write), with
+# BURST_COST_PER_HOUR_EUR as an operator override and a loud rate-unknown
+# journal line for any type not yet in the table. Every case here routes
+# the teardown through idle-guard's zero-runs-lifetime path rather than
+# down's own last-two-minutes-of-the-hour window (bursttdl AC1's own
+# migration case above already proves stripping "phase"/"phase_epoch"
+# reads as phase=provisioned, grace-exempt) so "N minutes alive" is exact
+# and never fighting an hour boundary.
+block_start "costrate"
+
+# ---- costrate AC1: a session recorded as ccx43 prices a 60-minute
+# teardown at 0.522/h (±0.001) in both the journal cost line and cost.jsonl.
+fresh_env
+export BURST_SERVER_TYPE=ccx43
+"$BL" up >/dev/null 2>&1
+cr1_sid="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+cr1_create="$(grep -oE '"create_epoch":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+expect "costrate AC1: the session records server_type=ccx43 at up time" \
+  "grep -q '\"server_type\":\"ccx43\"' \"$BURST_LANE_STATE_DIR/session.json\""
+python3 -c '
+import json, sys
+path = sys.argv[1]
+d = json.load(open(path))
+d.pop("phase", None)
+d.pop("phase_epoch", None)
+json.dump(d, open(path, "w"))
+' "$BURST_LANE_STATE_DIR/session.json"
+export BURST_LANE_NOW=$((cr1_create + 3600))
+cr1_out="$("$BL" idle-guard 2>&1)"
+unset BURST_LANE_NOW
+expect "costrate AC1: idle-guard tears down the 60-minute-old ccx43 box" \
+  "[ '$cr1_out' = 'idle-guard teardown: $cr1_sid (60m)' ]"
+expect "costrate AC1: the journal cost line prices ccx43 at 0.522/h for 60 minutes" \
+  "grep -qE 'burst-lane  down  decision=deleted  \\(server_id=$cr1_sid.*minutes=60 cost_eur=0\\.5220' \"$BURST_LANE_JOURNAL\""
+expect "costrate AC1: cost.jsonl prices the same session within 0.001 eur of ccx43's 0.522" \
+  "python3 -c \"import json; d=json.loads(open('$BURST_LANE_COST_LEDGER').read().strip().splitlines()[-1]); import sys; sys.exit(0 if abs(d.get('eur',0)-0.522) <= 0.001 else 1)\""
+unset BURST_SERVER_TYPE
+
+# ---- costrate AC2: BURST_COST_PER_HOUR_EUR overrides the table -------------
+fresh_env
+export BURST_COST_PER_HOUR_EUR=2.0
+"$BL" up >/dev/null 2>&1
+cr2_sid="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+cr2_create="$(grep -oE '"create_epoch":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+python3 -c '
+import json, sys
+path = sys.argv[1]
+d = json.load(open(path))
+d.pop("phase", None)
+d.pop("phase_epoch", None)
+json.dump(d, open(path, "w"))
+' "$BURST_LANE_STATE_DIR/session.json"
+export BURST_LANE_NOW=$((cr2_create + 3600))
+cr2_out="$("$BL" idle-guard 2>&1)"
+unset BURST_LANE_NOW
+expect "costrate AC2: idle-guard tears down the 60-minute-old box" \
+  "[ '$cr2_out' = 'idle-guard teardown: $cr2_sid (60m)' ]"
+expect "costrate AC2: BURST_COST_PER_HOUR_EUR=2.0 wins over the table" \
+  "grep -qE 'burst-lane  down  decision=deleted  \\(server_id=$cr2_sid.*minutes=60 cost_eur=2\\.0000' \"$BURST_LANE_JOURNAL\""
+expect "costrate AC2: cost.jsonl records the overridden 2.0 rate" \
+  "python3 -c \"import json; d=json.loads(open('$BURST_LANE_COST_LEDGER').read().strip().splitlines()[-1]); import sys; sys.exit(0 if abs(d.get('eur',0)-2.0) <= 0.001 else 1)\""
+unset BURST_COST_PER_HOUR_EUR
+
+# ---- costrate AC3: an unknown server type falls back to 0.47 and journals
+# rate-unknown once.
+fresh_env
+export BURST_SERVER_TYPE=cpx31
+"$BL" up >/dev/null 2>&1
+cr3_sid="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+cr3_create="$(grep -oE '"create_epoch":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+python3 -c '
+import json, sys
+path = sys.argv[1]
+d = json.load(open(path))
+d.pop("phase", None)
+d.pop("phase_epoch", None)
+json.dump(d, open(path, "w"))
+' "$BURST_LANE_STATE_DIR/session.json"
+export BURST_LANE_NOW=$((cr3_create + 3600))
+cr3_out="$("$BL" idle-guard 2>&1)"
+unset BURST_LANE_NOW
+expect "costrate AC3: idle-guard tears down the unknown-type box" \
+  "[ '$cr3_out' = 'idle-guard teardown: $cr3_sid (60m)' ]"
+expect "costrate AC3: an unknown type journals rate-unknown naming the fallback" \
+  "grep -q 'burst-lane  cost  rate-unknown  (type=cpx31 using=0.47)' \"$BURST_LANE_JOURNAL\""
+expect "costrate AC3: the teardown still prices at the 0.47 fallback" \
+  "grep -qE 'burst-lane  down  decision=deleted  \\(server_id=$cr3_sid.*minutes=60 cost_eur=0\\.4700' \"$BURST_LANE_JOURNAL\""
+unset BURST_SERVER_TYPE
+
+# ---- costrate AC4: a session booted as ccx43 stays priced ccx43 even when
+# BURST_SERVER_TYPE=ccx53 by the time it tears down.
+fresh_env
+export BURST_SERVER_TYPE=ccx43
+"$BL" up >/dev/null 2>&1
+cr4_sid="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+cr4_create="$(grep -oE '"create_epoch":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+python3 -c '
+import json, sys
+path = sys.argv[1]
+d = json.load(open(path))
+d.pop("phase", None)
+d.pop("phase_epoch", None)
+json.dump(d, open(path, "w"))
+' "$BURST_LANE_STATE_DIR/session.json"
+export BURST_SERVER_TYPE=ccx53
+export BURST_LANE_NOW=$((cr4_create + 3600))
+cr4_out="$("$BL" idle-guard 2>&1)"
+unset BURST_LANE_NOW
+expect "costrate AC4: idle-guard tears down the ccx43-booted box" \
+  "[ '$cr4_out' = 'idle-guard teardown: $cr4_sid (60m)' ]"
+expect "costrate AC4: the session still reads server_type=ccx43 at teardown time" \
+  "grep -qE 'burst-lane  down  decision=deleted  \\(server_id=$cr4_sid.*minutes=60 cost_eur=0\\.5220' \"$BURST_LANE_JOURNAL\""
+expect "costrate AC4: it is NOT priced at ccx53's 1.009 despite the env flip" \
+  "! grep -qE 'burst-lane  down  decision=deleted  \\(server_id=$cr4_sid.*minutes=60 cost_eur=1\\.0090' \"$BURST_LANE_JOURNAL\""
+unset BURST_SERVER_TYPE
+
+expect_block_green "costrate" "costrate: every costrate case above ran green"
+
 # ---- pullback AC11 (PRD-build-burst-pull-back-restore): record, on every
 # run, how many transfer-layer failures remain among this PRD's own
 # "pullback"-block fixtures (AC3/AC5/AC12 above) and the cause of each, to

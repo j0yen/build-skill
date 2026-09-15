@@ -717,6 +717,53 @@ state_write() {  # $1..$N = key=value pairs
 state_clear() { rm -f "$STATE_FILE" "$SERVED_FILE"; }
 state_active() { [ -f "$STATE_FILE" ]; }
 
+# ---- cost_rate_eur (price box-hours by server type) ------------------------
+# Single source of truth for the box-hour rate every cost computation in
+# this script uses (teardown_and_delete, prove_snapshot_cost, up's own
+# ssh-unreachable-before-boot fallback) — 2026-09-15 finding: a hardcoded
+# COST_PER_HOUR_EUR=0.47 kept pricing every box at the old ccx53 estimate
+# while the fleet actually ran ccx43 (real 0.522/h) and was about to move
+# to ccx53 (real 1.009/h), under-reporting every cost line, cost.jsonl row,
+# per-slug proration and the (future) eur/day auto-disable.
+#
+# Resolution order: 1) an explicit $1 override (a type string — used only
+# by the one call site, up's pre-session-json fallback, where the box was
+# just created with the current $SERVER_TYPE and no session.json exists
+# yet to read back); 2) the SESSION's own recorded server_type (state_read
+# — written at `up`/adopt time next to server_id/ip and carried forward,
+# unchanged, by every later state_write in this file), so a session
+# booted as ccx43 is priced ccx43 for its whole life even if an operator
+# flips $SERVER_TYPE/BURST_SERVER_TYPE for the NEXT box before this one
+# tears down; 3) the current $SERVER_TYPE var (no session yet at all).
+#
+# $BURST_COST_PER_HOUR_EUR, when set, overrides the table outright for
+# every type, known or not — the documented operator escape hatch. An
+# unknown type with no override falls back to the historical
+# $COST_PER_HOUR_EUR (0.47) default and journals the fact, so a fleet move
+# to a not-yet-priced type is loud (rate-unknown) rather than a silent
+# under-charge.
+cost_rate_eur() {  # $1 = optional explicit server type override -> stdout eur/h
+  local t="${1:-}"
+  if [ -z "$t" ]; then
+    t="$(state_read server_type 2>/dev/null)"
+    [ -n "$t" ] || t="$SERVER_TYPE"
+  fi
+  if [ -n "${BURST_COST_PER_HOUR_EUR:-}" ]; then
+    printf '%s' "$BURST_COST_PER_HOUR_EUR"
+    return 0
+  fi
+  case "$t" in
+    ccx33) printf '%s' "0.261" ;;
+    ccx43) printf '%s' "0.522" ;;
+    ccx53) printf '%s' "1.009" ;;
+    ccx63) printf '%s' "1.614" ;;
+    *)
+      journal_line "$(now_iso)  burst-lane  cost  rate-unknown  (type=$t using=$COST_PER_HOUR_EUR)"
+      printf '%s' "$COST_PER_HOUR_EUR"
+      ;;
+  esac
+}
+
 # Migration/compatibility: a session.json written before this PRD has no
 # "phase" key at all — that reads as phase=provisioned (existing behavior,
 # no grace), never as phase=setup. Every state_write call site that isn't
@@ -2381,7 +2428,7 @@ prove_snapshot_cost() {
     ''|*[!0-9]*) PROVE_COST_MINUTES=0 ;;
     *) PROVE_COST_MINUTES=$(( ($(now_epoch) - base_epoch) / 60 )) ;;
   esac
-  PROVE_COST_EUR="$(awk -v m="$PROVE_COST_MINUTES" -v r="$COST_PER_HOUR_EUR" 'BEGIN{printf "%.4f", (m/60.0)*r}')"
+  PROVE_COST_EUR="$(awk -v m="$PROVE_COST_MINUTES" -v r="$(cost_rate_eur)" 'BEGIN{printf "%.4f", (m/60.0)*r}')"
 }
 
 prove_journal_cost() {  # $1=outcome (done|failed|aborted)
@@ -3005,7 +3052,7 @@ print(d.get("id",""), d.get("public_net",{}).get("ipv4",{}).get("ip",""))
     # fails before boot is never a silent 0.0h/eur gap in the ledger.
     local pf_minutes pf_eur
     pf_minutes=$(( ($(now_epoch) - create_epoch) / 60 ))
-    pf_eur="$(awk -v m="$pf_minutes" -v r="$COST_PER_HOUR_EUR" 'BEGIN{printf "%.4f", (m/60.0)*r}')"
+    pf_eur="$(awk -v m="$pf_minutes" -v r="$(cost_rate_eur "$SERVER_TYPE")" 'BEGIN{printf "%.4f", (m/60.0)*r}')"
     journal_line "$(now_iso)  burst-lane  up  fallback  (cause=ssh-unreachable server_id=$id ip=$ip)"
     "$HCLOUD" server delete "$id" >/dev/null 2>&1 || true
     journal_line "$(now_iso)  burst-lane  down  decision=deleted  (server_id=$id cause=ssh-unreachable-before-boot minutes=$pf_minutes cost_eur=$pf_eur prds=none)"
@@ -6909,7 +6956,7 @@ teardown_and_delete() {  # $1=id $2=caller_tag(down|watchdog|idle-guard)
   if destroy_verify "$id"; then
     local hrs eur served
     hrs="$(awk -v m="$alive" 'BEGIN{printf "%.4f", m/60.0}')"
-    eur="$(awk -v h="$hrs" -v r="$COST_PER_HOUR_EUR" 'BEGIN{printf "%.4f", h*r}')"
+    eur="$(awk -v h="$hrs" -v r="$(cost_rate_eur)" 'BEGIN{printf "%.4f", h*r}')"
     served="$( [ -f "$SERVED_FILE" ] && paste -sd, "$SERVED_FILE" 2>/dev/null || true)"
     local prorate_out orphan_sid
     prorate_out="$(prorate_attribution "$id" "$hrs" "$eur" "$caller")" || true
