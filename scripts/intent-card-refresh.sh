@@ -580,7 +580,7 @@ if ! lint_out="$("$HERE/card-lint.sh" "${lint_args[@]}" 2>&1)"; then
 fi
 
 python3 - "$plan_path" <<'PY'
-import json, os, sys
+import json, os, re, shutil, sys
 
 plan_path = sys.argv[1]
 with open(plan_path, encoding="utf-8") as fh:
@@ -619,12 +619,57 @@ if os.path.isfile(amendment_path):
         os.remove(amendment_path)
         amendment_removed = True
 
+# Keep <repo>/extended-gates.toml's prd_path in step with the card this run
+# just wrote. CI's ac01_extended_gates_prd_path_resolves_and_matches_card
+# enforces prd_path's basename == prd_source's basename (and that prd_path
+# resolves to a real file), but until now this script only ever wrote the
+# card -- extended-gates.toml was left pointing at whatever PRD it named
+# before, so it drifted stale on every ship and someone had to hand-repoint
+# it after the fact (see mcphost's own "fix gate paper trail" commits, e.g.
+# 6e17b89, 24d1794 -- the exact recurring debt this closes). prd_path's
+# established convention here is a bare, repo-root-relative filename, so a
+# fresh copy of the PRD file is staged alongside the rewritten value.
+extended_gates_synced = False
+repo_dir = os.path.dirname(os.path.dirname(plan["card_path"]))  # card_path is <repo>/agent/intent-card.json
+gates_path = os.path.join(repo_dir, "extended-gates.toml")
+if os.path.isfile(gates_path):
+    with open(gates_path, encoding="utf-8") as fh:
+        gates_lines = fh.readlines()
+    prd_path_line_idx = None
+    current_rel = None
+    for i, line in enumerate(gates_lines):
+        m = re.match(r'^\s*prd_path\s*=\s*(.*?)\s*$', line)
+        if m:
+            prd_path_line_idx = i
+            current_rel = m.group(1).strip()
+            if len(current_rel) >= 2 and current_rel[0] == current_rel[-1] == '"':
+                current_rel = current_rel[1:-1]
+            break
+    if prd_path_line_idx is not None:
+        new_prd_abs = plan["prd_path"]
+        new_basename = os.path.basename(new_prd_abs)
+        if os.path.basename(current_rel or "") != new_basename:
+            # Repoint the repo-root PRD copy too, so prd_path keeps
+            # resolving to a real file, not just naming the right one.
+            if current_rel and "/" not in current_rel:
+                stale_copy = os.path.join(repo_dir, current_rel)
+                if os.path.isfile(stale_copy):
+                    os.remove(stale_copy)
+            new_copy = os.path.join(repo_dir, new_basename)
+            if not os.path.isfile(new_copy):
+                shutil.copyfile(new_prd_abs, new_copy)
+            gates_lines[prd_path_line_idx] = f'prd_path = "{new_basename}"\n'
+            with open(gates_path, "w", encoding="utf-8") as fh:
+                fh.writelines(gates_lines)
+            extended_gates_synced = True
+
 print(json.dumps({
     "written": plan["card_path"],
     "carried_forward_sidecar": plan["carried_sidecar_path"],
     "intent_slug": plan["intent_slug"],
     "ac_count": plan["ac_count"],
     "amendment_removed": amendment_removed,
+    "extended_gates_synced": extended_gates_synced,
 }))
 PY
 stage2_rc=$?
