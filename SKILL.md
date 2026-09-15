@@ -265,6 +265,30 @@ the dependent `needs_classification` and say which name failed. Ordering
 within a tick follows the same rule: never dispatch a dependent in the same
 tick as the PRD it waits on.
 
+**Shared resolution logic, gated before the slot (2026-09-15, PRD-build-
+select-guard-depends-before-slot).** "Unmet" is resolved by one function,
+`scripts/lib/depends-gate.sh`'s `depends_gate_unmet <prd-path> <built-prds-
+dir>` — `select-tick.sh`'s pre-filter above and any other call site
+(including a coordinator acting outside `select-tick.sh`'s composed
+pipeline) read the same definition, so two passes over the same PRD can
+never disagree about what "unmet" means. `select-guard.sh` itself now also
+evaluates this gate internally, before its own cap/same-target checks —
+not just before dispatch, before the SAME-TARGET SLOT is reserved. This
+closes the exact ordering bug the grounding incident hit (RedBaron ticks 6
+and 7, 2026-09-14): a same-target sibling with an unmet dependency,
+evaluated first by priority-then-path sort, returned `ok` from every check
+`select-guard.sh` ran at the time and burned the tick's one `build_into`
+slot, only to be refused afterward by a separate Depends-on pass — by
+which point a runnable, explicitly-prioritized sibling had nothing left to
+claim. A depends-on-gated call now returns `blocked: <slug>: gated:
+depends-on: <names>` and never touches admitted-targets state at all, and
+journals the literal line `select: <slug> gated (depends-on) slot-not-
+consumed` (the line a status sweep greps for — see
+`scripts/select-guard-selftest.sh`'s `selslot_*` fixtures for the
+contract). Priority-tie-break ordering among same-target candidates
+(fewest-unmet-deps-first, ahead of path) is tracked separately and not yet
+implemented — `deferred_acs: [3, 7]` on that PRD.
+
 **Classification bounce budget (2026-09-12, PRD-build-classification-self-
 heal).** `needs_classification` is already outside this phase's candidate
 pool by construction (only `in_progress`/`queued` are gathered below), so

@@ -67,15 +67,24 @@
 # Exit 1 + "blocked: <slug>: <reason>" dispatch MUST NOT happen this tick —
 #                                       reason names the busy claim (or
 #                                       cargo-bound skip, sub-cap, the
-#                                       BUILD_MAX_BRANCHES cap, or same-
-#                                       target) exactly as lane-predicate.sh
-#                                       reported it (or, for the cap/same-
-#                                       target checks, this script's own).
+#                                       BUILD_MAX_BRANCHES cap, same-target,
+#                                       or "gated: depends-on: <names>",
+#                                       PRD-build-select-guard-depends-
+#                                       before-slot, evaluated before every
+#                                       other check below) exactly as
+#                                       lane-predicate.sh reported it (or,
+#                                       for the cap/same-target/depends-on
+#                                       checks, this script's own). A
+#                                       depends-on gate never touches
+#                                       admitted-targets state — nothing it
+#                                       blocks ever consumes a slot.
 # Exit 4                               usage error / PRD file not found.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LANE_PREDICATE="$HERE/lane-predicate.sh"
+# shellcheck source=lib/depends-gate.sh
+source "$HERE/lib/depends-gate.sh"
 
 die() { echo "select-guard: $*" >&2; exit "${2:-4}"; }
 usage() { echo "usage: select-guard.sh <slug> [lane-name] [prd-dir] [branch-count] [admitted-targets]" >&2; exit 4; }
@@ -100,6 +109,27 @@ select_guard_journal_line() {
   printf '%s  select  %s  %s  (%s)\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$slug" "$outcome" "$detail" >>"$journal" 2>/dev/null || true
 }
 
+# select_guard_journal_gated — PRD-build-select-guard-depends-before-slot
+# requirement 4: a candidate refused by a skip-class gate (Depends-on today
+# — one that means the PRD cannot run this tick regardless of slots, as
+# opposed to the cap/same-target checks below which are about slot
+# availability) is journaled as one exact-format line so a status sweep can
+# grep for it without replaying the tick. Deliberately NOT timestamp-
+# prefixed like select_guard_journal_line above — this line's format is a
+# literal contract (requirement 4's AC asserts it with string equality).
+# Same override/isolation-guard.sh convention as select_guard_journal_line.
+select_guard_journal_gated() {
+  local slug="$1" reason="$2"
+  local journal="${SELECT_GUARD_JOURNAL:-$HOME/brain/journal/build/$(date -u +%Y-%m-%d).md}"
+  if [ -r "$HERE/isolation-guard.sh" ]; then
+    # shellcheck source=isolation-guard.sh
+    source "$HERE/isolation-guard.sh"
+    isolation_guard_path "$journal" "select-guard.sh"
+  fi
+  mkdir -p "$(dirname "$journal")" 2>/dev/null || return 0
+  printf 'select: %s gated (%s) slot-not-consumed\n' "$slug" "$reason" >>"$journal" 2>/dev/null || true
+}
+
 # Same build_into parser as lane-predicate.sh's read_field (PRD-build-
 # second-lane-carbon) — duplicated rather than sourced so this script's
 # own die/usage/main definitions never collide with lane-predicate.sh's.
@@ -120,6 +150,27 @@ main() {
   local prd="$prd_dir/build-queue/PRD-$slug.md"
   [ -f "$prd" ] || die "no such PRD in build-queue: $prd" 4
   [ -x "$LANE_PREDICATE" ] || die "lane-predicate.sh not found or not executable: $LANE_PREDICATE" 4
+
+  # Depends-on gate (PRD-build-select-guard-depends-before-slot requirement
+  # 1), evaluated before EVERY slot-pre-reservation check below (cap,
+  # same-target) — an unmet dependency is cheaper to check and more common
+  # in the failure record (2026-09-14 ticks 6/7) than the cap ever binding.
+  # Shared with anything standing in for the coordinator's own Depends-on
+  # check via scripts/lib/depends-gate.sh's depends_gate_unmet(), sourced
+  # above — one definition, so this call and the coordinator's can never
+  # disagree about what "unmet" means. On unmet, this returns WITHOUT
+  # touching admitted_targets/same_target_count logic at all: the whole
+  # point is that a gated candidate never spends the slot a runnable
+  # same-target sibling needs.
+  local built_prds_dir="$prd_dir/built-prds"
+  local unmet unmet_rc
+  unmet=$(depends_gate_unmet "$prd" "$built_prds_dir"); unmet_rc=$?
+  if [ "$unmet_rc" -ne 0 ]; then
+    local unmet_csv; unmet_csv=$(printf '%s' "$unmet" | tr '\n' ',' | sed 's/,$//')
+    select_guard_journal_gated "$slug" depends-on
+    echo "blocked: $slug: gated: depends-on: $unmet_csv"
+    exit 1
+  fi
 
   # BUILD_MAX_BRANCHES: unset/empty/non-positive-integer -> default 30
   # (preserves current unenforced-by-script behavior exactly).

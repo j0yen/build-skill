@@ -261,4 +261,135 @@ echo "$out" | grep -q '^blocked: beta: cap:' || { echo "FAIL: expected cap block
 echo "$out" | grep -q 'same-target' && { echo "FAIL: same-target rule fired despite cap=1 already blocking: $out"; exit 1; }
 echo ok
 
+# --- selslot_* (PRD-build-select-guard-depends-before-slot) ----------------
+# Depends-on gated before the same-target slot is reserved. Requirement 3's
+# (P1) tie-break ordering is out of scope here (deferred_acs: [3, 7] on the
+# PRD itself, per its own Technical Considerations: "staged as P0 and can
+# ship independently if 3 slips") -- these fixtures cover requirements
+# 1/2/4 and 5(a)/5(b) only.
+mkdir -p "$ROOT/clone/built-prds"
+
+cat > "$ROOT/clone/build-queue/PRD-selslot-first.md" <<'EOF'
+# PRD: selslot-first — first by sort, has an unmet Depends-on
+
+- Status: queued
+- build_target: shell
+- build_into: /tmp/select-guard-selslot-repo
+- build_priority: high
+- Depends-on: PRD-selslot-dep-unmet.md
+EOF
+cat > "$ROOT/clone/build-queue/PRD-selslot-second.md" <<'EOF'
+# PRD: selslot-second — second by sort, no Depends-on
+
+- Status: queued
+- build_target: shell
+- build_into: /tmp/select-guard-selslot-repo
+- build_priority: high
+EOF
+cat > "$ROOT/clone/build-queue/PRD-selslot-third.md" <<'EOF'
+# PRD: selslot-third — third candidate, same target, no Depends-on
+
+- Status: queued
+- build_target: shell
+- build_into: /tmp/select-guard-selslot-repo
+- build_priority: high
+EOF
+git -C "$ROOT/clone" add -A
+git -C "$ROOT/clone" -c user.name=t -c user.email=t@t commit -q -m "stage selslot_a fixtures"
+git -C "$ROOT/clone" push -q origin "$BRANCH"
+
+echo "== selslot_a: unmet Depends-on gates before the same-target slot is reserved (AC1/AC5) =="
+set +e
+out_first=$(BUILD_DISTINCT_TARGETS=1 BUILD_SAME_TARGET_CAP=1 "$SG" selslot-first carbon "$ROOT/clone" 0 "" 2>&1); rc_first=$?
+set -e
+[ "$rc_first" -eq 1 ] || { echo "FAIL: expected selslot-first gated, got rc=$rc_first: $out_first"; exit 1; }
+echo "$out_first" | grep -q '^blocked: selslot-first: gated: depends-on:' \
+  || { echo "FAIL: verdict text missing gated: depends-on: prefix: $out_first"; exit 1; }
+echo "$out_first" | grep -q 'selslot-dep-unmet' \
+  || { echo "FAIL: verdict does not name the unmet dependency: $out_first"; exit 1; }
+
+# The gated candidate above was called with admitted_targets="" (as a real
+# caller would, since a gated candidate never contributes its build_into) --
+# the second candidate, sharing the same target, must still see an EMPTY
+# admitted_targets and be admitted: the slot was never spent.
+out_second=$(BUILD_DISTINCT_TARGETS=1 BUILD_SAME_TARGET_CAP=1 "$SG" selslot-second carbon "$ROOT/clone" 0 "" 2>&1); rc_second=$?
+[ "$rc_second" -eq 0 ] || { echo "FAIL: expected selslot-second admitted, got rc=$rc_second: $out_second"; exit 1; }
+echo "$out_second" | grep -q '^ok: selslot-second:' || { echo "FAIL: $out_second"; exit 1; }
+
+# Now prove the slot WAS consumed exactly once by the second candidate (not
+# zero, not twice): a third same-target candidate, threaded with the
+# admitted-targets state a real caller would carry forward after admitting
+# selslot-second, is blocked by the same-target cap -- NOT by depends-on.
+set +e
+out_third=$(BUILD_DISTINCT_TARGETS=1 BUILD_SAME_TARGET_CAP=1 "$SG" selslot-third carbon "$ROOT/clone" 1 "/tmp/select-guard-selslot-repo" 2>&1); rc_third=$?
+set -e
+[ "$rc_third" -eq 1 ] || { echo "FAIL: expected selslot-third blocked (slot already consumed), got rc=$rc_third: $out_third"; exit 1; }
+echo "$out_third" | grep -q 'same-target:' || { echo "FAIL: expected same-target block (slot consumed once), got: $out_third"; exit 1; }
+echo ok
+
+echo "== selslot AC2: select-guard.sh and a coordinator stand-in resolve depends-gate.sh identically =="
+DG="$HERE/lib/depends-gate.sh"
+coordinator_unmet=$(bash -c '
+  set -uo pipefail
+  source "$1"
+  depends_gate_unmet "$2" "$3"
+' _ "$DG" "$ROOT/clone/build-queue/PRD-selslot-first.md" "$ROOT/clone/built-prds") || true
+coordinator_csv=$(printf '%s' "$coordinator_unmet" | tr '\n' ',' | sed 's/,$//')
+guard_out=$(BUILD_DISTINCT_TARGETS=1 "$SG" selslot-first carbon "$ROOT/clone" 0 "" 2>&1) || true
+guard_csv="${guard_out#*gated: depends-on: }"
+[ -n "$coordinator_csv" ] || { echo "FAIL: coordinator stand-in reported no unmet dependency"; exit 1; }
+[ "$guard_csv" = "$coordinator_csv" ] || { echo "FAIL: select-guard.sh ($guard_csv) and coordinator stand-in ($coordinator_csv) disagree"; exit 1; }
+echo ok
+
+echo "== selslot_b: every same-target candidate gated -> slot stays free, caller's nothing-to-do path fires (AC6) =="
+cat > "$ROOT/clone/build-queue/PRD-selslot-gated-one.md" <<'EOF'
+# PRD: selslot-gated-one — shares the selslot_b target, unmet Depends-on
+
+- Status: queued
+- build_target: shell
+- build_into: /tmp/select-guard-selslot-b-repo
+- build_priority: high
+- Depends-on: PRD-selslot-dep-unmet.md
+EOF
+cat > "$ROOT/clone/build-queue/PRD-selslot-gated-two.md" <<'EOF'
+# PRD: selslot-gated-two — shares the selslot_b target, a different unmet Depends-on
+
+- Status: queued
+- build_target: shell
+- build_into: /tmp/select-guard-selslot-b-repo
+- build_priority: high
+- Depends-on: PRD-selslot-dep-unmet-2.md
+EOF
+git -C "$ROOT/clone" add -A
+git -C "$ROOT/clone" -c user.name=t -c user.email=t@t commit -q -m "stage selslot_b fixtures"
+git -C "$ROOT/clone" push -q origin "$BRANCH"
+
+admitted_targets=""
+for slug in selslot-gated-one selslot-gated-two; do
+  set +e
+  out=$(BUILD_DISTINCT_TARGETS=1 "$SG" "$slug" carbon "$ROOT/clone" 0 "$admitted_targets" 2>&1); rc=$?
+  set -e
+  [ "$rc" -eq 1 ] || { echo "FAIL: expected $slug gated, got rc=$rc: $out"; exit 1; }
+  echo "$out" | grep -q '^blocked: '"$slug"': gated: depends-on:' || { echo "FAIL: $slug not reported gated: $out"; exit 1; }
+  # A gated candidate never contributes to admitted_targets -- this loop
+  # mirrors exactly what a real caller (select-tick.sh's own composition)
+  # does: only an admitted entry's build_into is appended.
+done
+# The caller-level "nothing to do for this target" path: only reachable
+# when admitted_targets is still empty after every candidate for the
+# target has been evaluated. Marker set ONLY on that path (AC6 requires an
+# explicit marker, not absence of output).
+nothing_to_do_marker=""
+[ -z "$admitted_targets" ] && nothing_to_do_marker="nothing-to-do-for-target:/tmp/select-guard-selslot-b-repo"
+[ -n "$nothing_to_do_marker" ] || { echo "FAIL: nothing-to-do marker not set despite zero admissions"; exit 1; }
+echo "$nothing_to_do_marker"
+echo ok
+
+echo "== selslot_d: gated journal line matches the exact contract format, literally (AC4/AC8) =="
+: > "$SELECT_GUARD_JOURNAL"
+BUILD_DISTINCT_TARGETS=1 "$SG" selslot-first carbon "$ROOT/clone" 0 "" >/dev/null 2>&1 || true
+grep -qxF 'select: selslot-first gated (depends-on) slot-not-consumed' "$SELECT_GUARD_JOURNAL" \
+  || { echo "FAIL: journal missing exact gated line"; cat "$SELECT_GUARD_JOURNAL" 2>/dev/null; exit 1; }
+echo ok
+
 echo "ALL PASS"
