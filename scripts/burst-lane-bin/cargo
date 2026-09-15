@@ -91,6 +91,13 @@ if [ -z "$REAL_CARGO" ]; then
   echo "burst-lane-bin/cargo: no real cargo found on PATH behind this shim" >&2
   exit 127
 fi
+# PRD-build-cargo-route-precedence: mark every child process tree from
+# here on as "already inside the burst shim" — cargo-budget-bin/cargo's
+# own real_cargo() checks this before deciding whether to hand off to
+# this shim, so a cargo call already routed through here (this exec, or
+# the remote/local `$REAL_CARGO` run below) never gets redirected back
+# into this shim a second time (no re-exec loop).
+export BURST_SHIM_ACTIVE=1
 
 route=0
 sub="${1:-}"

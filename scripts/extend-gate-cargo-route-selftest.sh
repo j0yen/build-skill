@@ -9,25 +9,32 @@
 # environment (tests/fixtures/burst-lane-fake, same fixtures
 # burst-lane-selftest.sh uses), then drives extend-gate.sh through:
 #
-#   AC1 — BURST_LANE=1, a fake active session, a fake real cargo placed
-#         FIRST on the inherited $PATH (no shim dir present at all): the
-#         gate's very first stdout line names the shim as the resolved
-#         cargo, and the fake real cargo's marker never records the ROUTED
-#         `cargo build` subcommand (it always records `cargo check` too —
-#         check/metadata are never routed BY DESIGN, so they're SUPPOSED
-#         to reach the real cargo directly; AC1's guarantee is about the
-#         routed subcommand only).
-#   AC3 — no session: the receipt's cargo_route reads intended=local,
-#         burst=0, and no route-mismatch line is journaled.
-#   AC4 — a fake session UP, but the shim forced BEHIND a fake real cargo
-#         (both already present on $PATH, real cargo first — the guard's
-#         self-arming only fires when NEITHER shim dir is present, so an
-#         already-shadowed shim stays shadowed, exactly the pre-fix
-#         2026-09-10 defect reproduced structurally): the journal gets one
-#         `gate  route-mismatch  (intended=burst ...)` line, the
-#         gate-cargo-route probe's last emission is dirty/mismatch, and the
-#         gate VERDICT is unchanged from the same run without the forcing
-#         (a route mismatch is a journaled guard event, never a block).
+#   AC1 — BUILD_BURST_ENABLED=1 + BURST_LANE=1, a fake active session, a
+#         fake real cargo placed FIRST on the inherited $PATH (no shim dir
+#         present at all): the gate's very first stdout line names
+#         cargo-budget-bin as the resolved cargo (PRD-build-cargo-route-
+#         precedence: cargo-budget-bin is now always the outermost/first-
+#         resolved entry, chaining internally to the burst shim), and the
+#         fake real cargo's marker never records the ROUTED `cargo build`
+#         subcommand (it always records `cargo check` too — check/metadata
+#         are never routed BY DESIGN, so they're SUPPOSED to reach the
+#         real cargo directly; AC1's guarantee is about the routed
+#         subcommand only).
+#   AC3 — no session (and no BUILD_BURST_ENABLED for the gate call itself
+#         — deliberately never opted in): the receipt's cargo_route reads
+#         intended=local, burst=0, and no route-mismatch line is
+#         journaled.
+#   AC4 — a fake session UP, and a fake real cargo forced ahead of BOTH
+#         shim dirs on the inherited $PATH — pre-PRD-build-cargo-route-
+#         precedence this shadowed the shim (the old guard only self-armed
+#         when NEITHER shim dir was present at all) and was merely
+#         detected after the fact. The rewritten guard now unconditionally
+#         re-arms the correct prefix ahead of everything, so this
+#         construction never reaches route-check as a mismatch at all:
+#         no route-mismatch line is journaled, the gate-cargo-route
+#         probe's last emission is clean, cargo_route.local stays 0, and
+#         the gate VERDICT is unchanged from the same run without the
+#         forcing either way.
 #   AC5 — every gate journal line (forced or not) carries
 #         `cargo=burst:<n>/local:<n>` with counts equal to the receipt's.
 #   AC6 — two gates against two DIFFERENT disposable repos each end up with
@@ -275,6 +282,19 @@ printf '0.10 0.08 0.05 1/200 12345\n' > "$CARGO_BUDGET_FAKE_LOADAVG"
 # before its recursion-hazard eval (see header), and the CARGO_BUDGET_*
 # vars above isolate every producer phase's cargo-budget.sh call from real
 # host state (see note above).
+#
+# PRD-build-cargo-route-precedence: BUILD_BURST_ENABLED=1 here (not just on
+# the separate `up` calls below) is what scripts/lib/cargo-route.sh's
+# burst_configured() now requires before extend-gate.sh's own PATH guard
+# (or run_unslotted_producer(), or burst-lane.sh route-check) will treat
+# burst as the declared policy at all — the legacy per-invocation
+# BURST_LANE=1 flag some scenarios below still set is burst-lane-bin/
+# cargo's OWN separate "should I actually attempt to route THIS call"
+# decision, unaffected by and unrelated to this. Safe to set for every
+# scenario including AC3 (no session): AC3's `intended` (extend-gate.sh's
+# own route_intended, cargo_route.intended in the receipt) comes from
+# whether a session is ACTIVE (`status --json`), never from whether burst
+# is merely configured, so AC3 stays intended=local exactly as before.
 COMMON_EXTEND_GATE_ENV=(
   "REVIEWER_PROMPT=/nonexistent/extend-gate-cargo-route-selftest-reviewer-prompt.md"
   "EXTEND_GATE_JOURNAL=$T/gate-journal.md"
@@ -285,6 +305,7 @@ COMMON_EXTEND_GATE_ENV=(
   "CARGO_BUDGET_LOADAVG=$CARGO_BUDGET_FAKE_LOADAVG"
   "CARGO_BUDGET_HOSTNAME=not-redbaron"
   "CARGO_BUDGET_SCCACHE_ASSERT=0"
+  "BUILD_BURST_ENABLED=1"
 )
 
 TIMEOUT_S="${EXTEND_GATE_CARGO_ROUTE_SELFTEST_TIMEOUT:-90}"
@@ -318,8 +339,14 @@ ac1_rc=$?
 
 expect "AC1: gate completed (not a hang/timeout)" "[ $ac1_rc -ne 124 ] && [ $ac1_rc -ne 137 ]"
 first_line="$(head -1 "$ac1_out")"
-expect "AC1: the very first stdout line names the shim as resolved cargo" \
-  "[[ \"\$first_line\" == extend-gate:\ cargo=*burst-lane-bin/cargo ]]"
+# PRD-build-cargo-route-precedence: cargo-budget-bin is now ALWAYS the
+# outermost/first-resolved entry in the chain (accounting must see every
+# call, routed to the box or not — requirement 1's cargo_route_path_
+# prefix()) — it hands off internally to burst-lane-bin/cargo whenever
+# burst is configured, rather than the PATH literally resolving straight
+# to burst-lane-bin/cargo the way the pre-this-PRD guard arranged.
+expect "AC1: the very first stdout line names cargo-budget-bin as resolved cargo (chains internally to the burst shim)" \
+  "[[ \"\$first_line\" == extend-gate:\ cargo=*cargo-budget-bin/cargo ]]"
 echo "  first line: $first_line"
 # The audit.sh fixture calls both `cargo build` (routed — must reach the
 # shim, never the fake real cargo directly) and `cargo check` (always
@@ -354,13 +381,22 @@ expect "AC3: cargo_route.burst=0" "[ \"\$(route_field \"$cache3\" .cargo_route.b
 expect "AC3: no route-mismatch line journaled" "! grep -q 'gate  route-mismatch' \"$T/gate-journal.md\""
 
 # =========================================================================
-# AC4 (+ AC5) — mismatch: shim present but forced BEHIND a fake real cargo,
-# active session up. The verdict must be unchanged from the same run
-# without the forcing (compare against AC3's own verdict summary, since
-# AC3's fixture ran with no session and a correctly-ordered PATH — the
-# mismatch itself must never alter pass/block accounting).
+# AC4 (+ AC5) — a fake real cargo forced ahead of the shim dirs, active
+# session up. PRD-build-cargo-route-precedence requirement 2 rewrote
+# extend-gate.sh's own PATH guard from "self-arm only when NEITHER shim
+# dir is present" to "always arm the correct prefix, unconditionally,
+# ahead of everything" — so the exact shadow this fixture constructs
+# (fake real cargo dir first, shim dirs behind it) is now fixed BEFORE
+# route-check ever runs, not merely detected after the fact. This is the
+# defect this whole PRD exists to close, reproduced here as a regression
+# check: intended=burst must still show local=0 (nothing silently ran
+# local), no route-mismatch line, and the verdict is unchanged from the
+# same run without the forcing (compare against AC3's own verdict
+# summary, since AC3's fixture ran with no session and a correctly-
+# ordered PATH — the forcing must never alter pass/block accounting
+# either way, mismatch-prevented or not).
 # =========================================================================
-echo "=== AC4: shim shadowed by a fake real cargo, session up -> route-mismatch ==="
+echo "=== AC4: fake real cargo forced ahead of both shim dirs, session up -> guard fixes it, no mismatch ==="
 REPO4="$T/repo-ac4"
 build_fixture "$REPO4" "gateroute-ac4"
 HEAD4="$(git -C "$REPO4" rev-parse HEAD)"
@@ -370,11 +406,11 @@ BUILD_BURST_ENABLED=1 PATH="$FAKE:$PATH" "$HERE/burst-lane.sh" up >/dev/null 2>&
 
 rm -f "$FAKE_CARGO_MARKER"
 ac4_out="$T/ac4.log"
-# Fake real cargo dir FIRST, shim dir SECOND (both already present — the
-# guard's self-arming only fires when NEITHER shim dir is on $PATH, so an
-# already-present-but-shadowed shim is left exactly as shadowed as the
-# caller put it — this is the "guard is a re-shadow guard, not an order
-# fixer" behavior the extend-gate.sh header itself documents).
+# Fake real cargo dir FIRST, shim dir SECOND — pre-this-PRD this shadowed
+# the shim (the guard only self-armed when NEITHER shim dir was present at
+# all); now the guard unconditionally re-arms the correct prefix at the
+# very front regardless of what the caller already put there, so this
+# construction no longer reaches route-check as a mismatch at all.
 env "${COMMON_EXTEND_GATE_ENV[@]}" \
   PATH="$FAKEBIN:$HERE/burst-lane-bin:$FAKE:$PATH" BURST_LANE=1 \
   timeout -k 5 "$TIMEOUT_S" "$EXTEND_GATE" "$REPO4" --head "$HEAD4" --force >"$ac4_out" 2>&1
@@ -387,22 +423,22 @@ expect "AC4: produced a gate verdict line" "[ -n \"$line4\" ]"
 # Same fixture SHAPE as AC3 (identical Cargo.toml/src/tests/intent-card
 # content, different crate name only) -> the receipts=/pass=/block=
 # portion of the summary (everything after "head=...") must match,
-# proving the mismatch never altered pass/block accounting (requirement
-# 4's own "the verdict is unchanged" — Non-goals: "never a block").
+# proving the forcing never altered pass/block accounting either way.
 verdict_shape() { sed -E 's/^gate: head=[^ ]+/gate: head=X/' <<<"$1"; }
 expect "AC4: verdict shape (receipts/pass/block/verdict) matches the unforced run" \
   "[ \"\$(verdict_shape \"$line4\")\" = \"\$(verdict_shape \"$line3\")\" ]"
 echo "  ac3 (unforced): $line3"
 echo "  ac4 (forced):   $line4"
 
-expect "AC4: journal has one gate route-mismatch line naming shim-not-first" \
-  "grep -q 'gate  route-mismatch  (intended=burst .*cause=shim-not-first)' \"$T/gate-journal.md\""
-expect "AC4: probe ledger's last gate-cargo-route emission is dirty (this probe's mismatch state)" \
-  "[ \"\$(jq -c 'select(.probe==\"gate-cargo-route\")' \"$BUILD_STATE_DIR/probes/ledger.jsonl\" 2>/dev/null | tail -1 | jq -r .state 2>/dev/null)\" = dirty ]"
+expect "AC4: NO gate route-mismatch line — the guard fixed the shadow before route-check ran" \
+  "! grep -q 'gate  route-mismatch' \"$T/gate-journal.md\""
+expect "AC4: probe ledger's last gate-cargo-route emission is clean (guard prevented the shadow)" \
+  "[ \"\$(jq -c 'select(.probe==\"gate-cargo-route\")' \"$BUILD_STATE_DIR/probes/ledger.jsonl\" 2>/dev/null | tail -1 | jq -r .state 2>/dev/null)\" = clean ]"
 
 cache4="$REPO4/target/autobuilder/last-verdict.json"
 expect "AC4: cargo_route.intended=burst" "[ \"\$(route_field \"$cache4\" .cargo_route.intended)\" = burst ]"
-expect "AC4: cargo_route.local > 0" "[ \"\$(route_field \"$cache4\" .cargo_route.local)\" -gt 0 ]"
+expect "AC4: cargo_route.local=0 — the forced-shadow PATH never actually ran anything local" \
+  "[ \"\$(route_field \"$cache4\" .cargo_route.local)\" = 0 ]"
 
 # ---- AC5 — every journal line above carries cargo=burst:<n>/local:<n>
 # with counts equal to the receipt's (checked on both AC3's local-only run
@@ -448,7 +484,7 @@ HEAD2="$(git -C "$REPO2" rev-parse HEAD)"
 setup_fake_burst_env ac2
 BUILD_BURST_ENABLED=1 PATH="$FAKE:$PATH" "$HERE/burst-lane.sh" up >/dev/null 2>&1
 
-mismatch_count_before="$(grep -c 'gate  route-mismatch' "$T/gate-journal.md" 2>/dev/null || echo 0)"
+mismatch_count_before="$(grep -c 'gate  route-mismatch' "$T/gate-journal.md" 2>/dev/null)"; mismatch_count_before="${mismatch_count_before:-0}"
 ac2_out="$T/ac2.log"
 env "${COMMON_EXTEND_GATE_ENV[@]}" \
   PATH="$HERE/burst-lane-bin:$FAKEBIN:$FAKE:$PATH" BURST_LANE=1 \
@@ -464,7 +500,7 @@ local2="$(route_field "$cache2" .cargo_route.local)"
 echo "  repo2 cargo_route: burst=$burst2 local=$local2"
 expect "AC2: at least one cargo call was decided burst (the shim actually routed, not silently local)" "[ \"${burst2:-0}\" -gt 0 ]"
 expect "AC2: local stayed 0 — a correctly-armed shim never silently falls local (no mismatch)" "[ \"${local2:-1}\" = 0 ]"
-mismatch_count_after="$(grep -c 'gate  route-mismatch' "$T/gate-journal.md" 2>/dev/null || echo 0)"
+mismatch_count_after="$(grep -c 'gate  route-mismatch' "$T/gate-journal.md" 2>/dev/null)"; mismatch_count_after="${mismatch_count_after:-0}"
 expect "AC2: no NEW route-mismatch line was journaled by this (correctly-armed) run" "[ \"$mismatch_count_after\" -eq \"$mismatch_count_before\" ]"
 
 # =========================================================================

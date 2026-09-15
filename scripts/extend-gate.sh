@@ -104,8 +104,10 @@
 #      the contending pid(s) ("producer-lock-contended, pid=<n>[,<n>...]"),
 #      is refused before any producer ran, and never emits a `gate: ...
 #      pass=.../block=...` verdict line — fail-closed, not fail-wrong.
-#   5  --head <sha> does not match actual HEAD — refused before any
-#      producer ran
+#   5  --head <sha> (abbreviated SHAs accepted — resolved via `git
+#      rev-parse --verify <sha>^{commit}` and compared full-SHA-to-
+#      full-SHA) does not resolve, or resolves to something other than
+#      actual HEAD — refused before any producer ran
 #   6  could not resolve a unique Cargo project root under <build_into>
 #      (none found, or more than one candidate) — refused before any
 #      producer ran
@@ -119,6 +121,13 @@
 #      e.g. a test HOME with no checked-out canonical crate — since this
 #      guard is about staleness, not about requiring the canonical source
 #      to exist on every box that runs a gate.
+#   8  cargo route mismatch that self-heal could not fix — burst was
+#      intended (a session is up) but no cargo shim is reachable on this
+#      process's own $PATH even after burst-lane.sh route-check tried
+#      prepending the correct prefix (PRD-build-cargo-route-precedence,
+#      requirement 3) — refused before any producer ran, rather than
+#      running the whole producer sequence locally and reporting a
+#      verdict that never touched the box it was supposed to.
 #
 # --record-baseline: runs the full producer sequence exactly as a normal
 # invocation, then instead of computing a delta verdict, writes
@@ -171,45 +180,41 @@
 set -uo pipefail
 BUILD_SCRIPTS="$(cd "$(dirname "$0")" && pwd)"
 
-# --- PATH order guard (P0 requirement 1, PRD-build-gate-cargo-route-attest) --
+# --- PATH order guard (P0 requirement 1, PRD-build-gate-cargo-route-attest;
+#     rewritten under PRD-build-cargo-route-precedence) -------------------
 # Previously this unconditionally prepended the real cargo/local-bin dirs
 # ahead of whatever $PATH the caller armed, silently shadowing the
 # burst-lane shim (scripts/burst-lane-bin/cargo) even when a caller had
 # already exported it first per SKILL.md's "mixed-tick burst routing"
 # section — the root cause of 53 autobuilder loops + 34 gate `cargo test`
 # runs all landing on RedBaron on 2026-09-10 while casper sat idle at 3%
-# utilization for EUR9.59. Now: $HOME/.cargo/bin and $HOME/.local/bin are
-# APPENDED (never prepended), so any shim directory the caller already
-# armed ahead of them on $PATH stays ahead. If BURST_LANE=1 and NEITHER
-# shim directory (burst-lane-bin, cargo-budget-bin) is already anywhere on
-# the inherited $PATH, this script arms burst-lane-bin itself, so a caller
-# that merely sets BURST_LANE=1 without separately exporting $PATH still
-# routes (AC1) — it does not reorder an already-present-but-shadowed shim
-# (see the route-check call below for that case; requirement 1 is a guard
-# against re-shadowing, not a guarantee of correct ordering the caller
-# already got wrong). The resolved cargo path is logged once, right here,
+# utilization for EUR9.59. That fix then regressed the SAME way on
+# 2026-09-15: the guard only self-armed under the legacy per-invocation
+# `BURST_LANE=1` flag, which had drifted from whether a burst box was
+# actually configured, so a gate ran `cargo test` locally while a real box
+# was up (166 route=local vs 49 route=burst that day). Now: this guard
+# ALWAYS arms scripts/lib/cargo-route.sh's own cargo_route_export_path()
+# (single source of truth, shared with run_unslotted_producer() below and
+# with burst-lane.sh's own route-check), which prepends cargo-budget-bin
+# (always) and burst-lane-bin (only when burst_configured — never the
+# legacy flag alone) — idempotent, so a caller that already exported the
+# same prefix ahead of everything else keeps it exactly where it was.
+# $HOME/.cargo/bin and $HOME/.local/bin stay APPENDED (never prepended),
+# so nothing this guard adds, or the caller already armed, is ever
+# shadowed by them. The resolved cargo path is logged once, right here,
 # before any producer — before even repo validation — runs.
-_extend_gate_path_has_dir() {  # $1=dir -> rc0 if present on $PATH (resolved, order-independent)
-  local want resolved d saved_ifs
-  want="$(cd "$1" 2>/dev/null && pwd -P || true)"
-  [ -n "$want" ] || return 1
-  saved_ifs="$IFS"; IFS=:
-  for d in $PATH; do
-    IFS="$saved_ifs"
-    [ -n "$d" ] || continue
-    resolved="$(cd "$d" 2>/dev/null && pwd -P || true)"
-    if [ "$resolved" = "$want" ]; then IFS="$saved_ifs"; return 0; fi
-  done
-  IFS="$saved_ifs"
-  return 1
-}
-if [ "${BURST_LANE:-0}" = "1" ] \
-   && ! _extend_gate_path_has_dir "$BUILD_SCRIPTS/burst-lane-bin" \
-   && ! _extend_gate_path_has_dir "$BUILD_SCRIPTS/cargo-budget-bin"; then
-  export PATH="$BUILD_SCRIPTS/burst-lane-bin:$PATH"
+CARGO_ROUTE_LIB="$BUILD_SCRIPTS/lib/cargo-route.sh"
+if [ -r "$CARGO_ROUTE_LIB" ]; then
+  # shellcheck source=lib/cargo-route.sh
+  source "$CARGO_ROUTE_LIB"
+  cargo_route_export_path
+else
+  # Fails open (never blocks the gate) if the lib is missing — same
+  # convention as every other sourced helper in this script — but the
+  # route is then whatever the caller's own $PATH already resolves.
+  :
 fi
 export PATH="$PATH:$HOME/.cargo/bin:$HOME/.local/bin"
-unset -f _extend_gate_path_has_dir
 _extend_gate_resolved_cargo="$(command -v cargo 2>/dev/null || true)"
 echo "extend-gate: cargo=${_extend_gate_resolved_cargo:-not-found}"
 
@@ -294,21 +299,26 @@ cargo_budgeted() {
 # that let an agent-driven, mostly-idle phase hold a slot for up to an
 # hour (the 2026-09-13 incident: one hold at peak_load=0.83, no compiler
 # running, while 20 other cargo invocations elsewhere timed out on the 2
-# slots this budgets). Instead the producer runs UNSLOTTED, with
-# cargo-budget-bin FIRST on $PATH (so every real `cargo test`/`clippy`/
-# `deny`/`nextest`/`build --release` call it shells to takes its own slot
-# for exactly its own duration — see cargo-budget.sh) and
-# CARGO_BUDGET_PARENT_STEP set so each of those slots' ledger rows records
-# which producer spawned it. The `VAR=val PATH=... cmd` prefix form here
-# scopes both to this one command's own process tree — it never mutates
-# this script's own $PATH/env for any later phase.
-CARGO_BUDGET_BIN_DIR="${CARGO_BUDGET_BIN_DIR:-$BUILD_SCRIPTS/cargo-budget-bin}"
+# slots this budgets). Instead the producer runs UNSLOTTED, with the SAME
+# PATH prefix cargo_route_path_prefix() gives the guard above FIRST on
+# $PATH (so every real `cargo test`/`clippy`/`deny`/`nextest`/`build
+# --release` call it shells to takes its own slot for exactly its own
+# duration — see cargo-budget.sh — and, when burst is configured, still
+# gets a chance to route to the box) and CARGO_BUDGET_PARENT_STEP set so
+# each of those slots' ledger rows records which producer spawned it.
+# PRD-build-cargo-route-precedence requirement 2: this MUST be the same
+# prefix burst-lane.sh's route-check attests against (both call the same
+# helper) — a producer PATH that drifted from what the probe checks is
+# exactly how the 2026-09-15 defect went unnoticed. The `VAR=val PATH=...
+# cmd` prefix form here scopes both to this one command's own process
+# tree — it never mutates this script's own $PATH/env for any later phase.
 run_unslotted_producer() {  # $1=parent-step name, then the producer command
   local step="$1"; shift
   if [ -x "$BURST_LANE_SH" ]; then
     "$BURST_LANE_SH" ensure-fresh "$repo" >/dev/null 2>&1 || true
   fi
-  PATH="$CARGO_BUDGET_BIN_DIR:$PATH" CARGO_BUDGET_PARENT_STEP="$step" "$@"
+  PATH="$(cargo_route_path_prefix 2>/dev/null || echo "$BUILD_SCRIPTS/cargo-budget-bin"):$PATH" \
+    CARGO_BUDGET_PARENT_STEP="$step" "$@"
 }
 
 die() { echo "extend-gate: $2" >&2; exit "$1"; }
@@ -779,8 +789,23 @@ fi
 
 # --- refuse a --head that doesn't match actual HEAD, before any producer
 #     runs (AC3) --------------------------------------------------------
-if [ -n "$head_want" ] && [ "$head_want" != "$head_now" ]; then
-  die 5 "refusing — HEAD is $head_now, --head asked for $head_want"
+# PRD-build-cargo-route-precedence requirement 4: --head now accepts an
+# abbreviated SHA — resolved via `git rev-parse --verify <arg>^{commit}`
+# (the `^{commit}` peels a tag/other object down to its commit, and
+# --verify makes an unresolvable ref a clean failure instead of printing
+# git's own error text) and compared as FULL SHAs against $head_now,
+# never as raw strings (a bare prefix compared string-wise against a full
+# SHA would always "mismatch" even when it names the exact same commit).
+# An unresolvable --head value refuses the same as a genuine mismatch —
+# the caller gave a ref this repo doesn't have, which is exactly as
+# unsafe to proceed on as one that names the wrong commit.
+if [ -n "$head_want" ]; then
+  head_want_resolved="$(git -C "$repo" rev-parse --verify "${head_want}^{commit}" 2>/dev/null || true)"
+  if [ -z "$head_want_resolved" ]; then
+    die 5 "refusing — HEAD is $head_now, --head asked for $head_want (does not resolve to a commit in $repo)"
+  elif [ "$head_want_resolved" != "$head_now" ]; then
+    die 5 "refusing — HEAD is $head_now, --head asked for $head_want_resolved (given as $head_want)"
+  fi
 fi
 
 # --- verdict cache (PRD-build-gate-delta-baseline P1; TREE-keyed since
@@ -871,7 +896,19 @@ if [ -x "$BURST_LANE_SH" ]; then
   # postcondition below still sees the failure even in the full-bypass
   # case where the shim never runs at all to log anything about itself —
   # the exact "shim forced behind a fake real cargo" fixture (AC4).
-  "$BURST_LANE_SH" route-check --repo "$repo" >&2 || true
+  #
+  # PRD-build-cargo-route-precedence requirement 3: this is now a HARD
+  # pre-flight gate, not just an attestation seed. route-check self-heals
+  # a resolvable mismatch on its own (exit 0, journals "route healed");
+  # an UNHEALABLE mismatch (the shim genuinely missing/broken, not just
+  # shadowed) exits with its own distinct rc (9 — see burst-lane.sh's
+  # cmd_route_check header) and this gate refuses before any producer
+  # runs, rather than proceeding to a misleading local verdict.
+  route_check_rc=0
+  "$BURST_LANE_SH" route-check --repo "$repo" >&2 || route_check_rc=$?
+  if [ "$route_check_rc" -eq 9 ]; then
+    die 8 "refusing — cargo route mismatch (burst intended, no cargo shim reachable even after self-heal; see burst-lane.sh route-check --repo $repo and $HOME/brain/journal/build/burst-lane.log) — no producer ran"
+  fi
 fi
 
 t0=$(date +%s)

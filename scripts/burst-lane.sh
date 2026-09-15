@@ -4130,30 +4130,50 @@ for r in json.loads(sys.argv[1]):
   exit 0
 }
 
-# ---- route-check (PRD-build-gate-cargo-route-attest) ------------------------
+# ---- route-check (PRD-build-gate-cargo-route-attest; self-heal +
+#      hard-fail added by PRD-build-cargo-route-precedence) ------------------
 # Attests whether a `cargo` call made under the CURRENT $PATH — the same
 # $PATH a cargo-invoking producer inherits from its caller — would actually
-# reach the burst-lane shim (scripts/burst-lane-bin/cargo) or silently fall
-# straight through to a real cargo ahead of it on PATH (the exact 2026-09-10
-# defect: extend-gate.sh re-prepending $HOME/.cargo/bin ahead of an
-# already-armed shim, so 53 autobuilder loops + 34 gate `cargo test` runs
-# all landed on RedBaron with casper idle). `intended` mirrors extend-
-# gate.sh's own definition: burst iff `status --json` reports an active
-# session RIGHT NOW; local otherwise. `resolved` is `command -v cargo`
-# under THIS process's own $PATH — the same resolution a real `cargo test`
-# call would get. `state` is clean when intended=local (nothing to route)
-# or resolved IS the shim; mismatch when intended=burst and resolved is
-# something else (the shim is present but shadowed, or entirely absent
-# from PATH — same observable symptom either way: the box never sees this
-# run); could-not-check when no cargo resolves at all. On mismatch, also
-# appends one synthetic route-log line (decision=local cause=shim-not-first)
-# to $BURST_ROUTE_LOG when that env var is set, so a caller scanning the
-# route log for local-decision causes (extend-gate.sh's own postcondition)
-# still sees this failure mode even though the shim itself never ran to log
-# anything about itself. Emits the shared three-state probe `gate-cargo-
-# route` (dirty for mismatch — the library only knows clean/dirty/could-
-# not-check; "mismatch" is this probe's own name for its dirty state, named
-# in the printed line and journal below).
+# reach the correct entry point (cargo-budget-bin/cargo, or burst-lane-
+# bin/cargo — see cargo-route.sh's cargo_route_path_prefix(): BOTH are
+# "clean" when burst is configured, since cargo-budget-bin now chains to
+# the burst shim internally) or silently fall straight through to a real
+# cargo ahead of them on PATH (the 2026-09-10 defect: extend-gate.sh
+# re-prepending $HOME/.cargo/bin ahead of an already-armed shim; recurred
+# 2026-09-15 as a legacy-flag/policy drift: 166 route=local vs 49
+# route=burst in one day while a box was actually up). `intended` mirrors
+# extend-gate.sh's own definition: burst iff `status --json` reports an
+# active session RIGHT NOW; local otherwise. `resolved` is `command -v
+# cargo` under THIS process's own $PATH. `state`:
+#   clean            burst not configured (nothing this probe polices —
+#                     no journal lines at all), OR intended=local, OR
+#                     resolved already lands in the correct chain.
+#   healed            intended=burst, resolved was NOT in the correct
+#                     chain, but prepending cargo_route_path_prefix()
+#                     would fix it (the shim exists, just shadowed) —
+#                     journaled ONCE per gate (dedup on $BURST_ROUTE_LOG's
+#                     own content, truncated fresh per gate), never fatal.
+#   mismatch          intended=burst, resolved is wrong, AND self-heal
+#                     couldn't fix it either (the shim itself is
+#                     missing/broken, not just shadowed) — journaled
+#                     UNCONDITIONALLY to the shared burst-lane journal
+#                     (never only under $BURST_ROUTE_LOG), and this
+#                     function exits 9 (documented, distinct from every
+#                     other burst-lane.sh subcommand's exit code) so a
+#                     caller (extend-gate.sh) refuses before any producer
+#                     runs instead of proceeding to a misleading local
+#                     verdict.
+#   could-not-check   no cargo resolves on $PATH at all.
+# On mismatch (only), also appends one synthetic route-log line
+# (decision=local cause=shim-not-first) to $BURST_ROUTE_LOG when that env
+# var is set, so a caller scanning the route log for local-decision causes
+# (extend-gate.sh's own postcondition) still sees this failure mode even
+# though the shim itself never ran to log anything about itself. Emits the
+# shared three-state probe `gate-cargo-route` (dirty for mismatch — the
+# library only knows clean/dirty/could-not-check; "mismatch" is this
+# probe's own name for its dirty state, named in the printed line and
+# journal below; "healed" still emits probe state clean — it is not a
+# guard event by the time this function returns, the route DID resolve).
 cmd_route_check() {
   local repo="$PWD"
   while [ $# -gt 0 ]; do
@@ -4162,42 +4182,130 @@ cmd_route_check() {
       *) echo "usage: burst-lane.sh route-check [--repo <path>]" >&2; exit 2 ;;
     esac
   done
+
+  # shellcheck disable=SC1091
+  if [ -r "$HERE/lib/cargo-route.sh" ]; then
+    source "$HERE/lib/cargo-route.sh"
+  else
+    burst_configured() { return 1; }
+    cargo_route_path_prefix() { printf '%s' "$HERE/cargo-budget-bin"; }
+  fi
+
   local shim="$HERE/burst-lane-bin/cargo"
   local status_json intended="local"
   status_json="$("$0" status --json 2>/dev/null || true)"
   case "$status_json" in *'"active":true'*) intended="burst" ;; esac
 
-  local resolved resolved_dir shim_dir
+  local resolved resolved_dir
   resolved="$(command -v cargo 2>/dev/null || true)"
   resolved_dir=""
   [ -n "$resolved" ] && resolved_dir="$(cd "$(dirname "$resolved")" 2>/dev/null && pwd -P || true)"
-  shim_dir="$(cd "$(dirname "$shim")" 2>/dev/null && pwd -P || true)"
+
+  # Nothing configured at all -> this probe has no policy to check against
+  # (test-suite AC "burst not configured -> no route lines"): never
+  # journals, never emits the probe, always clean.
+  if ! burst_configured; then
+    printf 'route: intended=%s resolved=%s shim=%s state=clean\n' \
+      "$intended" "${resolved:-none}" "$shim"
+    exit 0
+  fi
+
+  local prefix; prefix="$(cargo_route_path_prefix)"
+  # _route_check_is_chain_dir <dir> -> rc0 if <dir> resolves to one of the
+  # dirs cargo_route_path_prefix() names (cargo-budget-bin always;
+  # burst-lane-bin too, since burst is configured in this branch) — either
+  # is "clean": cargo-budget-bin now chains internally to the burst shim
+  # (PRD-build-cargo-route-precedence requirement 1), so a caller resolving
+  # straight to cargo-budget-bin is exactly as correct as resolving
+  # straight to burst-lane-bin.
+  _route_check_is_chain_dir() {
+    local d="$1" want saved_ifs
+    [ -n "$d" ] || return 1
+    saved_ifs="$IFS"; IFS=:
+    for want in $prefix; do
+      IFS="$saved_ifs"
+      [ -n "$want" ] || continue
+      want="$(cd "$want" 2>/dev/null && pwd -P || true)"
+      if [ -n "$want" ] && [ "$d" = "$want" ]; then IFS="$saved_ifs"; return 0; fi
+    done
+    IFS="$saved_ifs"
+    return 1
+  }
 
   local state cause=""
   if [ -z "$resolved" ]; then
     state="could-not-check"
-  elif [ "$intended" = "burst" ] && [ -n "$shim_dir" ] && [ "$resolved_dir" != "$shim_dir" ]; then
+  elif [ "$intended" = "burst" ] && ! _route_check_is_chain_dir "$resolved_dir"; then
     state="mismatch"; cause="shim-not-first"
   else
     state="clean"
   fi
 
-  if [ "$state" = "mismatch" ] && [ -n "${BURST_ROUTE_LOG:-}" ]; then
-    mkdir -p "$(dirname "$BURST_ROUTE_LOG")" 2>/dev/null || true
-    (
-      flock -w 2 205 2>/dev/null || exit 0
-      printf '%s %s - local %s %s\n' "$(now_iso)" "$$" "$cause" "$repo" >&205
-    ) 205>>"$BURST_ROUTE_LOG" 2>/dev/null || true
+  if [ "$state" = "mismatch" ]; then
+    # --- self-heal (requirement 3): would prepending the SAME prefix a
+    # correctly-armed caller uses actually resolve cargo into the correct
+    # chain? This never mutates the CALLER's own $PATH — route-check runs
+    # as a separate process (see cargo-route.sh's own header) — it only
+    # distinguishes a healable shadow (the shim exists, just behind
+    # something else on $PATH) from a genuinely missing/broken shim.
+    local healed_resolved healed_dir
+    healed_resolved="$(PATH="$prefix:$PATH" command -v cargo 2>/dev/null || true)"
+    healed_dir=""
+    [ -n "$healed_resolved" ] && healed_dir="$(cd "$(dirname "$healed_resolved")" 2>/dev/null && pwd -P || true)"
+    if [ -n "$healed_dir" ] && _route_check_is_chain_dir "$healed_dir"; then
+      state="healed"
+    fi
   fi
 
   case "$state" in
-    clean)           probe_emit gate-cargo-route clean "intended=$intended resolved=${resolved:-none}" >/dev/null ;;
-    mismatch)        probe_emit gate-cargo-route dirty "route-mismatch intended=$intended resolved=${resolved:-none} shim=$shim cause=$cause" >/dev/null ;;
-    could-not-check) probe_emit gate-cargo-route could-not-check "no cargo resolved on \$PATH" >/dev/null ;;
+    clean)
+      probe_emit gate-cargo-route clean "intended=$intended resolved=${resolved:-none}" >/dev/null
+      ;;
+    healed)
+      # Journaled once per gate: dedup by checking whether THIS gate's own
+      # route log ($BURST_ROUTE_LOG, truncated fresh per gate per
+      # PRD-build-gate-cargo-route-attest requirement 2) already carries a
+      # "route healed" line before writing another.
+      if [ -z "${BURST_ROUTE_LOG:-}" ] || [ ! -f "$BURST_ROUTE_LOG" ] \
+         || ! grep -q 'route healed' "$BURST_ROUTE_LOG" 2>/dev/null; then
+        journal_line "$(now_iso)  burst-lane  route  healed  (intended=$intended resolved=${resolved:-none} shim=$shim cause=shim-not-first repo=$repo)"
+      fi
+      if [ -n "${BURST_ROUTE_LOG:-}" ]; then
+        mkdir -p "$(dirname "$BURST_ROUTE_LOG")" 2>/dev/null || true
+        (
+          flock -w 2 206 2>/dev/null || exit 0
+          printf '%s %s - route healed shim-not-first %s\n' "$(now_iso)" "$$" "$repo" >&206
+        ) 206>>"$BURST_ROUTE_LOG" 2>/dev/null || true
+      fi
+      probe_emit gate-cargo-route clean "intended=$intended healed resolved=${resolved:-none}" >/dev/null
+      ;;
+    mismatch)
+      # Requirement 3: "never silent" — unconditional, regardless of
+      # whether the caller set $BURST_ROUTE_LOG.
+      journal_line "$(now_iso)  burst-lane  route  mismatch  (intended=$intended resolved=${resolved:-none} shim=$shim cause=$cause caller=burst-lane.sh:route-check repo=$repo)"
+      if [ -n "${BURST_ROUTE_LOG:-}" ]; then
+        mkdir -p "$(dirname "$BURST_ROUTE_LOG")" 2>/dev/null || true
+        (
+          flock -w 2 205 2>/dev/null || exit 0
+          printf '%s %s - local %s %s\n' "$(now_iso)" "$$" "$cause" "$repo" >&205
+        ) 205>>"$BURST_ROUTE_LOG" 2>/dev/null || true
+      fi
+      probe_emit gate-cargo-route dirty "route-mismatch intended=$intended resolved=${resolved:-none} shim=$shim cause=$cause" >/dev/null
+      ;;
+    could-not-check)
+      probe_emit gate-cargo-route could-not-check "no cargo resolved on \$PATH" >/dev/null
+      ;;
   esac
 
   printf 'route: intended=%s resolved=%s shim=%s state=%s%s\n' \
     "$intended" "${resolved:-none}" "$shim" "$state" "${cause:+ cause=$cause}"
+
+  # Exit code contract (documented here, the only place this rc is
+  # produced): 9 = unhealable route mismatch, refused before self-heal
+  # could fix it — every other state exits 0.
+  if [ "$state" = "mismatch" ]; then
+    exit 9
+  fi
   exit 0
 }
 

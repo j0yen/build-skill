@@ -12,10 +12,31 @@
 #   PRD's Technical considerations: the sandbox/thread storm comes from
 #   `cargo test`'s binaries and `cargo build`'s codegen, not `cargo
 #   check`/`cargo metadata`).
+#
+# PRD-build-cargo-route-precedence: <real cargo> above is resolved by
+# real_cargo() below, which now hands off to the burst-lane-bin shim
+# (never skips past it) whenever burst is configured — see that
+# function's own header for the full chain (this wrapper is always
+# outermost; burst-lane-bin decides box-or-local next; real cargo is
+# last).
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 WRAPPER="$HERE/../cargo-budget.sh"
+
+# PRD-build-cargo-route-precedence: burst_configured() (never the legacy
+# per-invocation BURST_LANE=1 flag alone — see cargo-route.sh's own
+# header) decides whether this budget wrapper should hand off to the
+# burst-lane shim below instead of skipping straight past it. Fails open
+# (never configured) if the lib is missing, same as every other sourcing
+# of it in this tree.
+CARGO_ROUTE_LIB="$HERE/../lib/cargo-route.sh"
+if [ -r "$CARGO_ROUTE_LIB" ]; then
+  # shellcheck source=../lib/cargo-route.sh
+  source "$CARGO_ROUTE_LIB"
+else
+  burst_configured() { return 1; }
+fi
 
 # Find the real cargo: walk $PATH entries in order, skip this shim's own
 # directory *and every other known cargo shim directory* (currently just
@@ -31,6 +52,27 @@ SHIM_DIRS=(
   "$(cd "$HERE/../burst-lane-bin" 2>/dev/null && pwd -P || true)"
 )
 real_cargo() {
+  # PRD-build-cargo-route-precedence: this budget wrapper must be
+  # OUTERMOST (every real cargo call gets counted, routed to the box or
+  # not) but the burst shim must still get its chance to route BEFORE a
+  # real local cargo runs — the 2026-09-15 defect was this function
+  # unconditionally skipping past burst-lane-bin and finding
+  # ~/.cargo/bin/cargo directly, silently bypassing the box whenever this
+  # dir was ahead of burst-lane-bin on $PATH. So: when burst is configured
+  # AND this invocation is not already inside the burst shim's own exec
+  # chain (BURST_SHIM_ACTIVE=1, set by burst-lane-bin/cargo right before
+  # it execs the real cargo it found — guards against the two shims
+  # re-exec-ing into each other), hand off to the burst-lane-bin shim
+  # instead of walking past it. burst-lane-bin/cargo keeps its own
+  # skip-both-shim-dirs walk for its local fallback unchanged, so there is
+  # exactly one place a real local cargo actually gets found.
+  if [ "${BURST_SHIM_ACTIVE:-0}" != "1" ] && burst_configured; then
+    local burst_shim="$HERE/../burst-lane-bin/cargo"
+    if [ -x "$burst_shim" ]; then
+      printf '%s\n' "$burst_shim"
+      return 0
+    fi
+  fi
   local dir bin resolved shim skip
   local saved_ifs="$IFS"
   IFS=:
@@ -85,12 +127,15 @@ if [ "$route" -eq 1 ] && [ -x "$WRAPPER" ]; then
   exec "$WRAPPER" run -- "$REAL_CARGO" "$@"
 fi
 
-# PRD-build-burst-pull-on-demand requirement 2: this shim runs purely
-# locally (cargo-budget.sh is a concurrency cap, never a remote route), but
-# a burst-lane `run` elsewhere may have marked $PWD remote-dirty in the
-# meantime — the invariant is "no local cargo without a preceding pull" for
-# EVERY local-cargo path, not just burst-lane-bin/cargo's own. Fails open if
-# burst-lane.sh is missing.
+# PRD-build-burst-pull-on-demand requirement 2: cargo-budget.sh is a local
+# concurrency cap, never a remote route, but $REAL_CARGO above may now
+# itself BE the burst-lane-bin shim (when burst is configured) — this
+# ensure-fresh call is therefore sometimes redundant with the one that
+# shim makes right before its own exec, which is harmless (idempotent,
+# best-effort) and cheaper than special-casing it out. The invariant is
+# "no local cargo without a preceding pull" for EVERY local-cargo path,
+# not just burst-lane-bin/cargo's own. Fails open if burst-lane.sh is
+# missing.
 BURST_LANE_SH="$HERE/../burst-lane.sh"
 if [ -x "$BURST_LANE_SH" ]; then
   "$BURST_LANE_SH" ensure-fresh "$PWD" >/dev/null 2>&1 || true

@@ -1181,21 +1181,46 @@ rc_nosession="$(PATH="$HERE/burst-lane-bin:$FAKEBIN_GR:$FAKE:$PATH" "$BL" route-
 expect "gateroute: no session reports intended=local" "grep -q 'intended=local' <<<\"$rc_nosession\""
 expect "gateroute: no session is state=clean regardless of PATH order" "grep -q 'state=clean' <<<\"$rc_nosession\""
 
-# ---- gateroute: mismatch when a fake real-cargo is forced first on PATH ----
+# ---- gateroute: shadowed-but-healable shim (fake real-cargo forced first
+# on PATH, both shim dirs still present further down) ------------------------
 # The exact 2026-09-10 defect, reproduced structurally: a session is up
 # (intended=burst) but something (the pre-fix extend-gate.sh, here just a
-# fake real-cargo directory) sits ahead of the shim on $PATH.
+# fake real-cargo directory) sits ahead of the shim on $PATH. Since
+# PRD-build-cargo-route-precedence (2026-09-15), route-check no longer just
+# detects this and stops: it self-heals whenever the shim dirs genuinely
+# exist further down $PATH (they do here), journals "route healed" ONCE,
+# and exits 0 — a true, unhealable "mismatch" (rc=9) now requires the shim
+# itself to be absent/broken, not merely shadowed (see the dedicated case
+# right after this one).
 fresh_env
 "$BL" up >/dev/null
-ROUTE_LOG_MISMATCH="$T/route-mismatch.log"
-rc_mismatch="$(BURST_ROUTE_LOG="$ROUTE_LOG_MISMATCH" PATH="$FAKEBIN_GR:$HERE/burst-lane-bin:$FAKE:$PATH" "$BL" route-check --repo "$T" 2>&1)"
-expect "gateroute: shadowed shim reports intended=burst" "grep -q 'intended=burst' <<<\"$rc_mismatch\""
-expect "gateroute: shadowed shim resolves to the fake real cargo, not the shim" "grep -q \"resolved=$FAKEBIN_GR/cargo\" <<<\"$rc_mismatch\""
-expect "gateroute: shadowed shim is state=mismatch cause=shim-not-first" "grep -q 'state=mismatch cause=shim-not-first' <<<\"$rc_mismatch\""
-expect "gateroute: mismatch seeded a synthetic local/shim-not-first route-log line" \
-  "[ -f \"$ROUTE_LOG_MISMATCH\" ] && awk '\$4==\"local\" && \$5==\"shim-not-first\"' \"$ROUTE_LOG_MISMATCH\" | grep -q ."
-expect "gateroute: mismatch probed the gate-cargo-route probe dirty (library's dirty == this probe's mismatch)" \
-  "grep -q '\"probe\": \"gate-cargo-route\", \"reason\": \"route-mismatch intended=burst' \"$BUILD_STATE_DIR/probes/ledger.jsonl\""
+ROUTE_LOG_HEALED="$T/route-healed.log"
+rc_healed="$(BURST_ROUTE_LOG="$ROUTE_LOG_HEALED" PATH="$FAKEBIN_GR:$HERE/burst-lane-bin:$FAKE:$PATH" "$BL" route-check --repo "$T" 2>&1)"; rc_healed_rc=$?
+expect "gateroute: shadowed-but-healable shim reports intended=burst" "grep -q 'intended=burst' <<<\"$rc_healed\""
+expect "gateroute: shadowed-but-healable shim resolves (pre-heal) to the fake real cargo, not the shim" "grep -q \"resolved=$FAKEBIN_GR/cargo\" <<<\"$rc_healed\""
+expect "gateroute: shadowed-but-healable shim is state=healed" "grep -q 'state=healed' <<<\"$rc_healed\""
+expect "gateroute: healed self-heal exits 0 (never fatal to the caller)" "[ \"$rc_healed_rc\" -eq 0 ]"
+expect "gateroute: healed seeded a synthetic 'route healed' route-log line" \
+  "[ -f \"$ROUTE_LOG_HEALED\" ] && grep -q 'route healed shim-not-first' \"$ROUTE_LOG_HEALED\""
+expect "gateroute: healed still probes the gate-cargo-route probe clean (the route DID resolve)" \
+  "grep -q '\"probe\": \"gate-cargo-route\", \"reason\": \"intended=burst healed' \"$BUILD_STATE_DIR/probes/ledger.jsonl\""
+healed_journal_count_1="$(grep -c '  route  healed  ' "$BURST_LANE_JOURNAL" 2>/dev/null)"; healed_journal_count_1="${healed_journal_count_1:-0}"
+rc_healed_again="$(BURST_ROUTE_LOG="$ROUTE_LOG_HEALED" PATH="$FAKEBIN_GR:$HERE/burst-lane-bin:$FAKE:$PATH" "$BL" route-check --repo "$T" 2>&1)"
+healed_journal_count_2="$(grep -c '  route  healed  ' "$BURST_LANE_JOURNAL" 2>/dev/null)"; healed_journal_count_2="${healed_journal_count_2:-0}"
+expect "gateroute: a second route-check against the SAME per-gate route log never double-journals 'route healed'" \
+  "[ \"$healed_journal_count_2\" -eq \"$healed_journal_count_1\" ]"
+
+# ---- gateroute: genuinely unhealable mismatch (the shim itself missing,
+# not just shadowed) is covered by tests/cargoroute_ac3_unhealable_mismatch
+# _exits_9.sh, not here — self-heal here resolves the shim by its real,
+# ABSOLUTE on-disk location (cargo_route_path_prefix() names the real
+# scripts/cargo-budget-bin and scripts/burst-lane-bin directories
+# regardless of what THIS test's own $PATH happens to contain), so nothing
+# constructible by manipulating $PATH alone inside this file's shared
+# fixture (which shares $HERE with the real, on-disk burst-lane.sh) can
+# ever fail to self-heal. Proving the truly-missing-shim case needs its
+# own isolated copy of the scripts/ tree with cargo-budget-bin deliberately
+# absent — see that dedicated test file's own header.
 
 # ---- gateroute: per-gate route log isolation between two concurrent fake
 # gates (requirement 2's own "counts are per gate, not global") — two shim
