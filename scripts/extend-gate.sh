@@ -310,7 +310,7 @@ usage() {
   cat <<'EOF'
 usage: extend-gate.sh <build_into> [--base <tag>] [--head <sha>] [--dry-run]
                        [--parallelism N] [--record-baseline] [--force]
-                       [--phases-json]
+                       [--phases-json] [--scope main|branch --slug <slug>]
 EOF
 }
 
@@ -340,6 +340,14 @@ record_baseline=false
 force=false
 project_root_override=""
 phases_json_mode=false
+# PRD-build-gate-before-land requirement 1 (P0): a branch-scoped gate runs
+# the full producer sequence inside a worktree, under a per-branch lock,
+# instead of the shared per-crate `autobuilder-integrate.lock` — so N
+# siblings on the same crate can gate concurrently with lock_wait=0s.
+# `--scope main` (the default, and the only value before this PRD) is
+# byte-identical to prior behavior: same lockfile, same journal shape.
+scope="main"
+slug=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -351,9 +359,19 @@ while [ $# -gt 0 ]; do
     --force)            force=true; shift ;;
     --project-root)     project_root_override="${2:?extend-gate: --project-root needs a value}"; shift 2 ;;
     --phases-json)      phases_json_mode=true; shift ;;
+    --scope)            scope="${2:?extend-gate: --scope needs a value}"; shift 2 ;;
+    --slug)             slug="${2:?extend-gate: --slug needs a value}"; shift 2 ;;
     *) die 1 "unknown argument: $1 (see --help)" ;;
   esac
 done
+
+case "$scope" in
+  main|branch) : ;;
+  *) die 1 "--scope must be 'main' or 'branch' (got: $scope)" ;;
+esac
+if [ "$scope" = branch ] && [ -z "$slug" ]; then
+  die 1 "--scope branch requires --slug <slug>"
+fi
 
 repo="$(cd "$repo_arg" 2>/dev/null && pwd)" || die 1 "no such directory: $repo_arg"
 git -C "$repo" rev-parse --git-dir >/dev/null 2>&1 || die 1 "not a git repo: $repo"
@@ -617,6 +635,25 @@ fi
 head_now="$(git -C "$repo" rev-parse HEAD 2>/dev/null)"
 base_ref="$(resolve_base)"
 
+# PRD-build-gate-before-land requirement 1 (P0, AC1): for `--scope branch`
+# the journal's `base=` field names main's own HEAD at gate start (not the
+# rollback-plan tag `resolve_base` computes above, which stays the diff
+# range every producer still uses unchanged) — the thing a later `land
+# --gated-at` needs to compare against. Resolved from `git worktree list`
+# so it works whether $repo IS the main checkout (main_sha == head_now,
+# trivially) or a worktree of it (first entry is always the main worktree
+# per `git worktree list`'s own contract).
+journal_base_field="$base_ref"
+if [ "$scope" = branch ]; then
+  main_worktree_path="$(git -C "$repo" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print $2; exit}')"
+  if [ -n "$main_worktree_path" ]; then
+    main_sha_at_gate_start="$(git -C "$main_worktree_path" rev-parse HEAD 2>/dev/null || echo "$head_now")"
+  else
+    main_sha_at_gate_start="$head_now"
+  fi
+  journal_base_field="$main_sha_at_gate_start"
+fi
+
 if $dry_run; then
   echo "extend-gate: dry-run for $repo"
   if [ "$project_rel" = "." ]; then
@@ -649,7 +686,19 @@ fi
 # git can't answer (e.g. $repo isn't a git repo at all) so a missing git
 # binary never turns into a gate outage.
 git_common_dir=$(git -C "$repo" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || echo "$repo/.git")
-lockfile="$git_common_dir/autobuilder-integrate.lock"
+# PRD-build-gate-before-land requirement 1 (P0, AC1): `--scope branch`
+# takes a per-slug lock instead of the shared per-crate integration lock,
+# so a branch gate never contends with (or blocks) a sibling branch gate,
+# or a `--scope main` run, on the same crate. Anchored at the same
+# git-common-dir as the integrate lock (not the worktree's own `.git`
+# file) for the same reason the integrate lock is: every worktree of one
+# crate shares one common dir, so this lock is visible regardless of
+# which checkout looks for it.
+if [ "$scope" = branch ]; then
+  lockfile="$git_common_dir/autobuilder-gate-$slug.lock"
+else
+  lockfile="$git_common_dir/autobuilder-integrate.lock"
+fi
 exec 9>"$lockfile"
 # PRD-build-extend-gate-concurrent-isolation requirement 8 (P2, journal
 # visibility): every run records how long it waited for producer access —
@@ -1101,8 +1150,14 @@ if $record_baseline; then
   rm -f "$gate_out_file"
   echo "extend-gate: recorded baseline to $repo/agent/gate-baseline.json"
   printf '%s\n' "$recorded"
-  printf '%s  gate  %s  record-baseline  (head=%s base=%s %s wall=%ss %s lock_wait=%ss cargo=burst:%s/local:%s)\n' \
-    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$crate_name" "$head_now" "$base_ref" \
+  # scope_prefix is empty for the default `--scope main` (unchanged output);
+  # `--scope branch` prepends `scope=branch slug=<slug> ` and swaps in
+  # $journal_base_field (main's HEAD at gate start) for the base= token
+  # (requirement 1, AC1).
+  scope_prefix=""
+  [ "$scope" = branch ] && scope_prefix="scope=branch slug=$slug "
+  printf '%s  gate  %s  record-baseline  (%shead=%s base=%s %s wall=%ss %s lock_wait=%ss cargo=burst:%s/local:%s)\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$crate_name" "$scope_prefix" "$head_now" "$journal_base_field" \
     "${summary:-gate: no-summary-line}" "$wall" "$phases_field" "$lock_wait" "$route_burst_n" "$route_local_n" >>"$journal"
   if $route_mismatch; then
     printf '%s  gate  route-mismatch  (intended=%s burst=%s local=%s cause=%s)\n' \
@@ -1150,8 +1205,10 @@ fi
 # uncontended), and (requirement 5 / AC5, PRD-build-gate-cargo-route-attest)
 # how many of this run's routed cargo calls actually reached the box vs
 # stayed local.
-printf '%s  gate  %s  %s  (head=%s base=%s %s blocking=%s wall=%ss %s lock_wait=%ss cargo=burst:%s/local:%s)%s\n' \
-  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$crate_name" "$outcome" "$head_now" "$base_ref" \
+scope_prefix=""
+[ "$scope" = branch ] && scope_prefix="scope=branch slug=$slug "
+printf '%s  gate  %s  %s  (%shead=%s base=%s %s blocking=%s wall=%ss %s lock_wait=%ss cargo=burst:%s/local:%s)%s\n' \
+  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$crate_name" "$outcome" "$scope_prefix" "$head_now" "$journal_base_field" \
   "${summary:-gate: no-summary-line}" "${blockers_csv:-none}" "$wall" "$phases_field" "$lock_wait" \
   "$route_burst_n" "$route_local_n" "$journal_suffix" >>"$journal"
 

@@ -202,6 +202,28 @@ write_target_config() {
     mkdir -p "$(dirname "$gp")"
     grep -qxF '.cargo/' "$gp" 2>/dev/null || printf '%s\n' '.cargo/' >> "$gp"
   fi
+  # PRD-build-gate-before-land requirement 1 (P0): the `.cargo/config.toml`
+  # above only redirects CARGO's own build artifacts off-root — autobuilder's
+  # producers (intake.rs, loop_runner.rs, ci_checks.rs, rollback.rs, gate.rs,
+  # ...) hardcode `<project>/target/autobuilder/...` and never consult cargo
+  # config at all (verified against the autobuilder source directly; the gate
+  # producers are this PRD's own Non-goal, so this closes the gap on OUR side
+  # instead). Symlinking `<wt>/target -> <tdir>` makes every one of those
+  # relative-path writes land off-root too, transparently, with no producer
+  # change — `extend-gate.sh --scope branch`'s receipts and last-verdict.json
+  # end up physically under $tdir, matching this PRD's AC1. A fresh worktree
+  # never has `target/` (git-ignored, never checked out), so the plain
+  # symlink case is the common one; the other two branches make repeat
+  # `add` calls idempotent (existing correct symlink) and fail safe (never
+  # clobber a real, non-symlink target/ some other mechanism created).
+  if [ -L "$wt/target" ]; then
+    local cur_link; cur_link="$(readlink "$wt/target" 2>/dev/null || true)"
+    [ "$cur_link" = "$tdir" ] || ln -sfn "$tdir" "$wt/target"
+  elif [ -e "$wt/target" ]; then
+    echo "worktree-extend: warn — $wt/target exists and is not a symlink; leaving it in place (autobuilder receipts may not land off-root)" >&2
+  else
+    ln -s "$tdir" "$wt/target"
+  fi
 }
 
 # Read the target-dir a worktree's own .cargo/config.toml names (empty if the
