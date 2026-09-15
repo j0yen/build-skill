@@ -258,12 +258,23 @@ is prose a coordinator executes by hand anymore.
 **Depends-on gate (2026-09-02).** A queued PRD whose frontmatter `Depends-on:`
 names a PRD that is not yet in `built-prds/` is not selectable this tick.
 Log one line per skipped PRD (`waiting on PRD-<slug>`), do not mark it
-blocked, and re-check next tick. Resolve the name against
-`~/Documents/PRDs/built-prds/` (a PRD is "built" once its file is there);
-a name that matches neither `build-queue/` nor `built-prds/` is a typo — mark
-the dependent `needs_classification` and say which name failed. Ordering
-within a tick follows the same rule: never dispatch a dependent in the same
-tick as the PRD it waits on.
+blocked, and re-check next tick. The only permitted resolution
+(2026-09-15, PRD-build-classification-durable-heal) is `prd-lint.sh`'s
+verdict on the dependent PRD's own file — an agent never resolves the name
+by hand against `built-prds/`/`build-queue/` itself: a `depends-on-missing`
+FAIL means the name is a typo, so mark the dependent `needs_classification`
+with `depends-on-missing` as the reason; anything else (no FAIL at all, or
+a FAIL on a different id) means the dependency is real and simply not
+built yet — leave it queued and re-check next tick, never park it on a
+guess. `mark-needs-classification.sh`'s own claim-reproduction gate
+(the same PRD's requirement 1) is the backstop when an agent ignores this
+and resolves the name by hand anyway: a reason naming `depends-on-missing`
+that `prd-lint.sh` does not currently FAIL on is refused (exit 3), not
+committed — the 2026-09-13 mcphost-agent-consent incident (a hand-resolved
+"missing" dependency that was, in the same commit, sitting right there in
+build-queue/) is exactly the mistake this closes. Ordering within a tick
+follows the same rule: never dispatch a dependent in the same tick as the
+PRD it waits on.
 
 **Shared resolution logic, gated before the slot (2026-09-15, PRD-build-
 select-guard-depends-before-slot).** "Unmet" is resolved by one function,

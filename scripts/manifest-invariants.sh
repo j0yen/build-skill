@@ -62,6 +62,7 @@ PRD_DIR="${PRD_DIR:-$HOME/Documents/PRDs}"
 LOCK="${LOCK:-$STATE_DIR/tick.lock}"
 MANIFEST_SET="${MANIFEST_SET:-$HERE/manifest-set.sh}"
 PRD_LINT="${PRD_LINT:-$HERE/prd-lint.sh}"
+REQUEUE_PRD="${REQUEUE_PRD:-$HERE/requeue-prd.sh}"
 LANE_CLAIM="${LANE_CLAIM:-$HERE/lane-claim.sh}"
 SHIPPED_NOT_ARCHIVED_MINUTES="${SHIPPED_NOT_ARCHIVED_MINUTES:-20}"
 STALE_ACTIVITY_HOURS="${STALE_ACTIVITY_HOURS:-24}"
@@ -304,19 +305,36 @@ print(json.dumps(plan["heals"]))
 PY
 )"
 
-# Iterate heals; for needs_lint_check entries, shell out to prd-lint.sh and
-# fill in the real patch (or drop the heal if lint still fails).
+# Iterate heals; for needs_lint_check entries, shell out to prd-lint.sh and,
+# if it now passes, to requeue-prd.sh (PRD-build-classification-durable-heal
+# req 3) so the FILE (the shared, cross-lane source of truth) is committed
+# and pushed back to queued BEFORE the cache is ever told the same thing.
+# Before req 3, this loop patched the cache directly here -- the exact
+# "cache says queued, file still says needs_classification" trap the
+# 2026-09-13 mcphost-agent-consent incident hit. A requeue-prd.sh failure
+# (push rejected, rebase conflict, ...) now drops the heal for this pass
+# entirely: the cache is left exactly as it was, and the next invariants
+# pass tries again -- never a cache claiming a file state that isn't real.
 final_heals="[]"
 while IFS= read -r heal_json; do
   [ -n "$heal_json" ] || continue
   needs_check="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("needs_lint_check", False))' "$heal_json")"
   if [ "$needs_check" = "True" ]; then
     path="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("path") or "")' "$heal_json")"
+    slug="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["slug"])' "$heal_json")"
     if [ -n "$path" ] && [ -f "$path" ] && "$PRD_LINT" "$path" >/dev/null 2>&1; then
-      heal_json="$(python3 -c 'import json,sys
+      if requeue_out="$("$REQUEUE_PRD" "$path" "lint now passes (needs-classification-lint-pass heal)" 2>&1)"; then
+        heal_json="$(python3 -c 'import json,sys
 h=json.loads(sys.argv[1])
 h["patch"]={"status":"queued","needs_classification_reason":""}
 print(json.dumps(h))' "$heal_json")"
+      else
+        requeue_rc=$?
+        printf '%s  %s  heal  deferred  (rule=needs-classification-lint-pass cause=requeue-failed rc=%s lane=%s)\n' \
+          "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$slug" "$requeue_rc" "$(hostname)" >> "$JOURNAL"
+        log "requeue-prd.sh failed for $slug (rc=$requeue_rc): $requeue_out"
+        continue  # cache untouched — requeue didn't land, don't claim it did
+      fi
     else
       continue  # lint still fails (or file missing) — no heal this pass
     fi
