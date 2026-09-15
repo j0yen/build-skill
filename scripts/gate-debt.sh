@@ -78,6 +78,10 @@
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# shellcheck source=lib/journal.sh
+source "$HERE/lib/journal.sh"
+
 PRD_LINT="${PRD_LINT:-$HERE/prd-lint.sh}"
 PRD_DIR_DEFAULT="${PRD_DIR:-$HOME/Documents/PRDs}"
 STATE_DIR_DEFAULT="${BUILD_STATE_DIR:-$HERE/../state}"
@@ -91,9 +95,13 @@ log() { echo "gate-debt: $*" >&2; }
 now_iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 now_epoch() { date -u +%s; }
 
-journal_line() {
+# gd_journal_line: this script's own 4-field convenience shape, formatted
+# here and appended via the shared scripts/lib/journal.sh journal_line
+# (--file, since $JOURNAL is set per-subcommand from JOURNAL_DEFAULT or
+# --journal, not always the day-default path) (PRD-build-test-isolation-by-default).
+gd_journal_line() {
   # $1=prd-slug $2=action $3=outcome $4=paren-tail (without parens)
-  printf '%s  %s  %s  %s  (%s)\n' "$(now_iso)" "$1" "$2" "$3" "$4" >> "$JOURNAL"
+  journal_line --file "$JOURNAL" "$(now_iso)  $1  $2  $3  ($4)"
 }
 
 # git_prd_repo <prd-dir> -> repo root (build-queue/ and built-prds/ live
@@ -384,7 +392,7 @@ EOF
   rm -f "/tmp/gate-debt-lint.$$.out"
 
   if git_commit_push "$prd_dir" "build: draft $fname (gate-debt, ${n_minus1:-} inherited findings at ${shortsha})"; then
-    journal_line "$slug" "gate-debt" "drafted" "prd=$fname head=$head inherited=$((n - 1))"
+    gd_journal_line "$slug" "gate-debt" "drafted" "prd=$fname head=$head inherited=$((n - 1))"
     echo "$fname"
     return 0
   else
@@ -435,7 +443,7 @@ with open(f, 'w') as fh:
     fh.writelines(head + rest)
 PYEOF
     changed=1
-    journal_line "$slug" "gate-debt" "parked" "prd=$slug behind=$debt_prd_name"
+    gd_journal_line "$slug" "gate-debt" "parked" "prd=$slug behind=$debt_prd_name"
   done
   if [ "$changed" -eq 1 ]; then
     git_commit_push "$prd_dir" "build: park behind $debt_prd_name (gate-debt)" || true
@@ -476,7 +484,7 @@ with open(f, 'w') as fh:
     fh.writelines(head + rest)
 PYEOF
     changed=1
-    journal_line "$slug" "gate-debt" "released" "prd=$slug behind=$dep"
+    gd_journal_line "$slug" "gate-debt" "released" "prd=$slug behind=$dep"
   done
   if [ "$changed" -eq 1 ]; then
     git_commit_push "$prd_dir" "build: release gate-debt park (dependency archived)" || true

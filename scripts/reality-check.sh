@@ -102,6 +102,10 @@ set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SKILL_DIR="$(cd "$HERE/.." && pwd)"
+
+# shellcheck source=lib/journal.sh
+source "$HERE/lib/journal.sh"
+
 PRD_LINT="$HERE/prd-lint.sh"
 JOURNAL_DIR="${BUILD_JOURNAL_DIR:-$HOME/brain/journal/build}"
 RECEIPTS_DIR="${BUILD_RECEIPTS_DIR:-$JOURNAL_DIR/receipts}"
@@ -418,10 +422,11 @@ commit_and_push() {
   fi
 }
 
-journal_line() {
-  mkdir -p "$JOURNAL_DIR"
-  printf '%s\n' "$1" >>"$JOURNAL_DIR/$(date -u +%F).md"
-}
+# journal_line is now the shared scripts/lib/journal.sh one (sourced
+# above): its default target ($(journal_root)/<date>.md) already matches
+# this script's own JOURNAL_DIR/<date>.md convention, and BUILD_JOURNAL_DIR
+# is one of the lib's honored legacy aliases, so call sites below are
+# unchanged (PRD-build-test-isolation-by-default).
 
 # ---- container tier (requirement 3, P0, container-coverable ACs) ---------
 # Runs `cmd` in a fresh, empty, non-root sandbox on THIS host (RedBaron) via

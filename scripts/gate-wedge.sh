@@ -106,6 +106,10 @@ set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 SKILL_DIR="${BUILD_SKILL_DIR:-$(cd "$HERE/.." && pwd)}"
+
+# shellcheck source=lib/journal.sh
+source "$HERE/lib/journal.sh"
+
 STATE_DIR="${GATE_WEDGE_STATE_DIR:-$SKILL_DIR/state/gate-wedge}"
 
 BUDGET_S="${GATE_STEP_BUDGET_S:-1800}"
@@ -118,18 +122,28 @@ LOCK_SCAN_DIRS="${GATE_WEDGE_LOCK_DIRS:-$SKILL_DIR/state/burst-lane/locks:$SKILL
 REMOTE_PROBE_BIN="${GATE_WEDGE_REMOTE_PROBE:-$HERE/gate-wedge-remote-probe.sh}"
 JOURNAL="${GATE_WEDGE_JOURNAL:-$HOME/brain/journal/build/$(date -u +%F).md}"
 
+# PRD-build-test-isolation-by-default requirement 4: structural isolation,
+# wired here (previously the one writer in the six-copy list that wasn't
+# wired to isolation-guard.sh at all — Grounding). Checked AFTER override
+# resolution (STATE_DIR/JOURNAL above) but BEFORE the first mkdir/write.
+if [ -r "$HERE/isolation-guard.sh" ]; then
+  # shellcheck source=isolation-guard.sh
+  source "$HERE/isolation-guard.sh"
+else
+  isolation_guard_path() { :; }
+fi
+isolation_guard_path "$STATE_DIR" "gate-wedge.sh"
+isolation_guard_path "$JOURNAL" "gate-wedge.sh"
+
 die() { echo "gate-wedge: $1" >&2; exit "${2:-2}"; }
 usage() { echo "usage: gate-wedge.sh run [--budget SECS] [--step NAME] -- <cmd...>" >&2; exit 2; }
 
 now_iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
-# One line per verdict (step 4): appended to the same daily journal
-# gate-wedge-rollup.sh already writes into — never touched on a fail-open
-# missing-dir basis (mkdir -p, best-effort, never blocks a verdict).
-journal_line() {
-  mkdir -p "$(dirname "$JOURNAL")" 2>/dev/null || true
-  printf '%s  gate-wedge  %s\n' "$(now_iso)" "$1" >> "$JOURNAL" 2>/dev/null || true
-}
+# journal_line is now the shared scripts/lib/journal.sh one (sourced
+# above); call sites embed the "<ts>  gate-wedge  " prefix the old private
+# copy used to add, and pass this script's own $JOURNAL as an absolute
+# --file target (PRD-build-test-isolation-by-default).
 
 is_int() { case "$1" in ''|*[!0-9-]*) return 1 ;; *) return 0 ;; esac; }
 
@@ -664,7 +678,7 @@ print('yes' if any(w['holder_alive'] for w in d['lock_waits']) else 'no')
       receipts+=("$receipt")
       wedges=$((wedges + 1))
       echo "gate-wedge: wedged: $classification receipt=$receipt" >&2
-      journal_line "$classification  (step=$step wall=${elapsed}s route=$last_route local_cpu=$last_local_cpu_delta io=$last_io_delta remote_cpu=${last_remote_cpu_delta:--} inflight=$last_inflight_count lock_waits=$last_lockwait_count)"
+      journal_line --file "$JOURNAL" "$(now_iso)  gate-wedge  $classification  (step=$step wall=${elapsed}s route=$last_route local_cpu=$last_local_cpu_delta io=$last_io_delta remote_cpu=${last_remote_cpu_delta:--} inflight=$last_inflight_count lock_waits=$last_lockwait_count)"
       rm -f "$snap1"; [ "$snap2" != "$snap1" ] && rm -f "$snap2"
       rm -f "$outlog"
       continue
@@ -675,7 +689,7 @@ print('yes' if any(w['holder_alive'] for w in d['lock_waits']) else 'no')
     cat "$outlog"
     rm -f "$outlog"
     echo "gate-wedge: wedges=$wedges" >&2
-    journal_line "ok  (step=$step wall=${elapsed}s route=$last_route local_cpu=$last_local_cpu_delta io=$last_io_delta remote_cpu=${last_remote_cpu_delta:--} inflight=$last_inflight_count lock_waits=$last_lockwait_count)"
+    journal_line --file "$JOURNAL" "$(now_iso)  gate-wedge  ok  (step=$step wall=${elapsed}s route=$last_route local_cpu=$last_local_cpu_delta io=$last_io_delta remote_cpu=${last_remote_cpu_delta:--} inflight=$last_inflight_count lock_waits=$last_lockwait_count)"
     exit "$rc"
   done
 

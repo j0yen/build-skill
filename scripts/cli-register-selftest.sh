@@ -231,9 +231,15 @@ BUILD_WT_ROOT="$tmp/wt4" EXTEND="$EXTEND_STUB" \
     || true  # expect exit 4 (conflict)
 
 # Check sidecar for last_error=integrate-conflict:...
-# manifest-sidecar.sh writes to state/status/<slug>.json
+# manifest-sidecar.sh writes to $STATE_DIR/status/<slug>.json, where
+# STATE_DIR defaults to $SKILL_DIR/state but honors a caller's own
+# STATE_DIR override (PRD-build-test-isolation-by-default's
+# scripts/lib/isolation.sh sets one under BUILD_TEST=1) — this must match
+# manifest-sidecar.sh's own resolution exactly, not assume the real repo
+# path, or a run under isolation looks in the wrong place for a file that
+# landed correctly under the isolated root.
 SKILL_DIR="$(cd "$HERE/.." && pwd)"
-SIDECAR_FILE="$SKILL_DIR/state/status/${SLUG}.json"
+SIDECAR_FILE="${STATE_DIR:-$SKILL_DIR/state}/status/${SLUG}.json"
 if [ -f "$SIDECAR_FILE" ]; then
     last_err="$(python3 -c "import json,sys; d=json.load(open('$SIDECAR_FILE')); print(d.get('last_error',''))" 2>/dev/null \
         || grep -o '"last_error":"[^"]*"' "$SIDECAR_FILE" | head -1 || echo "")"

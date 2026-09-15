@@ -229,6 +229,9 @@ set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SKILL_DIR="$(cd "$HERE/.." && pwd)"
 
+# shellcheck source=lib/journal.sh
+source "$HERE/lib/journal.sh"
+
 STATE_DIR="${BURST_LANE_STATE_DIR:-$SKILL_DIR/state/burst-lane}"
 STATE_FILE="$STATE_DIR/session.json"
 # PRD-build-burst-dispatch-reenable requirement 1: the baked-image record —
@@ -579,7 +582,9 @@ usage() { echo "usage: burst-lane.sh {up|status|run|sync-back|pull|ensure-fresh|
 
 now_epoch() { echo "${BURST_LANE_NOW:-$(date -u +%s)}"; }
 now_iso()   { date -u -d "@$(now_epoch)" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ; }
-journal_line() { mkdir -p "$(dirname "$JOURNAL")" 2>/dev/null || true; printf '%s\n' "$1" >> "$JOURNAL"; }
+# journal_line is now the shared scripts/lib/journal.sh one (sourced above);
+# this script's own flat $JOURNAL (burst-lane.log, or BURST_LANE_JOURNAL) is
+# an absolute --file target on every call site below (PRD-build-test-isolation-by-default).
 
 # ---- operator authorization (PRD-build-operator-authorization-contract) --
 # The money-spending commands below (prove/up/bake) never trust an agent's
@@ -597,7 +602,7 @@ authz_journal_suffix() {  # -> " authz=\"<string>\"" or "" when unset
 }
 authz_refuse_if_missing() {  # $1=subcommand name -> 0 ok to proceed, 1 refused (caller exits)
   if [ "${BURST_LANE_DISPATCH:-0}" = "1" ] && [ -z "${BURST_LANE_AUTHZ:-}" ]; then
-    journal_line "$(now_iso)  burst-lane  $1  refused  (cause=no-operator-authorization)"
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  $1  refused  (cause=no-operator-authorization)"
     echo "$1 refused (cause=no-operator-authorization)" >&2
     return 1
   fi
@@ -811,7 +816,7 @@ cost_rate_eur() {  # $1 = optional explicit server type override -> stdout eur/h
     ccx53) printf '%s' "1.009" ;;
     ccx63) printf '%s' "1.614" ;;
     *)
-      journal_line "$(now_iso)  burst-lane  cost  rate-unknown  (type=$t using=$COST_PER_HOUR_EUR)"
+      journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  cost  rate-unknown  (type=$t using=$COST_PER_HOUR_EUR)"
       printf '%s' "$COST_PER_HOUR_EUR"
       ;;
   esac
@@ -927,7 +932,7 @@ session_reconcile() {
   fi
   archive_stale_file "$STATE_FILE"
   rm -f "$SERVED_FILE"
-  journal_line "$(now_iso)  burst-lane  session  stale  (server_id=${id:-none} absent from hcloud — archived session.json, proceeding fresh)"
+  journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  session  stale  (server_id=${id:-none} absent from hcloud — archived session.json, proceeding fresh)"
   return 1
 }
 
@@ -948,7 +953,7 @@ volume_reconcile() {
     return 0
   fi
   archive_stale_file "$VOLUME_STATE_FILE"
-  journal_line "$(now_iso)  burst-lane  volume  stale  (volume_id=$vid absent from hcloud — archived volume.json)"
+  journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  volume  stale  (volume_id=$vid absent from hcloud — archived volume.json)"
   return 1
 }
 
@@ -1105,13 +1110,13 @@ volume_unwind_untracked() {  # $1=cause
   local cause="$1"
   local found; found="$(find_volume 2>/dev/null)"
   if [ -z "$found" ]; then
-    journal_line "$(now_iso)  burst-lane  up  volume-create-unwound  (name=$BURST_VOLUME_NAME id=unknown cause=$cause)"
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  up  volume-create-unwound  (name=$BURST_VOLUME_NAME id=unknown cause=$cause)"
     return 0
   fi
   local vid vsize vserver vdevice vcreated
   IFS='|' read -r vid vsize vserver vdevice vcreated <<<"$found"
   "$HCLOUD" volume delete "$vid" >/dev/null 2>&1
-  journal_line "$(now_iso)  burst-lane  up  volume-create-unwound  (name=$BURST_VOLUME_NAME id=$vid cause=$cause)"
+  journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  up  volume-create-unwound  (name=$BURST_VOLUME_NAME id=$vid cause=$cause)"
 }
 
 volume_ensure() {  # $1=ip $2=server_id
@@ -1138,12 +1143,12 @@ volume_ensure() {  # $1=ip $2=server_id
   # down is unchanged.
   if [ -n "$found" ] && [ -z "$vserver" ]; then
     if [ "$vsize" = "$BURST_VOLUME_GB" ]; then
-      journal_line "$(now_iso)  burst-lane  up  volume  adopted  (id=$vid name=$BURST_VOLUME_NAME size=${vsize}G cause=unattached-at-startup)"
+      journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  up  volume  adopted  (id=$vid name=$BURST_VOLUME_NAME size=${vsize}G cause=unattached-at-startup)"
     else
       if "$HCLOUD" volume delete "$vid" >/dev/null 2>&1; then
-        journal_line "$(now_iso)  burst-lane  up  volume-guard-replaced  (id=$vid name=$BURST_VOLUME_NAME old_size=${vsize}G target_size=${BURST_VOLUME_GB}G cause=size-mismatch)"
+        journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  up  volume-guard-replaced  (id=$vid name=$BURST_VOLUME_NAME old_size=${vsize}G target_size=${BURST_VOLUME_GB}G cause=size-mismatch)"
       else
-        journal_line "$(now_iso)  burst-lane  up  volume-guard-delete-failed  (id=$vid name=$BURST_VOLUME_NAME size=${vsize}G — booting on root disk)"
+        journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  up  volume-guard-delete-failed  (id=$vid name=$BURST_VOLUME_NAME size=${vsize}G — booting on root disk)"
         volume_state_write "volume_mounted=false"
         return 0
       fi
@@ -1164,7 +1169,7 @@ volume_ensure() {  # $1=ip $2=server_id
       # volume-create-failed — the create itself exited non-zero, so
       # nothing was made and nothing needs unwinding.
       local emsg; emsg="$(tail -3 "$create_err" 2>/dev/null | tr '\n' ' ')"; rm -f "$create_err"
-      journal_line "$(now_iso)  burst-lane  up  volume-create-failed  (name=$BURST_VOLUME_NAME err=\"$emsg\" — booting on root disk)"
+      journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  up  volume-create-failed  (name=$BURST_VOLUME_NAME err=\"$emsg\" — booting on root disk)"
       volume_state_write "volume_mounted=false"
       return 0
     fi
@@ -1179,7 +1184,7 @@ volume_ensure() {  # $1=ip $2=server_id
       volume_state_write "volume_mounted=false"
       return 0
     fi
-    journal_line "$(now_iso)  burst-lane  up  volume  created  (id=$vid name=$BURST_VOLUME_NAME size=${vsize}G)"
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  up  volume  created  (id=$vid name=$BURST_VOLUME_NAME size=${vsize}G)"
   fi
 
   # Requirement 6: single-attach safety. Hetzner volumes attach to one
@@ -1187,14 +1192,14 @@ volume_ensure() {  # $1=ip $2=server_id
   # attached here — this box boots without it (root disk) rather than
   # racing/stealing it.
   if [ -n "$vserver" ] && [ "$vserver" != "$sid" ]; then
-    journal_line "$(now_iso)  burst-lane  up  volume  busy  (attached_to=$vserver id=$vid)"
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  up  volume  busy  (attached_to=$vserver id=$vid)"
     volume_state_write "volume_id=$vid" "volume_mounted=false"
     return 0
   fi
 
   if [ -z "$vserver" ]; then
     if ! "$HCLOUD" volume attach --server "$sid" "$vid" >/dev/null 2>&1; then
-      journal_line "$(now_iso)  burst-lane  up  volume-attach-failed  (id=$vid server_id=$sid — booting on root disk)"
+      journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  up  volume-attach-failed  (id=$vid server_id=$sid — booting on root disk)"
       volume_state_write "volume_id=$vid" "volume_mounted=false"
       return 0
     fi
@@ -1205,7 +1210,7 @@ volume_ensure() {  # $1=ip $2=server_id
   if [ "$(volume_state_read volume_dirty)" = "true" ]; then
     "$SSH_BIN" $(ssh_kh_args) -o ConnectTimeout=8 -i "$SSH_KEY" "root@$ip" \
       "fsck -y '$vdevice' >/dev/null 2>&1; true # volume-fsck" >/dev/null 2>&1 || true
-    journal_line "$(now_iso)  burst-lane  up  volume  fsck  (id=$vid device=$vdevice cause=prior-detach-failed)"
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  up  volume  fsck  (id=$vid device=$vdevice cause=prior-detach-failed)"
   fi
 
   # Requirement 1: format only when the volume has no filesystem (a label
@@ -1224,7 +1229,7 @@ chown -R $REMOTE_USER:$REMOTE_USER '$REMOTE_ROOT'
 echo MOUNTED
 " 2>/dev/null)" || mount_rc=$?
   if [ "$mount_rc" -ne 0 ] || ! grep -q MOUNTED <<<"$mount_out"; then
-    journal_line "$(now_iso)  burst-lane  up  volume-mount-failed  (id=$vid device=$vdevice — booting on root disk)"
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  up  volume-mount-failed  (id=$vid device=$vdevice — booting on root disk)"
     volume_state_write "volume_id=$vid" "volume_mounted=false"
     return 0
   fi
@@ -1239,7 +1244,7 @@ echo MOUNTED
 
   volume_state_write "volume_id=$vid" "volume_mounted=true" "volume_dirty=false" \
     "volume_size_gb=${size_gb:-$BURST_VOLUME_GB}" "volume_used_pct=${pct:-0}"
-  journal_line "$(now_iso)  burst-lane  up  volume  attached  (id=$vid size=${size_gb:-$BURST_VOLUME_GB}G used=${pct:-0}%)"
+  journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  up  volume  attached  (id=$vid size=${size_gb:-$BURST_VOLUME_GB}G used=${pct:-0}%)"
 }
 
 # ---- persistent volume teardown (requirement 2) ----------------------------
@@ -1278,7 +1283,7 @@ volume_teardown() {  # $1=ip $2=caller(down|watchdog|idle-guard)
     "umount '$REMOTE_ROOT' 2>/dev/null; true # volume-umount" >/dev/null 2>&1 || true
 
   if ! "$HCLOUD" volume detach "$vid" >/dev/null 2>&1; then
-    journal_line "$(now_iso)  burst-lane  $caller  volume  detach-failed  (id=$vid)"
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  $caller  volume  detach-failed  (id=$vid)"
     volume_state_write "volume_dirty=true" "volume_mounted=false"
     return 0
   fi
@@ -1289,12 +1294,12 @@ volume_teardown() {  # $1=ip $2=caller(down|watchdog|idle-guard)
   local _cid _csize cserver _cdev
   IFS='|' read -r _cid _csize cserver _cdev <<<"${check:-}"
   if [ -n "$cserver" ]; then
-    journal_line "$(now_iso)  burst-lane  $caller  volume  detach-failed  (id=$vid cause=still-attached server=$cserver)"
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  $caller  volume  detach-failed  (id=$vid cause=still-attached server=$cserver)"
     volume_state_write "volume_dirty=true" "volume_mounted=false"
     return 0
   fi
   volume_state_write "volume_mounted=false" "volume_dirty=false"
-  journal_line "$(now_iso)  burst-lane  $caller  volume  detached  (id=$vid)"
+  journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  $caller  volume  detached  (id=$vid)"
 
   # Requirement 5: cold-volume policy. This lane runs exactly one session at
   # a time (SERVER_NAME is singular), so a teardown that reaches this point
@@ -1312,13 +1317,13 @@ volume_teardown() {  # $1=ip $2=caller(down|watchdog|idle-guard)
   case "$vruns" in ''|*[!0-9]*) vruns=0 ;; esac
   if [ "$used_pct" -lt "$keep_min" ] || [ "$vruns" -eq 0 ]; then
     if "$HCLOUD" volume delete "$vid" >/dev/null 2>&1; then
-      journal_line "$(now_iso)  burst-lane  $caller  volume  deleted  (id=$vid used_pct=$used_pct runs_served=$vruns cause=cold-volume — recreate-on-next-up cheaper than idle ${BURST_VOLUME_GB}GB)"
+      journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  $caller  volume  deleted  (id=$vid used_pct=$used_pct runs_served=$vruns cause=cold-volume — recreate-on-next-up cheaper than idle ${BURST_VOLUME_GB}GB)"
       rm -f "$VOLUME_STATE_FILE"
     else
-      journal_line "$(now_iso)  burst-lane  $caller  volume  delete-failed  (id=$vid used_pct=$used_pct)"
+      journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  $caller  volume  delete-failed  (id=$vid used_pct=$used_pct)"
     fi
   else
-    journal_line "$(now_iso)  burst-lane  $caller  volume-kept  (used_pct=$used_pct)"
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  $caller  volume-kept  (used_pct=$used_pct)"
   fi
 }
 
@@ -1442,13 +1447,13 @@ gate_tools_parse_probe() {
     tools_str+="${tools_str:+ }$name=$(_gt_collapse_ws "$val")"
   done <<<"$raw"
 
-  journal_line "$(now_iso)  burst-lane  gate-tools  probe  (phase=$phase user=$REMOTE_USER rc=$rc tools=\"$tools_str\")"
+  journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  gate-tools  probe  (phase=$phase user=$REMOTE_USER rc=$rc tools=\"$tools_str\")"
 
   # requirement 6/AC6: a probe that failed outright (nonzero ssh rc) or came
   # back with zero parseable tool= lines is "unparseable" — distinguishable
   # from a genuinely-measured empty result, never silently read as one.
   if [ "$rc" != "0" ] || [ "$tools_seen" -eq 0 ]; then
-    journal_line "$(now_iso)  burst-lane  gate-tools  probe-unparseable  (phase=$phase rc=$rc)"
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  gate-tools  probe-unparseable  (phase=$phase rc=$rc)"
   fi
 
   # requirement 7/AC9: no sentinel means the stream was cut off before the
@@ -1457,7 +1462,7 @@ gate_tools_parse_probe() {
   # that for free (a tool absent from _gt_map reads MISSING via the
   # probe-absent fail-safe), this just makes the truncation itself visible.
   if [ "$seen_sentinel" != "1" ]; then
-    journal_line "$(now_iso)  burst-lane  gate-tools  probe-truncated  (phase=$phase tools_seen=$tools_seen expected=$(set -- $GATE_TOOLS_LIST; echo $#))"
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  gate-tools  probe-truncated  (phase=$phase tools_seen=$tools_seen expected=$(set -- $GATE_TOOLS_LIST; echo $#))"
   fi
 }
 
@@ -1629,10 +1634,10 @@ provision_gate_tools() {  # $1=ip
     # routes to.
     "$SSH_BIN" $(ssh_kh_args) -o ConnectTimeout=8 -i "$SSH_KEY" "root@$ip" \
       "$(printf '%s\napt-get update -qq -o DPkg::Lock::Timeout=120\n' "# gate-tools-apt-update")" >"$apt_log" 2>&1 || apt_rc=$?
-    journal_line "$(now_iso)  burst-lane  gate-tools  apt-update  (ran=true rc=$apt_rc)"
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  gate-tools  apt-update  (ran=true rc=$apt_rc)"
     rm -f "$apt_log" 2>/dev/null || true
   else
-    journal_line "$(now_iso)  burst-lane  gate-tools  apt-update  (ran=false)"
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  gate-tools  apt-update  (ran=false)"
   fi
 
   # PRD-build-burst-provision-forensics requirement 1: an EXIT/signal trap
@@ -1655,7 +1660,7 @@ provision_gate_tools() {  # $1=ip
     # re-entering this handler via its own EXIT trap.
     trap - EXIT TERM INT HUP
     if [ -n "$_GT_CURRENT_TOOL" ]; then
-      journal_line "$(now_iso)  burst-lane  gate-tools  provision-aborted  (during=$_GT_CURRENT_TOOL rc=$trap_rc)"
+      journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  gate-tools  provision-aborted  (during=$_GT_CURRENT_TOOL rc=$trap_rc)"
     fi
     exit "$trap_rc"
   }
@@ -1684,13 +1689,13 @@ provision_gate_tools() {  # $1=ip
       ver="${_gt_pre[$name]}"
     else
       ver="MISSING"
-      journal_line "$(now_iso)  burst-lane  gate-tools  probe-absent  (tool=$name)"
+      journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  gate-tools  probe-absent  (tool=$name)"
     fi
     if [ "$ver" != "MISSING" ]; then
       # requirement 3: an explicit terminal record for the "present,
       # nothing to do" outcome — silence was never a valid outcome for a
       # listed tool.
-      journal_line "$(now_iso)  burst-lane  gate-tools  install-skipped  (tool=$name reason=present version=\"$(_gt_collapse_ws "$ver")\")"
+      journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  gate-tools  install-skipped  (tool=$name reason=present version=\"$(_gt_collapse_ws "$ver")\")"
       continue
     fi
     local start_ts rc secs err_log err_line
@@ -1704,9 +1709,9 @@ provision_gate_tools() {  # $1=ip
     # worth flagging distinctly from an ordinary (unbaked) first-boot
     # install. Installation proceeds exactly as it does today either way.
     if [ "${CURRENT_BOOT_IMAGE_SOURCE:-}" = "baked" ]; then
-      journal_line "$(now_iso)  burst-lane  gate-tools  bake-stale  (tool=$name)"
+      journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  gate-tools  bake-stale  (tool=$name)"
     fi
-    journal_line "$(now_iso)  burst-lane  gate-tools  install-start  (tool=$name)"
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  gate-tools  install-start  (tool=$name)"
     if [ "$name" = "autobuilder" ]; then
       if [ -f "$GATE_TOOLS_AUTOBUILDER_BIN" ]; then
         "$SSH_BIN" $(ssh_kh_args) -o ConnectTimeout=8 -i "$SSH_KEY" "$REMOTE_USER@$ip" \
@@ -1730,7 +1735,7 @@ provision_gate_tools() {  # $1=ip
     secs="$(( $(now_epoch) - start_ts ))"
     err_line=""
     if [ "$rc" = "0" ]; then
-      journal_line "$(now_iso)  burst-lane  gate-tools  install  (tool=$name rc=0 secs=$secs)"
+      journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  gate-tools  install  (tool=$name rc=0 secs=$secs)"
       rm -f "$err_log" 2>/dev/null || true
     else
       # requirement 1: FIRST non-blank stderr line (apt's/cargo's actual
@@ -1738,7 +1743,7 @@ provision_gate_tools() {  # $1=ip
       # "command failed" wrapper) — this is a deliberate change from the
       # pre-PRD `tail -n1` behavior.
       err_line="$(grep -v '^[[:space:]]*$' "$err_log" 2>/dev/null | head -n1)"
-      journal_line "$(now_iso)  burst-lane  gate-tools  install-failed  (tool=$name rc=$rc secs=$secs err=\"$err_line\")"
+      journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  gate-tools  install-failed  (tool=$name rc=$rc secs=$secs err=\"$err_line\")"
       # requirement 2: evidence retention — survives under logs/failed/,
       # deleted only on the rc=0 path above.
       cp -f "$err_log" "$GATE_TOOLS_FAILED_LOG_DIR/${session_id}-${name}.log" 2>/dev/null || true
@@ -1762,7 +1767,7 @@ provision_gate_tools() {  # $1=ip
   local gt_summary=""
   for t in $GATE_TOOLS_LIST; do gt_summary+="${gt_summary:+ }$t=${_gt_rc[$t]}"; done
   GATE_TOOLS_RC_SUMMARY="$gt_summary"
-  journal_line "$(now_iso)  burst-lane  gate-tools  summary  (per_tool_rc=\"$gt_summary\")"
+  journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  gate-tools  summary  (per_tool_rc=\"$gt_summary\")"
 
   sync_gate_tools_scripts "$ip"
 
@@ -1829,7 +1834,7 @@ json.dump({"tools": {}, "missing": sys.argv[1].split(), "gate_tool_versions": {}
     local dl dr
     dl="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("local",""))' "$drift_json" 2>/dev/null || true)"
     dr="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("remote",""))' "$drift_json" 2>/dev/null || true)"
-    journal_line "$(now_iso)  burst-lane  gate-tools  version-drift  (tool=autobuilder local=\"$dl\" remote=\"$dr\")"
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  gate-tools  version-drift  (tool=autobuilder local=\"$dl\" remote=\"$dr\")"
   fi
   if [ -z "$GATE_TOOLS_MISSING" ]; then GATE_READY="true"; else GATE_READY="false"; fi
 
@@ -1851,7 +1856,7 @@ json.dump({"tools": {}, "missing": sys.argv[1].split(), "gate_tool_versions": {}
       if [ "$_gt_pre_missing" = "1" ] && [ "${_gt_rc[$t]:-na}" = "0" ]; then
         continue  # expected: was missing, we installed it, now present
       fi
-      journal_line "$(now_iso)  burst-lane  gate-tools  probe-disagreement  (tool=$t pre=\"$(_gt_collapse_ws "$_gt_pre_eff")\" final=\"$(_gt_collapse_ws "$_gt_final_eff")\")"
+      journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  gate-tools  probe-disagreement  (tool=$t pre=\"$(_gt_collapse_ws "$_gt_pre_eff")\" final=\"$(_gt_collapse_ws "$_gt_final_eff")\")"
     fi
   done
 
@@ -1951,7 +1956,7 @@ place_gate_credential() {  # $1=ip
   [ "${BURST_GATE_REVIEWER:-0}" = "1" ] || return 0
   local ip="$1"
   if [ ! -f "$GATE_CRED_SRC" ]; then
-    journal_line "$(now_iso)  burst-lane  up  cred-absent  (BURST_GATE_REVIEWER=1 but no credential file at $GATE_CRED_SRC — reviewer will not run)"
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  up  cred-absent  (BURST_GATE_REVIEWER=1 but no credential file at $GATE_CRED_SRC — reviewer will not run)"
     return 0
   fi
   "$SSH_BIN" $(ssh_kh_args) -o ConnectTimeout=8 -i "$SSH_KEY" "$REMOTE_USER@$ip" \
@@ -1960,9 +1965,9 @@ place_gate_credential() {  # $1=ip
        "$GATE_CRED_SRC" "$REMOTE_USER@$ip:$GATE_CRED_REMOTE_PATH" >/dev/null 2>&1; then
     "$SSH_BIN" $(ssh_kh_args) -o ConnectTimeout=8 -i "$SSH_KEY" "$REMOTE_USER@$ip" \
       "chmod 600 '$GATE_CRED_REMOTE_PATH'" >/dev/null 2>&1 || true
-    journal_line "$(now_iso)  burst-lane  up  cred  placed  (host=$ip)"
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  up  cred  placed  (host=$ip)"
   else
-    journal_line "$(now_iso)  burst-lane  up  cred-place-failed  (host=$ip — rsync push failed, reviewer will not run)"
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  up  cred-place-failed  (host=$ip — rsync push failed, reviewer will not run)"
   fi
 }
 
@@ -1971,7 +1976,7 @@ shred_gate_credential() {  # $1=ip $2=caller(down|watchdog)
   [ -n "$ip" ] || return 0
   if "$SSH_BIN" $(ssh_kh_args) -o ConnectTimeout=8 -i "$SSH_KEY" "$REMOTE_USER@$ip" \
        "shred -u -f '$GATE_CRED_REMOTE_PATH'" >/dev/null 2>&1; then
-    journal_line "$(now_iso)  burst-lane  $caller  cred  shredded  (host=$ip)"
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  $caller  cred  shredded  (host=$ip)"
   fi
 }
 
@@ -2145,13 +2150,13 @@ cmd_bake() {
   # silent to the journal — an operator (05:50Z, 2026-09-15) lost a minute
   # to a refusal that never named the key it needed to set.
   if ! burst_configured; then
-    journal_line "$(now_iso)  burst-lane  bake  refused  (cause=not-configured key=BUILD_BURST_ENABLED)"
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  bake  refused  (cause=not-configured key=BUILD_BURST_ENABLED)"
     echo "burst: refused — not configured (RedBaron-local policy); set BUILD_BURST_ENABLED=1 to allow" >&2
     exit 3
   fi
   authz_refuse_if_missing bake || exit 3
   if ! state_active; then
-    journal_line "$(now_iso)  burst-lane  bake  refused  (cause=no-active-session)"
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  bake  refused  (cause=no-active-session)"
     echo "bake refused (cause=no-active-session)" >&2
     exit 3
   fi
@@ -2160,12 +2165,12 @@ cmd_bake() {
   gate_ready="$(state_read gate_ready)"
   sandbox_ok="$(state_read sandbox_ok)"
   if [ "$gate_ready" != "true" ]; then
-    journal_line "$(now_iso)  burst-lane  bake  refused  (cause=gate-not-ready server_id=$id)"
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  bake  refused  (cause=gate-not-ready server_id=$id)"
     echo "bake refused (cause=gate-not-ready)" >&2
     exit 3
   fi
   if [ "$sandbox_ok" != "true" ]; then
-    journal_line "$(now_iso)  burst-lane  bake  refused  (cause=sandbox-not-ok server_id=$id)"
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  bake  refused  (cause=sandbox-not-ok server_id=$id)"
     echo "bake refused (cause=sandbox-not-ok)" >&2
     exit 3
   fi
@@ -2177,7 +2182,7 @@ cmd_bake() {
   local bake_fd
   exec {bake_fd}>"$RUN_LOCK"
   if ! flock -n "$bake_fd"; then
-    journal_line "$(now_iso)  burst-lane  bake  refused  (cause=run-in-flight server_id=$id)"
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  bake  refused  (cause=run-in-flight server_id=$id)"
     echo "bake refused (cause=run-in-flight)" >&2
     exec {bake_fd}>&-
     exit 3
@@ -2232,7 +2237,7 @@ print(json.dumps(d.get("gate_tool_versions", {}), sort_keys=True))
   if ! "$HCLOUD" server create-image --type snapshot --description "$description" "$id" \
         >/dev/null 2>"$create_err"; then
     local emsg; emsg="$(tail -3 "$create_err" 2>/dev/null | tr '\n' ' ')"; rm -f "$create_err"
-    journal_line "$(now_iso)  burst-lane  bake  refused  (cause=hcloud-create-image-failed: $emsg)"
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  bake  refused  (cause=hcloud-create-image-failed: $emsg)"
     echo "bake refused (cause=hcloud-create-image-failed: $emsg)" >&2
     exit 3
   fi
@@ -2255,7 +2260,7 @@ else:
     print("", "")
 ' "$description" <<<"$list_out" 2>/dev/null)"
   if [ -z "${new_image_id:-}" ]; then
-    journal_line "$(now_iso)  burst-lane  bake  refused  (cause=could-not-parse-image-id)"
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  bake  refused  (cause=could-not-parse-image-id)"
     echo "bake refused (cause=could-not-parse-image-id)" >&2
     exit 3
   fi
@@ -2318,9 +2323,9 @@ json.dump(d, open(out_path, "w"), indent=2, sort_keys=True)
     "$gate_tool_versions" "$new_history" "$SNAPSHOT_STATE_FILE"
 
   local secs=$(( $(now_epoch) - start_epoch ))
-  journal_line "$(now_iso)  burst-lane  bake  done  (image_id=$new_image_id superseded=${prev_image_id:-none} secs=$secs)$(authz_journal_suffix)"
+  journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  bake  done  (image_id=$new_image_id superseded=${prev_image_id:-none} secs=$secs)$(authz_journal_suffix)"
   if [ -n "$superseded_id" ]; then
-    journal_line "$(now_iso)  burst-lane  bake  superseded  (image_id=$superseded_id delete=operator)"
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  bake  superseded  (image_id=$superseded_id delete=operator)"
   fi
   echo "bake done: image_id=$new_image_id"
   exit 0
@@ -2518,7 +2523,7 @@ prove_snapshot_cost() {
 }
 
 prove_journal_cost() {  # $1=outcome (done|failed|aborted)
-  journal_line "$(now_iso)  burst-lane  prove  cost  (server_id=${PROVE_COST_ID:-none} eur=${PROVE_COST_EUR:-0.0000} minutes=${PROVE_COST_MINUTES:-0} outcome=$1)"
+  journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  prove  cost  (server_id=${PROVE_COST_ID:-none} eur=${PROVE_COST_EUR:-0.0000} minutes=${PROVE_COST_MINUTES:-0} outcome=$1)"
 }
 
 # Shared proof.json writer — the normal tail and the abort trap both call
@@ -2640,7 +2645,7 @@ prove_preserve_evidence() {
   esac
 
   if [ "$trimmed" = true ]; then
-    journal_line "$(now_iso)  burst-lane  prove  evidence-trimmed  (reason=disk-floor dir=$dir free_gb=${free_gb:-unknown} floor_gb=$BURST_LOCAL_DISK_FLOOR_GB)"
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  prove  evidence-trimmed  (reason=disk-floor dir=$dir free_gb=${free_gb:-unknown} floor_gb=$BURST_LOCAL_DISK_FLOOR_GB)"
   elif [ -d "$local_target" ]; then
     if [ "$disposable" = true ]; then
       mv "$local_target" "$dir/target" 2>/dev/null || cp -a "$local_target" "$dir/target" 2>/dev/null || true
@@ -2669,7 +2674,7 @@ prove_preserve_evidence() {
   [ -f "$STATE_FILE" ] && cp -p "$STATE_FILE" "$dir/session.json" 2>/dev/null
 
   local bytes; bytes="$(du -sb "$dir" 2>/dev/null | cut -f1)"; bytes="${bytes:-0}"
-  journal_line "$(now_iso)  burst-lane  prove  $verb  (dir=$dir cause=${cause:-none} bytes=$bytes trimmed=$trimmed${extra:+ $extra})"
+  journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  prove  $verb  (dir=$dir cause=${cause:-none} bytes=$bytes trimmed=$trimmed${extra:+ $extra})"
   printf '%s' "$dir"
 }
 
@@ -2726,7 +2731,7 @@ reap_evidence() {  # -> stdout "evidence-reaped=N"
     mtime="$(stat -c %Y "$d" 2>/dev/null || echo "$(now_epoch)")"
     age_h=$(( ( $(now_epoch) - mtime ) / 3600 ))
     if rm -rf "$d" 2>/dev/null; then
-      journal_line "$(now_iso)  burst-lane  reap  evidence-deleted  (dir=$d bytes=$bytes age_h=$age_h)"
+      journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  reap  evidence-deleted  (dir=$d bytes=$bytes age_h=$age_h)"
       n=$((n+1))
     fi
   # `-L`: $EVIDENCE_DIR is a symlink to EVIDENCE_ROOT (see evidence_link_
@@ -2800,7 +2805,7 @@ prove_exit_trap() {
   prove_write_proof_json "" "$PROVE_ID" "$PROVE_WORKTREE" "$PROVE_SHA" false 0 \
     "$(( $(now_epoch) - ${PROVE_START_EPOCH:-$(now_epoch)} ))" "$cause" "$rc" "$step" "${PROVE_ERR_LINE:-}"
 
-  journal_line "$(now_iso)  burst-lane  prove  aborted  (step=$step line=${PROVE_ERR_LINE:-none} rc=$rc${tail:+ tail=\"$tail\"})$(authz_journal_suffix)"
+  journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  prove  aborted  (step=$step line=${PROVE_ERR_LINE:-none} rc=$rc${tail:+ tail=\"$tail\"})$(authz_journal_suffix)"
 
   prove_snapshot_cost
   ( cmd_down >/dev/null 2>&1 ) || true
@@ -2874,7 +2879,7 @@ cmd_prove() {
     PROVE_DISPOSABLE_REPO="$disposable_repo"
     if [ ! -d "$disposable_repo/.git" ] && ! git -C "$disposable_repo" rev-parse --git-dir >/dev/null 2>&1; then
       PROVE_FINISHED=true
-      journal_line "$(now_iso)  burst-lane  prove  failed  (cause=mcphost-repo-missing)"
+      journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  prove  failed  (cause=mcphost-repo-missing)"
       echo "prove failed (cause=mcphost-repo-missing)" >&2
       exit 1
     fi
@@ -2882,7 +2887,7 @@ cmd_prove() {
     PROVE_WORKTREE="$worktree"
     if ! git -C "$disposable_repo" worktree add --detach "$worktree" HEAD >/dev/null 2>&1; then
       PROVE_FINISHED=true
-      journal_line "$(now_iso)  burst-lane  prove  failed  (cause=worktree-add-failed)"
+      journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  prove  failed  (cause=worktree-add-failed)"
       echo "prove failed (cause=worktree-add-failed)" >&2
       exit 1
     fi
@@ -3087,7 +3092,7 @@ cmd_prove() {
     # Requirement 12/AC14: local_target is named on a success line too — the
     # off-root target-dir case has nothing to diagnose, but the operator
     # still gets to see which path was actually inspected.
-    journal_line "$(now_iso)  burst-lane  prove  done  (routed=true image_id=$image_id server_id=$id bytes=$bytes secs=$secs_remote local_target=${PROVE_LOCAL_TARGET:-none})$(authz_journal_suffix)"
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  prove  done  (routed=true image_id=$image_id server_id=$id bytes=$bytes secs=$secs_remote local_target=${PROVE_LOCAL_TARGET:-none})$(authz_journal_suffix)"
     echo "prove done: routed=true image_id=$image_id bytes=$bytes"
     exit 0
   fi
@@ -3097,7 +3102,7 @@ cmd_prove() {
   # diagnosis (files/newest_mtime/marker_mtime/remote_date/skew_s) right in
   # the journal line, same fields as proof.json.
   [ -n "$PROVE_ASSERT_DIAG_JSON" ] && fail_msg="$fail_msg $(prove_diag_tail "$PROVE_ASSERT_DIAG_JSON")"
-  journal_line "$(now_iso)  burst-lane  prove  failed  ($fail_msg)$(authz_journal_suffix)"
+  journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  prove  failed  ($fail_msg)$(authz_journal_suffix)"
   echo "prove failed (cause=$cause$cause_hint)" >&2
   exit 1
 }
@@ -3155,7 +3160,7 @@ print("allow", ts, proof.get("image_id", ""))
   read -r verdict cause_or_ts image_id <<<"$decision"
 
   if [ "$verdict" != "allow" ]; then
-    journal_line "$(now_iso)  burst-lane  enable  refused  (cause=$cause_or_ts)"
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  enable  refused  (cause=$cause_or_ts)"
     echo "enable refused (cause=$cause_or_ts)" >&2
     exit 3
   fi
@@ -3164,7 +3169,7 @@ print("allow", ts, proof.get("image_id", ""))
   printf '[Service]\nEnvironment=BUILD_BURST_ENABLED=1\n' > "$SYSTEMD_DROPIN"
   systemctl --user daemon-reload >/dev/null 2>&1 || true
 
-  journal_line "$(now_iso)  burst-lane  enable  done  (proof_ts=$cause_or_ts image_id=$image_id)"
+  journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  enable  done  (proof_ts=$cause_or_ts image_id=$image_id)"
   echo "enable done: image_id=$image_id"
   exit 0
 }
@@ -3183,7 +3188,7 @@ cmd_disable() {
   # $1 optional cause — defaults to "operator" (a manual `disable` call).
   local cause="${1:-operator}"
   remove_burst_dropin
-  journal_line "$(now_iso)  burst-lane  disable  done  (cause=$cause)"
+  journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  disable  done  (cause=$cause)"
   echo "disable done (cause=$cause)"
   exit 0
 }
@@ -3269,14 +3274,14 @@ print("trigger=none")
       local sessions="${decision#trigger=zero-run-sessions sessions=}"
       remove_burst_dropin
       local line; line="$(now_iso)  burst-lane  auto-disabled  (cause=zero-run-sessions sessions=$sessions)"
-      journal_line "$line"
+      journal_line --file "$JOURNAL" "$line"
       echo "$line" >&2
       ;;
     "trigger=eur-ceiling "*)
       local eur="${decision#trigger=eur-ceiling eur=}"
       remove_burst_dropin
       local line; line="$(now_iso)  burst-lane  auto-disabled  (cause=eur-ceiling eur=$eur)"
-      journal_line "$line"
+      journal_line --file "$JOURNAL" "$line"
       echo "$line" >&2
       ;;
     *) : ;;
@@ -3355,7 +3360,7 @@ run_pending_reality_check_if_gate_ready() {
   [ -x "$REALITY_CHECK_SH" ] || return 0
   local rc=0
   "$REALITY_CHECK_SH" pending-run build-skill >/dev/null 2>&1 || rc=$?
-  journal_line "$(now_iso)  burst-lane  up  pending-reality-run  (rc=$rc)"
+  journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  up  pending-reality-run  (rc=$rc)"
   return 0
 }
 
@@ -3375,7 +3380,7 @@ cmd_up() {
   if ! flock -n 221; then
     local holder_pid; holder_pid="$(up_lock_holder_pid)"
     local holder_desc; holder_desc="$(up_lock_holder_describe "$holder_pid")"
-    journal_line "$(now_iso)  burst-lane  up  up-refused  (lock-held $holder_desc)"
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  up  up-refused  (lock-held $holder_desc)"
     echo "up-refused: lock held by $holder_desc" >&2
     exit 3
   fi
@@ -3388,7 +3393,7 @@ cmd_up() {
   local prior_pid; prior_pid="$(cat "$UP_PID_FILE" 2>/dev/null || true)"
   case "$prior_pid" in
     ''|*[!0-9]*) : ;;
-    *) kill -0 "$prior_pid" 2>/dev/null || journal_line "$(now_iso)  burst-lane  up  lock-reclaimed  (stale_pid=$prior_pid)" ;;
+    *) kill -0 "$prior_pid" 2>/dev/null || journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  up  lock-reclaimed  (stale_pid=$prior_pid)" ;;
   esac
   echo "$$" > "$UP_PID_FILE" 2>/dev/null || true
   trap 'rm -f "$UP_PID_FILE" 2>/dev/null || true' EXIT
@@ -3436,7 +3441,7 @@ cmd_up() {
     if box_probe_out="$(probe_box_specs "$aip")"; then
       read -r box_cores box_mem_gb box_disk_gb <<<"$box_probe_out"
     else
-      journal_line "$(now_iso)  burst-lane  up  box-probe  failed  (server_id=$aid)"
+      journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  up  box-probe  failed  (server_id=$aid)"
     fi
     # Requirement 9: no `server create` happened on this path (the box
     # already existed), so its true creation moment is unknown here — no
@@ -3452,12 +3457,12 @@ cmd_up() {
       "gate_ready=$GATE_READY" "gate_tools_missing=$GATE_TOOLS_MISSING" \
       "box_cores=$box_cores" "box_mem_gb=$box_mem_gb" "box_disk_gb=$box_disk_gb" \
       "phase=setup" "phase_epoch=$(now_epoch)"
-    journal_line "$(now_iso)  burst-lane  up  adopted  (server_id=$aid ip=$aip sandbox_ok=$sbx gate_ready=$GATE_READY)$(authz_journal_suffix)"
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  up  adopted  (server_id=$aid ip=$aip sandbox_ok=$sbx gate_ready=$GATE_READY)$(authz_journal_suffix)"
     # requirement 5: the slot-cap derivation, journaled once per session so
     # it's auditable without a separate `status` call.
     run_slot_cap
-    journal_line "$(now_iso)  burst-lane  up  slots  (cap=$RUN_SLOT_CAP source=$RUN_SLOT_SOURCE bound=${RUN_SLOT_BOUND:-} cores=${box_cores:-} mem_gb=${box_mem_gb:-} disk_gb=${box_disk_gb:-})"
-    ( cmd_verify >/dev/null 2>&1 ) || journal_line "$(now_iso)  burst-lane  up  verify-failed-after-adopt  (lane unverified — run falls back local)"
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  up  slots  (cap=$RUN_SLOT_CAP source=$RUN_SLOT_SOURCE bound=${RUN_SLOT_BOUND:-} cores=${box_cores:-} mem_gb=${box_mem_gb:-} disk_gb=${box_disk_gb:-})"
+    ( cmd_verify >/dev/null 2>&1 ) || journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  up  verify-failed-after-adopt  (lane unverified — run falls back local)"
     local _adopt_image_id; read -r _adopt_image_id _ <<<"$(resolve_boot_image)"
     refresh_parity_baseline_on_image_change "$_adopt_image_id"
     schedule_session_parity "$aid"
@@ -3467,7 +3472,7 @@ cmd_up() {
 
   local pre_out; pre_out="$(precondition)"; local pre_rc=$?
   if [ "$pre_rc" -ne 0 ]; then
-    journal_line "$(now_iso)  burst-lane  up  fallback  (cause=precondition-failed: $pre_out)"
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  up  fallback  (cause=precondition-failed: $pre_out)"
     echo "fallback: precondition failed - $pre_out"
     exit 3
   fi
@@ -3480,7 +3485,7 @@ cmd_up() {
   local image_id image_source
   read -r image_id image_source <<<"$(resolve_boot_image)"
   CURRENT_BOOT_IMAGE_SOURCE="$image_source"
-  journal_line "$(now_iso)  burst-lane  up  image  (id=$image_id source=$image_source)"
+  journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  up  image  (id=$image_id source=$image_source)"
 
   # AC14 (primary-IP billing): deliberately never pass --primary-ipv4 (attach
   # an existing, standalone Primary IP) or --without-ipv4 here. Left at the
@@ -3496,7 +3501,7 @@ cmd_up() {
   if ! create_out="$("$HCLOUD" server create --name "$SERVER_NAME" --type "$SERVER_TYPE" \
         --location "$LOCATION" --image "$image_id" --ssh-key "${HCLOUD_SSH_KEY:-default}" -o json 2>"$create_err")"; then
     local emsg; emsg="$(tail -3 "$create_err" 2>/dev/null | tr '\n' ' ')"; rm -f "$create_err"
-    journal_line "$(now_iso)  burst-lane  up  fallback  (cause=hcloud-server-create-failed: $emsg)"
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  up  fallback  (cause=hcloud-server-create-failed: $emsg)"
     echo "fallback: hcloud server create failed - $emsg"
     exit 3
   fi
@@ -3509,7 +3514,7 @@ d = d.get("server", d)
 print(d.get("id",""), d.get("public_net",{}).get("ipv4",{}).get("ip",""))
 ' <<<"$create_out" 2>/dev/null)"
   if [ -z "${id:-}" ]; then
-    journal_line "$(now_iso)  burst-lane  up  fallback  (cause=could-not-parse-server-id)"
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  up  fallback  (cause=could-not-parse-server-id)"
     echo "fallback: could not parse server id from hcloud output"
     exit 3
   fi
@@ -3543,9 +3548,9 @@ print(d.get("id",""), d.get("public_net",{}).get("ipv4",{}).get("ip",""))
     local pf_minutes pf_eur
     pf_minutes=$(( ($(now_epoch) - create_epoch) / 60 ))
     pf_eur="$(awk -v m="$pf_minutes" -v r="$(cost_rate_eur "$SERVER_TYPE")" 'BEGIN{printf "%.4f", (m/60.0)*r}')"
-    journal_line "$(now_iso)  burst-lane  up  fallback  (cause=ssh-unreachable server_id=$id ip=$ip)"
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  up  fallback  (cause=ssh-unreachable server_id=$id ip=$ip)"
     "$HCLOUD" server delete "$id" >/dev/null 2>&1 || true
-    journal_line "$(now_iso)  burst-lane  down  decision=deleted  (server_id=$id cause=ssh-unreachable-before-boot minutes=$pf_minutes cost_eur=$pf_eur prds=none)"
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  down  decision=deleted  (server_id=$id cause=ssh-unreachable-before-boot minutes=$pf_minutes cost_eur=$pf_eur prds=none)"
     ledger_append "$(awk -v m="$pf_minutes" 'BEGIN{printf "%.4f", m/60.0}')" "$pf_eur" "$id"
     check_auto_disable
     echo "fallback: ssh never became reachable on $ip after 30s"
@@ -3569,7 +3574,7 @@ print(d.get("id",""), d.get("public_net",{}).get("ipv4",{}).get("ip",""))
   if box_probe_out="$(probe_box_specs "$ip")"; then
     read -r box_cores box_mem_gb box_disk_gb <<<"$box_probe_out"
   else
-    journal_line "$(now_iso)  burst-lane  up  box-probe  failed  (server_id=$id)"
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  up  box-probe  failed  (server_id=$id)"
   fi
   state_write "server_id=$id" "ip=$ip" "server_type=$SERVER_TYPE" \
     "boot_ts=$(now_iso)" "boot_epoch=$(now_epoch)" "create_epoch=$create_epoch" \
@@ -3579,14 +3584,14 @@ print(d.get("id",""), d.get("public_net",{}).get("ipv4",{}).get("ip",""))
     "gate_ready=$GATE_READY" "gate_tools_missing=$GATE_TOOLS_MISSING" \
     "box_cores=$box_cores" "box_mem_gb=$box_mem_gb" "box_disk_gb=$box_disk_gb" \
     "phase=setup" "phase_epoch=$(now_epoch)"
-  journal_line "$(now_iso)  burst-lane  up  booted  (server_id=$id ip=$ip type=$SERVER_TYPE sandbox_ok=$sbx gate_ready=$GATE_READY remote_user=$REMOTE_USER)$(authz_journal_suffix)"
+  journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  up  booted  (server_id=$id ip=$ip type=$SERVER_TYPE sandbox_ok=$sbx gate_ready=$GATE_READY remote_user=$REMOTE_USER)$(authz_journal_suffix)"
   # requirement 5: the slot-cap derivation, journaled once per session so
   # it's auditable without a separate `status` call.
   run_slot_cap
-  journal_line "$(now_iso)  burst-lane  up  slots  (cap=$RUN_SLOT_CAP source=$RUN_SLOT_SOURCE bound=${RUN_SLOT_BOUND:-} cores=${box_cores:-} mem_gb=${box_mem_gb:-} disk_gb=${box_disk_gb:-})"
-  ( cmd_verify >/dev/null 2>&1 ) || journal_line "$(now_iso)  burst-lane  up  verify-failed-after-boot  (lane unverified — run falls back local)"
+  journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  up  slots  (cap=$RUN_SLOT_CAP source=$RUN_SLOT_SOURCE bound=${RUN_SLOT_BOUND:-} cores=${box_cores:-} mem_gb=${box_mem_gb:-} disk_gb=${box_disk_gb:-})"
+  ( cmd_verify >/dev/null 2>&1 ) || journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  up  verify-failed-after-boot  (lane unverified — run falls back local)"
   if [ "$sbx" = false ]; then
-    journal_line "$(now_iso)  burst-lane  up  sandbox-unavailable  (server_id=$id — rust selection falls back to local cap for python-kind sandboxed tests this tick)"
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  up  sandbox-unavailable  (server_id=$id — rust selection falls back to local cap for python-kind sandboxed tests this tick)"
   fi
   refresh_parity_baseline_on_image_change "$image_id"
   schedule_session_parity "$id"
@@ -3679,12 +3684,12 @@ cmd_verify() {
   else
     gt_first="${gt_missing%%,*}"
     echo "verify FAIL: gate-tools (missing: ${gt_first:-unknown})"
-    journal_line "$(now_iso)  burst-lane  verify  gate-tools-missing  (missing=${gt_missing:-unknown})"
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  verify  gate-tools-missing  (missing=${gt_missing:-unknown})"
   fi
 
   if [ "$fails" -gt 0 ]; then
     probe_emit burst-verify dirty "$fails check(s) failed — lane stays unverified, all work falls back local" >/dev/null
-    journal_line "$(now_iso)  burst-lane  verify  FAILED  ($fails check(s) — lane stays unverified, all work falls back local)"
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  verify  FAILED  ($fails check(s) — lane stays unverified, all work falls back local)"
     exit 1
   fi
   state_write "server_id=$(state_read server_id)" "ip=$ip" "server_type=$(state_read server_type)" \
@@ -3699,7 +3704,7 @@ cmd_verify() {
     "box_disk_gb=$(state_read box_disk_gb)" \
     "verified=true" "phase=$(state_read_phase)" "phase_epoch=$(state_read phase_epoch)"
   probe_emit burst-verify clean "rsync+cargo+uv+python3+sandbox all real" >/dev/null
-  journal_line "$(now_iso)  burst-lane  verify  ok  (rsync+cargo+uv+python3+sandbox all real)"
+  journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  verify  ok  (rsync+cargo+uv+python3+sandbox all real)"
   echo "verify: ok"
   exit 0
 }
@@ -3762,7 +3767,7 @@ except Exception:
     if "$SSH_BIN" $(ssh_kh_args) -o ConnectTimeout=8 -i "$SSH_KEY" "root@$ip" \
          "mkdir -p '$new_remote_path' && cp -a '$old_remote_path/.' '$new_remote_path/' 2>/dev/null; rc=\$?; chown -R '$REMOTE_USER:$REMOTE_USER' '$new_remote_path' 2>/dev/null || true; exit \$rc" >/dev/null 2>&1; then
       mark_dirty "$wt" "$(state_read server_id)" "$new_remote_path" "$kind"
-      journal_line "$(now_iso)  burst-lane  provision  migrated  (worktree=$wt from=$old_remote_path to=$new_remote_path)"
+      journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  provision  migrated  (worktree=$wt from=$old_remote_path to=$new_remote_path)"
 
       # PRD-build-burst-parity-robust requirement 4: the copy landing is not
       # enough on its own to delete the source — verify size AND file count
@@ -3777,19 +3782,19 @@ except Exception:
       if [ "$old_bytes" = "$new_bytes" ] && [ "$old_count" = "$new_count" ]; then
         if "$SSH_BIN" $(ssh_kh_args) -o ConnectTimeout=8 -i "$SSH_KEY" "root@$ip" \
              "rm -rf '$old_remote_path'" >/dev/null 2>&1; then
-          journal_line "$(now_iso)  burst-lane  provision  migrated-removed  (from=$old_remote_path)"
+          journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  provision  migrated-removed  (from=$old_remote_path)"
         else
-          journal_line "$(now_iso)  burst-lane  provision  migrate-keep  (cause=remove-failed from=$old_remote_path)"
+          journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  provision  migrate-keep  (cause=remove-failed from=$old_remote_path)"
         fi
       else
-        journal_line "$(now_iso)  burst-lane  provision  migrate-keep  (cause=copy-mismatch from=$old_remote_path old_bytes=$old_bytes new_bytes=$new_bytes old_count=$old_count new_count=$new_count)"
+        journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  provision  migrate-keep  (cause=copy-mismatch from=$old_remote_path old_bytes=$old_bytes new_bytes=$new_bytes old_count=$old_count new_count=$new_count)"
       fi
     else
       clear_dirty "$wt"
-      journal_line "$(now_iso)  burst-lane  provision  migrate-cold  (worktree=$wt cause=copy-failed old=$old_remote_path new=$new_remote_path)"
+      journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  provision  migrate-cold  (worktree=$wt cause=copy-failed old=$old_remote_path new=$new_remote_path)"
     fi
   done
-  journal_line "$(now_iso)  burst-lane  provision  user-migrated  (server_id=$(state_read server_id) from=$prior_user to=$REMOTE_USER)"
+  journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  provision  user-migrated  (server_id=$(state_read server_id) from=$prior_user to=$REMOTE_USER)"
 }
 
 # ---- provision --------------------------------------------------------------
@@ -3807,7 +3812,7 @@ cmd_provision() {
   exec 220>"$PROVISION_LOCK_FILE"
   if ! flock -n 220; then
     local holder_pid; holder_pid="$(cat "$PROVISION_PID_FILE" 2>/dev/null || true)"
-    journal_line "$(now_iso)  burst-lane  provision  provision-refused  (lock-held pid=${holder_pid:-unknown})"
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  provision  provision-refused  (lock-held pid=${holder_pid:-unknown})"
     echo "provision-refused: lock held by pid=${holder_pid:-unknown}" >&2
     exit 1
   fi
@@ -3848,7 +3853,7 @@ cmd_provision() {
     "box_cores=$(state_read box_cores)" "box_mem_gb=$(state_read box_mem_gb)" \
     "box_disk_gb=$(state_read box_disk_gb)" \
     "phase=$new_phase" "phase_epoch=$(now_epoch)"
-  journal_line "$(now_iso)  burst-lane  provision  done  (server_id=$(state_read server_id) gate_ready=$GATE_READY gate_tools_missing=${GATE_TOOLS_MISSING:-none} remote_user=$REMOTE_USER per_tool_rc=\"${GATE_TOOLS_RC_SUMMARY:-}\" phase=$new_phase)"
+  journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  provision  done  (server_id=$(state_read server_id) gate_ready=$GATE_READY gate_tools_missing=${GATE_TOOLS_MISSING:-none} remote_user=$REMOTE_USER per_tool_rc=\"${GATE_TOOLS_RC_SUMMARY:-}\" phase=$new_phase)"
   echo "provision: gate_ready=$GATE_READY missing=${GATE_TOOLS_MISSING:-} per_tool_rc=\"${GATE_TOOLS_RC_SUMMARY:-}\""
   [ "$GATE_READY" = "true" ] && exit 0
   exit 1
@@ -3906,7 +3911,7 @@ cmd_status() {
   # (e.g. gate-burst.sh's `*'"active":true'*`) is unaffected.
   if [ -n "$JQ" ] && ! "$JQ" -e . "$STATE_FILE" >/dev/null 2>&1; then
     probe_emit burst-status could-not-check "session.json corrupted (unparseable): $STATE_FILE" >/dev/null
-    journal_line "$(now_iso)  burst-lane  status  could-not-check  (session.json corrupted at $STATE_FILE — treating as no active session, falling back local)"
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  status  could-not-check  (session.json corrupted at $STATE_FILE — treating as no active session, falling back local)"
     if [ "$json" -eq 1 ]; then
       status_json_with_extras '{"active":false,"could_not_check":true}'
     else
@@ -3920,7 +3925,7 @@ cmd_status() {
   # active:false + server_verified:false — never the stale truth an out-of-
   # band `hcloud server delete` left behind (2026-09-13 incident).
   if ! session_reconcile; then
-    journal_line "$(now_iso)  burst-lane  status  session-stale  (archived session.json — reporting active:false)"
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  status  session-stale  (archived session.json — reporting active:false)"
     if [ "$json" -eq 1 ]; then
       status_json_with_extras '{"active":false,"server_verified":false}'
     else
@@ -4288,7 +4293,7 @@ cmd_route_check() {
       # "route healed" line before writing another.
       if [ -z "${BURST_ROUTE_LOG:-}" ] || [ ! -f "$BURST_ROUTE_LOG" ] \
          || ! grep -q 'route healed' "$BURST_ROUTE_LOG" 2>/dev/null; then
-        journal_line "$(now_iso)  burst-lane  route  healed  (intended=$intended resolved=${resolved:-none} shim=$shim cause=shim-not-first repo=$repo)"
+        journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  route  healed  (intended=$intended resolved=${resolved:-none} shim=$shim cause=shim-not-first repo=$repo)"
       fi
       if [ -n "${BURST_ROUTE_LOG:-}" ]; then
         mkdir -p "$(dirname "$BURST_ROUTE_LOG")" 2>/dev/null || true
@@ -4302,7 +4307,7 @@ cmd_route_check() {
     mismatch)
       # Requirement 3: "never silent" — unconditional, regardless of
       # whether the caller set $BURST_ROUTE_LOG.
-      journal_line "$(now_iso)  burst-lane  route  mismatch  (intended=$intended resolved=${resolved:-none} shim=$shim cause=$cause caller=burst-lane.sh:route-check repo=$repo)"
+      journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  route  mismatch  (intended=$intended resolved=${resolved:-none} shim=$shim cause=$cause caller=burst-lane.sh:route-check repo=$repo)"
       if [ -n "${BURST_ROUTE_LOG:-}" ]; then
         mkdir -p "$(dirname "$BURST_ROUTE_LOG")" 2>/dev/null || true
         (
@@ -4999,7 +5004,7 @@ do_marker_pull() {  # $1=worktree $2=trigger(local-read|explicit|teardown) -> rc
       local pr_logged; pr_logged="$(dirty_field "$worktree" backoff_logged_epoch)"
       if [ "$pr_logged" != "$pr_next_retry" ]; then
         dirty_merge_fields "$worktree" "{\"backoff_logged_epoch\": $pr_next_retry}"
-        journal_line "$(now_iso)  burst-lane  pull  backoff  (worktree=$worktree trigger=$trigger attempts=$pr_attempts next_retry_s=$((pr_next_retry - $(now_epoch))))"
+        journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  pull  backoff  (worktree=$worktree trigger=$trigger attempts=$pr_attempts next_retry_s=$((pr_next_retry - $(now_epoch))))"
       fi
       PULL_OUTCOME="deferred-backoff"
       return 0
@@ -5060,7 +5065,7 @@ do_marker_pull() {  # $1=worktree $2=trigger(local-read|explicit|teardown) -> rc
       fi
 
       if [ "$pull_free_gb" -lt "$pull_need_gb" ]; then
-        journal_line "$(now_iso)  burst-lane  pull  deferred  (worktree=$worktree trigger=$trigger cause=local-disk free_gb=$pull_free_gb need_gb=$pull_need_gb rule=$pull_need_rule)"
+        journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  pull  deferred  (worktree=$worktree trigger=$trigger cause=local-disk free_gb=$pull_free_gb need_gb=$pull_need_gb rule=$pull_need_rule)"
         PULL_OUTCOME="deferred"
         return 0
       fi
@@ -5069,7 +5074,7 @@ do_marker_pull() {  # $1=worktree $2=trigger(local-read|explicit|teardown) -> rc
 
   if ! state_active; then
     clear_dirty "$worktree"
-    journal_line "$(now_iso)  burst-lane  pull  cold  (worktree=$worktree session_id=$sid trigger=$trigger cause=no-active-session — local target stale, next local build recompiles)"
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  pull  cold  (worktree=$worktree session_id=$sid trigger=$trigger cause=no-active-session — local target stale, next local build recompiles)"
     PULL_OUTCOME="cold"
     return 0
   fi
@@ -5092,7 +5097,7 @@ do_marker_pull() {  # $1=worktree $2=trigger(local-read|explicit|teardown) -> rc
     "$REMOTE_ROOT"/*) : ;;
     *)
       clear_dirty "$worktree"
-      journal_line "$(now_iso)  burst-lane  pull  cold  (worktree=$worktree session_id=$sid remote_path=$remote_path trigger=$trigger cause=remote-path-missing — local target stale, next local build recompiles)"
+      journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  pull  cold  (worktree=$worktree session_id=$sid remote_path=$remote_path trigger=$trigger cause=remote-path-missing — local target stale, next local build recompiles)"
       PULL_OUTCOME="cold"
       return 0
       ;;
@@ -5100,7 +5105,7 @@ do_marker_pull() {  # $1=worktree $2=trigger(local-read|explicit|teardown) -> rc
 
   if ! remote_dir_exists "$ip" "$remote_path"; then
     clear_dirty "$worktree"
-    journal_line "$(now_iso)  burst-lane  pull  cold  (worktree=$worktree session_id=$sid remote_path=$remote_path trigger=$trigger cause=remote-dir-missing — local target stale, next local build recompiles)"
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  pull  cold  (worktree=$worktree session_id=$sid remote_path=$remote_path trigger=$trigger cause=remote-dir-missing — local target stale, next local build recompiles)"
     PULL_OUTCOME="cold"
     return 0
   fi
@@ -5123,7 +5128,7 @@ do_marker_pull() {  # $1=worktree $2=trigger(local-read|explicit|teardown) -> rc
   # outcome, not a failure: clear the marker in one pass, never retried.
   if [ "$prc" -eq 2 ]; then
     clear_dirty "$worktree"
-    journal_line "$(now_iso)  burst-lane  pull  cold  (worktree=$worktree session_id=$sid remote_path=$remote_path trigger=$trigger cause=remote-target-missing — nothing was built on the box for this marker)"
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  pull  cold  (worktree=$worktree session_id=$sid remote_path=$remote_path trigger=$trigger cause=remote-target-missing — nothing was built on the box for this marker)"
     PULL_OUTCOME="cold"
     return 0
   fi
@@ -5177,9 +5182,9 @@ print(json.dumps({
 ' "$pf_new_attempts" "$pf_next_epoch" "$pf_stuck" "$pf_err")"
 
     if [ "$pf_stuck" = "true" ]; then
-      journal_line "$(now_iso)  burst-lane  pull  stuck  (worktree=$worktree trigger=$trigger cause=$pf_cause rc=$pf_rc err=\"$pf_err\" attempts=$pf_new_attempts — marker left dirty; needs a new routed run to reset)"
+      journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  pull  stuck  (worktree=$worktree trigger=$trigger cause=$pf_cause rc=$pf_rc err=\"$pf_err\" attempts=$pf_new_attempts — marker left dirty; needs a new routed run to reset)"
     else
-      journal_line "$(now_iso)  burst-lane  pull  fallback  (cause=$pf_cause rc=$pf_rc err=\"$pf_err\" attempts=$pf_new_attempts next_retry_s=$pf_delay worktree=$worktree trigger=$trigger)"
+      journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  pull  fallback  (cause=$pf_cause rc=$pf_rc err=\"$pf_err\" attempts=$pf_new_attempts next_retry_s=$pf_delay worktree=$worktree trigger=$trigger)"
     fi
     PULL_OUTCOME="failed"
     return 1
@@ -5194,7 +5199,7 @@ print(json.dumps({
   # triggered it (same derivation a run itself would use for this worktree).
   if [ "$trigger" = "teardown" ]; then slug="teardown"; else slug="$(attribution_slug_for "$worktree")"; fi
   attribution_record "$slug" "$sid" 0 "$sync_s" "${bytes:-0}" "$worktree" pull 0 0 false "$trigger"
-  journal_line "$(now_iso)  burst-lane  pull  ok  (worktree=$worktree trigger=$trigger bytes=${bytes:-0} slug=$slug)"
+  journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  pull  ok  (worktree=$worktree trigger=$trigger bytes=${bytes:-0} slug=$slug)"
   PULL_OUTCOME="transferred"
   return 0
 }
@@ -5229,7 +5234,7 @@ run_slot_cap_terms() {  # $1=cores $2=mem_gb $3=disk_gb -> stdout "<cap> <bound>
     cores_per="$BURST_CORES_PER_RUN"
   elif [ -n "${BURST_CORES_PER_BRANCH:-}" ]; then
     cores_per="$BURST_CORES_PER_BRANCH"
-    journal_line "$(now_iso)  burst-lane  run-slot-cap  deprecated-knob  (old=BURST_CORES_PER_BRANCH new=BURST_CORES_PER_RUN)"
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  run-slot-cap  deprecated-knob  (old=BURST_CORES_PER_BRANCH new=BURST_CORES_PER_RUN)"
   else
     cores_per=4
   fi
@@ -5237,7 +5242,7 @@ run_slot_cap_terms() {  # $1=cores $2=mem_gb $3=disk_gb -> stdout "<cap> <bound>
     gb_per="$BURST_GB_PER_RUN"
   elif [ -n "${BURST_GB_PER_BRANCH:-}" ]; then
     gb_per="$BURST_GB_PER_BRANCH"
-    journal_line "$(now_iso)  burst-lane  run-slot-cap  deprecated-knob  (old=BURST_GB_PER_BRANCH new=BURST_GB_PER_RUN)"
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  run-slot-cap  deprecated-knob  (old=BURST_GB_PER_BRANCH new=BURST_GB_PER_RUN)"
   else
     gb_per=8
   fi
@@ -5245,7 +5250,7 @@ run_slot_cap_terms() {  # $1=cores $2=mem_gb $3=disk_gb -> stdout "<cap> <bound>
     disk_per="$BURST_GB_DISK_PER_RUN"
   elif [ -n "${BURST_GB_DISK_PER_BRANCH:-}" ]; then
     disk_per="$BURST_GB_DISK_PER_BRANCH"
-    journal_line "$(now_iso)  burst-lane  run-slot-cap  deprecated-knob  (old=BURST_GB_DISK_PER_BRANCH new=BURST_GB_DISK_PER_RUN)"
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  run-slot-cap  deprecated-knob  (old=BURST_GB_DISK_PER_BRANCH new=BURST_GB_DISK_PER_RUN)"
   else
     disk_per=45
   fi
@@ -5363,7 +5368,7 @@ acquire_run_slot() {
     done
     sleep 2; waited=$((waited+2))
     if [ "$waited" -eq 120 ]; then
-      journal_line "$(now_iso)  burst-lane  run  slot-wait  (worktree=$1 cap=$cap waited=${waited}s)"
+      journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  run  slot-wait  (worktree=$1 cap=$cap waited=${waited}s)"
     fi
   done
 }
@@ -5407,7 +5412,7 @@ cmd_run() {
   if bfg_cause="$(build_fail_guard_check "$worktree")"; then
     :
   else
-    journal_line "$(now_iso)  burst-lane  run  build-failed  repeated  (n=3 cause=\"$bfg_cause\" worktree=$worktree)"
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  run  build-failed  repeated  (n=3 cause=\"$bfg_cause\" worktree=$worktree)"
     echo "fallback: build-failed repeated 3x on this worktree's HEAD (cause=\"$bfg_cause\") — refusing to re-run until HEAD changes"
     exit 3
   fi
@@ -5426,7 +5431,7 @@ cmd_run() {
       # shape the gate wrapper already journals at its own up call site, not
       # just print to stdout and fall back silently as far as the journal
       # is concerned. No server_id yet — up itself never got one.
-      journal_line "$(now_iso)  burst-lane  run  fallback  (cause=up-failed worktree=$worktree)"
+      journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  run  fallback  (cause=up-failed worktree=$worktree)"
       echo "$up_out"
       exit 3
     fi
@@ -5439,7 +5444,7 @@ cmd_run() {
       # AC8: cause=verify-failed, same fallback shape as up-failed above
       # (formerly journaled as a bespoke "lane-unverified" event with no
       # other reader depending on that literal text).
-      journal_line "$(now_iso)  burst-lane  run  fallback  (cause=verify-failed server_id=$id worktree=$worktree)"
+      journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  run  fallback  (cause=verify-failed server_id=$id worktree=$worktree)"
       echo "fallback: lane not verified (burst-lane.sh verify) — running locally"
       exit 3
     fi
@@ -5516,7 +5521,7 @@ cmd_run() {
       *)
         local disk_floor_run="${BURST_DISK_FLOOR_GB:-40}"
         if [ "$run_free_gb" -lt "$disk_floor_run" ]; then
-          journal_line "$(now_iso)  burst-lane  run  fallback  (cause=disk-low free_gb=$run_free_gb floor_gb=$disk_floor_run worktree=$worktree)"
+          journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  run  fallback  (cause=disk-low free_gb=$run_free_gb floor_gb=$disk_floor_run worktree=$worktree)"
           echo "fallback: disk-low (free_gb=$run_free_gb floor_gb=$disk_floor_run)"
           exit 3
         fi
@@ -5578,7 +5583,7 @@ cmd_run() {
             "$pd_dep/" "$REMOTE_USER@$ip:$pd_remote/" >"$pd_log" 2>&1 || pd_rc=$?
       if [ "$pd_rc" -ne 0 ]; then
         pd_err="$(grep -v '^[[:space:]]*$' "$pd_log" 2>/dev/null | tail -n1)"
-        journal_line "$(now_iso)  burst-lane  run  fallback  (cause=pathdep-rsync-failed rc=$pd_rc err=\"$pd_err\" worktree=$worktree dep=$pd_dep)"
+        journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  run  fallback  (cause=pathdep-rsync-failed rc=$pd_rc err=\"$pd_err\" worktree=$worktree dep=$pd_dep)"
         echo "fallback: rsync of path dependency $pd_dep to $ip failed rc=$pd_rc (see $pd_log)"
         rm -f "$map_file"
         exit 3
@@ -5604,7 +5609,7 @@ cmd_run() {
         rm -f "$pd_tmp"
       fi
     done
-    journal_line "$(now_iso)  burst-lane  run  pathdeps  (worktree=$worktree deps=${#pathdeps[@]} paths=$(IFS=,; echo "${pathdeps[*]}"))"
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  run  pathdeps  (worktree=$worktree deps=${#pathdeps[@]} paths=$(IFS=,; echo "${pathdeps[*]}"))"
   fi
 
   # PRD-build-burst-path-deps-workspaces requirement 1: sync $sync_root (the
@@ -5618,7 +5623,7 @@ cmd_run() {
         "$sync_root/" "$REMOTE_USER@$ip:$remote_path/" >"$up_log" 2>&1 || rsync_up_rc=$?
   if [ "$rsync_up_rc" -ne 0 ]; then
     local up_err; up_err="$(grep -v '^[[:space:]]*$' "$up_log" 2>/dev/null | tail -n1)"
-    journal_line "$(now_iso)  burst-lane  run  fallback  (cause=rsync-up-failed rc=$rsync_up_rc err=\"$up_err\" worktree=$worktree)"
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  run  fallback  (cause=rsync-up-failed rc=$rsync_up_rc err=\"$up_err\" worktree=$worktree)"
     echo "fallback: rsync to $ip failed rc=$rsync_up_rc (see $up_log)"
     rm -f "$map_file"
     exit 3
@@ -5728,12 +5733,12 @@ cmd_run() {
   # same fallback treatment, never a compile run against a server that
   # never answered.
   if [ "$rc" -eq 127 ] || [ "$rc" -eq 126 ]; then
-    journal_line "$(now_iso)  burst-lane  run  infra-fail  (server_id=$id worktree=$worktree remote_rc=$rc cmd=$first — falling back local)"
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  run  infra-fail  (server_id=$id worktree=$worktree remote_rc=$rc cmd=$first — falling back local)"
     echo "fallback: remote $first not runnable on box (rc=$rc)"
     exit 3
   fi
   if [ "$rc" -eq 97 ]; then
-    journal_line "$(now_iso)  burst-lane  run  sccache-unreachable  (server_id=$id worktree=$worktree cmd=$first — falling back local)"
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  run  sccache-unreachable  (server_id=$id worktree=$worktree cmd=$first — falling back local)"
     echo "fallback: remote sccache did not answer after one restart attempt (rc=97)"
     exit 3
   fi
@@ -5765,7 +5770,7 @@ cmd_run() {
   if [ "$phase" = "build" ]; then
     local build_cause; build_cause="$(grep -iE 'error(\[|:)|error:' "$remote_out_log" 2>/dev/null | head -n1)"
     [ -z "$build_cause" ] && build_cause="$(grep -v '^[[:space:]]*$' "$remote_out_log" 2>/dev/null | tail -n1)"
-    journal_line "$(now_iso)  burst-lane  run  build-failed  (worktree=$worktree cause=\"$build_cause\")"
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  run  build-failed  (worktree=$worktree cause=\"$build_cause\")"
     # PRD-build-burst-path-deps-workspaces requirement 4: advance the
     # per-worktree repeat counter — the NEXT attempt's build_fail_guard_check
     # (top of cmd_run) is what actually refuses a 4th run once this reaches 3.
@@ -5860,7 +5865,7 @@ cmd_run() {
   # (success, or a genuine test-phase failure) keeps this line, now also
   # naming its phase alongside PRD-build-burst-persistent-volume's warm=.
   if [ "$phase" != "build" ]; then
-    journal_line "$(now_iso)  burst-lane  run  routed  (server_id=$id worktree=$worktree runs_served=$runs exit=$rc dirty=1 kind=$kind bytes_saved=$bytes_saved slug=$slug wall_s=$wall_s concurrent=$slot_held warm=$warm phase=${phase:-n/a})"
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  run  routed  (server_id=$id worktree=$worktree runs_served=$runs exit=$rc dirty=1 kind=$kind bytes_saved=$bytes_saved slug=$slug wall_s=$wall_s concurrent=$slot_held warm=$warm phase=${phase:-n/a})"
   fi
   exit "$rc"
 }
@@ -5883,7 +5888,7 @@ cmd_sync_back() {
   # required one).
   local sb_remote_path; sb_remote_path="$(dirty_field "$worktree" remote_path 2>/dev/null || true)"
   if ! bytes="$(pull_target_incremental "$worktree" "$ip" "$sb_remote_path")"; then
-    journal_line "$(now_iso)  burst-lane  sync-back  fallback  (cause=rsync-failed worktree=$worktree)"
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  sync-back  fallback  (cause=rsync-failed worktree=$worktree)"
     echo "fallback: rsync from $ip failed"
     exit 3
   fi
@@ -5891,7 +5896,7 @@ cmd_sync_back() {
   # leave a stale dirty marker behind claiming target/ is still ahead.
   record_pull_size "$worktree" "${bytes:-0}"
   clear_dirty "$worktree"
-  journal_line "$(now_iso)  burst-lane  sync-back  ok  (worktree=$worktree bytes=$bytes)"
+  journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  sync-back  ok  (worktree=$worktree bytes=$bytes)"
   echo "synced: bytes=$bytes"
   exit 0
 }
@@ -5907,7 +5912,7 @@ cmd_pull() {
   mkdir -p "$STATE_DIR/locks" 2>/dev/null || true
   exec 205>"$(wt_lock_file "$worktree")"
   if ! flock -n 205; then
-    journal_line "$(now_iso)  burst-lane  pull  refused  (worktree=$worktree cause=worktree-busy — a live run holds this worktree's lock)"
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  pull  refused  (worktree=$worktree cause=worktree-busy — a live run holds this worktree's lock)"
     echo "refused: worktree busy (live run in progress)" >&2
     exit 4
   fi
@@ -6273,7 +6278,7 @@ refresh_parity_baseline_on_image_change() {  # $1=current resolved image_id
         cleared=$((cleared + 1))
       fi
     done
-    journal_line "$(now_iso)  burst-lane  parity  baseline-refreshed  (cause=bake image_id=$cur_id repos_cleared=$cleared)"
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  parity  baseline-refreshed  (cause=bake image_id=$cur_id repos_cleared=$cleared)"
   fi
   mkdir -p "$(dirname "$PARITY_BASELINE_IMAGE_FILE")" 2>/dev/null || true
   printf '%s' "$cur_id" > "$PARITY_BASELINE_IMAGE_FILE" 2>/dev/null || true
@@ -6290,10 +6295,10 @@ schedule_session_parity() {  # $1=session_id
   for name in $BURST_PARITY_REPOS; do
     repo="$ATTR_REPOS_DIR/$name"
     if [ ! -d "$repo/.git" ]; then
-      journal_line "$(now_iso)  burst-lane  parity  schedule-skip  (repo=$name session=$sid cause=not-a-repo)"
+      journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  parity  schedule-skip  (repo=$name session=$sid cause=not-a-repo)"
       continue
     fi
-    journal_line "$(now_iso)  burst-lane  parity  scheduled  (repo=$name session=$sid)"
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  parity  scheduled  (repo=$name session=$sid)"
     # Requirement 3 (PRD-build-burst-prove-forensics): a backgrounded child
     # inherits whatever fds its parent has open at fork time — including a
     # lock fd (220 provision, 221 up, 201 run, 203 worktree) `up` itself may
@@ -6323,7 +6328,7 @@ cmd_parity() {
   while ! parity_load_ok; do
     local pload_now pload_elapsed; pload_now="$(now_epoch)"; pload_elapsed=$(( pload_now - pload_wait_start ))
     if [ "$pload_elapsed" -ge "$PARITY_LOAD_WAIT_S" ]; then
-      journal_line "$(now_iso)  burst-lane  parity  deferred  (cause=load repo=$repo waited=${pload_elapsed}s)"
+      journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  parity  deferred  (cause=load repo=$repo waited=${pload_elapsed}s)"
       echo "fallback: load"
       exit 3
     fi
@@ -6340,7 +6345,7 @@ cmd_parity() {
   local id ip; id="$(state_read server_id)"; ip="$(state_read ip)"
 
   local head_sha; head_sha="$(git -C "$repo" rev-parse HEAD 2>/dev/null || true)"
-  [ -n "$head_sha" ] || { echo "fallback: could not resolve HEAD for $repo"; journal_line "$(now_iso)  burst-lane  parity  fallback  (cause=no-head repo=$repo)"; exit 3; }
+  [ -n "$head_sha" ] || { echo "fallback: could not resolve HEAD for $repo"; journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  parity  fallback  (cause=no-head repo=$repo)"; exit 3; }
 
   # Serialize against a live `run`/`parity` on the SAME worktree — same lock
   # `run`/`pull` already use, so a parity rsync-up never interleaves with a
@@ -6359,7 +6364,7 @@ cmd_parity() {
   if [ "$rsync_up_rc" -ne 0 ]; then
     flock -u 206
     local up_err; up_err="$(grep -v '^[[:space:]]*$' "$up_log" 2>/dev/null | tail -n1)"
-    journal_line "$(now_iso)  burst-lane  parity  fallback  (cause=rsync-up-failed rc=$rsync_up_rc err=\"$up_err\" repo=$repo)"
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  parity  fallback  (cause=rsync-up-failed rc=$rsync_up_rc err=\"$up_err\" repo=$repo)"
     echo "fallback: rsync to $ip failed rc=$rsync_up_rc (see $up_log)"
     exit 3
   fi
@@ -6402,7 +6407,7 @@ cmd_parity() {
     local box_results; box_results="$(printf '%s\n' "$box_log" | cargo_nextest_suites_json)"
     box_suites="$(nextest_merge_suites "$box_names" "$box_results")"
   else
-    journal_line "$(now_iso)  burst-lane  parity  capture=cargo-test  (side=box repo=$repo)"
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  parity  capture=cargo-test  (side=box repo=$repo)"
     box_log="$("$SSH_BIN" $(ssh_kh_args) -i "$SSH_KEY" "$REMOTE_USER@$ip" \
       "$remote_env_prefix $CARGO_TEST_RUNNER_TARGET_ENV='stdbuf -o0'; cargo test --workspace --no-fail-fast -- --test-threads=1" 2>&1)"
     box_suites="$(printf '%s\n' "$box_log" | cargo_test_suites_json)"
@@ -6423,7 +6428,7 @@ cmd_parity() {
     local local_results; local_results="$(printf '%s\n' "$local_log" | cargo_nextest_suites_json)"
     local_suites="$(nextest_merge_suites "$local_names" "$local_results")"
   else
-    journal_line "$(now_iso)  burst-lane  parity  capture=cargo-test  (side=local repo=$repo)"
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  parity  capture=cargo-test  (side=local repo=$repo)"
     if [ -f "$local_log_file" ]; then
       local_log="$(cat "$local_log_file")"
     else
@@ -6454,12 +6459,12 @@ print(",".join(sorted(n for n in box if n not in local)))
       local_log="$(cd "$repo" && env "$CARGO_TEST_RUNNER_TARGET_ENV=stdbuf -o0" CARGO_BUDGET_TEST_THREADS="${CARGO_BUDGET_TEST_THREADS:-4}" "$CARGO_BUDGET_SH" run -- nice -n 15 cargo test --workspace --no-fail-fast -- --test-threads=1 2>&1)"
       printf '%s\n' "$local_log" > "$local_log_file"
       local_suites="$(printf '%s\n' "$local_log" | cargo_test_suites_json)"
-      journal_line "$(now_iso)  burst-lane  parity  baseline-refreshed  (repo=$repo names=$missing_locally)"
+      journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  parity  baseline-refreshed  (repo=$repo names=$missing_locally)"
     fi
   fi
 
   if [ "$box_capture" != "$local_capture" ]; then
-    journal_line "$(now_iso)  burst-lane  parity  capture-mismatch  (repo=$repo box=$box_capture local=$local_capture)"
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  parity  capture-mismatch  (repo=$repo box=$box_capture local=$local_capture)"
   fi
 
   # PRD-build-burst-parity-robust requirement 3: a "no-output" suite is
@@ -6479,7 +6484,7 @@ print(",".join(sorted(n for n in box if n not in local)))
       flock -u 206
       if [ "$rr" != "no-output" ]; then
         box_suites="$(json_set_str "$box_suites" "$name" "$rr")"
-        journal_line "$(now_iso)  burst-lane  parity  rerun  (suite=$name side=box)"
+        journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  parity  rerun  (suite=$name side=box)"
       fi
     done <<<"$(json_names_with_value "$box_suites" no-output)"
   fi
@@ -6490,7 +6495,7 @@ print(",".join(sorted(n for n in box if n not in local)))
       local rr; rr="$(nextest_rerun_result_local "$repo" "$name")"
       if [ "$rr" != "no-output" ]; then
         local_suites="$(json_set_str "$local_suites" "$name" "$rr")"
-        journal_line "$(now_iso)  burst-lane  parity  rerun  (suite=$name side=local)"
+        journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  parity  rerun  (suite=$name side=local)"
       fi
     done <<<"$(json_names_with_value "$local_suites" no-output)"
   fi
@@ -6567,10 +6572,10 @@ json.dump(out, open(sys.argv[4], "w"), indent=2)
   local host_sensitive_count host_sensitive_names
   host_sensitive_count="$(python3 -c 'import json,sys; print(len(json.loads(sys.argv[1])["host_sensitive"]))' "$diff_json")"
   if [ "$diff_count" -eq 0 ]; then status_word="ok"; else status_word="diff"; fi
-  journal_line "$(now_iso)  burst-lane  parity  $status_word  (repo=$repo head=$head_sha box=$ip diff=$diff_count session=$session_id)"
+  journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  parity  $status_word  (repo=$repo head=$head_sha box=$ip diff=$diff_count session=$session_id)"
   if [ "$host_sensitive_count" -gt 0 ]; then
     host_sensitive_names="$(python3 -c 'import json,sys; print(",".join(json.loads(sys.argv[1])["host_sensitive"]))' "$diff_json")"
-    journal_line "$(now_iso)  burst-lane  parity  host-sensitive  (repo=$repo names=$host_sensitive_names)"
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  parity  host-sensitive  (repo=$repo names=$host_sensitive_names)"
   fi
   echo "parity: $status_word (diff=$diff_count) — $parity_file"
   exit 0
@@ -6656,9 +6661,9 @@ try:
 except Exception:
     print("unknown")
 ' "$repo/target/autobuilder/last-verdict.json" 2>/dev/null)"
-      journal_line "$(now_iso)  burst-lane  $caller  gate  $verdict  (repo=$repo host=$ip waited=true age=${age}s)"
+      journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  $caller  gate  $verdict  (repo=$repo host=$ip waited=true age=${age}s)"
     else
-      journal_line "$(now_iso)  burst-lane  $caller  gate  abandoned  (repo=$repo host=$ip age=${age}s budget=${budget_s}s)"
+      journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  $caller  gate  abandoned  (repo=$repo host=$ip age=${age}s budget=${budget_s}s)"
       rm -f "$repo/target/autobuilder/last-verdict.json"
     fi
     rm -f "$marker"
@@ -6711,7 +6716,7 @@ cmd_gate() {
   # host= field — only the requirement-3 routed-success shape does — so
   # AC8's "no gate remote line is journaled" holds.
   if [ "${BURST_GATE_REMOTE:-0}" != "1" ]; then
-    journal_line "$(now_iso)  burst-lane  gate  fallback  (cause=remote-disabled repo=$repo)"
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  gate  fallback  (cause=remote-disabled repo=$repo)"
     echo "fallback: remote-disabled"
     exit 3
   fi
@@ -6726,12 +6731,12 @@ cmd_gate() {
 
   local head_now; head_now="$(git -C "$repo" rev-parse HEAD 2>/dev/null || true)"
   if [ -z "$head_now" ]; then
-    journal_line "$(now_iso)  burst-lane  gate  fallback  (cause=no-head repo=$repo)"
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  gate  fallback  (cause=no-head repo=$repo)"
     echo "fallback: no-head"
     exit 3
   fi
   if [ -n "$head_arg" ] && [ "$head_arg" != "$head_now" ]; then
-    journal_line "$(now_iso)  burst-lane  gate  fallback  (cause=head-mismatch repo=$repo requested=$head_arg actual=$head_now)"
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  gate  fallback  (cause=head-mismatch repo=$repo requested=$head_arg actual=$head_now)"
     echo "fallback: head-mismatch (requested=$head_arg actual=$head_now)"
     exit 3
   fi
@@ -6752,7 +6757,7 @@ cmd_gate() {
     cause="$(check_parity_receipt "$repo")"
   fi
   if [ "$cause" = "session" ] || [ "$cause" = "toolchain" ]; then
-    journal_line "$(now_iso)  burst-lane  parity  reproof  (cause=$cause repo=$repo)"
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  parity  reproof  (cause=$cause repo=$repo)"
     # Subshell: cmd_parity ends every path with an `exit`, correct for a
     # top-level dispatch but fatal to the calling process if invoked as a
     # plain function call — `( ... )` scopes that exit to the subshell only.
@@ -6760,7 +6765,7 @@ cmd_gate() {
     cause="$(check_parity_receipt "$repo")"
   fi
   if [ -n "$cause" ]; then
-    journal_line "$(now_iso)  burst-lane  gate  fallback  (cause=$cause repo=$repo head=$head_now)"
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  gate  fallback  (cause=$cause repo=$repo head=$head_now)"
     echo "fallback: $cause"
     exit 3
   fi
@@ -6768,7 +6773,7 @@ cmd_gate() {
   if ! state_active; then
     local up_out; up_out="$(cmd_up 2>&1)"; local up_rc=$?
     if [ "$up_rc" -ne 0 ]; then
-      journal_line "$(now_iso)  burst-lane  gate  fallback  (cause=up-failed repo=$repo)"
+      journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  gate  fallback  (cause=up-failed repo=$repo)"
       echo "$up_out"
       exit 3
     fi
@@ -6783,7 +6788,7 @@ cmd_gate() {
   # discovering the gap 126/127-deep into a remote ssh call below.
   if [ "$(state_read gate_ready)" != "true" ]; then
     local gt_missing; gt_missing="$(state_read gate_tools_missing)"
-    journal_line "$(now_iso)  burst-lane  gate  fallback  (cause=gate-tools-missing repo=$repo missing=${gt_missing:-unknown})"
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  gate  fallback  (cause=gate-tools-missing repo=$repo missing=${gt_missing:-unknown})"
     echo "fallback: gate-tools-missing (${gt_missing:-unknown})"
     exit 3
   fi
@@ -6811,7 +6816,7 @@ cmd_gate() {
   if [ "$rsync_up_rc" -ne 0 ]; then
     flock -u 212
     local up_err; up_err="$(grep -v '^[[:space:]]*$' "$up_log" 2>/dev/null | tail -n1)"
-    journal_line "$(now_iso)  burst-lane  gate  fallback  (cause=rsync-up-failed rc=$rsync_up_rc err=\"$up_err\" repo=$repo)"
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  gate  fallback  (cause=rsync-up-failed rc=$rsync_up_rc err=\"$up_err\" repo=$repo)"
     echo "fallback: rsync to $ip failed rc=$rsync_up_rc (see $up_log)"
     exit 3
   fi
@@ -6854,7 +6859,7 @@ cmd_gate() {
 
   if [ "$rc" -eq 127 ] || [ "$rc" -eq 126 ]; then
     flock -u 212
-    journal_line "$(now_iso)  burst-lane  gate  fallback  (cause=remote-extend-gate-not-runnable rc=$rc repo=$repo)"
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  gate  fallback  (cause=remote-extend-gate-not-runnable rc=$rc repo=$repo)"
     echo "fallback: remote extend-gate.sh not runnable on box (rc=$rc)"
     exit 3
   fi
@@ -6907,7 +6912,7 @@ json.dump(d, open(path, "w"), indent=2)
   # (attribution_slug_for's header documents the same "gate-<repo>" shape
   # for the OLDER per-cargo-call routing; this is the gate run AS A WHOLE).
   attribution_record "gate-$(basename "$repo")" "$id" "$wall_s" 0 0 "$repo" gate
-  journal_line "$(now_iso)  burst-lane  gate  $verdict  (repo=$repo host=$ip wall=${wall_s}s head=$head_now exit=$rc)"
+  journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  gate  $verdict  (repo=$repo host=$ip wall=${wall_s}s head=$head_now exit=$rc)"
   exit "$rc"
 }
 
@@ -6960,7 +6965,7 @@ sweep_dirty_worktrees() {  # $1=caller (down|watchdog)
   # nothing will read them, and on 09-11 a sweep that pulled worktrees back for 10+ min kept a
   # billed box alive past a forced delete. Skip entirely when the loop is inactive; cap each pull.
   if [ "$(systemctl --user is-active claude-build.path 2>/dev/null)" != "active" ]; then
-    journal_line "$(now_iso)  burst-lane  ${1:-down}  sweep-skipped  (cause=loop-stopped — delete proceeds without pulls)"
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  ${1:-down}  sweep-skipped  (cause=loop-stopped — delete proceeds without pulls)"
     return 0
   fi
   local f wt
@@ -6980,7 +6985,7 @@ except Exception:
     if ( exec 206>"$(wt_lock_file "$wt")"; flock -n 206 && do_marker_pull "$wt" teardown ); then
       :
     else
-      journal_line "$(now_iso)  burst-lane  ${1:-down}  sweep-failed  (worktree=$wt — busy or pull failed; marker left in place, sweep continues)"
+      journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  ${1:-down}  sweep-failed  (worktree=$wt — busy or pull failed; marker left in place, sweep continues)"
     fi
   done
 }
@@ -7169,11 +7174,11 @@ reap_old_root() {
   while IFS= read -r name; do
     [ -n "$name" ] || continue
     if grep -qxF "$name" <<<"$inflight_names"; then
-      journal_line "$(now_iso)  burst-lane  reap  skip  (dir=$name root=$OLD_ROOT_REMOTE_ROOT reason=gate-inflight)"
+      journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  reap  skip  (dir=$name root=$OLD_ROOT_REMOTE_ROOT reason=gate-inflight)"
       continue
     fi
     if ! ( exec 208>"$(wt_lock_file "$OLD_ROOT_REMOTE_ROOT/$name")"; flock -n 208 ); then
-      journal_line "$(now_iso)  burst-lane  reap  skip  (dir=$name root=$OLD_ROOT_REMOTE_ROOT reason=busy)"
+      journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  reap  skip  (dir=$name root=$OLD_ROOT_REMOTE_ROOT reason=busy)"
       continue
     fi
     local bytes
@@ -7183,9 +7188,9 @@ reap_old_root() {
     if "$SSH_BIN" $(ssh_kh_args) -o ConnectTimeout=8 -i "$SSH_KEY" \
          "root@$ip" "rm -rf '$OLD_ROOT_REMOTE_ROOT/$name'" 2>/dev/null; then
       reaped_dirs=$((reaped_dirs + 1)); reaped_bytes=$((reaped_bytes + bytes))
-      journal_line "$(now_iso)  burst-lane  reap  ok  (dir=$name root=$OLD_ROOT_REMOTE_ROOT bytes=$bytes reason=old-root)"
+      journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  reap  ok  (dir=$name root=$OLD_ROOT_REMOTE_ROOT bytes=$bytes reason=old-root)"
     else
-      journal_line "$(now_iso)  burst-lane  reap  fail  (dir=$name root=$OLD_ROOT_REMOTE_ROOT cause=rm-failed)"
+      journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  reap  fail  (dir=$name root=$OLD_ROOT_REMOTE_ROOT cause=rm-failed)"
     fi
   done <<<"$list_out"
 
@@ -7249,7 +7254,7 @@ reap_deps_manifest_dirs() {  # $1=ip $2=inflight_names(newline list) -> stdout "
     [ -n "$child" ] || continue
     relkey="deps/$child"
     if grep -qxF "$relkey" <<<"$inflight_names"; then
-      journal_line "$(now_iso)  burst-lane  reap  skip  (dir=$relkey reason=gate-inflight)"
+      journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  reap  skip  (dir=$relkey reason=gate-inflight)"
       continue
     fi
     owner=""
@@ -7258,7 +7263,7 @@ reap_deps_manifest_dirs() {  # $1=ip $2=inflight_names(newline list) -> stdout "
         continue  # live: untouched, no journal noise (matches top-level "live")
       fi
       if ! ( exec 210>"$(wt_lock_file "$owner")"; flock -n 210 ); then
-        journal_line "$(now_iso)  burst-lane  reap  skip  (dir=$relkey reason=busy)"
+        journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  reap  skip  (dir=$relkey reason=busy)"
         continue
       fi
       local bytes
@@ -7269,9 +7274,9 @@ reap_deps_manifest_dirs() {  # $1=ip $2=inflight_names(newline list) -> stdout "
            "$REMOTE_USER@$ip" "rm -rf '$REMOTE_ROOT/$relkey'" 2>/dev/null; then
         reaped_dirs=$((reaped_dirs + 1)); reaped_bytes=$((reaped_bytes + bytes))
         remote_dirs_remove "$relkey"
-        journal_line "$(now_iso)  burst-lane  reap  ok  (dir=$relkey bytes=$bytes reason=owner-gone)"
+        journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  reap  ok  (dir=$relkey bytes=$bytes reason=owner-gone)"
       else
-        journal_line "$(now_iso)  burst-lane  reap  fail  (dir=$relkey cause=rm-failed)"
+        journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  reap  fail  (dir=$relkey cause=rm-failed)"
       fi
     else
       # No manifest entry — legacy pre-PRD mirror (or a race with a run
@@ -7283,9 +7288,9 @@ reap_deps_manifest_dirs() {  # $1=ip $2=inflight_names(newline list) -> stdout "
       if "$SSH_BIN" $(ssh_kh_args) -o ConnectTimeout=8 -i "$SSH_KEY" \
            "$REMOTE_USER@$ip" "rm -rf '$REMOTE_ROOT/$relkey'" 2>/dev/null; then
         reaped_dirs=$((reaped_dirs + 1)); reaped_bytes=$((reaped_bytes + lbytes))
-        journal_line "$(now_iso)  burst-lane  reap  ok  (dir=$relkey bytes=$lbytes reason=legacy-no-local-match)"
+        journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  reap  ok  (dir=$relkey bytes=$lbytes reason=legacy-no-local-match)"
       else
-        journal_line "$(now_iso)  burst-lane  reap  fail  (dir=$relkey cause=rm-failed)"
+        journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  reap  fail  (dir=$relkey cause=rm-failed)"
       fi
     fi
   done <<<"$deps_out"
@@ -7308,7 +7313,7 @@ reap_orphans() {
   list_out="$("$SSH_BIN" $(ssh_kh_args) -o ConnectTimeout=8 -i "$SSH_KEY" \
       "$REMOTE_USER@$ip" "$list_cmd" 2>/dev/null)" || list_rc=$?
   if [ "$list_rc" -ne 0 ]; then
-    journal_line "$(now_iso)  burst-lane  reap  fail  (cause=ssh rc=$list_rc)"
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  reap  fail  (cause=ssh rc=$list_rc)"
     reap_finish 0 0
     return 0
   fi
@@ -7342,13 +7347,13 @@ reap_orphans() {
   while IFS=$'\t' read -r name action reason wt; do
     [ -n "$name" ] || continue
     case "$action" in
-      keep)  journal_line "$(now_iso)  burst-lane  reap  skip  (dir=$name reason=keep)" ;;
-      dirty) journal_line "$(now_iso)  burst-lane  reap  skip  (dir=$name reason=dirty)" ;;
+      keep)  journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  reap  skip  (dir=$name reason=keep)" ;;
+      dirty) journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  reap  skip  (dir=$name reason=dirty)" ;;
       live)  : ;;  # untouched, no journal noise on every healthy pass
       container) : ;;  # "deps" itself — its children are reaped below, never this container
       orphan)
         if grep -qxF "$name" <<<"$inflight_names"; then
-          journal_line "$(now_iso)  burst-lane  reap  skip  (dir=$name reason=gate-inflight)"
+          journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  reap  skip  (dir=$name reason=gate-inflight)"
           continue
         fi
         local busy=0
@@ -7356,7 +7361,7 @@ reap_orphans() {
           busy=1
         fi
         if [ "$busy" -eq 1 ]; then
-          journal_line "$(now_iso)  burst-lane  reap  skip  (dir=$name reason=busy)"
+          journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  reap  skip  (dir=$name reason=busy)"
           continue
         fi
         local bytes
@@ -7366,9 +7371,9 @@ reap_orphans() {
         if "$SSH_BIN" $(ssh_kh_args) -o ConnectTimeout=8 -i "$SSH_KEY" \
              "$REMOTE_USER@$ip" "rm -rf '$REMOTE_ROOT/$name'" 2>/dev/null; then
           reaped_dirs=$((reaped_dirs + 1)); reaped_bytes=$((reaped_bytes + bytes))
-          journal_line "$(now_iso)  burst-lane  reap  ok  (dir=$name bytes=$bytes reason=$reason)"
+          journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  reap  ok  (dir=$name bytes=$bytes reason=$reason)"
         else
-          journal_line "$(now_iso)  burst-lane  reap  fail  (dir=$name cause=rm-failed)"
+          journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  reap  fail  (dir=$name cause=rm-failed)"
         fi
         ;;
     esac
@@ -7431,7 +7436,7 @@ reap_orphan_processes() {
       kill -TERM "$pid" 2>/dev/null || true
       sleep 1
       kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null || true
-      journal_line "$(now_iso)  burst-lane  reap  orphan-killed  (pid=$pid kind=$kind age_s=$age)"
+      journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  reap  orphan-killed  (pid=$pid kind=$kind age_s=$age)"
       killed=$((killed + 1))
     else
       keep_rows+=("$ts $pid $kind")  # alive, still young — leave it running
@@ -7475,7 +7480,7 @@ print("%s\t%s\t%s" % (str(bool(d.get("stuck", False))).lower(), d.get("worktree"
     if [ -z "$cur_sid" ] || [ "$sid" != "$cur_sid" ]; then
       rm -f "$f"
       n=$((n + 1))
-      journal_line "$(now_iso)  burst-lane  reap  marker-stuck-cleared  (worktree=$wt session_id=$sid)"
+      journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  reap  marker-stuck-cleared  (worktree=$wt session_id=$sid)"
     fi
   done
   echo "stuck-markers-reaped=$n"
@@ -7546,11 +7551,11 @@ reap_volumes() {  # -> stdout "volumes-reaped=N"
     [ -n "$created_epoch" ] && age_h=$(( ( $(now_epoch) - created_epoch ) / 3600 ))
   fi
   if "$HCLOUD" volume delete "$vid" >/dev/null 2>&1; then
-    journal_line "$(now_iso)  burst-lane  reap  volume-deleted  (id=$vid used_pct=$used_pct size=${vsize:-unknown}G age_h=$age_h cause=orphaned-no-session-pointer)"
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  reap  volume-deleted  (id=$vid used_pct=$used_pct size=${vsize:-unknown}G age_h=$age_h cause=orphaned-no-session-pointer)"
     rm -f "$VOLUME_STATE_FILE"
     echo "volumes-reaped=1"
   else
-    journal_line "$(now_iso)  burst-lane  reap  volume-delete-failed  (id=$vid used_pct=$used_pct size=${vsize:-unknown}G age_h=$age_h)"
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  reap  volume-delete-failed  (id=$vid used_pct=$used_pct size=${vsize:-unknown}G age_h=$age_h)"
     echo "volumes-reaped=0"
   fi
 }
@@ -7758,7 +7763,7 @@ with open(sys.argv[7], "a") as fh:
     fi
     echo "$(now_epoch)" > "$PROBE_UNAVAILABLE_MARK_FILE" 2>/dev/null || true
   fi
-  journal_line "$(now_iso)  burst-lane  $caller  decision=$decision  (server_id=$id cause=$cause evidence=$evidence)"
+  journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  $caller  decision=$decision  (server_id=$id cause=$cause evidence=$evidence)"
 }
 
 # teardown_decision: the single evidence-backed answer requirement 1 wants.
@@ -7874,7 +7879,7 @@ cmd_why_down() {
   [ -n "$id" ] || { echo "usage: burst-lane.sh why-down <server_id>" >&2; exit 2; }
   if [ ! -f "$DECISIONS_LEDGER" ] || ! grep -q "\"server_id\": *\"$id\"" "$DECISIONS_LEDGER" 2>/dev/null; then
     echo "no decision recorded"
-    journal_line "$(now_iso)  burst-lane  why-down  unrecorded-deletion  (server_id=$id)"
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  why-down  unrecorded-deletion  (server_id=$id)"
     exit 1
   fi
   python3 -c '
@@ -8046,7 +8051,7 @@ for s in sessions:
   rc=$?
   if [ "$rc" -eq 3 ] || [ "$out" = "COULD_NOT_CHECK" ]; then
     probe_emit burst-attribution could-not-check "attribution ledger unreadable at teardown ($ATTR_LEDGER)" >/dev/null
-    journal_line "$(now_iso)  burst-lane  ${4:-down}  attribution-could-not-check  ($ATTR_LEDGER unreadable — cost NOT attributed to any slug this teardown)"
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  ${4:-down}  attribution-could-not-check  ($ATTR_LEDGER unreadable — cost NOT attributed to any slug this teardown)"
     return 3
   fi
   : > "$ATTR_LEDGER"
@@ -8329,7 +8334,7 @@ teardown_and_delete() {  # $1=id $2=caller_tag(down|watchdog|idle-guard)
       elapsed=$(( now - ${phase_epoch:-$now} ))
       if [ "$elapsed" -lt "$grace_secs" ]; then
         local remaining=$(( grace_secs - elapsed ))
-        journal_line "$(now_iso)  burst-lane  $caller  teardown-deferred  (cause=setup-grace remaining=${remaining}s server_id=$id)"
+        journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  $caller  teardown-deferred  (cause=setup-grace remaining=${remaining}s server_id=$id)"
         return 2
       fi
       # Grace expired with nobody ever having provisioned this session —
@@ -8354,7 +8359,7 @@ teardown_and_delete() {  # $1=id $2=caller_tag(down|watchdog|idle-guard)
     while IFS= read -r orphan_sid; do
       case "$orphan_sid" in
         ORPHANED:*)
-          journal_line "$(now_iso)  burst-lane  $caller  attribution-orphan-included  (session_id=${orphan_sid#ORPHANED:} — crashed prior session's rows folded into this teardown's proration)"
+          journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  $caller  attribution-orphan-included  (session_id=${orphan_sid#ORPHANED:} — crashed prior session's rows folded into this teardown's proration)"
           ;;
       esac
     done <<<"$prorate_out"
@@ -8392,11 +8397,11 @@ prove_inflight_guard() {
     start_epoch="$(sed -n 's/^start_epoch=//p' "$PROVE_INFLIGHT_FILE" 2>/dev/null | head -n1)"
     case "$start_epoch" in ''|*[!0-9]*) start_epoch="$(now_epoch)" ;; esac
     age=$(( $(now_epoch) - start_epoch ))
-    journal_line "$(now_iso)  burst-lane  $who  decision=keep  (server_id=$id cause=prove-inflight pid=$pid age_s=$age)"
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  $who  decision=keep  (server_id=$id cause=prove-inflight pid=$pid age_s=$age)"
     echo "decision=keep"
     return 0
   fi
-  journal_line "$(now_iso)  burst-lane  $who  prove-inflight-stale  (pid=$pid)"
+  journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  $who  prove-inflight-stale  (pid=$pid)"
   rm -f "$PROVE_INFLIGHT_FILE" 2>/dev/null
   return 1
 }
@@ -8415,18 +8420,18 @@ cmd_down_force() {
     local ovr_pid; ovr_pid="$(sed -n 's/^pid=//p' "$PROVE_INFLIGHT_FILE" 2>/dev/null | head -n1)"
     case "$ovr_pid" in
       ''|*[!0-9]*) : ;;
-      *) kill -0 "$ovr_pid" 2>/dev/null && journal_line "$(now_iso)  burst-lane  down  prove-inflight-overridden  (pid=$ovr_pid cause=force)" ;;
+      *) kill -0 "$ovr_pid" 2>/dev/null && journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  down  prove-inflight-overridden  (pid=$ovr_pid cause=force)" ;;
     esac
   fi
   local id; id="$(state_read server_id)"
   if [ -n "$id" ]; then
     if destroy_verify "$id"; then
-      journal_line "$(now_iso)  burst-lane  down  decision=force-deleted  (server_id=$id)"
+      journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  down  decision=force-deleted  (server_id=$id)"
     else
-      journal_line "$(now_iso)  burst-lane  down  LEAK-FLAG  (server_id=$id action=page-a-human — force-delete did not confirm destroyed after 3 retries)"
+      journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  down  LEAK-FLAG  (server_id=$id action=page-a-human — force-delete did not confirm destroyed after 3 retries)"
     fi
   else
-    journal_line "$(now_iso)  burst-lane  down  decision=force-deleted  (server_id=none — nothing tracked)"
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  down  decision=force-deleted  (server_id=none — nothing tracked)"
   fi
   session_known_hosts_remove
   rm -f "$STATE_FILE" "$SERVED_FILE"
@@ -8449,7 +8454,7 @@ cmd_down() {
   # Operators who want a delayed teardown use the TTL; this lane never
   # schedules its own delete via an external timer again.
   if [ "${1:-}" = "--at" ]; then
-    journal_line "$(now_iso)  burst-lane  down  refused  (cause=scheduled-teardown-disabled requested_at=${2:-})"
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  down  refused  (cause=scheduled-teardown-disabled requested_at=${2:-})"
     echo "refused: scheduled soft-down is disabled — use the TTL instead" >&2
     exit 2
   fi
@@ -8517,9 +8522,9 @@ cmd_down() {
           "box_cores=$(state_read box_cores)" "box_mem_gb=$(state_read box_mem_gb)" \
           "box_disk_gb=$(state_read box_disk_gb)" \
           "phase=$(state_read_phase)" "phase_epoch=$(state_read phase_epoch)"
-        journal_line "$(now_iso)  burst-lane  down  decision=keep  (server_id=$id cause=rust-work-arrived, schedule cancelled)"
+        journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  down  decision=keep  (server_id=$id cause=rust-work-arrived, schedule cancelled)"
       else
-        journal_line "$(now_iso)  burst-lane  down  decision=keep  (server_id=$id)"
+        journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  down  decision=keep  (server_id=$id)"
       fi
       echo "decision=keep"
       exit 0
@@ -8527,13 +8532,13 @@ cmd_down() {
     local result_u hrs_u eur_u served_u alive_u
     if result_u="$(teardown_and_delete "$id" down)"; then
       IFS='|' read -r hrs_u eur_u served_u alive_u <<<"$result_u"
-      journal_line "$(now_iso)  burst-lane  down  decision=deleted  (server_id=$id cause=unproven-box gate_ready=${gate_ready:-false} runs_served=$runs_served minutes=$alive_u cost_eur=$eur_u prds=$served_u)"
+      journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  down  decision=deleted  (server_id=$id cause=unproven-box gate_ready=${gate_ready:-false} runs_served=$runs_served minutes=$alive_u cost_eur=$eur_u prds=$served_u)"
       state_clear
       session_known_hosts_remove
       echo "decision=deleted"
       exit 0
     fi
-    journal_line "$(now_iso)  burst-lane  down  LEAK-FLAG  (server_id=$id action=page-a-human — destroy failed after 3 retries)"
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  down  LEAK-FLAG  (server_id=$id action=page-a-human — destroy failed after 3 retries)"
     echo "LEAK-FLAG: server $id did not confirm destroyed after 3 retries"
     exit 1
   fi
@@ -8553,13 +8558,13 @@ cmd_down() {
     local result hrs eur served alive
     if result="$(teardown_and_delete "$id" down)"; then
       IFS='|' read -r hrs eur served alive <<<"$result"
-      journal_line "$(now_iso)  burst-lane  down  decision=deleted  (server_id=$id minutes=$alive cost_eur=$eur prds=$served)"
+      journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  down  decision=deleted  (server_id=$id minutes=$alive cost_eur=$eur prds=$served)"
       state_clear
       session_known_hosts_remove
       echo "decision=deleted"
       exit 0
     fi
-    journal_line "$(now_iso)  burst-lane  down  LEAK-FLAG  (server_id=$id action=page-a-human — destroy failed after 3 retries)"
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  down  LEAK-FLAG  (server_id=$id action=page-a-human — destroy failed after 3 retries)"
     echo "LEAK-FLAG: server $id did not confirm destroyed after 3 retries"
     exit 1
   fi
@@ -8574,7 +8579,7 @@ cmd_down() {
     "box_cores=$(state_read box_cores)" "box_mem_gb=$(state_read box_mem_gb)" \
     "box_disk_gb=$(state_read box_disk_gb)" \
     "phase=$(state_read_phase)" "phase_epoch=$(state_read phase_epoch)"
-  journal_line "$(now_iso)  burst-lane  down  decision=scheduled  (server_id=$id teardown_at=$(date -u -d "@$window_start" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "$window_start"))"
+  journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  down  decision=scheduled  (server_id=$id teardown_at=$(date -u -d "@$window_start" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "$window_start"))"
   echo "decision=scheduled"
   exit 0
 }
@@ -8638,7 +8643,7 @@ cmd_watchdog() {
   if [ "$rc" -eq 0 ]; then
     IFS='|' read -r hrs eur served alive <<<"$result"
     teardown_cause="$(cat "$TEARDOWN_CAUSE_FILE" 2>/dev/null || true)"
-    journal_line "$(now_iso)  burst-lane  watchdog  teardown  (server_id=$id uptime=${alive}m cost_eur=$eur prds=$served${teardown_cause:+ cause=$teardown_cause})"
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  watchdog  teardown  (server_id=$id uptime=${alive}m cost_eur=$eur prds=$served${teardown_cause:+ cause=$teardown_cause})"
     state_clear
     session_known_hosts_remove
     echo "watchdog teardown: $id (${alive}m)"
@@ -8647,7 +8652,7 @@ cmd_watchdog() {
     echo "watchdog: teardown deferred (setup-grace)"
     exit 0
   fi
-  journal_line "$(now_iso)  burst-lane  watchdog  LEAK-FLAG  (server_id=$id action=page-a-human — destroy failed after 3 retries)"
+  journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  watchdog  LEAK-FLAG  (server_id=$id action=page-a-human — destroy failed after 3 retries)"
   echo "LEAK-FLAG: server $id did not confirm destroyed after 3 retries"
   exit 1
 }
@@ -8707,7 +8712,7 @@ cmd_idle_guard() {
   if [ "$rc" -eq 0 ]; then
     IFS='|' read -r hrs eur served alive <<<"$result"
     teardown_cause="$(cat "$TEARDOWN_CAUSE_FILE" 2>/dev/null || true)"
-    journal_line "$(now_iso)  burst-lane  down  decision=deleted  (server_id=$id cause=${teardown_cause:-idle-guard:zero-runs-lifetime} minutes=$alive cost_eur=$eur prds=$served)"
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  down  decision=deleted  (server_id=$id cause=${teardown_cause:-idle-guard:zero-runs-lifetime} minutes=$alive cost_eur=$eur prds=$served)"
     state_clear
     session_known_hosts_remove
     echo "idle-guard teardown: $id (${alive}m)"
@@ -8716,7 +8721,7 @@ cmd_idle_guard() {
     echo "idle-guard: teardown deferred (setup-grace)"
     exit 0
   fi
-  journal_line "$(now_iso)  burst-lane  idle-guard  LEAK-FLAG  (server_id=$id action=page-a-human — destroy failed after 3 retries)"
+  journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  idle-guard  LEAK-FLAG  (server_id=$id action=page-a-human — destroy failed after 3 retries)"
   echo "LEAK-FLAG: server $id did not confirm destroyed after 3 retries"
   exit 1
 }
@@ -8775,7 +8780,7 @@ cmd_sub_cap() {
 
   if ! state_active; then
     probe_emit burst-subcap clean "no session — local cap applies" >/dev/null
-    journal_line "$(now_iso)  burst-lane  sub-cap  no-session  (local=3, fallback rules apply)"
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  sub-cap  no-session  (local=3, fallback rules apply)"
     echo "sub-cap=0 local=3 (no session — local cap applies)"
     exit 0
   fi
@@ -8789,7 +8794,7 @@ cmd_sub_cap() {
   # parse picks it up as the cap directly, with no separate wiring needed.
   if [ "$(state_read sandbox_ok)" = "false" ]; then
     probe_emit burst-subcap dirty "sandbox unavailable — local cap 2 applies this tick" >/dev/null
-    journal_line "$(now_iso)  burst-lane  sub-cap  sandbox-unavailable  (server_id=$(state_read server_id) local cap=2 this tick)"
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  sub-cap  sandbox-unavailable  (server_id=$(state_read server_id) local cap=2 this tick)"
     echo "sub-cap=2 local=0 (sandbox unavailable — falling back to local cap 2 this tick)"
     exit 0
   fi
@@ -8798,18 +8803,18 @@ cmd_sub_cap() {
   local probe
   if ! probe="$(probe_remote_capacity "$ip")"; then
     probe_emit burst-subcap could-not-check "capacity probe failed server_id=$(state_read server_id)" >/dev/null
-    journal_line "$(now_iso)  burst-lane  sub-cap  fallback  (cause=probe-failed server_id=$(state_read server_id))"
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  sub-cap  fallback  (cause=probe-failed server_id=$(state_read server_id))"
     echo "fallback: could not probe box capacity"
     exit 3
   fi
   local avail_gb nproc_n free_disk_gb
   read -r avail_gb nproc_n free_disk_gb <<<"$probe"
-  case "$avail_gb" in ''|*[!0-9]*) probe_emit burst-subcap could-not-check "bad probe output: $probe" >/dev/null; journal_line "$(now_iso)  burst-lane  sub-cap  fallback  (cause=bad-probe-output out=$probe)"; echo "fallback: bad probe output"; exit 3 ;; esac
-  case "$nproc_n"  in ''|*[!0-9]*) probe_emit burst-subcap could-not-check "bad probe output: $probe" >/dev/null; journal_line "$(now_iso)  burst-lane  sub-cap  fallback  (cause=bad-probe-output out=$probe)"; echo "fallback: bad probe output"; exit 3 ;; esac
+  case "$avail_gb" in ''|*[!0-9]*) probe_emit burst-subcap could-not-check "bad probe output: $probe" >/dev/null; journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  sub-cap  fallback  (cause=bad-probe-output out=$probe)"; echo "fallback: bad probe output"; exit 3 ;; esac
+  case "$nproc_n"  in ''|*[!0-9]*) probe_emit burst-subcap could-not-check "bad probe output: $probe" >/dev/null; journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  sub-cap  fallback  (cause=bad-probe-output out=$probe)"; echo "fallback: bad probe output"; exit 3 ;; esac
   # PRD-build-burst-remote-disk-guard requirement 1: a probe missing the
   # third (disk) field is the same bad-probe-output fallback as a missing
   # mem/cpu field — never a silently-skipped disk check.
-  case "$free_disk_gb" in ''|*[!0-9]*) probe_emit burst-subcap could-not-check "bad probe output: $probe" >/dev/null; journal_line "$(now_iso)  burst-lane  sub-cap  fallback  (cause=bad-probe-output out=$probe)"; echo "fallback: bad probe output"; exit 3 ;; esac
+  case "$free_disk_gb" in ''|*[!0-9]*) probe_emit burst-subcap could-not-check "bad probe output: $probe" >/dev/null; journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  sub-cap  fallback  (cause=bad-probe-output out=$probe)"; echo "fallback: bad probe output"; exit 3 ;; esac
 
   # PRD-build-burst-run-slots-from-box requirement 3: the exact same
   # min(cores,mem,disk) arithmetic run_slot_cap() uses for the run-slot
@@ -8848,7 +8853,7 @@ cmd_sub_cap() {
   [ "$bound" = "gates" ] && bound_suffix=" bound=gates gates_active=$active_gates"
 
   probe_emit burst-subcap clean "sub-cap=$subcap (avail_gb=$avail_gb nproc=$nproc_n free_disk_gb=$free_disk_gb)" >/dev/null
-  journal_line "$(now_iso)  burst-lane  sub-cap  computed  (burst: sub-cap=$subcap (avail_gb=$avail_gb nproc=$nproc_n free_disk_gb=$free_disk_gb)${bound_suffix} local=0)"
+  journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  sub-cap  computed  (burst: sub-cap=$subcap (avail_gb=$avail_gb nproc=$nproc_n free_disk_gb=$free_disk_gb)${bound_suffix} local=0)"
   echo "sub-cap=$subcap local=0 (avail_gb=$avail_gb nproc=$nproc_n free_disk_gb=$free_disk_gb)${bound_suffix}"
   exit 0
 }

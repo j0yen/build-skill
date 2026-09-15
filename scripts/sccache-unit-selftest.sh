@@ -74,7 +74,13 @@ if $SYSTEMCTL is-active --quiet "$UNIT" 2>/dev/null; then
   expect "tier2 live unit env carries SCCACHE_IDLE_TIMEOUT=0" \
     "[[ '$env_line' == *'SCCACHE_IDLE_TIMEOUT=0'* ]]"
 
-  logfile="$(grep -oP '(?<=^Environment=SCCACHE_ERROR_LOG=)\S+' "$UNIT_SRC" | sed "s#%h#$HOME#")"
+  # This is a REAL live systemd --user unit's own log path (systemd's `%h`
+  # specifier is always the invoking user's real home, regardless of any
+  # test-time $HOME override) — PRD-build-test-isolation-by-default's
+  # scripts/lib/isolation.sh overrides $HOME for the rest of this process,
+  # so this must resolve against the real one (BUILD_TEST_REAL_HOME when
+  # set) or it computes a path the live service never wrote to.
+  logfile="$(grep -oP '(?<=^Environment=SCCACHE_ERROR_LOG=)\S+' "$UNIT_SRC" | sed "s#%h#${BUILD_TEST_REAL_HOME:-$HOME}#")"
   expect "tier2 live server.log exists" "[ -f '$logfile' ]"
 
   if [ -f "$logfile" ] && command -v sccache >/dev/null 2>&1 && command -v rustc >/dev/null 2>&1; then

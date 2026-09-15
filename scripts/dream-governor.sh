@@ -131,6 +131,9 @@ set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SKILL_DIR="${BUILD_SKILL_DIR:-$(cd "$HERE/.." && pwd)}"
+
+# shellcheck source=lib/journal.sh
+source "$HERE/lib/journal.sh"
 STATE_DIR="${BUILD_STATE_DIR:-$SKILL_DIR/state}"
 PRDS_DIR="${DREAM_GOVERNOR_PRDS_DIR:-$HOME/Documents/PRDs}"
 CONFIG_FILE="${DREAM_GOVERNOR_CONFIG:-$STATE_DIR/dream-governor/config}"
@@ -151,10 +154,10 @@ usage() {
 now_iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 is_int() { case "$1" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
 
-journal_line() {
-  mkdir -p "$(dirname "$JOURNAL")" 2>/dev/null || true
-  printf '%s\n' "$1" >> "$JOURNAL" 2>/dev/null || true
-}
+# journal_line is now the shared scripts/lib/journal.sh one (sourced
+# above); this script's own $JOURNAL (dream-governor.log, or
+# DREAM_GOVERNOR_JOURNAL override) is an absolute --file target on every
+# call site below (PRD-build-test-isolation-by-default).
 
 # load_config -> sets DEPTH_MIN / HEADROOM_MAX; returns 0 iff both are
 # present, non-empty positive integers. A file that sets only one of the
@@ -361,11 +364,11 @@ launch_and_postprocess() {
     lint_rc=$?
     if [ "$lint_rc" -ne 0 ]; then
       fail=$((fail + 1))
-      journal_line "$(now_iso)  dream-governor  lint-fail  file=$f  ($(printf '%s' "$lint_out" | tr '\n' ' '))"
+      journal_line --file "$JOURNAL" "$(now_iso)  dream-governor  lint-fail  file=$f  ($(printf '%s' "$lint_out" | tr '\n' ' '))"
       ( cd "$PRDS_DIR" \
         && git rm -q -- "$f" \
         && git commit -q -m "dream-governor: drop $f (failed prd-lint post-run)" -- "$f" ) \
-        || journal_line "$(now_iso)  dream-governor  lint-fail-revert-error  file=$f"
+        || journal_line --file "$JOURNAL" "$(now_iso)  dream-governor  lint-fail-revert-error  file=$f"
       if git -C "$PRDS_DIR" remote get-url origin >/dev/null 2>&1; then
         git -C "$PRDS_DIR" push -q 2>>"$run_log" || true
       fi
@@ -384,7 +387,7 @@ launch_and_postprocess() {
 
 cmd_check() {
   evaluate
-  journal_line "$(build_decision_line check)"
+  journal_line --file "$JOURNAL" "$(build_decision_line check)"
   echo "$DECISION"
 }
 
@@ -401,7 +404,7 @@ cmd_run() {
       G_LOCK="held"
     fi
   fi
-  journal_line "$(build_decision_line run)"
+  journal_line --file "$JOURNAL" "$(build_decision_line run)"
   echo "$DECISION"
 }
 

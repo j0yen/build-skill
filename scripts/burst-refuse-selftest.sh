@@ -33,11 +33,32 @@ EOF
 STATE_DIR="$T/state"
 mkdir -p "$STATE_DIR"
 
+# PRD-build-test-isolation-by-default requirement 4: isolation-guard.sh now
+# arms unconditionally under BUILD_TEST=1 (run-selftests.sh's structural
+# marker, not just this test's own BURST_LANE_TEST), so any burst-lane.sh
+# invocation under the runner needs its own hcloud/ssh/rsync overrides —
+# even on this refusal path, which never reaches them, since the guard
+# checks BEFORE subcommand dispatch. Fakes that would themselves fail
+# loudly if ever actually invoked (they shouldn't be, on this path).
+FAKEBIN="$T/fakebin"
+mkdir -p "$FAKEBIN"
+for _b in rsync ssh hcloud; do
+  cat > "$FAKEBIN/$_b" <<EOF
+#!/bin/sh
+echo "fake-$_b: should never be invoked on the not-configured refusal path" >&2
+exit 9
+EOF
+  chmod +x "$FAKEBIN/$_b"
+done
+
 echo "== burst-lane.sh up refuses when not configured (RedBaron-local policy) =="
 set +e
 out="$(env -u BUILD_BURST_ENABLED \
   BURST_LANE_ENV_FILE="$T/wm-burst.env" \
   BURST_LANE_STATE_DIR="$STATE_DIR" \
+  BURST_LANE_RSYNC_BIN="$FAKEBIN/rsync" \
+  BURST_LANE_SSH_BIN="$FAKEBIN/ssh" \
+  BURST_LANE_HCLOUD_BIN="$FAKEBIN/hcloud" \
   "$BL" up 2>&1)"
 rc=$?
 set -e

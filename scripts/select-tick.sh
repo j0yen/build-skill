@@ -69,6 +69,10 @@ set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SKILL_DIR="$(cd "$HERE/.." && pwd)"
+
+# shellcheck source=lib/journal.sh
+source "$HERE/lib/journal.sh"
+
 SCAN_PRDS="$HERE/scan-prds.sh"
 SELECT_GUARD="$HERE/select-guard.sh"
 BURST_LANE_SH="${BURST_LANE_SH:-$HERE/burst-lane.sh}"
@@ -110,10 +114,9 @@ MANIFEST="${BUILD_MANIFEST:-$STATE_DIR/manifest.json}"
 # (select-guard.sh's SELECT_GUARD_JOURNAL, scan-prds.sh's JOURNAL) --
 # overridable so a selftest never touches the real shared journal.
 JOURNAL="${SELECT_TICK_JOURNAL:-$HOME/brain/journal/build/$(date -u +%F).md}"
-journal_line() {
-  mkdir -p "$(dirname "$JOURNAL")" 2>/dev/null || return 0
-  printf '%s\n' "$1" >> "$JOURNAL" 2>/dev/null || true
-}
+# journal_line is now the shared scripts/lib/journal.sh one (sourced
+# above); this script's own $JOURNAL is an absolute --file target on the
+# call site below (PRD-build-test-isolation-by-default).
 
 # --- Step 1: scan (post-reconcile, post-lint -- scan-prds.sh's own lint
 # pass already ran and parked anything mechanically defective before this
@@ -469,7 +472,7 @@ if [ "$FORMAT" = "text" ]; then
 fi
 
 if [ "$DRY_RUN" = false ]; then
-  journal_line "$(date -u +%Y-%m-%dT%H:%M:%SZ)  select-tick  admitted=$admitted_count skipped=$skipped_count pool=$pool_count cap=$limit distinct_targets=$distinct_targets burst_session=$burst_session sub_cap=$same_target_cap lane=$LANE_ARG"
+  journal_line --file "$JOURNAL" "$(date -u +%Y-%m-%dT%H:%M:%SZ)  select-tick  admitted=$admitted_count skipped=$skipped_count pool=$pool_count cap=$limit distinct_targets=$distinct_targets burst_session=$burst_session sub_cap=$same_target_cap lane=$LANE_ARG"
 fi
 
 exit 0

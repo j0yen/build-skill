@@ -104,6 +104,9 @@ set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SKILL_DIR="$(cd "$HERE/.." && pwd)"
 
+# shellcheck source=lib/journal.sh
+source "$HERE/lib/journal.sh"
+
 STATE_DIR="${GATE_BURST_STATE_DIR:-$SKILL_DIR/state/gate-burst}"
 STATE_FILE="$STATE_DIR/active.json"
 LEDGER="${GATE_BURST_LEDGER:-$HOME/brain/journal/build/gate-burst-cost-ledger.ndjson}"
@@ -148,7 +151,9 @@ usage() { echo "usage: gate-burst.sh {precondition|should-route|up|run|status|do
 
 now_epoch() { echo "${GATE_BURST_NOW:-$(date -u +%s)}"; }
 now_iso()   { date -u -d "@$(now_epoch)" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ; }
-journal_line() { mkdir -p "$(dirname "$JOURNAL")" 2>/dev/null || true; printf '%s\n' "$1" >> "$JOURNAL"; }
+# journal_line is now the shared scripts/lib/journal.sh one (sourced above);
+# this script's own $JOURNAL (GATE_BURST_JOURNAL override) is an absolute
+# --file target on every call site below (PRD-build-test-isolation-by-default).
 
 mkdir -p "$STATE_DIR" 2>/dev/null || true
 
@@ -270,7 +275,7 @@ cmd_up() {
 
   local pre_out; pre_out="$(cmd_precondition 2>&1)"; local pre_rc=$?
   if [ "$pre_rc" -ne 0 ]; then
-    journal_line "$(now_iso)  gate-burst  up  fallback  (cause=precondition-failed: $pre_out)"
+    journal_line --file "$JOURNAL" "$(now_iso)  gate-burst  up  fallback  (cause=precondition-failed: $pre_out)"
     echo "fallback: precondition failed - $pre_out"
     exit 3
   fi
@@ -279,7 +284,7 @@ cmd_up() {
   local create_out
   if ! create_out="$("$HCLOUD" server create --name "$name" --type "$SERVER_TYPE" \
         --location "$LOCATION" --image "$SNAPSHOT_ID" --ssh-key "${HCLOUD_SSH_KEY:-default}" 2>&1)"; then
-    journal_line "$(now_iso)  gate-burst  up  fallback  (cause=hcloud-server-create-failed: $create_out)"
+    journal_line --file "$JOURNAL" "$(now_iso)  gate-burst  up  fallback  (cause=hcloud-server-create-failed: $create_out)"
     echo "fallback: hcloud server create failed - $create_out"
     exit 3
   fi
@@ -287,7 +292,7 @@ cmd_up() {
   id="$(echo "$create_out" | grep -oE '"id":[0-9]+' | head -n1 | cut -d: -f2)"
   ip="$(echo "$create_out" | grep -oE '"ip":"[^"]*"' | head -n1 | cut -d'"' -f4)"
   if [ -z "$id" ]; then
-    journal_line "$(now_iso)  gate-burst  up  fallback  (cause=could-not-parse-server-id)"
+    journal_line --file "$JOURNAL" "$(now_iso)  gate-burst  up  fallback  (cause=could-not-parse-server-id)"
     echo "fallback: could not parse server id from hcloud output"
     exit 3
   fi
@@ -302,7 +307,7 @@ cmd_up() {
     tries=$((tries + 1)); sleep 1
   done
   if [ "$tries" -ge 30 ]; then
-    journal_line "$(now_iso)  gate-burst  up  fallback  (cause=ssh-unreachable server_id=$id ip=$ip)"
+    journal_line --file "$JOURNAL" "$(now_iso)  gate-burst  up  fallback  (cause=ssh-unreachable server_id=$id ip=$ip)"
     echo "fallback: ssh never became reachable on $ip after 30s"
     "$HCLOUD" server delete "$id" >/dev/null 2>&1 || true
     exit 3
@@ -310,7 +315,7 @@ cmd_up() {
 
   state_write "server_id=$id" "ip=$ip" "server_type=$SERVER_TYPE" \
     "boot_ts=$(now_iso)" "boot_epoch=$(now_epoch)" "runs_served=0" "unavailable=false"
-  journal_line "$(now_iso)  gate-burst  up  booted  (server_id=$id ip=$ip type=$SERVER_TYPE)"
+  journal_line --file "$JOURNAL" "$(now_iso)  gate-burst  up  booted  (server_id=$id ip=$ip type=$SERVER_TYPE)"
   echo "up: $id $ip"
   exit 0
 }
@@ -341,7 +346,7 @@ cmd_run() {
     while [ "${1:-}" = "--" ]; do shift; done
     "$BURST_LANE_SH" run "$repo" -- "$@"
     rc=$?
-    journal_line "$(now_iso)  gate-burst  run  routed-via-burst-lane  (repo=$repo exit=$rc)"
+    journal_line --file "$JOURNAL" "$(now_iso)  gate-burst  run  routed-via-burst-lane  (repo=$repo exit=$rc)"
     exit "$rc"
   fi
 
@@ -371,7 +376,7 @@ cmd_run() {
     state_write "server_id=$id" "ip=$ip" "unavailable=true" \
       "boot_ts=$(state_read boot_ts)" "boot_epoch=$(state_read boot_epoch)" \
       "runs_served=$(state_read runs_served)" "server_type=$(state_read server_type)"
-    journal_line "$(now_iso)  gate-burst  run  fallback  (cause=rsync-up-failed repo=$repo)"
+    journal_line --file "$JOURNAL" "$(now_iso)  gate-burst  run  fallback  (cause=rsync-up-failed repo=$repo)"
     echo "fallback: rsync to $ip failed (see /tmp/gate-burst-rsync-up.$$.log)"
     exit 3
   fi
@@ -389,14 +394,14 @@ cmd_run() {
     state_write "server_id=$id" "ip=$ip" "unavailable=true" \
       "boot_ts=$(state_read boot_ts)" "boot_epoch=$(state_read boot_epoch)" \
       "runs_served=$(state_read runs_served)" "server_type=$(state_read server_type)"
-    journal_line "$(now_iso)  gate-burst  run  sccache-unreachable  (repo=$repo — falling back local)"
+    journal_line --file "$JOURNAL" "$(now_iso)  gate-burst  run  sccache-unreachable  (repo=$repo — falling back local)"
     echo "fallback: remote sccache did not answer after one restart attempt (rc=97)"
     exit 3
   fi
 
   if ! "$RSYNC_BIN" -az -e "$SSH_BIN -o StrictHostKeyChecking=no -i $SSH_KEY" \
         "$REMOTE_USER@$ip:$remote_path/target/" "$repo/target/" >/tmp/gate-burst-rsync-down.$$.log 2>&1; then
-    journal_line "$(now_iso)  gate-burst  run  fallback  (cause=rsync-down-failed repo=$repo)"
+    journal_line --file "$JOURNAL" "$(now_iso)  gate-burst  run  fallback  (cause=rsync-down-failed repo=$repo)"
     echo "fallback: rsync from $ip failed (see /tmp/gate-burst-rsync-down.$$.log)"
     exit 3
   fi
@@ -410,7 +415,7 @@ cmd_run() {
   state_write "server_id=$id" "ip=$ip" "unavailable=false" \
     "boot_ts=$(state_read boot_ts)" "boot_epoch=$(state_read boot_epoch)" \
     "runs_served=$runs" "server_type=$(state_read server_type)"
-  journal_line "$(now_iso)  gate-burst  run  routed  (server_id=$id repo=$repo runs_served=$runs exit=$rc)"
+  journal_line --file "$JOURNAL" "$(now_iso)  gate-burst  run  routed  (server_id=$id repo=$repo runs_served=$runs exit=$rc)"
   exit "$rc"
 }
 
@@ -524,14 +529,14 @@ cmd_down() {
   if destroy_verify "$id"; then
     local cost; cost="$(awk -v m="$alive" -v r="$COST_PER_HOUR_USD" 'BEGIN{printf "%.4f", (m/60.0)*r}')"
     printf '%s\t%s\t%s\t%s\t%s\n' "$(now_iso)" "$stype" "$alive" "$runs" "$cost" >> "$LEDGER"
-    journal_line "$(now_iso)  gate-burst  down  destroyed-verified  (server_id=$id minutes=$alive runs_served=$runs cost_usd=$cost)"
+    journal_line --file "$JOURNAL" "$(now_iso)  gate-burst  down  destroyed-verified  (server_id=$id minutes=$alive runs_served=$runs cost_usd=$cost)"
     state_clear
     echo "destroyed: $id (verified, ${alive}m, \$${cost})"
     exit 0
   fi
 
   local bleed; bleed="$(awk -v r="$COST_PER_HOUR_USD" 'BEGIN{printf "%.4f", r}')"
-  journal_line "$(now_iso)  gate-burst  down  LEAK-FLAG  (server_id=$id bleed_usd_per_hour=$bleed action=page-a-human — destroy failed after 3 retries)"
+  journal_line --file "$JOURNAL" "$(now_iso)  gate-burst  down  LEAK-FLAG  (server_id=$id bleed_usd_per_hour=$bleed action=page-a-human — destroy failed after 3 retries)"
   echo "LEAK-FLAG: server $id did not confirm destroyed after 3 retries — bleeding \$$bleed/hr, paging via journal"
   exit 1
 }

@@ -2908,6 +2908,29 @@ incident happened. `BUILD_TICK_ARGS` is the one knob: set it to whatever
 argument string `/build` should receive (`run <slug>`, `status`, etc.);
 everything else about the manual path is identical to the timer's.
 
+## Selftests
+
+**`scripts/run-selftests.sh <name...> | --all` is the one selftest
+entrypoint (PRD-build-test-isolation-by-default, 2026-09-15).** Do not
+invoke a `*-selftest.sh` script or a `tests/*.sh` file directly for a real
+verification run — the runner is what sets `BUILD_TEST_ROOT` (via `mktemp
+-d` under `/mnt/data/jsy/tmp`, never tmpfs `/tmp`), exports `BUILD_TEST=1`,
+and sources `scripts/lib/isolation.sh` to redirect `HOME` /
+`BUILD_JOURNAL_ROOT` / the burst-lane / gate-wedge / gate-burst state dirs
+into that temp root before the test ever runs — a bare invocation gets
+none of that and, per the 2026-09-15 incident this PRD is named for, can
+leak fixture-shaped lines straight into the real production journal.
+`--all` additionally proves, via sha256 of the real journal tree + state/
+plus `git -C ~/repos/PRDs status --porcelain`, that the whole registered
+suite left production byte-identical. `scripts/lib/journal.sh`'s
+`journal_line` is the one journal writer every build-skill script now
+sources — it refuses (exit 3) a fixture-shaped line aimed at the
+unmodified production root even if isolation was somehow skipped, so a
+leak fails loud instead of polluting evidence silently.
+`scripts/lint-journal-fixtures.sh --code` fails a review that reintroduces
+a private `journal_line()`; `--corpus [date]` reports (never edits)
+fixture-shaped lines already sitting in a day's production journal.
+
 ## Disable
 
 ```

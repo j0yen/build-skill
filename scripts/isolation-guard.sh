@@ -40,12 +40,23 @@
 # production.
 
 # Live roots a path must never resolve under while the sentinel is on
-# (requirement 2, verbatim).
-ISOLATION_LIVE_STATE_ROOT="$HOME/.claude/skills/build/state"
-ISOLATION_LIVE_JOURNAL_ROOT="$HOME/brain/journal"
-ISOLATION_LIVE_JOURNAL_FILE="${BURST_ISOLATION_LIVE_JOURNAL:-$HOME/brain/journal/build/burst-lane.log}"
+# (requirement 2, verbatim). scripts/lib/isolation.sh overrides $HOME for
+# the rest of a test run, so these are keyed off BUILD_TEST_REAL_HOME (the
+# pre-override $HOME it exports) when present — otherwise this guard would
+# end up "protecting" the test's own temp root instead of production.
+_ISOLATION_REAL_HOME="${BUILD_TEST_REAL_HOME:-$HOME}"
+ISOLATION_LIVE_STATE_ROOT="$_ISOLATION_REAL_HOME/.claude/skills/build/state"
+ISOLATION_LIVE_JOURNAL_ROOT="$_ISOLATION_REAL_HOME/brain/journal"
+ISOLATION_LIVE_JOURNAL_FILE="${BURST_ISOLATION_LIVE_JOURNAL:-$_ISOLATION_REAL_HOME/brain/journal/build/burst-lane.log}"
 
-isolation_sentinel_on() { [ "${BURST_LANE_TEST:-0}" = "1" ]; }
+# PRD-build-test-isolation-by-default requirement 4: the sentinel arms
+# unconditionally under BUILD_TEST=1 (scripts/lib/isolation.sh's
+# structural marker, set by run-selftests.sh for every test) — no
+# per-test BURST_LANE_TEST to remember. BURST_LANE_TEST alone still arms
+# it too, for any caller that only sets that legacy marker.
+isolation_sentinel_on() {
+  [ "${BURST_LANE_TEST:-0}" = "1" ] || [ "${BUILD_TEST:-0}" = "1" ]
+}
 
 # isolation_refuse <caller> <path> — journals the refusal to the live
 # journal (Requirement 3/4), prints the operator-facing message, and exits

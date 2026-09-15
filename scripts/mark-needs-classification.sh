@@ -104,6 +104,10 @@
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# shellcheck source=lib/journal.sh
+source "$HERE/lib/journal.sh"
+
 GIT_ID=(-c user.email=jyen.tech@gmail.com -c user.name="Joe Yen")
 PRD_DIR="${PRD_DIR:-$HOME/Documents/PRDs}"
 PRD_LINT="${PRD_LINT:-$HERE/prd-lint.sh}"
@@ -111,10 +115,9 @@ JOURNAL="${JOURNAL:-$HOME/brain/journal/build/$(date -u +%F).md}"
 
 die() { printf '%s\n' "mark-needs-classification: $*" >&2; exit "${2:-4}"; }
 
-journal_line() {
-  mkdir -p "$(dirname "$JOURNAL")" 2>/dev/null || true
-  printf '%s\n' "$1" >> "$JOURNAL"
-}
+# journal_line is now the shared scripts/lib/journal.sh one (sourced
+# above); this script's own $JOURNAL is an absolute --file target on every
+# call site below (PRD-build-test-isolation-by-default).
 
 # ---- args ---------------------------------------------------------------
 dry_run=false
@@ -360,9 +363,9 @@ reproduced="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["reprod
 
 if [ -n "$matched_id" ] && [ "$reproduced" != "True" ]; then
   if $force; then
-    journal_line "$(date -u +%Y-%m-%dT%H:%M:%SZ)  $slug  needs_classification  forced  (cause=claim-not-reproduced lint_id=$matched_id lint_rc=$lint_rc lane=$(hostname))"
+    journal_line --file "$JOURNAL" "$(date -u +%Y-%m-%dT%H:%M:%SZ)  $slug  needs_classification  forced  (cause=claim-not-reproduced lint_id=$matched_id lint_rc=$lint_rc lane=$(hostname))"
   else
-    journal_line "$(date -u +%Y-%m-%dT%H:%M:%SZ)  $slug  needs_classification  refused  (cause=claim-not-reproduced lint_id=$matched_id lint_rc=$lint_rc)"
+    journal_line --file "$JOURNAL" "$(date -u +%Y-%m-%dT%H:%M:%SZ)  $slug  needs_classification  refused  (cause=claim-not-reproduced lint_id=$matched_id lint_rc=$lint_rc)"
     echo "needs-classification-refused: $slug (cause=claim-not-reproduced lint_id=$matched_id lint_rc=$lint_rc)"
     exit 3
   fi
