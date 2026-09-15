@@ -5005,6 +5005,99 @@ expect "provefx AC15: the journal failed line carries the same diagnosis fields"
 
 expect_block_green "provefx" "provefx: every provefx case above ran green"
 
+# ---- proveguard block (PRD-build-burst-prove-inflight-guard) ---------------
+# 2026-09-15: box 165981910 was deleted by a concurrent `down` between
+# prove's own `up` finishing and its `run` starting (runs_served=0 at that
+# instant reads as an unproven box). AC1-3 exercise `down`'s new
+# prove.inflight check (live marker keeps, dead marker is reclaimed and
+# proceeds normally, --force still overrides but journals the override);
+# AC4 exercises the same check in idle-guard; AC5 proves the marker never
+# outlives a real (fixture) `prove` process.
+block_start "proveguard"
+
+# ---- proveguard AC1: a live prove.inflight pid blocks down -----------------
+fresh_env
+"$BL" up >/dev/null 2>&1
+pg1_sid="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+sleep 300 & pg1_pid=$!
+printf 'pid=%s\nstart_epoch=%s\nserver_id=%s\n' "$pg1_pid" "$(date -u +%s)" "$pg1_sid" > "$BURST_LANE_STATE_DIR/prove.inflight"
+pg1_out="$("$BL" down 2>&1)"; pg1_rc=$?
+expect "proveguard AC1: down exits 0 while a live prove.inflight pid is running" "[ $pg1_rc -eq 0 ]"
+expect "proveguard AC1: down prints decision=keep" "grep -q '^decision=keep$' <<<\"$pg1_out\""
+expect "proveguard AC1: down journals decision=keep cause=prove-inflight naming the live pid" \
+  "grep -q \"burst-lane  down  decision=keep  (server_id=$pg1_sid cause=prove-inflight pid=$pg1_pid\" \"$BURST_LANE_JOURNAL\""
+expect "proveguard AC1: the box is still alive (down never reached its own delete decision)" \
+  "hcloud server describe \"$pg1_sid\" -o json >/dev/null 2>&1"
+kill "$pg1_pid" 2>/dev/null; wait "$pg1_pid" 2>/dev/null
+
+# ---- proveguard AC2: a dead pid in the marker is reclaimed, then down ------
+# proceeds to its normal unproven-box delete (same fake-rust-work-queued
+# fixture bursthyg AC4 above uses, so this is provably the ordinary path,
+# not a special case).
+fresh_env
+"$BL" up >/dev/null 2>&1
+pg2_sid="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+( : ) & pg2_pid=$!
+wait "$pg2_pid" 2>/dev/null
+printf 'pid=%s\nstart_epoch=%s\nserver_id=%s\n' "$pg2_pid" "$(date -u +%s)" "$pg2_sid" > "$BURST_LANE_STATE_DIR/prove.inflight"
+cat > "$BURST_LANE_PRD_DIR/build-queue/PRD-fake-rust-proveguard.md" <<'EOF'
+# PRD — fake-rust-proveguard
+
+- Status: queued
+- build_target: rust-extend
+EOF
+pg2_out="$("$BL" down 2>&1)"
+expect "proveguard AC2: down deletes the unproven box once the stale marker is reclaimed" "[ \"$pg2_out\" = 'decision=deleted' ]"
+expect "proveguard AC2: journal has prove-inflight-stale naming the dead pid" \
+  "grep -q \"burst-lane  down  prove-inflight-stale  (pid=$pg2_pid)\" \"$BURST_LANE_JOURNAL\""
+expect "proveguard AC2: the stale marker file is removed" "[ ! -f \"$BURST_LANE_STATE_DIR/prove.inflight\" ]"
+expect "proveguard AC2: journal still names the ordinary unproven-box cause" \
+  "grep -q 'burst-lane  down  decision=deleted.*cause=unproven-box' \"$BURST_LANE_JOURNAL\""
+rm -f "$BURST_LANE_PRD_DIR/build-queue/PRD-fake-rust-proveguard.md"
+
+# ---- proveguard AC3: down --force overrides a live marker, but journals ---
+# the override rather than silently ignoring it.
+fresh_env
+"$BL" up >/dev/null 2>&1
+pg3_sid="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+sleep 300 & pg3_pid=$!
+printf 'pid=%s\nstart_epoch=%s\nserver_id=%s\n' "$pg3_pid" "$(date -u +%s)" "$pg3_sid" > "$BURST_LANE_STATE_DIR/prove.inflight"
+pg3_out="$("$BL" down --force 2>&1)"; pg3_rc=$?
+expect "proveguard AC3: down --force still exits 0 despite a live prove.inflight" "[ $pg3_rc -eq 0 ]"
+expect "proveguard AC3: down --force still deletes (decision=force-deleted)" "grep -q '^decision=force-deleted$' <<<\"$pg3_out\""
+expect "proveguard AC3: the box is actually gone" "! hcloud server describe \"$pg3_sid\" -o json >/dev/null 2>&1"
+expect "proveguard AC3: journal names the prove-inflight override, naming the live pid" \
+  "grep -q \"burst-lane  down  prove-inflight-overridden  (pid=$pg3_pid\" \"$BURST_LANE_JOURNAL\""
+kill "$pg3_pid" 2>/dev/null; wait "$pg3_pid" 2>/dev/null
+
+# ---- proveguard AC4: idle-guard honors the same marker ---------------------
+fresh_env
+"$BL" up >/dev/null 2>&1
+pg4_sid="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+pg4_create="$(grep -oE '"create_epoch":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+sleep 300 & pg4_pid=$!
+printf 'pid=%s\nstart_epoch=%s\nserver_id=%s\n' "$pg4_pid" "$(date -u +%s)" "$pg4_sid" > "$BURST_LANE_STATE_DIR/prove.inflight"
+export BURST_LANE_NOW=$((pg4_create + 1000))   # well past the 900s zero-runs idle threshold
+pg4_out="$("$BL" idle-guard 2>&1)"; pg4_rc=$?
+unset BURST_LANE_NOW
+expect "proveguard AC4: idle-guard exits 0 while a live prove.inflight pid is running" "[ $pg4_rc -eq 0 ]"
+expect "proveguard AC4: idle-guard does not delete the box" "hcloud server describe \"$pg4_sid\" -o json >/dev/null 2>&1"
+expect "proveguard AC4: idle-guard journals decision=keep cause=prove-inflight" \
+  "grep -q \"burst-lane  idle-guard  decision=keep  (server_id=$pg4_sid cause=prove-inflight pid=$pg4_pid\" \"$BURST_LANE_JOURNAL\""
+kill "$pg4_pid" 2>/dev/null; wait "$pg4_pid" 2>/dev/null
+
+# ---- proveguard AC5: a real (fixture) prove leaves no marker behind --------
+# Reuses provefx AC1's own fault-injection fixture (BURST_PROVE_TEST_ABORT)
+# — the abort path is the one that most needs proving here, since it's the
+# one that skips prove's own normal end-of-function cleanup entirely and
+# relies solely on prove_exit_trap.
+fresh_env
+WT_PG5="$T/proveguard-ac5"; mkdir -p "$WT_PG5"
+BURST_PROVE_TEST_ABORT=run-unbound "$BL" prove --worktree "$WT_PG5" >/dev/null 2>&1
+expect "proveguard AC5: prove.inflight does not outlive an aborted fixture prove" "[ ! -f \"$BURST_LANE_STATE_DIR/prove.inflight\" ]"
+
+expect_block_green "proveguard" "proveguard: every proveguard case above ran green"
+
 # ---- reenable AC7: `enable` writes the systemd drop-in only when
 # proof.json is routed=true, younger than 7 days, and names the image `up`
 # would boot now; otherwise it refuses (rc 3, no drop-in). `disable` always

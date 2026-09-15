@@ -358,6 +358,12 @@ PROVISION_LOCK_FILE="$STATE_DIR/provision.lock"
 PROVISION_PID_FILE="$STATE_DIR/provision.pid"
 UP_LOCK_FILE="$STATE_DIR/up.lock"
 UP_PID_FILE="$STATE_DIR/up.pid"
+# PRD-build-burst-prove-inflight-guard requirement 1: cmd_prove's own
+# in-flight marker — present from just before its `up` call until its EXIT
+# trap fires, so down/idle-guard/watchdog (all three autonomous deleters)
+# can see a prove is live before deciding to tear the box down under it
+# (2026-09-15: box 165981910 deleted between prove's `up` and `run`).
+PROVE_INFLIGHT_FILE="$STATE_DIR/prove.inflight"
 # requirement 4: reap's orphan sweep. INFLIGHT_LOG is an append-only
 # "<epoch> <pid> <kind>" ledger, one row per provision/up invocation that
 # got far enough to acquire its lock — reap prunes rows whose pid is dead
@@ -393,6 +399,11 @@ GATE_CRED_SRC="${BURST_CLAUDE_CRED_SRC:-$HOME/.claude/.credentials.json}"
 HCLOUD="${BURST_LANE_HCLOUD_BIN:-hcloud}"
 SSH_BIN="${BURST_LANE_SSH_BIN:-ssh}"
 RSYNC_BIN="${BURST_LANE_RSYNC_BIN:-rsync}"
+# PRD-build-burst-prove-inflight-guard requirement 3: the run-path ssh calls
+# (prove's remote-clock probe and cmd_run's remote exec) fail within ~60s of
+# a box disappearing instead of hanging on a dead IP with no keepalive at all
+# (2026-09-15: box 165981910 deleted mid-prove, `run` hung ~6m until killed).
+SSH_RUN_KEEPALIVE_OPTS="-o ServerAliveInterval=15 -o ServerAliveCountMax=4"
 
 # ---- session-scoped host keys (PRD-build-burst-session-hygiene) -----------
 # Every ssh/rsync call in this file must pin against a SESSION-scoped known-
@@ -2425,6 +2436,11 @@ json.dump(d, open(out_path, "w"), indent=2, sort_keys=True)
 # do nothing. Anything else reaching here is a premature exit.
 prove_exit_trap() {
   local rc="$1"
+  # requirement 1: the marker's whole life is "between the write above and
+  # this trap firing" -- removed here on EVERY exit path (finished or
+  # aborted) so down/idle-guard/watchdog never keep waiting on an owner
+  # that's already gone.
+  rm -f "$PROVE_INFLIGHT_FILE" 2>/dev/null || true
   [ "$PROVE_FINISHED" = true ] && exit "$rc"
 
   local step="${PROVE_STEP:-unknown}"
@@ -2529,6 +2545,12 @@ cmd_prove() {
 
   local routed=false bytes=0 cause="" id="" secs_remote=0
 
+  # PRD-build-burst-prove-inflight-guard requirement 1: written before `up`
+  # so down/idle-guard/watchdog see this prove as live before the box it's
+  # about to create could be torn down out from under it; prove_exit_trap
+  # removes it on every exit path below, not this line.
+  printf 'pid=%s\nstart_epoch=%s\n' "$$" "$PROVE_START_EPOCH" > "$PROVE_INFLIGHT_FILE" 2>/dev/null || true
+
   PROVE_STEP="up"
   local up_out up_rc; up_out="$(cmd_up 2>&1)"; up_rc=$?
   prove_write_step_log up "$up_out"
@@ -2537,6 +2559,10 @@ cmd_prove() {
   else
     id="$(state_read server_id)"
     PROVE_ID="$id"
+    # requirement 1: server_id joins the marker once `up` names one, so a
+    # down/idle-guard/watchdog journal line can name the box a live prove
+    # is holding, not just the pid.
+    [ -n "$id" ] && printf 'pid=%s\nstart_epoch=%s\nserver_id=%s\n' "$$" "$PROVE_START_EPOCH" "$id" > "$PROVE_INFLIGHT_FILE" 2>/dev/null
 
     PROVE_STEP="run"
     # Test-only fault injection (requirement 7's provefx selftest block):
@@ -4599,7 +4625,7 @@ cmd_run() {
   local marker_cmd=""
   if [ "${PROVE_ACTIVE:-false}" = true ]; then
     local remote_date_iso
-    remote_date_iso="$("$SSH_BIN" -o BatchMode=yes -o ConnectTimeout=5 $(ssh_kh_args) \
+    remote_date_iso="$("$SSH_BIN" -o BatchMode=yes -o ConnectTimeout=5 $SSH_RUN_KEEPALIVE_OPTS $(ssh_kh_args) \
         -i "$SSH_KEY" "$REMOTE_USER@$ip" "date -u +%Y-%m-%dT%H:%M:%SZ" 2>/dev/null)"
     if [ -n "$remote_date_iso" ]; then
       mkdir -p "$STATE_DIR/logs" 2>/dev/null || true
@@ -4616,7 +4642,7 @@ cmd_run() {
   local remote_cmd="cd $remote_cwd && export PATH=$GATE_TOOLS_REMOTE_BIN_DIR:\$PATH:$ROOT_CARGO_HOME/bin:/root/.local/bin RUSTUP_HOME=$ROOT_RUSTUP_HOME CARGO_HOME=$RUN_CARGO_HOME CARGO_TARGET_DIR=$remote_path/target RUSTC_WRAPPER=sccache SCCACHE_DIR=$REMOTE_SCCACHE_DIR SCCACHE_CACHE_SIZE=${BURST_SCCACHE_GB}G; timeout 5 sccache --show-stats >/dev/null 2>&1 || { sccache --stop-server >/dev/null 2>&1; sccache --start-server >/dev/null 2>&1; sleep 1; }; timeout 5 sccache --show-stats >/dev/null 2>&1 || { echo 'burst-lane: sccache_unreachable on remote box' >&2; exit 97; }; ${marker_cmd}$first $*"
   local rc=0
   local remote_out_log="$STATE_DIR/logs/run-remote.$$.log"
-  "$SSH_BIN" $(ssh_kh_args) -i "$SSH_KEY" "$REMOTE_USER@$ip" "$remote_cmd" 2>&1 | tee "$remote_out_log"
+  "$SSH_BIN" $SSH_RUN_KEEPALIVE_OPTS $(ssh_kh_args) -i "$SSH_KEY" "$REMOTE_USER@$ip" "$remote_cmd" 2>&1 | tee "$remote_out_log"
   rc="${PIPESTATUS[0]}"
   t_remote_end="$(now_fractional)"
 
@@ -6876,6 +6902,36 @@ teardown_and_delete() {  # $1=id $2=caller_tag(down|watchdog|idle-guard)
   return 1
 }
 
+# PRD-build-burst-prove-inflight-guard requirement 2: the single check
+# down/idle-guard/watchdog (the three autonomous deleters) all run BEFORE
+# their own delete decision. rc=0 means the caller must stop and report
+# decision=keep (a live prove owns the marker; server_id/pid/age are
+# journaled by the caller); rc=1 means it's safe to proceed with the normal
+# decision — either the marker was never there, or its pid was dead (this
+# reclaims and journals that case itself). $1 is the calling command's own
+# journal component name (down|watchdog|idle-guard); $2 is that caller's
+# server_id, for the journal line only.
+prove_inflight_guard() {
+  local who="$1" id="${2:-none}"
+  [ -f "$PROVE_INFLIGHT_FILE" ] || return 1
+  local pid; pid="$(sed -n 's/^pid=//p' "$PROVE_INFLIGHT_FILE" 2>/dev/null | head -n1)"
+  case "$pid" in
+    ''|*[!0-9]*) rm -f "$PROVE_INFLIGHT_FILE" 2>/dev/null; return 1 ;;
+  esac
+  if kill -0 "$pid" 2>/dev/null; then
+    local start_epoch age
+    start_epoch="$(sed -n 's/^start_epoch=//p' "$PROVE_INFLIGHT_FILE" 2>/dev/null | head -n1)"
+    case "$start_epoch" in ''|*[!0-9]*) start_epoch="$(now_epoch)" ;; esac
+    age=$(( $(now_epoch) - start_epoch ))
+    journal_line "$(now_iso)  burst-lane  $who  decision=keep  (server_id=$id cause=prove-inflight pid=$pid age_s=$age)"
+    echo "decision=keep"
+    return 0
+  fi
+  journal_line "$(now_iso)  burst-lane  $who  prove-inflight-stale  (pid=$pid)"
+  rm -f "$PROVE_INFLIGHT_FILE" 2>/dev/null
+  return 1
+}
+
 # Requirement 3: an explicit, unconditional teardown — bypasses every keep
 # rule, the billed-hour window, and cost/attribution bookkeeping entirely.
 # Always rc=0, even when the server hcloud once knew about is already gone
@@ -6883,6 +6939,16 @@ teardown_and_delete() {  # $1=id $2=caller_tag(down|watchdog|idle-guard)
 # and didn't have (a raw hcloud delete plus a stale session.json left
 # behind after it).
 cmd_down_force() {
+  # requirement 2: `--force` is the one caller allowed to override a live
+  # prove-inflight marker (explicit operator escalation) — it never blocks
+  # on it, but the override is still journaled, not silent.
+  if [ -f "$PROVE_INFLIGHT_FILE" ]; then
+    local ovr_pid; ovr_pid="$(sed -n 's/^pid=//p' "$PROVE_INFLIGHT_FILE" 2>/dev/null | head -n1)"
+    case "$ovr_pid" in
+      ''|*[!0-9]*) : ;;
+      *) kill -0 "$ovr_pid" 2>/dev/null && journal_line "$(now_iso)  burst-lane  down  prove-inflight-overridden  (pid=$ovr_pid cause=force)" ;;
+    esac
+  fi
   local id; id="$(state_read server_id)"
   if [ -n "$id" ]; then
     if destroy_verify "$id"; then
@@ -6922,6 +6988,12 @@ cmd_down() {
   fi
 
   local id boot_epoch; id="$(state_read server_id)"; boot_epoch="$(state_read boot_epoch)"
+
+  # requirement 2: a live prove owns this box — never delete/schedule out
+  # from under it. Checked before the reap sweep below too.
+  if prove_inflight_guard down "$id"; then
+    exit 0
+  fi
 
   # PRD-build-burst-remote-disk-guard requirement 6: reap runs on every
   # `down` call, before the keep/scheduled/deleted decision below — disk
@@ -7049,6 +7121,12 @@ cmd_watchdog() {
     exit 0
   fi
 
+  # requirement 2: a live prove owns this box — never delete out from under
+  # it, TTL-due or not; watchdog just gets another pass at it later.
+  if prove_inflight_guard watchdog "$id"; then
+    exit 0
+  fi
+
   # The watchdog is a teardown path too — same hygiene (dirty sweep, gate
   # wait, credential shred, volume detach) as `down`'s delete path, via the
   # shared teardown_and_delete helper (PRD-build-burst-session-hygiene).
@@ -7110,6 +7188,13 @@ cmd_idle_guard() {
   fi
   if [ "$due" -eq 0 ]; then
     echo "ok: idle-guard sees no idle condition (runs_served=$runs_served age=${age}s)"
+    exit 0
+  fi
+
+  # requirement 2: a live prove owns this box (a fixture/human `prove` run
+  # against runs_served=0 is exactly the idle shape below) — never delete
+  # out from under it.
+  if prove_inflight_guard idle-guard "$id"; then
     exit 0
   fi
 
