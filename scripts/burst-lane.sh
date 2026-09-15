@@ -855,7 +855,17 @@ volume_state_write() {  # $1..$N = key=value pairs, merged onto whatever's
 
 # ---- hcloud helpers -------------------------------------------------------
 server_alive() {  # $1 = server id -> 0 if hcloud still sees it
-  "$HCLOUD" server describe "$1" -o json >/dev/null 2>&1
+  # Fail OPEN when hcloud itself is unavailable (binary off PATH, no token):
+  # a probe that cannot run says nothing about the server, and archiving a
+  # live session as stale on that basis dropped three billed boxes on
+  # 2026-09-15 (06:46Z, 07:08Z, 08:51Z). Only hcloud actually answering
+  # "not found", or a working hcloud that lists servers without this id,
+  # counts as gone.
+  command -v "$HCLOUD" >/dev/null 2>&1 || return 0
+  local out; out="$("$HCLOUD" server describe "$1" -o json 2>&1)" && return 0
+  case "$out" in *"not found"*|*"not exist"*) return 1 ;; esac
+  "$HCLOUD" server list -o noheader -o columns=id >/dev/null 2>&1 || return 0
+  return 1
 }
 
 volume_alive() {  # $1 = volume id -> 0 if hcloud still sees it
