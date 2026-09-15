@@ -747,7 +747,12 @@ read it before assuming a step is "the last one this tick".
   routinely-shipped head with `intent-card-diff-scope-mismatch` against a
   diff the card never described (mcphost, 2026-09-05: two blocks in one
   night from a card frozen since v0.5.x while six PRDs and eight version
-  bumps landed). Run:
+  bumps landed). **Capture `pre_refresh_sha="$(git -C <build_into> rev-parse
+  HEAD)"` immediately before running this** (PRD-build-main-push-gate) — this
+  is the head the gate above actually tested; main-push-gate.sh at the
+  `push` step below diffs the refresh's own commit against it, since the
+  refresh is precisely the commit that lands untested otherwise (the
+  bb44d28/3c11214 grounding incidents). Run:
 
   ```
   scripts/intent-card-refresh.sh <build_into> <prd-path>
@@ -776,6 +781,20 @@ read it before assuming a step is "the last one this tick".
   (same serial per-repo lock), immediately after that step's version-bump
   commit and before its own push, for the same reason.
 
+- **main push gate** [rust-extend only, PRD-build-main-push-gate]: before
+  `wm-push`, run `scripts/main-push-gate.sh <build_into> --gated
+  "$pre_refresh_sha" [--changed "<the intent-card-refresh.sh 'changed:'
+  line>"]` — the head the loop is about to push is the intent-card-refresh
+  commit, never the head the gate above actually tested; this closes that
+  gap (see the grounding incident in this PRD's own header). Exit 0: fall
+  through to `push` below. Exit 4 (`refused` — the resolved check went red)
+  or 5 (`unknown` — no `.buildloop/ci-equivalent.toml`, or the check timed
+  out) defers the branch exactly like `target-dirty`: run `cleanup`
+  WITHOUT `--drop-branch` (branch and refresh commit survive), leave the
+  PRD `in_progress`, set `last_error=main-push-refused` (exit 4) or
+  `last_error=main-push-unknown` (exit 5), and do NOT call `wm-push`. Counts
+  as one tick action when it stops the chain here; otherwise folds into the
+  same step as `push`.
 - **push** [rust-extend only]: `wm-push --slug <slug>` from inside
   `<build_into>`. `wm-push` (installed at `~/.local/bin/wm-push` per
   PRD-build-push-allowlist) wraps `git push origin <branch>` with a
@@ -2633,11 +2652,18 @@ python-specific contract.
    AC lines) is treated the same as a `target-dirty`/conflict defer:
    leave the PRD `in_progress`, do not push a card-stale head.
 5. **push + cleanup** — after a successful integrate (and intent card
-   refresh), `wm-push --slug
+   refresh), PRD-build-main-push-gate: run `scripts/main-push-gate.sh
+   <repo> --gated <sha at integrate's bump commit, i.e. HEAD right before
+   intent-card-refresh.sh ran> [--changed "<its 'changed:' stdout line>"]`
+   first — same reasoning and same exit-code contract as the non-shared
+   rust-extend push step above (the refresh commit is what's about to be
+   pushed, and it is not what the gate tested). Exit 0: `wm-push --slug
    <repo>` once, then `worktree-extend.sh cleanup <repo> <slug>
-   --drop-branch`. On a deferred branch (dirty target / conflict / red
-   gate) run `cleanup` WITHOUT `--drop-branch` so the next tick resumes
-   the same branch via `add`.
+   --drop-branch`. Exit 4/5, same as any other deferred branch (dirty
+   target / conflict / red gate): run `cleanup` WITHOUT `--drop-branch` so
+   the next tick resumes the same branch via `add`, leave the PRD
+   `in_progress`, and set `last_error=main-push-refused` (4) or
+   `last_error=main-push-unknown` (5) — no `wm-push` call is made.
 6. **gate** — the real gate already ran, INSIDE `gate-then-land.sh`, BEFORE
    step 3 above (`extend-gate.sh <worktree> --head <worktree HEAD> --scope
    branch --slug <slug>`, no crate-wide lock — see the **gate** action's

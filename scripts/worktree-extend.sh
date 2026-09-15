@@ -353,6 +353,7 @@ cmd_add() {
     print_cargo_budget_path_reminder "$repo" >&2
     print_burst_lane_path_reminder "$repo" >&2
     print_python_burst_lane_path_reminder "$repo" >&2
+    ensure_repo_hooks_installed "$repo"
     echo "$wt"; return 0
   fi
   # Base the branch on the repo's REAL default branch HEAD (clean commit),
@@ -373,7 +374,24 @@ cmd_add() {
   print_cargo_budget_path_reminder "$repo" >&2
   print_burst_lane_path_reminder "$repo" >&2
   print_python_burst_lane_path_reminder "$repo" >&2
+  ensure_repo_hooks_installed "$repo"
   echo "$wt"
+}
+
+# PRD-build-main-push-gate requirement 4: every build_into repo an
+# extend/land path touches gets the shared pre-push hook wired the first
+# time `add` sees it (core.hooksPath unset there) — never re-run once
+# installed (install-repo-hooks.sh's own idempotency), and never fatal to
+# `add` on refusal/failure (a repo with some other hooksPath already set
+# keeps it; the worktree still gets created either way). Best-effort,
+# entirely on stderr — cmd_add's stdout contract (the bare worktree path)
+# is unchanged.
+ensure_repo_hooks_installed() {
+  local repo="${1:?ensure_repo_hooks_installed: missing repo arg}"
+  local installer="$HOME/.claude/skills/build/scripts/install-repo-hooks.sh"
+  [ -x "$installer" ] || installer="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/install-repo-hooks.sh"
+  [ -x "$installer" ] || return 0
+  "$installer" "$repo" >&2 || true
 }
 
 # PRD-build-cargo-concurrency-budget: a worktree's `cargo test`/`clippy`/
