@@ -34,6 +34,7 @@ inside fenced code blocks are ignored; first match wins.
 | `deferred_acs` | inline list of bare integers, e.g. `[3, 4]` | no | block-list form parses to `[]` silently (no key at all reads the same way); a PROSE value (e.g. `deferred_acs: see note below`) is flagged — `scan-prds.sh` emits `deferred_acs_unparsed: true` and `verified-completed.sh --derive` prints `deferred_acs: unparsed — use [N, N]` instead of silently treating it as "none declared" |
 | `test_prefix` | bare scalar (`test_prefix: http`) or inline list (`test_prefix: [http, https]`) | no | names the test-file prefix an extend PRD's ACs use on a shared crate, e.g. `mcphost`'s `http_ac01_*.rs` / `python_ac01_*.rs`. Read by `verified-completed.sh --derive`'s AC-pairing derivation (see SKILL.md "archive" / Verified-completed checklist). Without it, derivation guesses a prefix from the slug, which is often wrong for a crate whose PRDs don't name themselves after their test convention |
 | `mock_unjustified_for` / `mock_justifications` | see SKILL.md C5 | with deferred ACs | one sentence per deferred AC |
+| `deferred_ac_reasons` | inline JSON object keyed by AC number as a string, e.g. `{"10": "...", "11": "..."}` | with deferred ACs (equivalent to `mock_justifications` for this purpose) | one sentence per deferred AC, same as `mock_justifications` — read by `scan-prds.sh`, `verified-completed.sh`, and `archive-trailer.sh`; `prd-lint.sh`'s `deferred-acs-missing-justification` check accepts EITHER this key or `mock_justifications` as the justification for a non-empty `deferred_acs:` list (PRD-build-prd-lint-deferred-reasons-key, 2026-09-15 — before this, the lint knew only `mock_justifications`, which parked a finished PRD using only this key) |
 | `publish` | `j0yen/private` `j0yen/public` `none` | recommended | new key — org + visibility for the shipped repo. Until Phase 4 honours it, `/build` still routes by directory (see Follow-ups) |
 | `Vision` | `visions/<slug>.md` | yes | |
 | `Depends-on` | `PRD-<slug>.md`, comma-separated | no | reconciler resolves against git |
@@ -96,6 +97,23 @@ in an extend PRD's AC, a possible `Depends-on` deadlock, a `/home/` path in
 an AC) are warnings and do not block selection. Run it standalone —
 `scripts/prd-lint.sh <file>... [--format text|json]` — before committing a
 new or edited PRD; exit 0 clean, 1 on any failure, 2 on usage error.
+
+**Deferred-AC justification, two accepted keys (PRD-build-prd-lint-
+deferred-reasons-key, 2026-09-15).** `deferred-acs-missing-justification`
+passes when a non-empty `deferred_acs:` list is accompanied by EITHER
+`mock_justifications:` OR `deferred_ac_reasons:` (see the key table above);
+`prd-lint.sh --explain deferred-acs-missing-justification` prints an
+example of each. Two more checks validate the second key's own shape:
+`deferred-acs-reason-missing` (present but missing a non-empty entry for
+one of the declared AC numbers — the message names them) and
+`deferred-acs-reasons-prose` (present but not a parseable JSON object).
+A **key-parity selftest** (`scripts/prd-lint-selftest.sh`) asserts every
+literal frontmatter key `scan-prds.sh` itself declares is either a key
+`prd-lint.sh` checks the shape of or named in that selftest's own
+allowlist with a one-line reason — this is what closes the class of defect
+`deferred_ac_reasons` was: a key the parsers read that the lint had never
+heard of, which parked a finished PRD (`PRD-mcphost-tenant-tables`) three
+times before a human noticed.
 
 **Substrate check, `build-into-substrate-mismatch` (PRD-build-classification-
 self-heal, 2026-09-12).** When `build_into` is set and exists locally, a
