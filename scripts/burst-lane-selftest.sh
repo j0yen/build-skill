@@ -5031,6 +5031,51 @@ expect "provefx AC16: artifacts 82s newer than the marker with skew_s=-330 asser
 expect "provefx AC16: proof.json routed=true, not no-fresh-artifact" \
   "python3 -c \"import json; d=json.load(open('$BURST_LANE_STATE_DIR/proof.json')); assert d['routed'] is True, d\""
 
+# ---- provefx AC17 (regression, commit ac319ac): the freshness check was
+# `find -L ... | grep -q .` under `set -uo pipefail` — on a real pulled
+# cargo target with 5816 files, `grep -q` exits after its first match,
+# `find` gets SIGPIPE (exit 141), pipefail fails the pipeline, and the `!`
+# in front turns a genuinely fresh target into cause=no-fresh-artifact.
+# Three real boxes were burned on this because every prior fixture's target
+# was too small for `find` to ever get killed before `grep` was satisfied.
+# This fixture forces the race: a dedicated fake `cargo` populates target/
+# with 8000 files (one `seq | xargs touch` call — per-file `touch`
+# processes would make this case too slow to run every suite invocation)
+# all backdated to 60s AFTER the marker, so `find -L` has thousands of
+# newer-than-marker candidates to walk past before `grep -q` can see the
+# first one and close its end of the pipe. The `-print -quit` fix (this
+# commit) makes `find` itself stop at the first match, so `grep` never
+# gets a chance to hang up on it; reverting to plain `-print` (no -quit)
+# reproduces the SIGPIPE and must fail this case.
+PFX17_CARGO="$T/fakebin-provefx-ac17-cargo"; mkdir -p "$PFX17_CARGO"
+cat > "$PFX17_CARGO/cargo" <<'EOF'
+#!/usr/bin/env bash
+if [ "${1:-}" = "--version" ]; then
+  echo "cargo 1.85.0-fake"
+  exit 0
+fi
+mkdir -p target
+epoch="${FAKE_CARGO_ARTIFACT_EPOCH:-$(date +%s)}"
+seq -f "target/f%05g.o" 1 8000 | xargs touch -d "@$epoch"
+exit 0
+EOF
+chmod +x "$PFX17_CARGO/cargo"
+fresh_env
+export BURST_LANE_AUTOBUILDER_BIN="$REEN_PROVE_AB_SRC/autobuilder"
+WT_PFX17="$T/provefx-ac17"; mkdir -p "$WT_PFX17"
+pfx17_marker_epoch=1789456973   # 2026-09-15T05:02:53Z
+pfx17_artifact_epoch=$((pfx17_marker_epoch + 60))   # 2026-09-15T05:03:53Z
+pfx17_remote_date="2026-09-15T05:02:50Z"
+pfx17_out="$(PATH="$PFX17_CARGO:$PATH" FAKE_SSH_HOSTNAME=wm-burst-lane-fake-box \
+  BURST_PROVE_TEST_MARKER_EPOCH="$pfx17_marker_epoch" \
+  FAKE_CARGO_ARTIFACT_EPOCH="$pfx17_artifact_epoch" \
+  FAKE_SSH_REMOTE_DATE="$pfx17_remote_date" \
+  "$BL" prove --worktree "$WT_PFX17" 2>&1)"; pfx17_rc=$?
+expect "provefx AC17: a pulled target with 8000 files newer than the marker asserts routed=true (find must not die of SIGPIPE under pipefail)" \
+  "[ $pfx17_rc -eq 0 ]"
+expect "provefx AC17: proof.json routed=true, not no-fresh-artifact" \
+  "python3 -c \"import json; d=json.load(open('$BURST_LANE_STATE_DIR/proof.json')); assert d['routed'] is True, d\""
+
 expect_block_green "provefx" "provefx: every provefx case above ran green"
 
 # ---- proveguard block (PRD-build-burst-prove-inflight-guard) ---------------
