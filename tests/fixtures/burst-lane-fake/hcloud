@@ -54,8 +54,17 @@ case "${1:-}" in
           shift
         done
         id=$((RANDOM % 900000 + 100000))
-        echo "$id|$name|alive" >> "$STATE"
-        printf '{"server":{"id":%s,"name":"%s","public_net":{"ipv4":{"ip":"127.0.0.1"}}}}\n' "$id" "$name"
+        # PRD-build-burst-teardown-evidence: a 4th field, `created` (ISO8601,
+        # honors BURST_LANE_NOW like the volume state's own `created` field
+        # already does) — teardown_decision()'s hcloud_probe_status() reads
+        # this back via `describe`. FAKE_HCLOUD_CREATED_OVERRIDE lets a test
+        # stamp an adopted/pre-existing server's own creation time directly
+        # (e.g. "3 hours ago") without needing to fabricate a real create
+        # call at that offset first.
+        created_epoch="${BURST_LANE_NOW:-$(date -u +%s)}"
+        created="${FAKE_HCLOUD_CREATED_OVERRIDE:-$(date -u -d "@$created_epoch" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ)}"
+        echo "$id|$name|alive|$created" >> "$STATE"
+        printf '{"server":{"id":%s,"name":"%s","created":"%s","public_net":{"ipv4":{"ip":"127.0.0.1"}}}}\n' "$id" "$name" "$created"
         exit 0
         ;;
       describe)
@@ -63,9 +72,10 @@ case "${1:-}" in
         line="$(grep -E "^$key\|" "$STATE" 2>/dev/null | head -n1)"
         [ -z "$line" ] && line="$(awk -F'|' -v k="$key" '$2==k' "$STATE" 2>/dev/null | head -n1)"
         [ -z "$line" ] && exit 1
-        IFS='|' read -r id name alive <<<"$line"
+        IFS='|' read -r id name alive created <<<"$line"
         [ "$alive" = "alive" ] || exit 1
-        printf '{"server":{"id":%s,"name":"%s","public_net":{"ipv4":{"ip":"127.0.0.1"}}}}\n' "$id" "$name"
+        created="${created:-1970-01-01T00:00:00Z}"
+        printf '{"server":{"id":%s,"name":"%s","created":"%s","public_net":{"ipv4":{"ip":"127.0.0.1"}}}}\n' "$id" "$name" "$created"
         exit 0
         ;;
       delete)

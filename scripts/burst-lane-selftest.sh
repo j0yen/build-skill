@@ -6300,7 +6300,7 @@ export BURST_LANE_LOOP_ACTIVE_OVERRIDE=false
 td2_sid="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
 td2_before="$(cat "$BURST_LANE_STATE_DIR/session.json")"
 td2_fakebin="$T/no-hcloud-path"; mkdir -p "$td2_fakebin"
-for tool in ssh rsync python3 systemctl awk grep sed date cut mkdir cat rm mv sleep tr head tail sort xargs sha1sum flock seq basename dirname find touch python; do
+for tool in bash env sh ssh rsync python3 systemctl awk grep sed date cut mkdir cat rm mv sleep tr head tail sort xargs sha1sum flock seq basename dirname find touch python wc stat ln readlink expr; do
   p="$(command -v "$tool" 2>/dev/null)"; [ -n "$p" ] && ln -sf "$p" "$td2_fakebin/$tool"
 done
 td2_down_out="$(PATH="$td2_fakebin" "$BL" down 2>&1)"
@@ -6431,10 +6431,10 @@ td9_dry_cause="$(sed -n 's/^cause=//p' <<<"$td9_dry_out")"
 expect "teardown AC9: status --json's next_teardown.decision is present and matches a dry-run" \
   "[ -n \"$td9_nt_decision\" ] && [ \"$td9_nt_decision\" = \"$td9_dry_decision\" ]"
 expect "teardown AC9: status --json's next_teardown.cause matches a dry-run" "[ \"$td9_nt_cause\" = \"$td9_dry_cause\" ]"
-td9_ledger_before="$(wc -l < "$BURST_LANE_STATE_DIR/decisions.jsonl" 2>/dev/null || echo 0)"
+td9_ledger_before="$(cat "$BURST_LANE_STATE_DIR/decisions.jsonl" 2>/dev/null | wc -l)"
 "$BL" status --json >/dev/null
 "$BL" status --json >/dev/null
-td9_ledger_after="$(wc -l < "$BURST_LANE_STATE_DIR/decisions.jsonl" 2>/dev/null || echo 0)"
+td9_ledger_after="$(cat "$BURST_LANE_STATE_DIR/decisions.jsonl" 2>/dev/null | wc -l)"
 expect "teardown AC9: polling status --json never appends to decisions.jsonl (dry-run has no side effects)" \
   "[ \"$td9_ledger_after\" -eq \"$td9_ledger_before\" ]"
 
