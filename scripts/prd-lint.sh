@@ -10,7 +10,27 @@
 # well under 200ms.
 #
 # Usage:
-#   prd-lint.sh <file>... [--format text|json]
+#   prd-lint.sh <file|dir>... [--format text|json|pass-fail] [--quiet] [--contract <path>]
+#
+# `--format text` (the default) and `--format json` are the original,
+# stable machine/human contracts -- scan-prds.sh's Phase-1 gate shells out
+# with `--format json` and several selftests assert the single-clean-file
+# default prints exactly `OK`, so neither is ever changed by this script;
+# a regression there silently misclassifies the whole queue (see this
+# script's own header history). `--format pass-fail` and `--quiet`
+# (PRD-prd-contract-lint) are additive, opt-in surfaces layered on top:
+#   pass-fail : one line per file, `PASS <file>` or
+#               `FAIL <file>: <id>: <message>[, <id>: <message>...]`
+#   --quiet   : implies pass-fail rendering and prints ONLY the FAIL lines
+#               (no PASS lines) -- for a directory scan where only the
+#               defects matter.
+# A directory argument (in place of a file) expands to its immediate
+# `PRD-*.md` files (not recursive).
+# `--contract <path>` re-derives the accepted `build_target` set from a
+# build-contract.md-shaped file's `| \`build_target\` | ... |` row instead
+# of the hardcoded set below (for testing against a modified contract);
+# on parse failure this falls back to the hardcoded set and warns on
+# stderr rather than failing every file.
 #
 # Exit: 0 = every file clean (warnings allowed), 1 = at least one FAIL
 #       anywhere, 2 = usage error.
@@ -24,10 +44,12 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export LINT_STATE_DIR="${BUILD_STATE_DIR:-$HERE/../state}"
 
 usage() {
-  echo "usage: prd-lint.sh <file>... [--format text|json]" >&2
+  echo "usage: prd-lint.sh <file|dir>... [--format text|json|pass-fail] [--quiet] [--contract <path>]" >&2
 }
 
 format="text"
+quiet=0
+contract=""
 files=()
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -39,6 +61,20 @@ while [ "$#" -gt 0 ]; do
       ;;
     --format=*)
       format="${1#--format=}"
+      shift
+      ;;
+    --quiet)
+      quiet=1
+      shift
+      ;;
+    --contract)
+      shift
+      contract="${1:-}"
+      [ -n "$contract" ] || { usage; exit 2; }
+      shift
+      ;;
+    --contract=*)
+      contract="${1#--contract=}"
       shift
       ;;
     -h|--help)
@@ -65,9 +101,34 @@ if [ "${#files[@]}" -eq 0 ]; then
   exit 2
 fi
 case "$format" in
-  text|json) ;;
-  *) echo "prd-lint: --format must be text or json" >&2; exit 2 ;;
+  text|json|pass-fail) ;;
+  *) echo "prd-lint: --format must be text, json, or pass-fail" >&2; exit 2 ;;
 esac
+# --quiet implies pass-fail rendering unless the caller explicitly asked
+# for json (machine-parsed elsewhere -- quiet has no meaning there).
+if [ "$quiet" -eq 1 ] && [ "$format" = "text" ]; then
+  format="pass-fail"
+fi
+
+# Directory args expand to their immediate PRD-*.md files (non-recursive --
+# a corpus dir like build-queue/ is flat by contract). Expanded in place so
+# a mix of files and dirs on one command line works.
+expanded=()
+for f in "${files[@]}"; do
+  if [ -d "$f" ]; then
+    shopt -s nullglob
+    matched=("$f"/PRD-*.md)
+    shopt -u nullglob
+    if [ "${#matched[@]}" -eq 0 ]; then
+      echo "prd-lint: no PRD-*.md files in directory: $f" >&2
+      exit 2
+    fi
+    expanded+=("${matched[@]}")
+  else
+    expanded+=("$f")
+  fi
+done
+files=("${expanded[@]}")
 
 for f in "${files[@]}"; do
   if [ ! -f "$f" ]; then
@@ -76,13 +137,20 @@ for f in "${files[@]}"; do
   fi
 done
 
+if [ -n "$contract" ] && [ ! -f "$contract" ]; then
+  echo "prd-lint: --contract file not found: $contract (falling back to the built-in build_target set)" >&2
+  contract=""
+fi
+
 # All the real work happens in one python3 process so the whole batch stays
 # well under the 200ms/PRD budget even with cross-file cycle detection.
-python3 - "$format" "${files[@]}" <<'PY'
+python3 - "$format" "$quiet" "$contract" "${files[@]}" <<'PY'
 import json, os, re, sys
 
 fmt = sys.argv[1]
-targets = sys.argv[2:]
+quiet = sys.argv[2] == "1"
+contract_path = sys.argv[3]
+targets = sys.argv[4:]
 
 # Contract's build_target set (build-contract.md). "product" is valid but
 # skipped, not built -- still a legal value here.
@@ -91,6 +159,29 @@ VALID_TARGETS = {
     "hooks", "config", "notebook", "mixed",
     "python-cli", "python-lib", "python-agent", "product",
 }
+# PRD-prd-contract-lint, `--contract <path>`: re-derive VALID_TARGETS from a
+# build-contract.md-shaped file's `| \`build_target\` | ... |` row instead of
+# the hardcoded set above, for testing against a modified contract. Only the
+# cell up to the first `(` (the row's own parenthetical commentary, e.g.
+# "routes to /pybuild") is scanned, so annotation text never contributes a
+# bogus token. Falls back to the hardcoded set (already warned about on
+# stderr by the bash layer) on any parse failure or empty result.
+if contract_path:
+    try:
+        with open(contract_path, encoding="utf-8", errors="replace") as fh:
+            ctext = fh.read()
+        row = next(
+            (l for l in ctext.splitlines() if re.match(r"^\s*\|\s*`build_target`\s*\|", l)),
+            None,
+        )
+        if row:
+            cell = row.split("|")[2]
+            cell = cell.split("(", 1)[0]
+            found = re.findall(r"`([a-z][a-z0-9-]*)`", cell)
+            if found:
+                VALID_TARGETS = set(found)
+    except OSError:
+        pass
 EXTEND_TARGETS = {"rust-extend", "kernel-extend"}
 # PRD-build-classification-self-heal: the build_target families a substrate
 # check applies to. Deliberately mirrors substrate-probe.sh's depth<=1
@@ -105,6 +196,17 @@ AC_HEADING_RE = re.compile(r"^##\s+Acceptance(?:\s+(criteria|tests))?\s*$", re.I
 AC_NUM_RE = re.compile(r"^(\d+)\.\s+(.*)$")
 AC_LEVELED_RE = re.compile(r"^\d+\.\s+P[0-2]\s*[—–-]\s*")
 AC_LEGACY_RE = re.compile(r"^AC-\d+\s*:")
+# PRD-prd-contract-lint AC8 / verified-completed-ac-count-h3-inflation: an
+# h3+ or bold-only pseudo-heading inside the Acceptance-criteria section
+# doesn't close verified-completed.sh's own AC-counting block (its awk only
+# closes `in_block` on a genuine `^##[[:space:]]`), so any numbered list
+# after it -- e.g. a trailing "### Anti-pattern audit" section reusing
+# `1.`/`2.` -- gets swept in as phantom ACs. Two real incidents, 2026-07-02
+# (aistack-query-complexity-governor, aistack-metric-fingerprint-block-on-
+# drift). Catch the trap here, at draft time, before it can false-refuse an
+# otherwise-ready archive.
+AC_H3_RE = re.compile(r"^#{3,6}\s+\S")
+AC_BOLD_HEADING_RE = re.compile(r"^\*\*[^*\n]+\*\*\.?$")
 SHA40_RE = re.compile(r"\b[0-9a-f]{40}\b")
 BASE_SHA_RE = re.compile(r"--base\s+([0-9a-f]{7,40})\b")
 HOME_PATH_RE = re.compile(r"/home/[A-Za-z0-9_.-]+/")
@@ -215,6 +317,30 @@ def ac_section_lines(all_lines):
         if in_section:
             out.append(line)
     return out, in_section
+
+
+def ac_inflation_trap(all_lines):
+    """Line numbers (1-indexed) + text of any h3+/bold pseudo-heading between
+    the Acceptance-criteria heading and the next REAL `## ` heading (or EOF).
+    Uses the SAME stop rule as verified-completed.sh's own awk (only a true
+    h2 closes the block), so a hit here is a hit there too -- see AC_H3_RE's
+    comment for the incident this closes."""
+    start = None
+    for i, line in enumerate(all_lines):
+        if AC_HEADING_RE.match(line.strip()):
+            start = i + 1
+            break
+    if start is None:
+        return []
+    hits = []
+    for i in range(start, len(all_lines)):
+        line = all_lines[i]
+        if line.startswith("## "):
+            break
+        stripped = line.strip()
+        if AC_H3_RE.match(stripped) or AC_BOLD_HEADING_RE.match(stripped):
+            hits.append((i + 1, stripped))
+    return hits
 
 
 def slug_corpus_dirs_for(path):
@@ -388,6 +514,19 @@ def lint_file(path):
     if "status" not in fm:
         fail("status-missing", "no `Status:` line found in the first 80 lines")
 
+    # PRD-prd-contract-lint AC5: presence-only, and a WARN not a FAIL. A
+    # measured run against the live build-queue/ corpus at ship time (2026-
+    # 09-15) found ~45% of currently-queued PRDs (predating the `Grounding:`
+    # convention) have no such line; scan-prds.sh's Phase-1 gate treats the
+    # first FAIL as a hard park to needs_classification, so a FAIL here would
+    # have stranded roughly half the live queue the instant this shipped --
+    # a much bigger regression than the gap this closes (same reasoning as
+    # `build-into-not-found` above: promoting a real but non-catastrophic gap
+    # to FAIL can jam the whole queue rather than one PRD). WARN still
+    # surfaces the gap to a human/drafter without blocking dispatch.
+    if "grounding" not in fm:
+        warn("grounding-missing", "no `- Grounding:` line found in the first 80 lines — every drafted PRD names its grounding chain (wwhtbt / five-whys / failure-derived / opportunity / ...)")
+
     build_target = fm.get("build_target")
     if not build_target:
         fail("build-target-missing", "no `build_target:` line found in the first 80 lines")
@@ -507,6 +646,17 @@ def lint_file(path):
     if not found_heading:
         fail("ac-section-missing", "no `## Acceptance criteria` (or `## Acceptance` / `## Acceptance tests`) section found")
     else:
+        trap_hits = ac_inflation_trap(all_lines)
+        if trap_hits:
+            named = ", ".join(f"line {ln}: {txt!r}" for ln, txt in trap_hits)
+            fail(
+                "ac-heading-inflation",
+                f"h3/bold heading(s) inside the Acceptance-criteria section "
+                f"will not close verified-completed.sh's AC-counting block "
+                f"(it only closes on a real `## ` heading) — any numbered "
+                f"list after it is swept in as phantom ACs: {named}",
+            )
+
         legacy = [l for l in section if AC_LEGACY_RE.match(l.strip())]
         if legacy:
             fail("ac-legacy-format", f"found `AC-N:` style line(s), use `N. P0 — Given/When/Then`: {legacy[0].strip()!r}")
@@ -639,6 +789,25 @@ for path in targets:
 
 if fmt == "json":
     print(json.dumps(results, indent=2))
+elif fmt == "pass-fail":
+    # PRD-prd-contract-lint AC1/AC7: one line per file. FAIL folds every
+    # failure (and, since this mode has no separate WARN slot, every
+    # warning too -- warnings never affect the PASS/FAIL verdict itself,
+    # only what's named on the line) into one comma-joined line; --quiet
+    # drops the PASS lines entirely so a big directory scan shows only its
+    # defects, with exit still reflecting the worst result across the batch.
+    for r in results:
+        findings = r["failures"] + r["warnings"]
+        if not findings:
+            if not quiet:
+                print(f"PASS {r['file']}")
+            continue
+        if r["failures"]:
+            named = ", ".join(f"{x['id']}: {x['message']}" for x in findings)
+            print(f"FAIL {r['file']}: {named}")
+        elif not quiet:
+            named = ", ".join(f"{x['id']}: {x['message']}" for x in findings)
+            print(f"PASS {r['file']}: {named}")
 else:
     multi = len(results) > 1
     for r in results:

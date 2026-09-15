@@ -602,11 +602,144 @@ echo '{"value":"x","written_at":"2026-01-01T00:00:00Z"}' > "$cred_state/secrets/
 BUILD_STATE_DIR="$cred_state" expect_clean_no_id "$q/PRD-cred-claim.md" warnings credential-reuse-unbacked "credential-reuse-unbacked/pass (secret file present)"
 expect_clean_no_id "$q/PRD-status-ok.md" warnings credential-reuse-unbacked "credential-reuse-unbacked/pass (no claim in text)"
 
+# ============================================================ grounding-missing
+# PRD-prd-contract-lint AC5: presence-only (see the check's own comment for
+# why the vocabulary itself -- wwhtbt/five-whys/failure-derived/... -- isn't
+# enforced), and a WARN not a FAIL (see the check's own comment: ~45% of the
+# live build-queue/ corpus at ship time predates this convention -- a FAIL
+# would have stranded roughly half the queue into needs_classification the
+# instant this shipped).
+cat > "$q/PRD-grounding-missing.md" <<'EOF'
+- Status: queued
+- build_target: shell
+- Vision: visions/plain.md
+
+## Acceptance criteria
+
+1. P0 — Given a, When b, Then c.
+EOF
+expect_warn "$q/PRD-grounding-missing.md" grounding-missing "grounding-missing/warn"
+
+cat > "$q/PRD-grounding-ok.md" <<'EOF'
+- Status: queued
+- build_target: shell
+- Vision: visions/plain.md
+- Grounding: wwhtbt — visions/plain.md leaf 1 (fixture)
+
+## Acceptance criteria
+
+1. P0 — Given a, When b, Then c.
+EOF
+expect_clean_no_id "$q/PRD-grounding-ok.md" warnings grounding-missing "grounding-missing/pass"
+
+# ============================================================ ac-heading-inflation
+# PRD-prd-contract-lint AC8 / real 2026-07-02 incident shape: numbered ACs
+# followed by an h3 (or bold-only) pseudo-heading that reuses `1.`/`2.` for
+# something else. verified-completed.sh's own awk never closes its AC block
+# on that heading (only a real `## ` does), so it counts the reused numbers
+# as phantom ACs -- see verified-completed-ac-count-h3-inflation memory.
+cat > "$q/PRD-ac-inflation-h3.md" <<'EOF'
+- Status: queued
+- build_target: shell
+- Vision: visions/plain.md
+- Grounding: wwhtbt — visions/plain.md leaf 1 (fixture)
+
+## Acceptance criteria
+
+1. P0 — Given a, When b, Then c.
+2. P0 — Given d, When e, Then f.
+
+### Anti-pattern audit
+
+1. Not a real AC, just a checklist reusing numbers.
+2. Same shape as the real 2026-07-02 incident.
+EOF
+expect_fail "$q/PRD-ac-inflation-h3.md" ac-heading-inflation "ac-heading-inflation/fail (h3)"
+
+cat > "$q/PRD-ac-inflation-bold.md" <<'EOF'
+- Status: queued
+- build_target: shell
+- Vision: visions/plain.md
+- Grounding: wwhtbt — visions/plain.md leaf 1 (fixture)
+
+## Acceptance criteria
+
+1. P0 — Given a, When b, Then c.
+
+**Anti-pattern audit.**
+
+1. Not a real AC either.
+EOF
+expect_fail "$q/PRD-ac-inflation-bold.md" ac-heading-inflation "ac-heading-inflation/fail (bold)"
+
+expect_clean_no_id "$q/PRD-status-ok.md" failures ac-heading-inflation "ac-heading-inflation/pass"
+
+# ============================================================ directory arg / --quiet / --format pass-fail (PRD-prd-contract-lint AC1, AC7)
+dirtest="$tmp/dirtest"
+mkdir -p "$dirtest/visions"
+cp "$v/plain.md" "$dirtest/visions/plain.md"
+cp "$q/PRD-grounding-ok.md" "$dirtest/PRD-dir-ok.md"
+cp "$q/PRD-ac-inflation-h3.md" "$dirtest/PRD-dir-fail.md"
+
+total=$((total+1))
+out="$("$LINT" --format json "$dirtest" 2>/dev/null)"
+if printf '%s' "$out" | python3 -c "import json,sys; d=json.load(sys.stdin); sys.exit(0 if len(d)==2 else 1)" 2>/dev/null; then
+  echo "ok: directory-arg -> expands to its 2 PRD-*.md files"
+else
+  echo "FAIL: directory-arg expected 2 results, got: $out"
+  fails=$((fails+1))
+fi
+
+total=$((total+1))
+out="$("$LINT" --quiet "$dirtest" 2>/dev/null)"
+n_lines="$(printf '%s\n' "$out" | grep -c '^FAIL ')"
+n_pass_lines="$(printf '%s\n' "$out" | grep -c '^PASS ')"
+if [ "$n_lines" -eq 1 ] && [ "$n_pass_lines" -eq 0 ]; then
+  echo "ok: --quiet -> one FAIL line, no PASS lines, over a mixed directory"
+else
+  echo "FAIL: --quiet expected 1 FAIL line and 0 PASS lines, got: $out"
+  fails=$((fails+1))
+fi
+
+total=$((total+1))
+out="$("$LINT" --format pass-fail "$dirtest/PRD-dir-ok.md" 2>/dev/null)"
+if [ "$out" = "PASS $dirtest/PRD-dir-ok.md" ]; then
+  echo "ok: format pass-fail -> 'PASS <file>' on a clean file"
+else
+  echo "FAIL: format pass-fail expected 'PASS <file>', got: $out"
+  fails=$((fails+1))
+fi
+
+total=$((total+1))
+out="$("$LINT" --format pass-fail "$dirtest/PRD-dir-fail.md" 2>/dev/null)"
+case "$out" in
+  "FAIL $dirtest/PRD-dir-fail.md:"*"ac-heading-inflation"*)
+    echo "ok: format pass-fail -> 'FAIL <file>: <finding>...' on a failing file" ;;
+  *)
+    echo "FAIL: format pass-fail expected 'FAIL <file>: ...ac-heading-inflation...', got: $out"
+    fails=$((fails+1)) ;;
+esac
+
+# ============================================================ --contract override (PRD-prd-contract-lint P2)
+contract_file="$tmp/mini-contract.md"
+cat > "$contract_file" <<'EOF'
+| `build_target` | `widget-only` (test contract, not the real one) | yes | anything else -> needs_classification |
+EOF
+total=$((total+1))
+out="$("$LINT" --format json --contract "$contract_file" "$q/PRD-grounding-ok.md" 2>/dev/null)"
+if has_id "$out" failures build-target-unknown; then
+  echo "ok: --contract override -> shell now fails against a restricted test contract"
+else
+  echo "FAIL: --contract override expected build-target-unknown, got: $out"
+  fails=$((fails+1))
+fi
+
 # ================================================================================ OK
 cat > "$b/PRD-clean-built.md" <<'EOF'
 - Status: built
 - build_target: shell
 - Vision: visions/plain.md
+- Grounding: wwhtbt — visions/plain.md leaf 1 (fixture)
 
 ## Acceptance criteria
 
