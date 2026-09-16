@@ -582,6 +582,36 @@ Read the PRD. Determine its implementation shape:
   no-op when already in sync. If it exits 5 (diverged), `git fetch` +
   rebase onto `origin/main` first, then re-run; never force-push.
   # After self-push.sh: answerable-emit.sh self-edit <file> "<why>" false
+
+  **Cross-repo write, gated (PRD-build-cross-repo-commit-gate).** When this
+  PRD's write target is a DIFFERENT existing git repo than its own
+  `build_into` (this shell PRD is dropping a file into, say, mcphost rather
+  than build-skill itself), first check
+  `scripts/gated-targets.sh is-gated <target-repo>` — exit 0 means some
+  `rust-extend` PRD in the corpus declares `<target-repo>` as its own
+  `build_into`, so a commit there needs that repo's branch gate BEFORE it
+  reaches the default branch (the 2026-09-16 grounding incident: a
+  build-skill shell PRD wrote `.buildloop/ci-equivalent.toml` straight into
+  mcphost, landed through a green-CI PR, and reds every mcphost branch's
+  vti-plan because the commit was unrouted in `agent/proof-lanes.toml`). On
+  a gated target, do NOT commit+push directly: run
+  `scripts/worktree-extend.sh add <target-repo> <this-prd-slug>`, make the
+  edit and commit it on that worktree branch, then
+  `scripts/worktree-extend.sh land <target-repo> <this-prd-slug>
+  --writer-build-into <this PRD's own build_into>` — `land` detects the
+  cross-repo case (target differs from `--writer-build-into`) and runs
+  `extend-gate.sh <worktree> --scope branch --slug <this-prd-slug>` on the
+  commit before ever touching the target's default branch, journaling
+  `cross-repo-gate  refused  (writer=<slug> target=<repo>
+  blocking=<producer>)` and refusing (exit 8, branch/worktree left intact)
+  on anything but pass/delta-pass, or `cross-repo-gate  pass  (writer=<slug>
+  target=<repo>)` and merging otherwise. An `is-gated` miss (the common
+  case — most shell-PRD writes are same-repo, or into a repo no rust-extend
+  PRD claims) is unaffected: commit+push directly as above, no worktree, no
+  gate call. If this shell PRD's own push ever routes through
+  `main-push-gate.sh` instead of `worktree-extend.sh land` (see that
+  script's section below), the identical gated-repo check runs there too —
+  either path is a real branch-gate verdict, never "CI green" alone.
 - **Config / settings.json changes** → edit settings.json with jq plus
   atomic rename. Always snapshot first to `settings.json.bak.<ts>`. For
   ticks that touch settings.json AND one or more hook scripts in the
@@ -805,6 +835,25 @@ read it before assuming a step is "the last one this tick".
   push again once the pre-push hook is installed on it (caught live,
   2026-09-15, on this PRD's own self-push). Counts as one tick action when
   it stops the chain here; otherwise folds into the same step as `push`.
+
+  **Gated-repo branch-verdict check (PRD-build-cross-repo-commit-gate
+  requirement 3), same script, additive.** When `<build_into>` is itself a
+  registered gated target (`scripts/gated-targets.sh is-gated <build_into>`
+  — some OTHER rust-extend PRD in the corpus, not necessarily this one,
+  declares it as their own `build_into`), a green CI-equivalent delta is
+  not the whole story: this script ALSO requires a FRESH branch-gate
+  verdict (`pass`/`delta-pass`, read from
+  `<build_into>/target/autobuilder/last-verdict.json`) for the EXACT head
+  about to be pushed, checked BEFORE the CI-equivalent machinery above
+  runs at all. Missing, stale (a different head), or `block` all refuse
+  (exit 1) with `cross-repo-gate  refused  (writer=<slug> target=<repo>
+  blocking=<producer>)` — the same failure mode `worktree-extend.sh
+  land`'s own cross-repo check guards (see the Phase 3 "Shell scripts"
+  section above): a green CI-equivalent alone must never admit an
+  unrouted/unreviewed commit into a repo this loop also extends via
+  rust-extend. A `<build_into>` that isn't a registered gated target is
+  entirely unaffected — this check is a no-op for the common case, same as
+  today.
 - **push** [rust-extend only]: **check `scripts/branch-protection.sh
   status <repo>`'s `push_via_branch` field (or read
   `state/branch-protection.json` directly) before choosing how to push —

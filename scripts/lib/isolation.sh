@@ -146,5 +146,28 @@ selftest_init() {
     export BUILD_TEST_ROOT
   fi
   export BUILD_TEST=1
-  isolation_apply
+  isolation_apply || return 1
+
+  # PRD-build-journal-single-writer requirement 6 (P1 nudge): one
+  # `journal  test-run  (via=direct|runner name=<file>)` line per test that
+  # sources this prelude, landing under $BUILD_JOURNAL_ROOT (the test
+  # root isolation_apply just set — never production; journal_line is
+  # already sourced by every caller of this file's convention, but source
+  # it defensively here too so a bare `source isolation.sh; selftest_init`
+  # with no other sourcing still works). RUN_SELFTESTS_RUNNER=1 is set by
+  # run-selftests.sh around each test it invokes (see that script); a test
+  # invoked any other way (a coordinator running one selftest directly, a
+  # human at a shell) is "direct". scripts/tick-selftest-summary.sh reads
+  # these lines back to derive the tick summary's `selftests direct=<n>
+  # runner=<n>` field (SKILL.md's dispatch-nudge doc).
+  if ! command -v journal_line >/dev/null 2>&1; then
+    # shellcheck disable=SC1091
+    source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/journal.sh" 2>/dev/null || true
+  fi
+  if command -v journal_line >/dev/null 2>&1; then
+    local via="direct"
+    [ "${RUN_SELFTESTS_RUNNER:-0}" = "1" ] && via="runner"
+    journal_line "$(date -u +%Y-%m-%dT%H:%M:%SZ)  journal  test-run  (via=$via name=${0##*/})"
+  fi
+  return 0
 }

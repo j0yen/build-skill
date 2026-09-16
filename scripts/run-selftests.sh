@@ -298,12 +298,27 @@ for t in "${to_run[@]}"; do
   before_lines="$(_journal_line_count)"
 
   rc=0
-  bash "$t" || rc=$?
+  RUN_SELFTESTS_RUNNER=1 bash "$t" || rc=$?
 
   after_lines="$(_journal_line_count)"
 
-  if [ "$after_lines" != "$before_lines" ]; then
-    echo "run-selftests: LEAK: $name grew the real production journal ($before_lines -> $after_lines lines)" >&2
+  # PRD-build-journal-single-writer requirement 3/9: a raw line-count
+  # inequality here used to fail a test outright even when every new line
+  # was unrelated, non-fixture-shaped concurrent production activity (this
+  # box runs a live /build loop plus sibling cargo-budget/gate-wedge
+  # writers) — the exact false-positive AC7's --all-mode classification
+  # below already solves for the whole-run window, just not yet for this
+  # per-test check. Apply the same classification here: a shrink, or any
+  # NEW line that IS fixture-shaped, still fails loud; non-fixture growth
+  # is logged as a NOTE, not a failure.
+  if [ "$after_lines" -lt "$before_lines" ]; then
+    echo "run-selftests: LEAK: $name — real production journal SHRANK ($before_lines -> $after_lines lines, append-only violation)" >&2
+    fail=$((fail + 1))
+    failed_names+=("$name")
+    continue
+  elif [ "$after_lines" -gt "$before_lines" ] \
+       && tail -n "$((after_lines - before_lines))" "$REAL_JOURNAL_TODAY" | _any_fixture_shaped_line; then
+    echo "run-selftests: LEAK: $name grew the real production journal with fixture-shaped line(s) ($before_lines -> $after_lines lines)" >&2
     echo "run-selftests: leaked line(s):" >&2
     tail -n "$((after_lines - before_lines))" "$REAL_JOURNAL_TODAY" >&2
     fail=$((fail + 1))

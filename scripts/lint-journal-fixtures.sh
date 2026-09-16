@@ -271,6 +271,31 @@ _JOURNAL_TESTS_MARKER_RE='selftest_init|isolation_apply|BUILD_JOURNAL_ROOT|BURST
 # call inside a helper this file sources indirectly through more than one
 # hop). Closing every one is real, separate work outside this PRD's named
 # Engineering target — tracked as a follow-on gap, not silently unlisted.
+#
+# tests/decisions_ac*.sh (8 files, landed after this PRD's own P0 commit
+# via PRD-build-open-decision-escalation): same thin-wrapper shape as the
+# repohealth_ac*.sh entries below — each execs scripts/decisions-selftest.sh
+# as a child process rather than sourcing it, so the one-hop `source`/`.`
+# scan below never sees that script's own isolation. Verified by hand
+# (2026-09-16, this PRD's own step): decisions-selftest.sh sets
+# BUILD_JOURNAL_ROOT to a per-run mktemp sandbox before any assertion runs;
+# ran tests/decisions_ac1_open_dedup_same_id.sh directly and confirmed 0
+# line growth in the real journal. Genuinely isolated, just not through a
+# marker this static check follows — not new debt, a detection gap.
+#
+# tests/jsw_ac*.sh (12 files, this PRD's own AC-pairing wrappers, test_prefix
+# jsw): same thin-wrapper shape again, exec'ing
+# scripts/lint-journal-fixtures-selftest.sh as a child rather than sourcing
+# it. That script sources scripts/lib/isolation.sh at its own top; every
+# ac<N> function that touches a real path either reads the shipped tree
+# read-only (ac1/ac2/ac6/ac12), extracts select-guard.sh's two journal
+# functions into an isolated sandbox (ac4/ac5), or uses selftest_init / a
+# plain mktemp HOME override before writing anything (ac7/ac8/ac10/ac11);
+# ac3/ac9 assert against the real production journal on purpose (their own
+# AC's Given clause) using the same growth-is-only-ok-if-not-fixture-shaped
+# classification run-selftests.sh's own AC7 uses, never a raw line-count
+# leak. Verified by hand (2026-09-16): `bash scripts/lint-journal-fixtures-
+# selftest.sh all` — 12/12 ok, 0 production journal growth of any kind.
 _JOURNAL_TESTS_ALLOWLIST="scripts/archive-commit-selftest.sh
 scripts/archive-finalize-selftest.sh
 scripts/cli-register-selftest.sh
@@ -304,7 +329,27 @@ tests/claims-resume_ac2_new_candidate_still_subcapped.sh
 tests/claims-resume_ac3_dead_pid_stale_immediately.sh
 tests/claims-resume_ac4_otherhost_live_pid_still_ages.sh
 tests/claims-resume_ac6_selftests_pass.sh
+tests/decisions_ac1_open_dedup_same_id.sh
+tests/decisions_ac2_list_age_and_overdue.sh
+tests/decisions_ac3_close_writes_iter_log_and_journal.sh
+tests/decisions_ac4_nudge_once_per_day_per_id.sh
+tests/decisions_ac5_sessionstart_banner.sh
+tests/decisions_ac6_import_vision_idempotent.sh
+tests/decisions_ac7_remote_unreachable_fails_open.sh
+tests/decisions_ac8_repo_filter_and_seeded_prd_evidence.sh
 tests/durheal_ac1_refuse_unreproduced_claim.sh
+tests/jsw_ac10_tick_summary_direct_runner.sh
+tests/jsw_ac11_isolation_guard_path_exit9.sh
+tests/jsw_ac12_explain_lists_three_checks.sh
+tests/jsw_ac1_code_zero_offenses.sh
+tests/jsw_ac2_code_flags_fixture_append.sh
+tests/jsw_ac3_select_tick_selftest_no_env_clean.sh
+tests/jsw_ac4_select_guard_test_journal_root.sh
+tests/jsw_ac5_select_guard_refuses_production_tmp_target.sh
+tests/jsw_ac6_tests_lint_flags_new_unisolated_file.sh
+tests/jsw_ac7_corpus_counts_and_alarm_line.sh
+tests/jsw_ac8_quarantine_idempotent.sh
+tests/jsw_ac9_full_pass_zero_leak.sh
 tests/durheal_ac2_reproduced_claim_commits.sh
 tests/durheal_ac3_requeue_prd_transitions.sh
 tests/durheal_ac4b_report_mode_never_requeues.sh
