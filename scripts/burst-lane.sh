@@ -4701,9 +4701,79 @@ print(json.dumps(out))
   next_teardown_json="$(printf '{"decision":"%s","cause":"%s","eta_s":%s}' "$nt_decision" "$nt_cause" "${nt_eta:-null}")"
 
   if [ "$json" -eq 1 ]; then
+    # PRD-build-burst-state-keyed-by-server-v2 requirement 7: a per-box
+    # breakdown (boxes) and a summed totals object, so a caller never has
+    # to shell out to `cost --today` merely to see how many boxes are up
+    # and what each is doing. Built AFTER every single-box field above
+    # already computed (run_slots_json, next_teardown_json, ...) so it
+    # never disturbs how they read `current`'s own globals; box_context is
+    # explicitly restored to `current`'s own id ($id, captured above at the
+    # top of cmd_status) immediately after this loop, before
+    # status_json_with_extras below touches any BOX_STATE_DIR-relative
+    # global again (its proof/bake reads are per-box — requirement 1's own
+    # classification of proof.json/prove.inflight — and must keep reading
+    # `current`, not whichever box this loop last visited).
+    local box_args=() bid b_type b_runs b_held_cap b_held b_cap b_age b_eur
+    while IFS= read -r bid; do
+      [ -n "$bid" ] || continue
+      box_context "$bid"
+      b_type="$(state_read server_type)"
+      b_runs="$(state_read runs_served)"; case "$b_runs" in ''|*[!0-9]*) b_runs=0 ;; esac
+      b_held_cap="$(count_held_slots)"
+      b_held="${b_held_cap%%/*}"; b_cap="${b_held_cap##*/}"
+      b_age="$(minutes_alive)"
+      b_eur="$(python3 -c '
+import json, sys
+eur = 0.0
+try:
+    with open(sys.argv[1]) as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                d = json.loads(line)
+            except ValueError:
+                continue
+            if d.get("kind") == "slug":
+                continue
+            eur += float(d.get("eur", 0) or 0)
+except OSError:
+    pass
+print(f"{eur:.4f}")
+' "$COST_LEDGER" 2>/dev/null)"
+      case "$b_eur" in ''|*[!0-9.]*) b_eur=0 ;; esac
+      box_args+=("$bid" "$b_type" "$b_runs" "$b_held" "$b_cap" "$b_age" "$b_eur")
+    done < <(list_active_box_ids)
+    box_context "$id"
+    local boxes_json totals_json
+    boxes_json="$(python3 -c '
+import json, sys
+rows = sys.argv[1:]
+out = []
+for i in range(0, len(rows), 7):
+    sid, stype, runs, held, cap, age, eur = rows[i:i + 7]
+    out.append({
+        "server_id": sid, "server_type": stype, "ready": True,
+        "runs_served": int(runs), "held": int(held), "cap": int(cap),
+        "age_min": int(age), "eur": round(float(eur), 4),
+    })
+print(json.dumps(out, separators=(",", ":")))
+' "${box_args[@]}")"
+    totals_json="$(python3 -c '
+import json, sys
+boxes = json.loads(sys.argv[1])
+totals = {
+    "boxes": len(boxes),
+    "held": sum(b["held"] for b in boxes),
+    "cap": sum(b["cap"] for b in boxes),
+    "eur": round(sum(b["eur"] for b in boxes), 4),
+}
+print(json.dumps(totals, separators=(",", ":")))
+' "$boxes_json")"
     local status_base
-    status_base="$(printf '{"active":true,"server_verified":true,"server_id":"%s","ip":"%s","minutes_alive":%s,"ttl_hours":"%s","sandbox_ok":"%s","concurrent":"%s","run_slots":%s,"free_disk_gb":%s,"disk_state":"%s","dirty":%s,"gates":%s,"gate_ready":"%s","gate_tools_missing":"%s","volume":%s,"volume_verified":%s,"redbaron_free_gb":%s,"parity":%s,"next_teardown":%s}' \
-      "$id" "$ip" "$alive" "$ttl" "$sbx" "$conc" "$run_slots_json" "$free_disk_gb" "$disk_state" "$dirty_json" "$gates_json" "$(state_read gate_ready)" "$(state_read gate_tools_missing)" "$vol_json" "$volume_verified" "$redbaron_free_gb" "$parity_json" "$next_teardown_json")"
+    status_base="$(printf '{"active":true,"server_verified":true,"server_id":"%s","ip":"%s","minutes_alive":%s,"ttl_hours":"%s","sandbox_ok":"%s","concurrent":"%s","run_slots":%s,"free_disk_gb":%s,"disk_state":"%s","dirty":%s,"gates":%s,"gate_ready":"%s","gate_tools_missing":"%s","volume":%s,"volume_verified":%s,"redbaron_free_gb":%s,"parity":%s,"next_teardown":%s,"boxes":%s,"totals":%s}' \
+      "$id" "$ip" "$alive" "$ttl" "$sbx" "$conc" "$run_slots_json" "$free_disk_gb" "$disk_state" "$dirty_json" "$gates_json" "$(state_read gate_ready)" "$(state_read gate_tools_missing)" "$vol_json" "$volume_verified" "$redbaron_free_gb" "$parity_json" "$next_teardown_json" "$boxes_json" "$totals_json")"
     status_json_with_extras "$status_base"
   else
     local gate_count; gate_count="$(python3 -c 'import json,sys; print(len(json.loads(sys.argv[1])))' "$gates_json")"

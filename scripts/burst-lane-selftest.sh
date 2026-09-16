@@ -6891,6 +6891,27 @@ expect "multibox AC7: breakdown lists box 2's server_id and type" \
 expect "multibox AC7: breakdown TOTAL line names both boxes" \
   "grep -qE 'TOTAL boxes=2 hours=1\\.50 eur=0\\.30' <<<\"$mb7_cost_out\""
 
+# ---- multibox requirement 7: `status --json` gains a per-box `boxes`
+# array and a summed `totals` object — reuses the exact two-box/two-ledger
+# fixture AC7 just built above (box 1 eur=0.10, box 2 eur=0.20) rather than
+# re-deriving a third one, since this is the same underlying per-box cost
+# read requirement 5 already proved via `cost --today`.
+mb_r7_json="$("$BL" status --json)"
+mb_r7_boxes_count="$(python3 -c 'import json,sys; print(len(json.loads(sys.argv[1])["boxes"]))' "$mb_r7_json" 2>/dev/null)"
+expect "multibox req7: status --json boxes has 2 entries" "[ \"$mb_r7_boxes_count\" = 2 ]"
+mb_r7_ids="$(python3 -c 'import json,sys; print(" ".join(sorted(b["server_id"] for b in json.loads(sys.argv[1])["boxes"])))' "$mb_r7_json" 2>/dev/null)"
+expect "multibox req7: boxes names both server_ids" "[ \"$mb_r7_ids\" = \"$(printf '%s\n%s' "$mb7_id1" "$mb7_id2" | sort | tr '\n' ' ' | sed 's/ $//')\" ]"
+mb_r7_eur1="$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); print(next(b["eur"] for b in d["boxes"] if b["server_id"]==sys.argv[2]))' "$mb_r7_json" "$mb7_id1" 2>/dev/null)"
+expect "multibox req7: box 1's own eur (0.1) is reported" "[ \"$mb_r7_eur1\" = 0.1 ]"
+mb_r7_eur2="$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); print(next(b["eur"] for b in d["boxes"] if b["server_id"]==sys.argv[2]))' "$mb_r7_json" "$mb7_id2" 2>/dev/null)"
+expect "multibox req7: box 2's own eur (0.2) is reported" "[ \"$mb_r7_eur2\" = 0.2 ]"
+mb_r7_ready="$(python3 -c 'import json,sys; print(all(b["ready"] for b in json.loads(sys.argv[1])["boxes"]))' "$mb_r7_json" 2>/dev/null)"
+expect "multibox req7: both boxes report ready=true" "[ \"$mb_r7_ready\" = True ]"
+mb_r7_totals="$(python3 -c 'import json,sys; d=json.loads(sys.argv[1])["totals"]; print(d["boxes"], d["eur"])' "$mb_r7_json" 2>/dev/null)"
+expect "multibox req7: totals.boxes=2 and totals.eur=0.3 (sum of both)" "[ \"$mb_r7_totals\" = \"2 0.3\" ]"
+expect "multibox req7: legacy top-level server_id still mirrors current (box 1)" \
+  "[ \"$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["server_id"])' "$mb_r7_json")\" = \"$mb7_id1\" ]"
+
 # ---- multibox AC4 (requirement 4): idle-guard iterates every active box —
 # a busy box (runs_served=3) is left alone while an idle box (runs_served=0,
 # age past the 900s zero-runs threshold) is torn down in the same pass, and
