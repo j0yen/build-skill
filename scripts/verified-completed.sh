@@ -508,6 +508,39 @@ done < <(awk '
   }
 ' "$prd")
 
+# whole-suite tagging (PRD-build-verified-completed-realbox-perserver R5):
+# which written AC numbers name a `scripts/*.sh` or `*-selftest.sh` path
+# anywhere on the AC's own line — this repo's authoring convention for an
+# AC whose evidence is "the named script's own exit code," not a dedicated
+# per-AC test file (worked example: PRD-build-gate-route-parity-ledger's
+# AC8, "Given tests/routepar_ac*.sh, When scripts/routepar-selftest.sh runs
+# on RedBaron, Then 0 FAIL" — the script is named on the AC's line, not
+# strictly inside a "Then" clause the PRD prose describes, so this matches
+# the whole line rather than trying to isolate a Then-clause substring).
+# Purely additive: classify_ac only consults this AFTER rule (a) (the
+# per-AC `<prefix>_ac<n>_*.sh` search) has already come up empty for that
+# number — see rule g below.
+declare -A ac_is_wholesuite=() ac_wholesuite_script=()
+while IFS=$'\t' read -r acn script; do
+  [ -n "$acn" ] || continue
+  [ -n "$script" ] || continue
+  ac_is_wholesuite[$acn]=1
+  ac_wholesuite_script[$acn]="$script"
+done < <(awk '
+  /^##[[:space:]]+([[:digit:]]+\.[[:space:]]+)?Acceptance/ { in_block=1; next }
+  /^##[[:space:]]/ && in_block { in_block=0 }
+  in_block && match($0, /^[[:digit:]]+\./) {
+    n = substr($0, RSTART, RLENGTH-1) + 0
+    script = ""
+    if (match($0, /scripts\/[A-Za-z0-9._-]+\.sh/)) {
+      script = substr($0, RSTART, RLENGTH)
+    } else if (match($0, /[A-Za-z0-9._-]+-selftest\.sh/)) {
+      script = substr($0, RSTART, RLENGTH)
+    }
+    if (script != "") print n "\t" script
+  }
+' "$prd")
+
 declare -A is_paired is_deferred reason_for paired_evidence
 declare -A derived_rule derived_path is_failing
 declare -A fnscan_path
@@ -636,43 +669,105 @@ find_collision() {
 # enforces, AND naming the image `status --json` reports as what `up` would
 # boot right now (a proof against a superseded/un-baked image never pairs).
 check_real_box_evidence() {
-  local repo="$1" bl status_json boot_image proof_path
+  local repo="$1" bl status_json boot_image
   bl="$repo/scripts/burst-lane.sh"
-  proof_path="$repo/state/burst-lane/proof.json"
   [ -x "$bl" ] || return 1
-  [ -f "$proof_path" ] || return 1
   status_json="$("$bl" status --json 2>/dev/null)" || return 1
   boot_image="$("$JQ" -r '.image_id // empty' <<<"$status_json" 2>/dev/null)"
   [ -n "$boot_image" ] || return 1
+
+  # PRD-build-verified-completed-realbox-perserver R1/R2: the legacy flat
+  # path is retired in favor of one proof.json per box under
+  # state/burst-lane/boxes/<server_id>/ (PRD-build-burst-state-keyed-by-
+  # server-v2) — pool BOTH the flat path (kept as one candidate among many,
+  # never a separately-prioritized first check, per Technical
+  # considerations) and every boxes/*/proof.json, and let the freshest
+  # VALID `ts` among them win. A box dir with no proof.json inside
+  # (_orphan-* dirs, confirmed present on this host) must not error the
+  # glob — nullglob elides the unmatched pattern instead of leaving a
+  # literal nonexistent path in the array.
+  local -a candidates=()
+  [ -f "$repo/state/burst-lane/proof.json" ] && candidates+=("$repo/state/burst-lane/proof.json")
+  shopt -s nullglob
+  local box_proof
+  for box_proof in "$repo"/state/burst-lane/boxes/*/proof.json; do
+    candidates+=("$box_proof")
+  done
+  shopt -u nullglob
+  [ "${#candidates[@]}" -gt 0 ] || return 1
+
   python3 -c '
 import calendar, json, sys, time
 
-proof_path, boot_image = sys.argv[1:3]
+repo, boot_image = sys.argv[1], sys.argv[2]
+paths = sys.argv[3:]
 
-try:
-    proof = json.load(open(proof_path))
-except Exception:
+best = None  # (epoch, relpath, proof)
+for proof_path in paths:
+    try:
+        proof = json.load(open(proof_path))
+    except Exception:
+        continue
+
+    if proof.get("routed") is not True:
+        continue
+    if not (proof.get("bytes") or 0) > 0:
+        continue
+    if proof.get("image_id") != boot_image:
+        continue
+
+    ts = proof.get("ts", "")
+    try:
+        t = time.strptime(ts, "%Y-%m-%dT%H:%M:%SZ")
+        epoch = calendar.timegm(t)
+    except Exception:
+        continue
+    if (time.time() - epoch) / 3600.0 > 168:
+        continue
+
+    if best is None or epoch > best[0]:
+        rel = proof_path[len(repo) + 1:] if proof_path.startswith(repo + "/") else proof_path
+        best = (epoch, rel, proof)
+
+if best is None:
     sys.exit(1)
 
-if proof.get("routed") is not True:
-    sys.exit(1)
-if not (proof.get("bytes") or 0) > 0:
-    sys.exit(1)
-if proof.get("image_id") != boot_image:
-    sys.exit(1)
+_, rel, proof = best
+print("%s (routed=true image=%s bytes=%s ts=%s)" % (
+    rel, proof.get("image_id"), proof.get("bytes"), proof.get("ts", "")))
+' "$repo" "$boot_image" "${candidates[@]}"
+}
 
-ts = proof.get("ts", "")
-try:
-    t = time.strptime(ts, "%Y-%m-%dT%H:%M:%SZ")
-    age_h = (time.time() - calendar.timegm(t)) / 3600.0
-except Exception:
-    sys.exit(1)
-if age_h > 168:
-    sys.exit(1)
-
-print("state/burst-lane/proof.json (routed=true image=%s bytes=%s ts=%s)" % (
-    proof.get("image_id"), proof.get("bytes"), ts))
-' "$proof_path" "$boot_image"
+# whole_suite_evidence <n> — stdout: evidence string, rc 0, when the AC's
+# own named selftest script (ac_wholesuite_script[$n]) has a fresh receipt,
+# scoped to THIS PRD's own slug, recording exit 0 from its most recent
+# selftest-runner invocation; rc 1 (no stdout) otherwise. See rule g in
+# classify_ac and the header's R5 note. Receipts are
+# verdict-receipts.sh's own format (`<date>-<slug>-<kind>.txt`, a `command:`
+# line and an `exit:` line) — scoping the search to this PRD's own slug is
+# exactly what keeps this from ever picking up an unrelated PRD's run of a
+# same-named script. Freshest by mtime wins when more than one receipt
+# mentions the script (e.g. a re-run for the verdict-receipt protocol).
+whole_suite_evidence() {
+  local n="$1" script="${ac_wholesuite_script[$n]:-}" receipts_dir best_path="" best_mtime=-1
+  [ -n "$script" ] || return 1
+  receipts_dir="${VC_RECEIPTS_DIR:-$HOME/brain/journal/build/receipts}"
+  [ -d "$receipts_dir" ] || return 1
+  shopt -s nullglob
+  local f mtime
+  for f in "$receipts_dir/"*"-${slug}-"*.txt; do
+    grep -qF "$script" "$f" 2>/dev/null || continue
+    mtime="$(stat -c %Y "$f" 2>/dev/null || echo 0)"
+    if [ "$mtime" -gt "$best_mtime" ]; then
+      best_mtime="$mtime"; best_path="$f"
+    fi
+  done
+  shopt -u nullglob
+  [ -n "$best_path" ] || return 1
+  local rc
+  rc="$(grep -m1 '^exit:' "$best_path" | awk '{print $2}')"
+  [ "$rc" = "0" ] || return 1
+  printf '%s (script=%s exit=0)\n' "${best_path#"$HOME"/}" "$script"
 }
 
 classify_ac() {
@@ -728,6 +823,26 @@ classify_ac() {
       fi
     done
   done
+  # g. whole-suite (PRD-build-verified-completed-realbox-perserver R5) —
+  # tried here, right after rule (a) has already come up empty for this
+  # AC number and BEFORE any collision-guess logic below: an AC tagged
+  # ac_is_wholesuite has no per-AC test file BY DESIGN (its own evidence
+  # is the named script's exit code), so falling through to (b)-(e)'s
+  # number-matching would only ever find an unrelated sibling PRD's
+  # same-numbered file and misreport ac-number-collision (the exact
+  # AC8/routepar-selftest.sh false positive this PRD exists to close).
+  # Additive: an AC with no whole-suite tag is completely unaffected. Does
+  # NOT touch the outer nullglob setting — whole_suite_evidence manages
+  # its own nullglob mode internally, and rules (b)/(e) below still need
+  # nullglob left exactly as rule (a) leaves it (set, on the non-declared-
+  # prefix path) for their own globs to behave as before.
+  if [ -n "${ac_is_wholesuite[$n]:-}" ]; then
+    if hit="$(whole_suite_evidence "$n")"; then
+      shopt -u nullglob
+      printf 'PAIRED|whole-suite|%s|\n' "$hit"
+      return
+    fi
+  fi
   # A DECLARED test_prefix with no match under it is MISSING, full stop —
   # never falls through to (b)-(e). See header guard 5. A GUESSED prefix
   # (declared_prefix=0) still falls through, matching prior behavior. One
