@@ -59,6 +59,12 @@
 #       (see cmd_nudge below), which is what ends up in the banner line
 #       and in NOTIFY_CMD's stdin either way.
 #
+#   decisions.sh import-vision <visions/file.md>
+#       One-time (idempotent) backfill: extracts Joe-owned rows from the
+#       file's Open-questions tables (see decisions-vision-extract.py for
+#       the exact shape parsed) and opens each via the same dedup path as
+#       `open` — a second run opens zero new rows.
+#
 # Exit: 0 ok | 2 usage/argument error | 4 io/manifest error.
 set -uo pipefail
 
@@ -70,6 +76,7 @@ ROWS_PY="${DECISIONS_ROWS_PY:-$HERE/decisions-rows.py}"
 MANIFEST_SET="${MANIFEST_SET:-$HERE/manifest-set.sh}"
 MANIFEST="${BUILD_MANIFEST:-$STATE_DIR/manifest.json}"
 ALERT_DELIVER="${ALERT_DELIVER:-$HERE/alert-deliver.sh}"
+VISION_EXTRACT="${VISION_EXTRACT:-$HERE/decisions-vision-extract.py}"
 
 # shellcheck source=lib/journal.sh
 source "$HERE/lib/journal.sh"
@@ -119,26 +126,16 @@ default_due() {
   date -u -d "@$(( $(date -u +%s) + 172800 ))" +%Y-%m-%dT%H:%M:%SZ
 }
 
-cmd_open() {
-  local question="${1:-}"
-  [ -n "$question" ] || die "usage: decisions.sh open \"<question>\" --owner <name> [--repo <repo>] [--blocks <slug>,...] [--due <ISO>]" 2
-  shift
-  local owner="" repo="" blocks="" due=""
-  while [ $# -gt 0 ]; do
-    case "$1" in
-      --owner) owner="${2:?--owner needs a value}"; shift 2 ;;
-      --repo) repo="${2:?--repo needs a value}"; shift 2 ;;
-      --blocks) blocks="${2:?--blocks needs a value}"; shift 2 ;;
-      --due) due="${2:?--due needs a value}"; shift 2 ;;
-      *) die "unknown argument: $1" 2 ;;
-    esac
-  done
-  [ -n "$owner" ] || die "open requires --owner <name>" 2
-
+# open_one <question> <owner> <repo> <blocks-csv> <due> — does the actual
+# work of `open`, without exiting the process: prints the id on stdout and
+# returns 0/4, so import-vision (below) can call it in a loop. cmd_open is
+# the CLI-facing wrapper that parses flags and exits.
+open_one() {
+  local question="$1" owner="$2" repo="$3" blocks="$4" due="$5"
   local id; id="$(id_of "$question")"
   if row_exists "$id"; then
     printf '%s\n' "$id"
-    exit 0
+    return 0
   fi
 
   local opened; opened="$(ts)"
@@ -160,10 +157,30 @@ row = {
     "status": "open",
 }
 json.dump(row, sys.stdout, sort_keys=True)
-' "$question" "$owner" "$repo" "$blocks" "$opened" "$due" "$id")" || die "failed to build row json" 4
+' "$question" "$owner" "$repo" "$blocks" "$opened" "$due" "$id")" || return 4
 
   append_row "$json"
   printf '%s\n' "$id"
+  return 0
+}
+
+cmd_open() {
+  local question="${1:-}"
+  [ -n "$question" ] || die "usage: decisions.sh open \"<question>\" --owner <name> [--repo <repo>] [--blocks <slug>,...] [--due <ISO>]" 2
+  shift
+  local owner="" repo="" blocks="" due=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --owner) owner="${2:?--owner needs a value}"; shift 2 ;;
+      --repo) repo="${2:?--repo needs a value}"; shift 2 ;;
+      --blocks) blocks="${2:?--blocks needs a value}"; shift 2 ;;
+      --due) due="${2:?--due needs a value}"; shift 2 ;;
+      *) die "unknown argument: $1" 2 ;;
+    esac
+  done
+  [ -n "$owner" ] || die "open requires --owner <name>" 2
+
+  open_one "$question" "$owner" "$repo" "$blocks" "$due" || die "failed to build row json" 4
   exit 0
 }
 
@@ -323,8 +340,34 @@ cmd_nudge() {
   exit 0
 }
 
+# cmd_import_vision <visions/file.md> — one-time (idempotent) backfill of
+# the Joe-owned open questions a vision file already carries (requirement
+# 7). Delegates the actual extraction to decisions-vision-extract.py (see
+# that script's header for the table-vs-prose scope decision) and calls
+# open_one in-process for each candidate — dedup is inherited for free
+# from open_one's own row_exists check, so a second run of this same
+# command opens zero new rows (AC6).
+cmd_import_vision() {
+  local file="${1:-}"
+  [ -n "$file" ] && [ -r "$file" ] || die "usage: decisions.sh import-vision <visions/file.md>" 2
+
+  local opened=0 seen=0
+  while IFS=$'\t' read -r question due; do
+    [ -n "$question" ] || continue
+    seen=$((seen + 1))
+    local before after
+    before="$(row_exists "$(id_of "$question")" && echo 1 || echo 0)"
+    open_one "$question" joe "" "" "" >/dev/null || die "failed to open row for: $question" 4
+    after="$(row_exists "$(id_of "$question")" && echo 1 || echo 0)"
+    [ "$before" = "0" ] && [ "$after" = "1" ] && opened=$((opened + 1))
+  done < <(python3 "$VISION_EXTRACT" "$file")
+
+  echo "decisions: import-vision: $seen candidate(s) seen, $opened new row(s) opened from $file" >&2
+  exit 0
+}
+
 usage() {
-  echo "usage: decisions.sh {open|list|close|nudge} ..." >&2
+  echo "usage: decisions.sh {open|list|close|nudge|import-vision} ..." >&2
   exit 2
 }
 
@@ -337,6 +380,7 @@ main() {
     list)  cmd_list "$@" ;;
     close) cmd_close "$@" ;;
     nudge) cmd_nudge "$@" ;;
+    import-vision) cmd_import_vision "$@" ;;
     *) usage ;;
   esac
 }

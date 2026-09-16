@@ -27,6 +27,7 @@ set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LANE_CLAIM="$HERE/lane-claim.sh"
 CARGO_BUDGET="${CARGO_BUDGET:-$HERE/cargo-budget.sh}"
+DECISIONS="${DECISIONS:-$HERE/decisions.sh}"
 SKILL_DIR="${BUILD_SKILL_DIR:-$(cd "$HERE/.." && pwd)}"
 STATE_DIR="${BUILD_STATE_DIR:-$SKILL_DIR/state}"
 GATE_STATUS="${GATE_STATUS:-$HERE/gate-status.sh}"
@@ -268,6 +269,18 @@ cmd_report() {
     "$CARGO_BUDGET" last 5
   else
     echo "(cargo-budget.sh not found at $CARGO_BUDGET)"
+  fi
+
+  echo
+  echo "== open decisions (PRD-build-open-decision-escalation) =="
+  if [ -x "$DECISIONS" ]; then
+    local dec_json dec_n dec_overdue
+    dec_json="$("$DECISIONS" list --json 2>/dev/null || echo '[]')"
+    dec_n="$(printf '%s' "$dec_json" | python3 -c 'import json,sys; print(len(json.load(sys.stdin)))' 2>/dev/null || echo 0)"
+    dec_overdue="$(printf '%s' "$dec_json" | python3 -c 'import json,sys; print(sum(1 for r in json.load(sys.stdin) if r.get("overdue")))' 2>/dev/null || echo 0)"
+    echo "open-decisions=$dec_n overdue=$dec_overdue"
+  else
+    echo "(decisions.sh not found at $DECISIONS)"
   fi
 
   echo

@@ -134,6 +134,23 @@ ac5() {
   rm -rf "$sbx" "$sbx2"
 }
 
+ac6() {
+  local sbx; sbx="$(new_sandbox)"
+  eval "$(sbx_env "$sbx")"
+  local fixture="$SKILL_DIR/tests/fixtures/decisions/vision-sample.md"
+  local out1 out2 n1 n2
+  out1="$("$DECISIONS" import-vision "$fixture" 2>&1)"
+  n1="$(wc -l < "$sbx/state/decisions.jsonl")"
+  out2="$("$DECISIONS" import-vision "$fixture" 2>&1)"
+  n2="$(wc -l < "$sbx/state/decisions.jsonl")"
+  if [ "$n1" -ge 7 ] && [ "$n1" -eq "$n2" ]; then
+    ok "AC6: import-vision opens >=7 rows once, zero more on a second run (n1=$n1 n2=$n2)"
+  else
+    notok "AC6: import-vision opens >=7 rows once, zero more on a second run" "n1=$n1 n2=$n2 out1=[$out1] out2=[$out2]"
+  fi
+  rm -rf "$sbx"
+}
+
 ac7() {
   local sbx; sbx="$(new_sandbox)"
   local t0 t1 elapsed out
@@ -157,9 +174,10 @@ case "${1:-all}" in
   ac3) ac3 ;;
   ac4) ac4 ;;
   ac5) ac5 ;;
+  ac6) ac6 ;;
   ac7) ac7 ;;
-  all) ac1; ac2; ac3; ac4; ac5; ac7 ;;
-  *) echo "usage: decisions-selftest.sh [ac1|ac2|ac3|ac4|ac5|ac7|all]" >&2; exit 2 ;;
+  all) ac1; ac2; ac3; ac4; ac5; ac6; ac7 ;;
+  *) echo "usage: decisions-selftest.sh [ac1|ac2|ac3|ac4|ac5|ac6|ac7|all]" >&2; exit 2 ;;
 esac
 
 total=$((pass + fail))
