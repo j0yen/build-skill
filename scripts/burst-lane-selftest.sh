@@ -6659,10 +6659,12 @@ expect_block_green "teardown" "teardown: every teardown case above ran green"
 # PRD-build-burst-state-keyed-by-server-v2: state layout migration
 # (requirement 1/10/11) — AC1, AC12, AC13, AC14, AC15, AC16 — plus
 # requirement 2/6 (`up --count N`, server naming, the BURST_MAX_BOXES money
-# cap) — AC2, AC6. Requirements 3-5/7-9 (run/down/idle-guard/watchdog/cost/
-# status/reap/prove actually iterating the set, not just `up` creating it)
-# are NOT covered here — see the PRD's own `next:` note; this block proves
-# the state layout itself plus `up`'s own multi-box behavior never
+# cap) — AC2, AC6 — plus requirement 9 (`prove`/`bake` refuse cause=multi-
+# box with more than one box up) — AC8. Requirements 3-5/7-8 (run/down/
+# idle-guard/watchdog/cost/status/reap actually iterating the set, not just
+# `up` creating it or `prove`/`bake` refusing on it) are NOT covered here —
+# see the PRD's own `next:` note; this block proves the state layout itself
+# plus `up`'s own multi-box behavior never
 # regresses the single-box case.
 # =============================================================================
 block_start "multibox"
@@ -6832,6 +6834,26 @@ expect "multibox AC6: no server create call was ever made" "! grep -q 'server cr
 # the cap bounds --count, it does not disable the lane.
 mb6b_rc=0; BURST_MAX_BOXES=1 "$BL" up >/dev/null 2>&1 || mb6b_rc=$?
 expect "multibox AC6: BURST_MAX_BOXES=1 (default) still allows an uncapped single-box up" "[ $mb6b_rc -eq 0 ]"
+
+# ---- multibox AC8: with two boxes up, `prove` (and, requirement 9's own
+# text — "prove AND bake" — `bake`) refuse with cause=multi-box and no box
+# is modified.
+fresh_env
+BURST_MAX_BOXES=2 "$BL" up --count 2 >/dev/null 2>&1
+mb8_boxes_before="$(find "$BURST_LANE_STATE_DIR/boxes" -maxdepth 1 -mindepth 1 -type d ! -name pending ! -name '_orphan-*' 2>/dev/null | sort)"
+mb8_prove_rc=0; mb8_prove_out="$("$BL" prove --worktree "$T" 2>&1)" || mb8_prove_rc=$?
+expect "multibox AC8: prove refuses with cause=multi-box when two boxes are up" \
+  "[ $mb8_prove_rc -ne 0 ] && grep -q 'multi-box' <<<\"$mb8_prove_out\""
+expect "multibox AC8: journal has 'prove  refused  (cause=multi-box'" \
+  "grep -q 'burst-lane  prove  refused  (cause=multi-box' \"$BURST_LANE_JOURNAL\""
+mb8_bake_rc=0; mb8_bake_out="$("$BL" bake 2>&1)" || mb8_bake_rc=$?
+expect "multibox AC8: bake also refuses with cause=multi-box when two boxes are up" \
+  "[ $mb8_bake_rc -ne 0 ] && grep -q 'multi-box' <<<\"$mb8_bake_out\""
+expect "multibox AC8: journal has 'bake  refused  (cause=multi-box'" \
+  "grep -q 'burst-lane  bake  refused  (cause=multi-box' \"$BURST_LANE_JOURNAL\""
+mb8_boxes_after="$(find "$BURST_LANE_STATE_DIR/boxes" -maxdepth 1 -mindepth 1 -type d ! -name pending ! -name '_orphan-*' 2>/dev/null | sort)"
+expect "multibox AC8: no box was modified (same box set before/after the refused calls)" \
+  "[ \"$mb8_boxes_before\" = \"$mb8_boxes_after\" ]"
 
 expect_block_green "multibox" "multibox: every state-layout migration case above ran green"
 

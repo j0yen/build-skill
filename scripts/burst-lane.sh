@@ -816,6 +816,26 @@ box_reset_pending() {
   ln -sfn "boxes/pending" "$STATE_DIR/current"
 }
 
+# count_active_boxes: number of boxes/<id>/ directories carrying a live
+# session.json (excludes the "pending" scratch placeholder and any
+# "_orphan-<ts>" migration residue, and a torn-down box's directory once
+# its session.json has been archived to .stale-*/.deleted-* — same literal-
+# file test state_active()/box_point_current_at() already use elsewhere in
+# this block). Requirement 9: `prove`/`bake` are only ever attributable to
+# ONE box (a proof is per image, not per box) — see their own refusal
+# checks below this function.
+count_active_boxes() {
+  local n=0 d
+  for d in "$STATE_DIR"/boxes/*/; do
+    [ -d "$d" ] || continue
+    case "$(basename "$d")" in
+      pending|_orphan-*) continue ;;
+    esac
+    [ -f "${d}session.json" ] && n=$((n + 1))
+  done
+  echo "$n"
+}
+
 # box_activate <server_id>: point `current` at boxes/<id>, creating it if
 # needed, folding forward whatever transient content was already sitting
 # at `current` (the startup "pending" placeholder, or a plain directory —
@@ -2405,6 +2425,16 @@ cmd_bake() {
     echo "burst: refused — not configured (RedBaron-local policy); set BUILD_BURST_ENABLED=1 to allow" >&2
     exit 3
   fi
+  # PRD-build-burst-state-keyed-by-server-v2 requirement 9: a bake is a
+  # point-in-time image freeze — with more than one box up there is no
+  # single answer to "which box's disk is this image", so refuse rather
+  # than silently picking `current`.
+  local bake_active_boxes; bake_active_boxes="$(count_active_boxes)"
+  if [ "$bake_active_boxes" -gt 1 ]; then
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  bake  refused  (cause=multi-box boxes=$bake_active_boxes)"
+    echo "bake refused (cause=multi-box)" >&2
+    exit 3
+  fi
   authz_refuse_if_missing bake || exit 3
   if ! state_active; then
     journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  bake  refused  (cause=no-active-session)"
@@ -3098,6 +3128,17 @@ cmd_prove() {
   # EXIT trap install below -- this is a plain, ordinary early exit, not an
   # abort the trap needs to forensically capture.
   authz_refuse_if_missing prove || exit 3
+
+  # PRD-build-burst-state-keyed-by-server-v2 requirement 9: a proof is per
+  # image, not per box — with more than one box up there is no single
+  # answer to "which box did this proof run on", so refuse rather than
+  # silently proving against whichever box `current` happens to name.
+  local prove_active_boxes; prove_active_boxes="$(count_active_boxes)"
+  if [ "$prove_active_boxes" -gt 1 ]; then
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  prove  refused  (cause=multi-box boxes=$prove_active_boxes)"
+    echo "prove refused (cause=multi-box)" >&2
+    exit 3
+  fi
 
   # `errtrace` lets the ERR trap below fire from inside this function (bash
   # default: ERR is not inherited by functions) — best-effort $LINENO for an
