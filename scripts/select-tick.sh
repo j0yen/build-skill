@@ -345,8 +345,26 @@ pool_count="$(printf '%s' "$queue_json" | "$JQ" 'length')"
 # Effective caps, computed identically to select-guard.sh's own resolution
 # (mirrored here purely for the counts.cap/counts.sub_cap summary -- the
 # actual enforcement still happens inside select-guard.sh, never duplicated).
-limit="${BUILD_MAX_BRANCHES:-30}"
-case "$limit" in ''|*[!0-9]*|0) limit=30 ;; esac
+#
+# Cap clamp (PRD-build-tick-under-dispatch-ledger requirement 5): the
+# harness itself caps a tick at BUILD_SUBAGENT_LIMIT concurrent subagents
+# (observed 20 on 2026-09-15T12:19:32Z) -- BUILD_MAX_BRANCHES raised above
+# that (e.g. 30) admits PRDs that can never actually be dispatched, every
+# tick, silently. `limit` below is the EFFECTIVE cap used everywhere after
+# this point (counts.cap, the summary journal line, and the BUILD_MAX_BRANCHES
+# override threaded into every select-guard.sh call below) -- the raw
+# requested value only survives in `requested_limit` for the cap-clamped
+# journal line's own `requested=` field.
+requested_limit="${BUILD_MAX_BRANCHES:-30}"
+case "$requested_limit" in ''|*[!0-9]*|0) requested_limit=30 ;; esac
+subagent_limit="${BUILD_SUBAGENT_LIMIT:-20}"
+case "$subagent_limit" in ''|*[!0-9]*|0) subagent_limit=20 ;; esac
+limit="$requested_limit"
+cap_clamped=false
+if [ "$requested_limit" -gt "$subagent_limit" ]; then
+  limit="$subagent_limit"
+  cap_clamped=true
+fi
 same_target_cap="${BUILD_SAME_TARGET_CAP:-1}"
 case "$same_target_cap" in ''|*[!0-9]*|0) same_target_cap=1 ;; esac
 distinct_targets=0
@@ -354,6 +372,13 @@ case "${BUILD_DISTINCT_TARGETS:-}" in
   1) distinct_targets=1; same_target_cap=1 ;;
   0) same_target_cap=999999 ;;
 esac
+
+# Requirement 5: journaled once per tick, before the guard loop even
+# starts -- never gated on there being anything admitted at all, only on
+# --dry-run (build-has-work.sh's own dry-run probes must not journal).
+if [ "$cap_clamped" = true ] && [ "$DRY_RUN" = false ]; then
+  journal_line --file "$JOURNAL" "$(date -u +%Y-%m-%dT%H:%M:%SZ)  select-tick  cap-clamped  (requested=$requested_limit effective=$limit cause=subagent-limit)"
+fi
 
 burst_session=0
 if [ -x "$BURST_LANE_SH" ]; then
@@ -391,7 +416,11 @@ while [ "$i" -lt "$n" ]; do
   last_error="$(printf '%s' "$cand" | "$JQ" -r '.last_error // ""')"
   ticks_invested="$(printf '%s' "$cand" | "$JQ" -r '.ticks_invested // 0')"
 
-  out="$("$SELECT_GUARD" "$slug" "$LANE_ARG" "$PRD_DIR_ARG" "$branch_count" "$admitted_targets" 2>/dev/null)"
+  # BUILD_MAX_BRANCHES overridden to the CLAMPED $limit for this one call
+  # only (requirement 5) -- select-guard.sh reads BUILD_MAX_BRANCHES
+  # straight from its own environment (default 30), so without this
+  # override it would enforce the raw requested cap, not the effective one.
+  out="$(BUILD_MAX_BRANCHES="$limit" "$SELECT_GUARD" "$slug" "$LANE_ARG" "$PRD_DIR_ARG" "$branch_count" "$admitted_targets" 2>/dev/null)"
   rc=$?
 
   # Computed here (once, before the explain block below needs it too --
@@ -593,6 +622,57 @@ result_json="$("$JQ" -n \
   '{admitted:$admitted, skipped:$skipped, pinned:$pinned,
     counts:{pool:$pool, admitted:$admitted_n, skipped:$skipped_n, cap:$cap,
             distinct_targets:$distinct_targets, burst_session:$burst_session, sub_cap:$sub_cap}}')"
+
+# --- Persistence (PRD-build-tick-under-dispatch-ledger requirement 1):
+# "what did the tick admit" becomes a file read, not a journal grep. tick-id
+# = the enclosing tick-run.sh holder's start epoch + its pid -- read from
+# the SAME holder file tick-run.sh itself writes (state/tick.lock.holder,
+# "pid boot_id started_epoch cmdline"), or SELECT_TICK_TICK_ID/
+# SELECT_TICK_TICK_STARTED if tick-run.sh already exported them (it does,
+# from 2026-09-16 on -- reading the holder file independently is the
+# fallback for a standalone/manual select-tick.sh call with no enclosing
+# tick-run.sh at all, which still must not crash here). ------------------
+TICK_HOLDER_FILE="${SELECT_TICK_TICK_HOLDER_FILE:-$STATE_DIR/tick.lock.holder}"
+_tick_id="${SELECT_TICK_TICK_ID:-}"
+_tick_started="${SELECT_TICK_TICK_STARTED:-}"
+if [ -z "$_tick_id" ] && [ -r "$TICK_HOLDER_FILE" ]; then
+  _h_pid="" _h_bid="" _h_started="" _h_cmd=""
+  IFS=' ' read -r _h_pid _h_bid _h_started _h_cmd < "$TICK_HOLDER_FILE" 2>/dev/null || true
+  if [ -n "$_h_pid" ] && [ -n "$_h_started" ]; then
+    _tick_id="${_h_started}-${_h_pid}"
+    _tick_started="$_h_started"
+  fi
+fi
+if [ -z "$_tick_id" ]; then
+  _tick_started="$(date -u +%s)"
+  _tick_id="${_tick_started}-$$"
+fi
+[ -n "$_tick_started" ] || _tick_started="$(date -u +%s)"
+started_at_iso="$(date -u -d "@$_tick_started" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+# persist_json carries cap+started_at for the FILE only -- result_json
+# itself (stdout) stays byte-identical between a real run and --dry-run
+# (select-tick-selftest.sh AC10), which a wall-clock started_at field
+# embedded in stdout would break the instant two calls landed in
+# different seconds.
+persist_json="$(printf '%s' "$result_json" | "$JQ" -c --argjson cap "$limit" --arg started_at "$started_at_iso" \
+  '. + {cap:$cap, started_at:$started_at}')"
+
+SELECT_TICK_STATE_DIR="${SELECT_TICK_STATE_DIR:-$STATE_DIR/select-tick}"
+mkdir -p "$SELECT_TICK_STATE_DIR" 2>/dev/null || true
+if [ -d "$SELECT_TICK_STATE_DIR" ]; then
+  _outfile="$SELECT_TICK_STATE_DIR/${_tick_id}.json"
+  _tmpfile="$(mktemp "$SELECT_TICK_STATE_DIR/.tmp.XXXXXX" 2>/dev/null || true)"
+  if [ -n "$_tmpfile" ]; then
+    printf '%s\n' "$persist_json" | "$JQ" -S . > "$_tmpfile" 2>/dev/null && mv -f "$_tmpfile" "$_outfile" \
+      || rm -f "$_tmpfile" 2>/dev/null
+    if [ -f "$_outfile" ]; then
+      _tmplink="$SELECT_TICK_STATE_DIR/.last.json.tmp.$$"
+      ln -sfn "$(basename "$_outfile")" "$_tmplink" 2>/dev/null \
+        && mv -Tf "$_tmplink" "$SELECT_TICK_STATE_DIR/last.json" 2>/dev/null
+    fi
+  fi
+fi
 
 result_json="$(printf '%s' "$result_json" | "$JQ" -S .)"
 

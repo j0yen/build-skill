@@ -242,12 +242,46 @@ threaded internally) into one call, and emits `{"admitted":[...],
 "skipped":[...],"pinned":[...],"counts":{...}}`.
 The coordinator must dispatch every entry of admitted[] in one message — do not re-derive the pool, do not call any of the
 composed guards a second time, and do not stop selecting partway through;
-`select-tick.sh` already finished selecting before you saw its output. A
-coordinator that dispatches fewer than `counts.admitted` PRDs must journal
-`select-tick  under-dispatched  (admitted=<n> dispatched=<m>
-cause=<text>)` — the line exists so the deviation is countable, not so it
-is allowed. `select-tick.sh --explain <slug>` answers "why wasn't my PRD
+`select-tick.sh` already finished selecting before you saw its output.
+`select-tick.sh --explain <slug>` answers "why wasn't my PRD
 picked" without reading the coordinator's own narration.
+
+**The under-dispatched line is written by `tick-run.sh`, from evidence,
+every tick — not by the coordinator (2026-09-16,
+PRD-build-tick-under-dispatch-ledger).** The coordinator's own honesty used
+to be the ONLY source of `select-tick  under-dispatched`: it existed
+exactly when the coordinator noticed its own deviation and chose to write
+it, which is why a 21:24Z tick that admitted 5 and worked 3 wrote nothing
+at all. `select-tick.sh` now persists its own result to
+`state/select-tick/<tick-id>.json` (`last.json` resolves to the latest);
+`tick-run.sh` runs the coordinator as a child (no longer `exec`s it) and,
+the instant the child exits — normally, or killed by a signal — compares
+that persisted `admitted[]` against dispatch evidence it reads itself:
+- a `state/prd-<slug>.lock.pid` or `.lock` file with an mtime at or after
+  the tick's start,
+- an `iter_log:` line with an ISO-8601 timestamp at or after tick start,
+  appended to the PRD's own file,
+- a journal `build  prd  <slug>  ...` or `<slug>  <step>  ...` line at or
+  after tick start.
+
+Fewer dispatched than admitted mechanically produces one `select-tick
+under-dispatched  (admitted=<n> dispatched=<m> missing=<slug,...>
+cause=<text> lane=<host>)` line naming the missing slugs — `cause=unknown`
+unless the coordinator ALSO wrote its own `under-dispatched` line this
+tick (in which case that line is left alone, untouched — `cause=` in it is
+the coordinator's own text — and a `select-tick  under-dispatched-detail
+(missing=<slug,...>)` line is appended instead, never a second
+`under-dispatched` line) or the child was killed by a signal
+(`cause=coordinator-killed-<SIG>`). A coordinator writing its own line is
+optional narration, useful context for `cause=`, never required for the
+deviation to be recorded. Two consecutive under-dispatched ticks also
+raise `<lane>  alarm  under-dispatched twice (...)  (class=under-dispatch
+lane=<host>)` through the same notifier `alert-deliver.sh` uses for every
+other repo-health alarm, rate-limited to once per hour per lane.
+`tick-run.sh --status` prints the last tick's
+`admitted=<n> dispatched=<m> missing=<slug,...>` line from this same
+persisted evidence, so answering "what did the tick admit / actually
+dispatch" is a file read, never a journal grep.
 
 **`run <slugs>` is a pin, resolved inside this one call (2026-09-15,
 PRD-build-select-tick-run-pin) — the coordinator never sees the slug
@@ -2176,9 +2210,13 @@ answer into each blocked PRD.
 Issue every entry of `select-tick.sh`'s `admitted[]` as **parallel Agent
 tool calls in a single tool-use message**, one Agent call per PRD. Use
 `subagent_type=general-purpose` unless the PRD frontmatter declares
-otherwise. A coordinator that issues fewer calls than `counts.admitted`
-must journal `select-tick  under-dispatched  (admitted=<n> dispatched=<m>
-cause=<text>)` in the same tick — see Phase 2's lead section.
+otherwise. Dispatching fewer than `counts.admitted` PRDs is recorded
+whether or not the coordinator says anything about it — `tick-run.sh`
+journals `select-tick  under-dispatched` from evidence the instant the
+tick ends (see Phase 2's lead section); a coordinator that already knows
+why may still journal its own `select-tick  under-dispatched  (...
+cause=<text>)` line in the same tick as useful, optional context for that
+`cause=`.
 
 **Model override (added 2026-05-28).** Each `admitted[]` entry already
 carries the `model` `select-tick.sh` computed for it (requirement 5) —

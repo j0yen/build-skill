@@ -157,7 +157,10 @@ clear_queue
 for i in $(seq -w 1 35); do
   write_prd "cap$i" shell "/tmp/select-tick-cap-repo-$i"
 done
-out=$(BUILD_MAX_BRANCHES=30 run_select_tick --format json)
+# BUILD_SUBAGENT_LIMIT pinned above 30 (PRD-build-tick-under-dispatch-ledger
+# requirement 5 default is 20) so this AC keeps testing BUILD_MAX_BRANCHES's
+# own cap in isolation from the newer subagent-limit clamp.
+out=$(BUILD_MAX_BRANCHES=30 BUILD_SUBAGENT_LIMIT=30 run_select_tick --format json)
 admitted_n=$(printf '%s' "$out" | "$JQ" '.counts.admitted')
 cap_skips=$(printf '%s' "$out" | "$JQ" '[.skipped[] | select(.reason == "cap")] | length')
 [ "$admitted_n" -eq 30 ] || fail "AC4: expected exactly 30 admitted, got $admitted_n"

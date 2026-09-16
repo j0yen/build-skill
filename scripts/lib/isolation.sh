@@ -109,6 +109,19 @@ isolation_apply() {
   export GATE_BURST_STATE_DIR="$BUILD_TEST_ROOT/state/gate-burst"
   export PRD_DIR="$HOME/Documents/PRDs"
 
+  # select-tick.sh's BUILD_SUBAGENT_LIMIT (PRD-build-tick-under-dispatch-
+  # ledger requirement 5, default 20 in production) would otherwise clamp
+  # -- and journal `cap-clamped` -- on every isolated selftest that uses
+  # BUILD_MAX_BRANCHES > 20 without an opinion of its own on the subagent
+  # cap, which is every select-tick.sh selftest written before this PRD
+  # existed. Neutralized here the same way every other production default
+  # is neutralized for a test run: a test that actually wants to exercise
+  # the clamp (see tests/udl_ac5_cap_clamped_subagent_limit.sh) sets
+  # BUILD_SUBAGENT_LIMIT itself on that one call, which still wins (a
+  # per-command env prefix always overrides an exported ambient value for
+  # that command's own environment).
+  export BUILD_SUBAGENT_LIMIT="${BUILD_SUBAGENT_LIMIT:-999999}"
+
   # Arm isolation-guard.sh unconditionally (requirement 4). Legacy
   # BURST_LANE_TEST continues to work too (isolation-guard.sh checks both).
   export BUILD_TEST=1
