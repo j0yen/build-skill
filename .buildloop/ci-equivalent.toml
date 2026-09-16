@@ -1,0 +1,31 @@
+# .buildloop/ci-equivalent.toml — build-skill's own CI-equivalent
+# declaration for scripts/main-push-gate.sh (PRD-build-main-push-gate
+# requirement 7). Added by PRD-build-repo-health-invariants because
+# main-push-gate.sh started refusing every push to this repo the moment
+# it landed (rc=5 unknown, "no .buildloop/ci-equivalent.toml") and no PRD
+# had yet declared one for build-skill itself — every self-mod to this
+# repo was blocked on origin until this file existed.
+#
+# [default].command is a fast syntax-only smoke (`bash -n` over every
+# scripts/*.sh, ~0.15s for 147 files as of this writing): the closest
+# analog to "does it compile" for a shell-script repo, and specifically
+# the failure mode a self-mod is most likely to introduce (a typo that
+# would otherwise only surface the next time the broken script actually
+# ran, in production, mid-tick). It is NOT a substitute for
+# scripts/run-selftests.sh's much larger, slower selftest suite — running
+# that suite as the default here was considered and deferred (untimed at
+# PR time; a maintainer who confirms its wall time fits comfortably under
+# main-push-gate.sh's 15-minute unknown-timeout should upgrade [default]
+# to it, or add a [delta] mapping for the specific paths a given change
+# touches, following mcphost's own ci-equivalent.toml as the pattern).
+#
+# [delta] maps this PRD's own new files to their real selftest, so an
+# actual repo-health self-mod gets checked by more than a syntax scan.
+[delta]
+"scripts/repo-health.sh" = "bash scripts/repo-health-selftest.sh all"
+"scripts/manifest-invariants.sh" = "bash scripts/repo-health-selftest.sh all"
+"scripts/alert-deliver.sh" = "bash scripts/repo-health-selftest.sh all"
+"scripts/notify-gh-issue.sh" = "bash scripts/repo-health-selftest.sh all"
+
+[default]
+command = "bash -c 'for f in scripts/*.sh; do bash -n \"$f\" || exit 1; done'"
