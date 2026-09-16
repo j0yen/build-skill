@@ -1001,6 +1001,10 @@ if [ -x "$BURST_LANE_SH" ]; then
     case "$route_status_json" in
       *'"active":true'*)
         route_intended="burst"
+        # Bridge: the burst-lane-bin/cargo shim routes only on BURST_LANE=1;
+        # declaring intent without exporting it left every gate cargo call
+        # local (route.log: burst-lane-disabled) — 2026-09-16 canary.
+        export BURST_LANE=1
         route_host="$(printf '%s' "$route_status_json" | sed -n 's/.*"ip":"\([^"]*\)".*/\1/p')"
         [ -n "$route_host" ] || route_host="unknown"
         ;;
