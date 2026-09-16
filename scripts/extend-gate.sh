@@ -1796,6 +1796,79 @@ if [ "$route_intended" = "burst" ] && [ "$route_burst_n" -eq 0 ]; then
 fi
 # END canary-r13-no-burst-detect
 
+# BEGIN canary-r15-producer-attestation (tests/canary_ac17_producer_cargo_attestation.sh
+# extracts this exact block by marker — keep it self-contained: only reads
+# route_intended (already resolved above) and t0 (gate start epoch, set
+# near the top of this script), and only SETS producer_unattested_first/
+# producer_unattested_csv, never mutates outcome/final_rc/journal_suffix
+# directly — that happens in the paired -block marker below, same split
+# R13 uses).
+# PRD-build-burst-gate-canary-invariant requirement 15 (R15/AC17): a
+# producer whose cargo call resolves OUTSIDE the shims (the 2026-09-16
+# 04:56Z incident: rustbuild 93abb03, $HOME/.cargo/bin ahead of the shims,
+# all 17 producers local, gate-wedge budget-exceeded) never reaches the
+# cargo-budget ledger at all — R13's route-log check can't see it, because
+# the producer's cargo call never even tried to route (route.log is
+# extend-gate's own routing, not extended-receipts.sh's per-producer
+# subprocess routing). For a burst-intended gate, every producer named in
+# state/cargo-producers.txt must have at least one cargo-budget.sh ledger
+# row with parent_step=<producer> and ts_start at or after this gate's own
+# start — the first (list-order) missing producer names the block; every
+# missing producer is still named in the journal (AC17's second half).
+producer_unattested_first=""
+producer_unattested_csv=""
+if [ "$route_intended" = "burst" ]; then
+  CARGO_PRODUCERS_FILE="${CARGO_PRODUCERS_FILE:-$BUILD_SCRIPTS/../state/cargo-producers.txt}"
+  # Nested default, one line: bash only evaluates the inner
+  # ${CARGO_BUDGET_STATE_DIR:-...} expansion when CARGO_PRODUCERS_LEDGER
+  # itself is unset -- a two-step version (assign CARGO_BUDGET_STATE_DIR
+  # first, unconditionally) evaluates $BUILD_SCRIPTS even when a caller
+  # (e.g. a selftest driving just this block) sets CARGO_PRODUCERS_LEDGER
+  # directly but never sets BUILD_SCRIPTS, which is an unbound-variable
+  # error under this script's `set -uo pipefail` (caught empirically
+  # writing tests/canary_ac17_producer_cargo_attestation.sh).
+  CARGO_PRODUCERS_LEDGER="${CARGO_PRODUCERS_LEDGER:-${CARGO_BUDGET_STATE_DIR:-$BUILD_SCRIPTS/../state/cargo-budget}/ledger.jsonl}"
+  if [ -f "$CARGO_PRODUCERS_FILE" ]; then
+    producer_unattested_csv="$(python3 -c '
+import calendar, json, sys, time
+
+producers_file, ledger_file, gate_start_epoch = sys.argv[1:4]
+gate_start_epoch = float(gate_start_epoch)
+
+wanted = [l.strip() for l in open(producers_file)
+          if l.strip() and not l.strip().startswith("#")]
+seen = set()
+try:
+    with open(ledger_file) as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except Exception:
+                continue
+            step = row.get("parent_step") or ""
+            if step not in wanted or step in seen:
+                continue
+            ts = row.get("ts_start") or ""
+            try:
+                t = calendar.timegm(time.strptime(ts, "%Y-%m-%dT%H:%M:%SZ"))
+            except Exception:
+                continue
+            if t >= gate_start_epoch:
+                seen.add(step)
+except FileNotFoundError:
+    pass
+
+missing = [p for p in wanted if p not in seen]
+print(",".join(missing))
+' "$CARGO_PRODUCERS_FILE" "$CARGO_PRODUCERS_LEDGER" "$t0" 2>/dev/null || true)"
+    producer_unattested_first="${producer_unattested_csv%%,*}"
+  fi
+fi
+# END canary-r15-producer-attestation
+
 wall=$(( $(date +%s) - t0 ))
 blockers_csv=""
 if [ "${#blocking_notes[@]}" -gt 0 ]; then
@@ -1987,6 +2060,22 @@ if $route_no_burst; then
   journal_suffix="$journal_suffix cause=route-mismatch intended=$route_intended burst=$route_burst_n local=$route_local_n first_local_cause=${route_first_local_cause:-unknown}"
 fi
 # END canary-r13-no-burst-block
+
+# BEGIN canary-r15-producer-attestation-block (tests/canary_ac17_producer_cargo_attestation.sh
+# extracts this exact block by marker — applied last, same convention as
+# R13's no-burst-block above: forces outcome+exit code directly regardless
+# of whatever verdict was just computed (including R13's own), never
+# touches gate_rc/delta_rc/blocking_notes. `unattested=<csv>` names every
+# missing producer (AC17's "the journal names every producer... with no
+# ledger row"); `cause=...producer=<name>` names only the first, same
+# single-value convention every other `cause=` field in this journal line
+# already uses.
+if [ -n "$producer_unattested_first" ]; then
+  outcome="block"
+  final_rc=1
+  journal_suffix="$journal_suffix cause=producer-cargo-unattested producer=$producer_unattested_first unattested=$producer_unattested_csv"
+fi
+# END canary-r15-producer-attestation-block
 
 # One journal line per gate run (requirement 8 / AC13): crate, HEAD, base
 # tag, pass/block counts, blocking receipt names, wall seconds, (PRD-
