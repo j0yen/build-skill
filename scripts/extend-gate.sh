@@ -844,22 +844,34 @@ fi
 if ! $record_baseline && ! $force && [ -f "$cache_file" ]; then
   cached_tree="$(jq -r '.tree_sha // empty' "$cache_file" 2>/dev/null || true)"
   cached_hash="$(jq -r '.script_sha256 // empty' "$cache_file" 2>/dev/null || true)"
-  # NOTE (PRD-build-branch-gate-scope-artifacts, Technical considerations):
-  # "a deferred verdict must not be reused at main scope — include scope in
-  # the cache key" sounds like it belongs here, but a blanket scope check
-  # on this general hit condition regresses PRD-build-gate-before-land
-  # requirement 4 / AC7b's already-shipped contract — `land` deliberately
+  # PRD-build-branch-gate-scope-artifacts requirement 5 (P0, AC7):
+  # "a deferred verdict must not be reused at main scope — include scope
+  # in the cache key" (Technical considerations) is deliberately NOT a
+  # blanket scope check here — that would regress PRD-build-gate-before-
+  # land requirement 4 / AC7b's already-shipped contract, where `land`
   # transfers a branch-scope cache entry (scope=branch, same tree) so a
-  # post-land `--scope main` gate call CAN replay it as a cache hit instead
-  # of re-running all 25 producers on an unchanged tree
+  # post-land `--scope main` gate call CAN replay it as a cache hit
+  # instead of re-running all 25 producers on an unchanged tree
   # (extend-gate-scope-selftest.sh / gate-verdict-tree-cache-selftest.sh
-  # AC7b assert exactly this: 0 producer output after land). The actual
-  # fix belongs to requirement 5 (land re-runs deferred producers at main
-  # scope before tagging): that re-run is what must clear/refresh
-  # `deferred_receipts` on the transferred cache entry so a later hit is
-  # known-safe — not a scope match here, which would just make every
-  # post-land gate re-run everything. Left as plain tree+hash, unchanged.
-  if [ -n "$cached_tree" ] && [ "$cached_tree" = "$tree_now" ] && [ -n "$cached_hash" ] && [ "$cached_hash" = "$self_hash" ]; then
+  # AC7b assert exactly this: 0 producer output after land) — that
+  # contract is still exactly what every land WITHOUT a deferral should
+  # get. The narrower, correct guard: a cached entry that itself carries
+  # `deferred_receipts` (rollback-plan/ci-checks rewritten to pass on disk
+  # at branch scope, never actually re-verified) is never a safe hit for
+  # ANY scope, branch or main — the preconditions it deferred on (a real
+  # tag, a pushed CI run) were never checked, so replaying it would let
+  # `ship-tag.sh` tag a commit whose rollback-plan/ci-checks were never
+  # actually green. A cache MISS here falls through to a full run, which
+  # is exactly how a normal `--scope main` gate call already re-verifies
+  # deferred producers for real (they hit the `scope != branch` producer
+  # paths below, unchanged main-scope behavior, Non-goals) — "before any
+  # tag is created" holds because ship-tag.sh only ever runs after that
+  # gate call itself exits 0 (SKILL.md's rust-extend ship step).
+  cached_deferred_n=0
+  if [ -f "$cache_file" ]; then
+    cached_deferred_n="$(jq -r '(.deferred_receipts // []) | length' "$cache_file" 2>/dev/null || echo 0)"
+  fi
+  if [ -n "$cached_tree" ] && [ "$cached_tree" = "$tree_now" ] && [ -n "$cached_hash" ] && [ "$cached_hash" = "$self_hash" ] && [ "${cached_deferred_n:-0}" = "0" ]; then
     cached_verdict="$(jq -r '.verdict // empty' "$cache_file" 2>/dev/null || true)"
     cached_rc="$(jq -r '.exit_code // empty' "$cache_file" 2>/dev/null || true)"
     if [ -n "$cached_verdict" ] && [ -n "$cached_rc" ]; then

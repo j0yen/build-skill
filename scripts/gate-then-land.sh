@@ -40,6 +40,31 @@
 #   After --max-retries consecutive stale-base attempts: blocked, exit 6,
 #   with all the main shas seen recorded in the sidecar/journal (AC5).
 #
+# Post-land deferred re-verification (PRD-build-branch-gate-scope-
+# artifacts requirement 5, P0, AC7): a branch-scope verdict can carry
+# `deferred_receipts` (rollback-plan's head-untagged, ci-checks'
+# no-runs-on-ref — both branch-scope artifacts extend-gate.sh's own
+# `--scope branch` post-classifies rather than blocks on, per that PRD's
+# requirements 1/2). Those preconditions (a real tag on HEAD, a pushed CI
+# run) only become real once the branch is actually ON main — so the
+# instant `integrate` above returns 0, and only when this land's own gate
+# verdict (at $verdict_path) named at least one deferred receipt, this
+# script re-runs the FULL, ordinary `--scope main` gate (unchanged from
+# any other main-scope call — no hand-picked subset of producers, and the
+# verdict cache can never silently replay a deferred entry regardless —
+# see extend-gate.sh's cache-hit guard) against the just-landed head,
+# before reporting success. A block there does NOT revert the merge (main
+# already advanced; un-landing a fast-forward this script itself just
+# made would itself be a destructive git operation this script has no
+# other reason to perform) — it is "a normal main-scope block (existing
+# path)": main is left gated-red at the landed head, exactly as any other
+# main-scope gate failure already leaves it, ready for the next tick to
+# fix forward; ship-tag.sh (SKILL.md's separate ship step) only ever runs
+# after a `--scope main` gate itself exits 0, so "before any tag is
+# created" holds. Exit 11 (below) reports this distinctly from the
+# 6/7/8/9/10 family, all of which mean "branch kept, main untouched" —
+# that is NOT true here, so no caller may treat 11 as one of those.
+#
 # Exit codes:
 #   0  landed (prints the landed sha on stdout)
 #   1  usage error
@@ -48,6 +73,11 @@
 #   8  rebase-conflict while recovering from a stale base — no retry
 #   9  extend-gate.sh returned an infra failure (not pass=0/block=1) — no retry
 #  10  worktree-extend.sh integrate returned an unexpected infra code — no retry
+#  11  post-land-main-gate-block — the branch DID land on main (main is NOT
+#      untouched, unlike 6/7/8/9/10); the post-land `--scope main` re-run of
+#      this land's own deferred receipts blocked. Main is left gated-red at
+#      the landed head, not reverted — the next tick's ordinary main-scope
+#      gate/ship path fixes it forward like any other main-scope block.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
@@ -116,6 +146,13 @@ while [ "$attempt" -le "$max_retries" ]; do
   "$EXTEND_GATE" "$wt" --head "$wt_head" --scope branch --slug "$slug" "${pr_args[@]}" >&2
   gate_rc=$?
   verdict_path="$("$EXTEND_GATE" "$wt" "${pr_args[@]}" --print-verdict-path 2>/dev/null)"
+  # requirement 5 / AC7: read BEFORE `integrate` runs, below — a
+  # successful land deletes the worktree (and its off-root target dir,
+  # where $verdict_path lives) as its own cleanup, so reading this AFTER
+  # `integrate` returns 0 silently sees a missing file and never re-runs
+  # anything (caught by a manual gate-then-land test that set
+  # FAKE_BRANCH_DEFERRED and never saw the re-verification fire).
+  deferred_list="$([ -f "$verdict_path" ] && jq -r '(.deferred_receipts // []) | join(",")' "$verdict_path" 2>/dev/null || true)"
 
   case "$gate_rc" in
     0|1) : ;;   # pass or block — a real verdict, let land's own precondition decide
@@ -136,6 +173,20 @@ while [ "$attempt" -le "$max_retries" ]; do
   case "$land_rc" in
     0)
       landed_sha="$(git -C "$repo" rev-parse HEAD)"
+      # requirement 5 / AC7 — see file header and $deferred_list's own
+      # comment above (captured before `integrate` deleted the worktree
+      # this verdict lived in). Only when THIS land's own gate verdict
+      # actually deferred something; an ordinary land (no deferrals) pays
+      # no extra gate at all, unchanged from before this PRD.
+      if [ -n "$deferred_list" ]; then
+        echo "gate-then-land: [$slug] verdict carried deferred receipts ($deferred_list) — re-verifying at --scope main on landed head $landed_sha before declaring this land ship-strength-unchanged" >&2
+        if ! "$EXTEND_GATE" "$repo" --head "$landed_sha" "${pr_args[@]}" --force >&2; then
+          [ -x "$SIDECAR" ] && "$SIDECAR" write "$slug" "last_error=post-land-main-gate-block:${deferred_list}" >&2 || true
+          jlog "post-land-main-gate-block attempt=$attempt deferred=${deferred_list} sha=$landed_sha"
+          die 11 "post-land main-scope re-verification of deferred receipts ($deferred_list) blocked on $landed_sha — branch already landed on main (NOT reverted); main is gated-red at $landed_sha until fixed forward"
+        fi
+        jlog "post-land-main-gate-pass attempt=$attempt deferred=${deferred_list} sha=$landed_sha"
+      fi
       jlog "landed attempt=$attempt version=$land_out sha=$landed_sha"
       [ -x "$SIDECAR" ] && "$SIDECAR" write "$slug" "outcome=landed attempt $attempt/$max_retries" >&2 || true
       printf '%s\n' "$landed_sha"
