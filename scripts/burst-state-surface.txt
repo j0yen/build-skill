@@ -1,0 +1,64 @@
+# scripts/burst-state-surface.txt — PRD-build-burst-state-keyed-by-server-v2
+# requirement 1/10. One line per name mechanically discoverable under
+# $STATE_DIR (state/burst-lane/) in scripts/burst-lane.sh, classified
+# per-box | lane-wide | structural. Format: "<name> <class>  # <note>",
+# whitespace-separated, first token is the name — checked by
+# scripts/burst-state-tripwire.sh (run from burst-lane-selftest.sh's
+# tripwire block), which fails the moment a new $STATE_DIR/<name> or
+# $BOX_STATE_DIR/<name> literal lands in burst-lane.sh without a matching
+# line here (AC13). Do not delete a line when a name stops being used —
+# an extra, unused entry is harmless; a missing one fails the build.
+#
+# "per-box" = lives under state/burst-lane/boxes/<server_id>/, reached via
+# $BOX_STATE_DIR (== $STATE_DIR/current, requirement 1's box_path()).
+# "lane-wide" = stays at state/burst-lane/<name> top-level, reached via
+# $STATE_DIR directly — never routed through box_path()/$BOX_STATE_DIR.
+# "structural" = not itself a state file/dir with owner semantics; part of
+# the layout mechanism.
+
+# ---- per-box ---------------------------------------------------------------
+session.json        per-box   # + .backup, .stale-*, .deleted-* siblings
+volume.json          per-box   # + .stale-*, .deleted-* siblings
+proof.json           per-box
+run.lock             per-box
+cost.jsonl           per-box
+attribution.jsonl    per-box
+prds_served          per-box
+gate-tools.json      per-box
+remote-dirs.json     per-box
+remote-dirs.lock     per-box
+up.lock              per-box
+up.pid               per-box
+prove.inflight       per-box
+inflight.log         per-box
+.last-teardown-cause     per-box
+.probe-unavailable-last  per-box
+slots                per-box   # incl. slots/<i>.lock, slots/broken-*
+locks                per-box   # incl. locks/wt-*
+dirty                per-box
+pull-sizes           per-box
+evidence             per-box   # symlink into BURST_PROVE_TMP; per-box path, external bytes
+gate-inflight         per-box
+known_hosts           per-box   # today known_hosts.<server_id>
+# logs/ is split: the per-run log prefixes below are per-box (reached via
+# $BOX_STATE_DIR/logs/<prefix>.*); logs/failed/ and logs/failed-sessions.log
+# (GATE_TOOLS_FAILED_LOG_DIR / GATE_TOOLS_FAILED_SESSIONS_LOG) are the one
+# lane-wide carve-out under the same top segment, deliberately never routed
+# through box_path() — see burst-lane.sh's migrate_state_layout() header.
+# The tripwire only classifies the first path segment ("logs"), so this
+# split is documented here, not separately mechanically enforced.
+logs                 per-box   # run-remote, rsync-{up,gate,parity}, pathdep-rsync, pull-fail, prove, gate-tools-{install,apt-update}.* — EXCEPT failed/, failed-sessions.log (lane-wide, see above)
+
+# ---- lane-wide ---------------------------------------------------------------
+current               lane-wide   # symlink -> boxes/<server_id>, requirement 1's box_path() target
+snapshot.json         lane-wide
+parity-baseline-image lane-wide
+.bake-history.tmp     lane-wide
+.rollup-cursor        lane-wide
+build-fail            lane-wide
+provision.lock        lane-wide
+provision.pid         lane-wide
+decisions.jsonl       lane-wide   # append-only teardown-decision audit trail (server_id per row); same cross-box-story shape as the journal (Non-goals: "moving the journal ... stays one file"), not named in the PRD's own requirement-1 bullets — kept lane-wide by analogy rather than fragmented per box.
+
+# ---- structural --------------------------------------------------------------
+boxes                 structural  # container directory for every per-box dir; only touched by box_path()/migrate_state_layout()/box_ensure_current()/box_activate()
