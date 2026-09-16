@@ -176,6 +176,25 @@ main_push_refused_today_stat() {
   printf '%s\n' "${n:-0}"
 }
 
+# branch_gates_stats <journal-file> -> "<pass> <block> <deferred_only>"
+# PRD-build-branch-gate-scope-artifacts requirement 7 (P1, AC9): today's
+# cumulative count of `--scope branch` gate verdicts (same "today's
+# journal, not a since-last-tick delta" convention as the stats above),
+# split pass vs block, plus how many of the passes carried at least one
+# `deferred=<name>` producer (i.e. would have blocked on a scope artifact
+# alone before this PRD) — so a day like 2026-09-15 (0 of 14 branch gates
+# passing) is visible on this same health line without grepping the raw
+# journal. extend-gate.sh's own gate line shape (requirement 4/8) is
+# `... gate  <crate>  pass|block  (scope=branch slug=... ...)[ deferred=...]`
+# — see that script's final journal_line call.
+branch_gates_stats() {
+  local journal="$1" pass block deferred_only
+  pass="$(grep -c '  gate  .*  pass  (scope=branch ' "$journal" 2>/dev/null || true)"
+  block="$(grep -c '  gate  .*  block  (scope=branch ' "$journal" 2>/dev/null || true)"
+  deferred_only="$(grep '  gate  .*  pass  (scope=branch ' "$journal" 2>/dev/null | grep -c ' deferred=' || true)"
+  printf '%s %s %s\n' "${pass:-0}" "${block:-0}" "${deferred_only:-0}"
+}
+
 cmd_tick_summary() {
   local lane="$1" claimed="$2" skipped="$3"
   local journal="${4:-$HOME/brain/journal/build/$(date -u +%F).md}"
@@ -219,6 +238,11 @@ cmd_tick_summary() {
   local main_push_refused_today; main_push_refused_today="$(main_push_refused_today_stat "$journal")"
   printf '%s  lane-health  MAIN-PUSH: refused_today=%s\n' \
     "$(now_iso)" "$main_push_refused_today" >> "$journal"
+  # PRD-build-branch-gate-scope-artifacts requirement 7 (P1, AC9).
+  local bg_pass bg_block bg_deferred_only
+  read -r bg_pass bg_block bg_deferred_only < <(branch_gates_stats "$journal")
+  printf '%s  lane-health  BRANCH-GATES: branch_gates pass=%s block=%s deferred_only=%s\n' \
+    "$(now_iso)" "$bg_pass" "$bg_block" "$bg_deferred_only" >> "$journal"
   echo "appended: $journal"
 }
 

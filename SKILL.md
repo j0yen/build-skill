@@ -915,6 +915,39 @@ read it before assuming a step is "the last one this tick".
   described below — arm the same `BURST_LANE`/`BURST_GATE_REMOTE` env
   before invoking it, nothing about those mechanics changes.
 
+  **Branch-scope policy (PRD-build-branch-gate-scope-artifacts) —
+  `extend-gate.sh --explain-scope` prints this table standalone.** A
+  branch gate runs BEFORE land, so two of main scope's assumptions never
+  hold: the branch HEAD never carries a release tag, and the branch is
+  usually not pushed yet. Rather than block on those artifacts (2026-09-15:
+  14 of 14 branch gates that day blocked this way, 0 ships), the gate
+  post-classifies them `scope-deferred` — recorded, non-blocking, and
+  re-run for real at `--scope main` before `land` cuts a tag:
+  - `rollback-plan` — a `head-untagged` block on this run's own fresh HEAD
+    is rewritten to a pass and noted `scope-deferred`; any OTHER
+    `block_reason` still blocks (a real rollback problem is not a scope
+    artifact).
+  - `ci-checks` — `BRANCH_GATE_PUSH=1` (default) pushes the branch to
+    `origin` under its own ref and waits up to `CI_CHECKS_BRANCH_WAIT`
+    (default 900s) for a run to appear; no run within the wait is
+    `scope-deferred (no-runs-on-ref)`. `BRANCH_GATE_PUSH=0` never invokes
+    `ci-checks` at all — `scope-deferred (push-disabled)`. A real run that
+    failed or is still pending still blocks.
+  - `reviewer-agent` — runs on every branch gate whose recorded blocks are
+    ALL scope-deferred (i.e. no real in-scope block) — same as main scope
+    always did when nothing blocked. Unlike main scope, it ALSO runs when
+    a real in-scope block already exists (e.g. a failing test): the
+    quota-guard "no Sonnet spend on a red gate" skip applies only at
+    `--scope main`, because a branch gate is a one-shot evaluation, and a
+    wrong branch's next step needs the reviewer's finding attached to the
+    block, not just a passing branch's.
+  - Journal/verdict: the gate line's `deferred=<names>` (comma-joined) and
+    `last-verdict.json.deferred_receipts` name whichever producers above
+    were deferred THIS run; `land` re-runs exactly those producers at
+    `--scope main` on the landed head before tagging — a block there is a
+    normal main-scope block (branch stays merged, main untagged, existing
+    exit-11 `post-land-main-gate-block` path).
+
   **Post-land main check is now a cache hit, not a re-run.** After `push`,
   still run the SAME `scripts/gate-launch.sh <build_into> --head <landed
   sha> --scope main --slug <slug> --wait` command shown above (same
