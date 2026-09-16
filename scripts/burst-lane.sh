@@ -526,6 +526,17 @@ isolation_guard_bin "$(command -v "$SSH_BIN" 2>/dev/null)" "burst-lane.sh(ssh)"
 isolation_guard_bin "$(command -v "$RSYNC_BIN" 2>/dev/null)" "burst-lane.sh(rsync)"
 
 SERVER_NAME="${BURST_LANE_SERVER_NAME:-wm-burst-lane}"
+# PRD-build-burst-state-keyed-by-server-v2 requirement 2: SERVER_NAME above
+# is now a PREFIX, not a literal server name — every box is
+# "$SERVER_NAME-<n>" (n from 1), so a single-box caller (no --count) still
+# gets exactly one box, now named wm-burst-lane-1 instead of the old bare
+# wm-burst-lane (functionally identical: one box, same lifecycle, same
+# journal/cost/state shape — Goal 2 is about behavior, not the literal name
+# string). requirement 6: the money cap `up --count` is bounded by — a
+# request above it is refused (`up refused cause=max-boxes`) before any
+# hcloud call is made; the operator raises this in the same env file as
+# SERVER_TYPE (see ENV_FILE below), never by editing this default.
+BURST_MAX_BOXES="${BURST_MAX_BOXES:-1}"
 SERVER_TYPE="${BURST_SERVER_TYPE:-ccx53}"
 DEFAULT_LOCATION="nbg1"
 DEFAULT_SNAPSHOT_ID="427125061"
@@ -783,6 +794,26 @@ box_carry_forward_volume_state() {
   [ -f "$new_dir/volume.json" ] && return 0   # never clobber a box that already has its own
   mkdir -p "$new_dir" 2>/dev/null || true
   cp -p "$old_dir/volume.json" "$new_dir/volume.json" 2>/dev/null || true
+}
+
+# box_reset_pending: force `current` to a FRESH, empty "pending" placeholder
+# regardless of what it currently names. PRD-build-burst-state-keyed-by-
+# server-v2 requirement 2: cmd_up's `--count N` loop calls this between
+# box 2..N — each new box's own create/adopt body (up_one_box) writes
+# exclusively through box_path()'s "current"-relative globals (STATE_FILE,
+# COST_LEDGER, SERVED_FILE, UP_LOCK_FILE, ...), so without this, box 2's own
+# up_one_box call would silently overwrite box 1's state the moment
+# `current` already names it (box 1 having just been activated by the
+# previous loop iteration). Never called for box 1 in that loop — box 1
+# reuses whatever `current` already legitimately names, so a caller that
+# never passes --count never calls this at all (Goal 2: zero behavior
+# change for a single-box caller). Defined here (before box_activate, still
+# inside the tripwire's box_path()/migration block) since it shares that
+# block's one license to spell "boxes/" literally.
+box_reset_pending() {
+  rm -rf "$STATE_DIR/boxes/pending" 2>/dev/null || true
+  mkdir -p "$STATE_DIR/boxes/pending" 2>/dev/null || true
+  ln -sfn "boxes/pending" "$STATE_DIR/current"
 }
 
 # box_activate <server_id>: point `current` at boxes/<id>, creating it if
@@ -1156,6 +1187,37 @@ d = json.loads(sys.stdin.read())
 d = d.get("server", d)
 print(d.get("id",""), d.get("public_net",{}).get("ipv4",{}).get("ip",""))
 ' <<<"$out" 2>/dev/null
+}
+
+# find_by_prefix <prefix> -> one line per live server whose name is exactly
+# <prefix> or starts with "<prefix>-" (the wm-burst-lane-<n> convention,
+# requirement 2): "id ip name", rc 0 if any found else rc 1. Set-discovery
+# primitive `up --count`, `reap`, and any future multi-box iterator use
+# instead of `find_by_name`'s single-exact-name lookup — hcloud has no
+# server-list-by-name-prefix flag, so this lists every server the account
+# owns (one hcloud call) and filters client-side; safe at this lane's scale
+# (single-digit boxes) and matches the fake hcloud fixture's own `server
+# list -o json` shape (a plain JSON array, same envelope the real CLI uses).
+find_by_prefix() {
+  local prefix="$1" out
+  out="$("$HCLOUD" server list -o json 2>/dev/null)" || return 1
+  python3 -c '
+import json, sys
+prefix = sys.argv[1]
+try:
+    d = json.loads(sys.stdin.read())
+except Exception:
+    sys.exit(1)
+servers = d if isinstance(d, list) else d.get("servers", [])
+found = False
+for s in servers:
+    name = s.get("name", "")
+    if name == prefix or name.startswith(prefix + "-"):
+        ip = s.get("public_net", {}).get("ipv4", {}).get("ip", "")
+        print(s.get("id", ""), ip, name)
+        found = True
+sys.exit(0 if found else 1)
+' "$prefix" <<<"$out"
 }
 
 precondition() {  # stdout = message; rc 0 pass, 1 fail
@@ -3572,12 +3634,37 @@ cmd_up() {
     return 3
   fi
   authz_refuse_if_missing up || exit 3
+
+  # PRD-build-burst-state-keyed-by-server-v2 requirement 2/6: parse
+  # `--count N` (default 1) and enforce the money cap BEFORE taking the
+  # up.lock or making any hcloud call — a refused request never journals
+  # a lock-held/reclaimed line, it just refuses.
+  local UP_COUNT=1
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --count) UP_COUNT="${2:-1}"; shift 2 ;;
+      --count=*) UP_COUNT="${1#--count=}"; shift ;;
+      *) shift ;;
+    esac
+  done
+  case "$UP_COUNT" in ''|*[!0-9]*) UP_COUNT=1 ;; esac
+  [ "$UP_COUNT" -ge 1 ] || UP_COUNT=1
+  if [ "$UP_COUNT" -gt "$BURST_MAX_BOXES" ]; then
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  up  refused  (cause=max-boxes requested=$UP_COUNT max=$BURST_MAX_BOXES)"
+    echo "up-refused: cause=max-boxes (requested=$UP_COUNT max=$BURST_MAX_BOXES)" >&2
+    exit 3
+  fi
+
   # PRD-build-burst-provision-forensics requirement 4: exactly one live
   # `up` per lane. Same fd-tied-to-process, refuse-fast pattern as
   # cmd_provision's 220 above (never a detached holder); a second `up`
   # while a prior one is still alive refuses instead of racing it (the
   # observed 2026-09-13 incident: 3 orphaned `up` processes doing apt work
-  # against the box concurrently with a controlled provision).
+  # against the box concurrently with a controlled provision). One lock
+  # guards the WHOLE `--count N` loop below, not one per box — see
+  # up_one_box()'s own header for why a second, genuinely concurrent `up`
+  # invocation still serializes here rather than racing a sibling box
+  # (a documented simplification, not the tech consideration's ideal).
   exec 221>"$UP_LOCK_FILE"
   if ! flock -n 221; then
     local holder_pid; holder_pid="$(up_lock_holder_pid)"
@@ -3600,6 +3687,73 @@ cmd_up() {
   echo "$$" > "$UP_PID_FILE" 2>/dev/null || true
   trap 'rm -f "$UP_PID_FILE" 2>/dev/null || true' EXIT
   printf '%s %s %s\n' "$(now_epoch)" "$$" "up" >> "$INFLIGHT_LOG" 2>/dev/null || true
+
+  # requirement 2: one box per iteration, named "$SERVER_NAME-<n>". n=1
+  # reuses whatever `current` already names (a real active box short-
+  # circuits to "already-up" inside up_one_box exactly as the pre-count
+  # single-box code always has — Goal 2, zero behavior change for a caller
+  # that never passes --count). n>=2 always starts from a fresh empty
+  # "pending" placeholder — `current` already names box 1 (or an older
+  # session) by the time n=2 runs, and box 1's state must never be
+  # overwritten by box 2's up_one_box call, which reads/writes exclusively
+  # through box_path()'s "current"-relative globals (STATE_FILE,
+  # COST_LEDGER, SERVED_FILE, ...).
+  local _n _box_name _rc=0 _ready=0 _first_ready_id=""
+  for _n in $(seq 1 "$UP_COUNT"); do
+    _box_name="${SERVER_NAME}-${_n}"
+    if [ "$_n" -gt 1 ]; then
+      box_reset_pending
+      # Artifact-only re-stamp (NOT a second flock — the fd 221 lock above
+      # already guards this whole loop): box N's own up.lock/up.pid exist
+      # once box_activate folds "pending" into boxes/<id>, satisfying AC2
+      # ("each with its own ... up.lock") without a per-box mutex.
+      echo "$$" > "$UP_PID_FILE" 2>/dev/null || true
+      : > "$UP_LOCK_FILE" 2>/dev/null || true
+      printf '%s %s %s\n' "$(now_epoch)" "$$" "up" >> "$INFLIGHT_LOG" 2>/dev/null || true
+    fi
+    if up_one_box "$_box_name"; then
+      _ready=$((_ready + 1))
+      [ -n "$_first_ready_id" ] || _first_ready_id="$(state_read server_id)"
+    else
+      _rc=$?
+      journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  up  box-failed  (name=$_box_name n=$_n of=$UP_COUNT rc=$_rc)"
+      break
+    fi
+  done
+  # requirement 1/2: `current` names "the first ready one" (AC2) — box 2+
+  # becoming ready must never steal it from box 1 (up_one_box's own
+  # box_activate always repoints `current` to whichever box it just
+  # finished, so the LAST-processed box is what `current` names when the
+  # loop above ends; this restores it to the first).
+  if [ -n "$_first_ready_id" ]; then
+    box_point_current_at "$_first_ready_id"
+  fi
+  if [ "$UP_COUNT" -gt 1 ]; then
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  up  count-done  (requested=$UP_COUNT ready=$_ready current=${_first_ready_id:-none})"
+  fi
+  [ "$_ready" -ge 1 ] && exit 0
+  exit "${_rc:-3}"
+}
+
+# up_one_box <box_name>: get exactly one named box ready (adopt an existing
+# hcloud server with this name, or create a fresh one) — the pre-
+# PRD-build-burst-state-keyed-by-server-v2 body of cmd_up itself, unchanged
+# in substance, parameterized by name instead of the (now singular-again-
+# per-call) global SERVER_NAME, and using `return` instead of `exit` so
+# cmd_up's `--count N` loop above can move on to the next box (or stop and
+# report) instead of the whole process dying the moment ANY one box's
+# fallback path fires. Concurrency note (requirement 2's tech
+# consideration): a genuinely concurrent second `up --count` PROCESS still
+# serializes on cmd_up's single up.lock above rather than racing this
+# function on a different box in parallel — the PRD's "up.lock lives under
+# the box directory so two callers don't serialize on one lock" ideal is
+# NOT implemented by this step (that needs a name-keyed lock taken before
+# the box's id is known, since `boxes/<id>/` doesn't exist yet); a single
+# process's own `--count N` loop, which is what every caller in this repo
+# actually uses, is unaffected by that gap — it never races itself.
+up_one_box() {
+  local SERVER_NAME="$1"
+
   # Requirement 5: reconcile the persistent-volume state file FIRST, before
   # even the already-up short-circuit below — an operator calling `up`
   # against a box that's still alive must still learn that its volume was
@@ -3618,7 +3772,7 @@ cmd_up() {
   if state_active; then
     if session_reconcile; then
       echo "already-up: $(state_read server_id) $(state_read ip)"
-      exit 0
+      return 0
     fi
   fi
 
@@ -3674,14 +3828,14 @@ cmd_up() {
     refresh_parity_baseline_on_image_change "$_adopt_image_id"
     schedule_session_parity "$aid"
     echo "already-up: $aid $aip (adopted)"
-    exit 0
+    return 0
   fi
 
   local pre_out; pre_out="$(precondition)"; local pre_rc=$?
   if [ "$pre_rc" -ne 0 ]; then
     journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  up  fallback  (cause=precondition-failed: $pre_out)"
     echo "fallback: precondition failed - $pre_out"
-    exit 3
+    return 3
   fi
 
   # PRD-build-burst-dispatch-reenable requirement 2: resolve the image to
@@ -3710,7 +3864,7 @@ cmd_up() {
     local emsg; emsg="$(tail -3 "$create_err" 2>/dev/null | tr '\n' ' ')"; rm -f "$create_err"
     journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  up  fallback  (cause=hcloud-server-create-failed: $emsg)"
     echo "fallback: hcloud server create failed - $emsg"
-    exit 3
+    return 3
   fi
   rm -f "$create_err"
   local id ip
@@ -3723,7 +3877,7 @@ print(d.get("id",""), d.get("public_net",{}).get("ipv4",{}).get("ip",""))
   if [ -z "${id:-}" ]; then
     journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  up  fallback  (cause=could-not-parse-server-id)"
     echo "fallback: could not parse server id from hcloud output"
-    exit 3
+    return 3
   fi
   box_activate "$id"
   # Requirement 9 (PRD-build-burst-prove-forensics): Hetzner starts billing
@@ -3762,7 +3916,7 @@ print(d.get("id",""), d.get("public_net",{}).get("ipv4",{}).get("ip",""))
     ledger_append "$(awk -v m="$pf_minutes" 'BEGIN{printf "%.4f", m/60.0}')" "$pf_eur" "$id"
     check_auto_disable
     echo "fallback: ssh never became reachable on $ip after 30s"
-    exit 3
+    return 3
   fi
 
   box_bootstrap "$ip"
@@ -3806,7 +3960,7 @@ print(d.get("id",""), d.get("public_net",{}).get("ipv4",{}).get("ip",""))
   refresh_parity_baseline_on_image_change "$image_id"
   schedule_session_parity "$id"
   echo "up: $id $ip"
-  exit 0
+  return 0
 }
 
 # ---- verify ---------------------------------------------------------------

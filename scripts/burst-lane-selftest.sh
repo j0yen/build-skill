@@ -5911,12 +5911,21 @@ expect "reenable AC13c: no baseline-refreshed line was journaled" \
 # fresh-boot and adopt paths, and in each case BEFORE it calls
 # schedule_session_parity, so the refresh (and its journal line) always
 # precede the actual backgrounded parity comparison — grep-checked directly
-# against cmd_up's own source rather than driving two full `up` sessions
-# (adopt + a real second boot) just to observe ordering.
+# against the source rather than driving two full `up` sessions (adopt + a
+# real second boot) just to observe ordering.
+#
+# PRD-build-burst-state-keyed-by-server-v2 requirement 2: this per-box body
+# (adopt/create, verify, refresh, schedule_session_parity) now lives in
+# up_one_box(), called once per box by cmd_up's own `--count N` loop —
+# cmd_up() itself is just that loop plus the lock/cap bookkeeping and no
+# longer contains either call. Scans up_one_box() instead of cmd_up() for
+# exactly that reason; the ordering being asserted (refresh before
+# schedule_session_parity) is unchanged, only which function's source holds
+# it moved.
 expect "reenable AC13d: cmd_up's fresh-boot path calls the refresh before scheduling parity" \
-  "awk '/^cmd_up\\(\\)/,/^}/' \"$BL\" | grep -B2 'schedule_session_parity \"\\\$id\"' | grep -q refresh_parity_baseline_on_image_change"
+  "awk '/^up_one_box\\(\\)/,/^}/' \"$BL\" | grep -B2 'schedule_session_parity \"\\\$id\"' | grep -q refresh_parity_baseline_on_image_change"
 expect "reenable AC13d: cmd_up's adopt path calls the refresh before scheduling parity" \
-  "awk '/^cmd_up\\(\\)/,/^}/' \"$BL\" | grep -B2 'schedule_session_parity \"\\\$aid\"' | grep -q refresh_parity_baseline_on_image_change"
+  "awk '/^up_one_box\\(\\)/,/^}/' \"$BL\" | grep -B2 'schedule_session_parity \"\\\$aid\"' | grep -q refresh_parity_baseline_on_image_change"
 
 # ---- reenable AC14: `up` on a gate-ready boot calls
 # `reality-check.sh pending-run build-skill` before ordinary work, so a
@@ -6648,11 +6657,13 @@ expect_block_green "teardown" "teardown: every teardown case above ran green"
 
 # =============================================================================
 # PRD-build-burst-state-keyed-by-server-v2: state layout migration
-# (requirement 1/10/11) — AC1, AC12, AC13, AC14, AC15, AC16. Requirements
-# 2-9 (actual N-box up/run/down/cost/reap orchestration) are NOT covered
-# here — see the PRD's own `next:` note; this block only proves the state
-# layout itself (the migration, the completeness tripwire, and the two
-# external readers) never regresses the single-box case.
+# (requirement 1/10/11) — AC1, AC12, AC13, AC14, AC15, AC16 — plus
+# requirement 2/6 (`up --count N`, server naming, the BURST_MAX_BOXES money
+# cap) — AC2, AC6. Requirements 3-5/7-9 (run/down/idle-guard/watchdog/cost/
+# status/reap/prove actually iterating the set, not just `up` creating it)
+# are NOT covered here — see the PRD's own `next:` note; this block proves
+# the state layout itself plus `up`'s own multi-box behavior never
+# regresses the single-box case.
 # =============================================================================
 block_start "multibox"
 
@@ -6789,6 +6800,38 @@ cp "$HERE/gate-wedge.sh" "$mb15_fixture"
 echo 'ROGUE="$SKILL_DIR/state/burst-lane/locks"' >> "$mb15_fixture"
 mb15_out="$(bash "$mb_tw" "$BL" "$mb_surface" "$mb15_fixture" 2>&1)"; mb15_rc=$?
 expect "multibox AC15: tripwire fails on a stray top-level locks/slots literal in an external reader" "[ $mb15_rc -ne 0 ]"
+
+# ---- multibox AC2: `up --count N` boots N boxes, each with its own
+# boxes/<id>/session.json and up.lock, current naming the first ready one.
+fresh_env
+mb2_rc=0; mb2_out="$(BURST_MAX_BOXES=2 "$BL" up --count 2 2>&1)" || mb2_rc=$?
+expect "multibox AC2: up --count 2 exits 0" "[ $mb2_rc -eq 0 ]"
+mb2_id1="$(awk -F'|' '$2=="wm-burst-lane-1"{print $1}' "$FAKE_HCLOUD_STATE" | head -n1)"
+mb2_id2="$(awk -F'|' '$2=="wm-burst-lane-2"{print $1}' "$FAKE_HCLOUD_STATE" | head -n1)"
+expect "multibox AC2: wm-burst-lane-1 exists in hcloud" "[ -n \"$mb2_id1\" ]"
+expect "multibox AC2: wm-burst-lane-2 exists in hcloud" "[ -n \"$mb2_id2\" ]"
+expect "multibox AC2: box 1 has its own boxes/<id>/session.json" "[ -f \"$BURST_LANE_STATE_DIR/boxes/$mb2_id1/session.json\" ]"
+expect "multibox AC2: box 2 has its own boxes/<id>/session.json" "[ -f \"$BURST_LANE_STATE_DIR/boxes/$mb2_id2/session.json\" ]"
+expect "multibox AC2: box 1 has its own up.lock" "[ -f \"$BURST_LANE_STATE_DIR/boxes/$mb2_id1/up.lock\" ]"
+expect "multibox AC2: box 2 has its own up.lock" "[ -f \"$BURST_LANE_STATE_DIR/boxes/$mb2_id2/up.lock\" ]"
+expect "multibox AC2: current points at the first ready box (wm-burst-lane-1)" "[ \"\$(readlink \"$BURST_LANE_STATE_DIR/current\")\" = \"boxes/$mb2_id1\" ]"
+mb2_current_sid="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("server_id",""))' "$("$BL" status --json)" 2>/dev/null)"
+expect "multibox AC2: status --json .server_id follows current (box 1)" "[ \"$mb2_current_sid\" = \"$mb2_id1\" ]"
+
+# ---- multibox AC6: BURST_MAX_BOXES caps `--count`; a request above it is
+# refused (journaled `up refused cause=max-boxes`) before any hcloud call,
+# and at most one box exists afterward.
+fresh_env
+mb6_rc=0; mb6_out="$(BURST_MAX_BOXES=1 "$BL" up --count 2 2>&1)" || mb6_rc=$?
+expect "multibox AC6: up --count 2 exits non-zero under BURST_MAX_BOXES=1" "[ $mb6_rc -ne 0 ]"
+expect "multibox AC6: journal has 'up  refused  (cause=max-boxes'" "grep -q 'burst-lane  up  refused  (cause=max-boxes' \"$BURST_LANE_JOURNAL\""
+mb6_boxcount="$(find "$BURST_LANE_STATE_DIR/boxes" -maxdepth 1 -mindepth 1 -type d ! -name pending ! -name '_orphan-*' 2>/dev/null | wc -l)"
+expect "multibox AC6: no box was created (refused before any hcloud call)" "[ \"$mb6_boxcount\" -eq 0 ]"
+expect "multibox AC6: no server create call was ever made" "! grep -q 'server create' \"$FAKE_HCLOUD_CALLLOG\""
+# BURST_MAX_BOXES=1 (the default) still allows a plain single-box `up` —
+# the cap bounds --count, it does not disable the lane.
+mb6b_rc=0; BURST_MAX_BOXES=1 "$BL" up >/dev/null 2>&1 || mb6b_rc=$?
+expect "multibox AC6: BURST_MAX_BOXES=1 (default) still allows an uncapped single-box up" "[ $mb6b_rc -eq 0 ]"
 
 expect_block_green "multibox" "multibox: every state-layout migration case above ran green"
 
