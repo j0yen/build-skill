@@ -5,6 +5,14 @@
 # usage: gate-status.sh <slug>
 #         gate-status.sh --parity [--since <iso>] [--producer <name>]
 #                         [--json] [--min-runs <n>] [--diff-local]
+#         gate-status.sh --red
+#
+# --red (PRD-build-gate-red-alarm-invariant R9): prints
+# state/gate-red.json verbatim — the JSON twin gate-red-summary.sh writes
+# every tick (green/red counts, families, oldest_red, red_slugs,
+# parse_skipped) — for a human or script that wants the structured form
+# instead of parsing the plain-text state/gate-red.summary line. Prints
+# `{}` (never errors) when the file doesn't exist yet (no tick has run).
 #
 # --parity (PRD-build-gate-route-parity-ledger, R3/R7/R8/R9): reads tick
 # journal `gate` lines (default $HOME/brain/journal/build/*.md, override
@@ -52,6 +60,16 @@ STATE_DIR="${BUILD_STATE_DIR:-$SKILL_DIR/state}"
 INFLIGHT_DIR="$STATE_DIR/gate-inflight"
 SYSTEMCTL="${GATE_STATUS_SYSTEMCTL:-systemctl}"
 JQ="${JQ:-jq}"
+
+if [ "${1:-}" = "--red" ]; then
+  json_file="${GATE_RED_JSON_FILE:-$STATE_DIR/gate-red.json}"
+  if [ -r "$json_file" ]; then
+    cat "$json_file"
+  else
+    echo '{}'
+  fi
+  exit 0
+fi
 
 if [ "${1:-}" = "--parity" ]; then
   shift

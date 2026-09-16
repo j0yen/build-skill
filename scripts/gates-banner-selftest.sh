@@ -99,5 +99,29 @@ printf '%s  slugB  archive  archived  (repo=fixture)\n' "$old" >> "$D/journal/${
 n="$(BUILD_JOURNAL_ROOT="$D/journal" "$HERE/shipped-count.sh")"
 expect "shipped-count counts only the in-window archive" "[ \"\$n\" = 1 ]"
 
+# ============================================================================
+# AC11 — handoff-header.sh prints the current summary line; SKILL.md's
+# Handoff section names it.
+# ============================================================================
+HH="$HERE/handoff-header.sh"
+if [ -x "$HH" ]; then
+  D="$T/ac11"; mkdir -p "$D/state"
+  printf '2026-09-16T15:00:00Z GATES(3h): green=1 red=2 blockers: x x1 oldest-red=2026-09-16T10:00:00Z red_slugs: a b\n' \
+    > "$D/state/gate-red.summary"
+  out11="$(BUILD_STATE_DIR="$D/state" "$HH")"
+  expect "AC11 prints the summary line without the write-ts" \
+    "[ \"\$out11\" = 'GATES(3h): green=1 red=2 blockers: x x1 oldest-red=2026-09-16T10:00:00Z red_slugs: a b' ]"
+  out11_empty="$(BUILD_STATE_DIR="$T/ac11-nofile" "$HH")"
+  rc11_empty=$?
+  expect "AC11 exit 0 with no summary file yet" "[ $rc11_empty -eq 0 ]"
+  expect "AC11 prints nothing with no summary file yet" "[ -z \"\$out11_empty\" ]"
+else
+  echo "FAIL AC11: handoff-header.sh not found at $HH" >&2
+  FAIL=$((FAIL + 1))
+fi
+SKILL_MD="$(cd "$HERE/.." && pwd)/SKILL.md"
+expect "AC11 SKILL.md names handoff-header.sh in a Handoff section" \
+  "grep -q '^## Handoff' '$SKILL_MD' && grep -q 'handoff-header.sh' '$SKILL_MD'"
+
 echo "gates-banner-selftest: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

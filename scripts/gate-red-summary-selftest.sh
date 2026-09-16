@@ -102,5 +102,23 @@ json3="$(cat "$D/state/gate-red.json")"
 expect "AC3 parse_skipped=1" "[ \"\$(printf '%s' \"\$json3\" | jq -r .parse_skipped)\" = 1 ]"
 expect "AC3 still counts slugA red, slugB green" "[[ \"\$out3\" == *'green=1 red=1'* ]]"
 
+# ============================================================================
+# R9 — gate-status.sh --red prints the JSON twin verbatim.
+# ============================================================================
+GS="$SKILL_DIR/scripts/gate-status.sh"
+if [ -x "$GS" ]; then
+  D="$T/r9"; mkdir -p "$D/state"
+  BUILD_STATE_DIR="$D/state" GATE_RED_JSON_FILE="$D/state/gate-red.json" "$GRS" --now 2026-01-01T01:00:00Z --window-h 2 >/dev/null 2>&1
+  # (empty journal -> green=0 red=0, just proving the file round-trips)
+  echo '{"ts":"2026-01-01T00:00:00Z","red":2}' > "$D/state/gate-red.json"
+  out_r9="$(BUILD_STATE_DIR="$D/state" "$GS" --red)"
+  expect "R9 gate-status --red prints the JSON twin" "[ \"\$out_r9\" = '{\"ts\":\"2026-01-01T00:00:00Z\",\"red\":2}' ]"
+  out_r9_missing="$(BUILD_STATE_DIR="$T/r9-missing" "$GS" --red)"
+  expect "R9 gate-status --red prints {} when no file exists" "[ \"\$out_r9_missing\" = '{}' ]"
+else
+  echo "FAIL R9: gate-status.sh not found at $GS" >&2
+  FAIL=$((FAIL + 1))
+fi
+
 echo "gate-red-summary-selftest: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
