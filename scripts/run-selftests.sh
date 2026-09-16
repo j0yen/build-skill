@@ -81,6 +81,7 @@ SELFTEST_REGISTRY=(
   scripts/routepar-selftest.sh
   tests/canary_ac3_receipt_diff_diverged.sh
   tests/canary_ac4_receipt_diff_same.sh
+  tests/canary_ac15_route_block.sh
 )
 
 usage() { echo "usage: run-selftests.sh <name-or-path>... | --all" >&2; exit 2; }

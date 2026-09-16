@@ -1777,6 +1777,25 @@ else
   probe_emit gate-cargo-route clean "intended=local — nothing to route" >/dev/null
 fi
 
+# BEGIN canary-r13-no-burst-detect (tests/canary_ac15_route_block.sh
+# extracts this exact block by marker — keep it self-contained: no
+# variable here may depend on anything computed outside route_intended/
+# route_burst_n, both already resolved above this point).
+# PRD-build-burst-gate-canary-invariant requirement 13 (R13/AC15): the
+# route_mismatch case above (some local, some burst) stays a journaled
+# guard event only, never a block — that non-goal from PRD-build-gate-
+# cargo-route-attest is unchanged. But ZERO burst lines at all under
+# burst intent means the box was never used this run at all, which is
+# exactly the 2026-09-16 03:22Z canary evidence (0 routed calls, cause
+# burst-lane-disabled) that a dirty-only probe let through silently for
+# a full box-day. That case is a hard block, independent of
+# route_mismatch above.
+route_no_burst=false
+if [ "$route_intended" = "burst" ] && [ "$route_burst_n" -eq 0 ]; then
+  route_no_burst=true
+fi
+# END canary-r13-no-burst-detect
+
 wall=$(( $(date +%s) - t0 ))
 blockers_csv=""
 if [ "${#blocking_notes[@]}" -gt 0 ]; then
@@ -1949,6 +1968,25 @@ fi
 if [ -n "$deferred_csv" ]; then
   journal_suffix="$journal_suffix deferred=$deferred_csv"
 fi
+
+# BEGIN canary-r13-no-burst-block (tests/canary_ac15_route_block.sh
+# extracts this exact block by marker — keep it self-contained: only
+# reads route_no_burst/route_intended/route_burst_n/route_local_n/
+# route_first_local_cause and mutates outcome/final_rc/journal_suffix,
+# all already defined above this point).
+# PRD-build-burst-gate-canary-invariant requirement 13 (R13/AC15): zero
+# burst lines under burst intent overrides whatever verdict was just
+# computed (pass, delta-pass, anything) — this is a hard block, applied
+# last so no earlier pass/delta-pass path can quietly win. Unlike
+# route_mismatch above, this never touches gate_rc/delta_rc/blocking_notes
+# — it forces outcome+exit code directly, so a passing local run under
+# burst intent that never actually reached the box still exits nonzero.
+if $route_no_burst; then
+  outcome="block"
+  final_rc=1
+  journal_suffix="$journal_suffix cause=route-mismatch intended=$route_intended burst=$route_burst_n local=$route_local_n first_local_cause=${route_first_local_cause:-unknown}"
+fi
+# END canary-r13-no-burst-block
 
 # One journal line per gate run (requirement 8 / AC13): crate, HEAD, base
 # tag, pass/block counts, blocking receipt names, wall seconds, (PRD-
