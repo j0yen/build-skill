@@ -37,6 +37,15 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SG="$HERE/select-guard.sh"
 [ -x "$SG" ] || { echo "selftest: $SG not executable" >&2; exit 2; }
 
+# R16/AC19 (PRD-build-burst-gate-canary-invariant): every fake `status
+# --json` below is built by loading the recorded FIXTURE and overriding
+# just the field(s) under test via jq — never an inline JSON literal
+# carrying a `gate_ready` key (the handwritten-interface-fixture lint,
+# scripts/handwritten-fixture-lint.sh, fails exactly that shape).
+FIXTURE="$HERE/../tests/fixtures/burst-status.json"
+[ -f "$FIXTURE" ] || { echo "selftest: $FIXTURE not found" >&2; exit 2; }
+JQ="$(command -v jq)" || { echo "selftest: jq not found" >&2; exit 2; }
+
 fail=0
 expect() {
   local label="$1" cond="$2"
@@ -127,10 +136,13 @@ FAKE="$T/fake-burst-bin"
 mkdir -p "$FAKE"
 mk_fake_burst() {
   local width="$1"
+  local body; body="$("$JQ" -c --argjson w "$width" '. + {width: $w}' "$FIXTURE")"
   cat > "$FAKE/burst-lane.sh" <<EOF
 #!/usr/bin/env bash
 if [ "\${1:-}" = "status" ] && [ "\${2:-}" = "--json" ]; then
-  printf '{"active":true,"gate_ready":"true","width":$width}\n'
+  cat <<'JSONEOF'
+$body
+JSONEOF
   exit 0
 fi
 exit 1
@@ -162,10 +174,13 @@ unset BURST_LANE_SH BUILD_SAME_TARGET_CAP_BURST
 # only `run_slots.cap` (no `width`) as the regression-guard fixture.
 # =========================================================================
 mk_fake_burst_no_width() {
-  cat > "$FAKE/burst-lane.sh" <<'EOF'
+  local body; body="$("$JQ" -c 'del(.width) | del(.run_slots.cap)' "$FIXTURE")"
+  cat > "$FAKE/burst-lane.sh" <<EOF
 #!/usr/bin/env bash
-if [ "${1:-}" = "status" ] && [ "${2:-}" = "--json" ]; then
-  printf '{"active":true,"gate_ready":"true"}\n'
+if [ "\${1:-}" = "status" ] && [ "\${2:-}" = "--json" ]; then
+  cat <<'JSONEOF'
+$body
+JSONEOF
   exit 0
 fi
 exit 1
@@ -174,10 +189,13 @@ EOF
 }
 mk_fake_burst_slots_cap() {
   local cap="$1"
+  local body; body="$("$JQ" -c --argjson c "$cap" 'del(.width) | .run_slots.cap = $c' "$FIXTURE")"
   cat > "$FAKE/burst-lane.sh" <<EOF
 #!/usr/bin/env bash
 if [ "\${1:-}" = "status" ] && [ "\${2:-}" = "--json" ]; then
-  printf '{"active":true,"gate_ready":"true","run_slots":{"cap":$cap}}\n'
+  cat <<'JSONEOF'
+$body
+JSONEOF
   exit 0
 fi
 exit 1
