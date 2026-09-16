@@ -251,6 +251,20 @@ STATE_DIR="${BURST_LANE_STATE_DIR:-$SKILL_DIR/state/burst-lane}"
 # ACTIVE box via `current`, same as BOX_STATE_DIR.
 BOX_STATE_DIR="$STATE_DIR/current"
 box_path() { printf '%s/%s\n' "$BOX_STATE_DIR" "$1"; }
+# box_path_for <server_id> <name> -> stdout "$STATE_DIR/boxes/<server_id>/<name>"
+# -- the multi-box counterpart to box_path() above, added for
+# PRD-build-burst-gate-canary-invariant (R5/R6/R8): canary state is keyed
+# by server_id, not always the CURRENTLY active box, so it cannot resolve
+# through box_path()'s "current"-relative BOX_STATE_DIR alone. Defined here
+# (between the BOX_STATE_DIR= assignment and box_activate()'s closing
+# brace) rather than hand-rolling "$STATE_DIR/boxes/..." at each call site,
+# so it stays inside scripts/burst-state-tripwire.sh's own box_path()/
+# box_activate() license region for a "boxes/" literal (AC14) -- placing it
+# textually AFTER box_activate() instead (this function's first draft) is
+# NOT inside that region: the tripwire's block-end anchor is box_activate()'s
+# own closing brace specifically, not "wherever the next related helper
+# happens to sit."
+box_path_for() { printf '%s/boxes/%s/%s\n' "$STATE_DIR" "${1:-unknown}" "$2"; }
 STATE_FILE="$BOX_STATE_DIR/session.json"
 # PRD-build-burst-dispatch-reenable requirement 1: the baked-image record —
 # `image_id`/`created`/`base_image_id`/`build_skill_sha`/`gate_tool_versions`
@@ -2455,6 +2469,10 @@ print(d.get("image_id", ""))
 status_extra_fields_json() {  # stdout: one JSON object (never fails/exits)
   local img_id img_source
   read -r img_id img_source <<<"$(resolve_boot_image)"
+  # R8: canary=<pass|diverged|missing>@<age_h>h head=<sha7>, read via the
+  # same canary_read_status() the R6 gates use -- one definition of "the
+  # box's canary state" for both gating and display.
+  local canary_raw; canary_raw="$(canary_read_status "$(state_read server_id)")"
   python3 -c '
 import calendar, glob, json, os, sys, time
 
@@ -2523,6 +2541,19 @@ enabled = os.path.isfile(dropin_path)
 # too, not a second script invocation.
 evidence = json.loads(sys.argv[7]) if len(sys.argv) > 7 and sys.argv[7] else {"count": 0, "bytes": 0, "newest_ts": None}
 
+# R8: canary_raw is "<verdict> <age_h> <head7> <ts>" from canary_read_status
+# (bash side, sys.argv[8]) -- "missing 0 ------- -" when no canary.json
+# exists yet for this server_id (the Migration section documents this state).
+canary_parts = (sys.argv[8].split() if len(sys.argv) > 8 else ["missing", "0", "-------", "-"])
+canary_parts += ["missing", "0", "-------", "-"][len(canary_parts):]
+canary_verdict, canary_age_raw, canary_head, canary_ts = canary_parts[:4]
+try:
+    canary_age_h = float(canary_age_raw)
+except Exception:
+    canary_age_h = None
+canary = {"verdict": canary_verdict, "age_h": canary_age_h, "head": canary_head,
+          "ts": None if canary_ts == "-" else canary_ts}
+
 print(json.dumps({
     "image_id": img_id,
     "image_source": img_source,
@@ -2532,8 +2563,9 @@ print(json.dumps({
     "enabled": enabled,
     "prove_last": prove_last,
     "evidence": evidence,
+    "canary": canary,
 }))
-' "$img_id" "$img_source" "$SNAPSHOT_STATE_FILE" "$PROOF_STATE_FILE" "$SYSTEMD_DROPIN" "$BOX_STATE_DIR/logs" "$(evidence_status_json "$EVIDENCE_DIR")"
+' "$img_id" "$img_source" "$SNAPSHOT_STATE_FILE" "$PROOF_STATE_FILE" "$SYSTEMD_DROPIN" "$BOX_STATE_DIR/logs" "$(evidence_status_json "$EVIDENCE_DIR")" "$canary_raw"
 }
 
 # Same fields, one text-mode summary line (requirement 6: "text and --json").
@@ -2545,9 +2577,15 @@ import json, sys
 d = json.loads(sys.argv[1])
 def s(v):
     return "none" if v is None else v
-print("image: id=%s source=%s bake_age_h=%s proof_age_h=%s proof_routed=%s enabled=%s" % (
+# R8/AC8: canary=<pass|diverged|missing>@<age_h>h head=<sha7>, appended onto
+# this same line 2 rather than a new line -- AC8 names "line 2" itself.
+c = d.get("canary") or {"verdict": "missing", "age_h": None, "head": "-------"}
+age_h = c.get("age_h")
+age_str = ("%.1f" % age_h) if isinstance(age_h, (int, float)) and age_h >= 0 else "?"
+print("image: id=%s source=%s bake_age_h=%s proof_age_h=%s proof_routed=%s enabled=%s canary=%s@%sh head=%s" % (
     s(d["image_id"]), s(d["image_source"]), s(d["bake_age_h"]), s(d["proof_age_h"]),
-    s(d["proof_routed"]), str(d["enabled"]).lower()))
+    s(d["proof_routed"]), str(d["enabled"]).lower(), c.get("verdict", "missing"), age_str,
+    c.get("head", "-------")))
 ev = d.get("evidence") or {"count": 0, "bytes": 0, "newest_ts": None}
 gb = (ev.get("bytes") or 0) / 1e9
 print("evidence: %s sets, %.2f GB, newest %s" % (ev.get("count", 0), gb, s(ev.get("newest_ts"))))
@@ -2622,6 +2660,21 @@ cmd_bake() {
     echo "bake refused (cause=sandbox-not-ok)" >&2
     exit 3
   fi
+  # R6: a bake freezes this box's disk into the image every future `up`
+  # boots from, so it requires a passing CACHED canary verdict (same
+  # canary_gate_check the up/enable gates use — see its own header for why
+  # this is a cached read, never a live cmd_canary call) before the
+  # snapshot is taken. R6 gives bake one unsplit cause (`cause=canary`),
+  # unlike enable's canary-missing/canary-diverged split.
+  local bake_canary_verdict; read -r bake_canary_verdict _ <<<"$(canary_gate_check bake)"
+  case "$bake_canary_verdict" in
+    pass) : ;;
+    *)
+      journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  bake  refused  (cause=canary verdict=$bake_canary_verdict server_id=$id)"
+      echo "bake refused (cause=canary verdict=$bake_canary_verdict)" >&2
+      exit 3
+      ;;
+  esac
   # Refuse while a `run` is in flight — a bake is a point-in-time credential
   # shred + image freeze; racing a live run would either bake mid-write or
   # yank the credential out from under it. Non-blocking contention probe:
@@ -3637,11 +3690,55 @@ print("allow", ts, proof.get("image_id", ""))
     exit 3
   fi
 
+  # R6/AC5: enable requires a passing canary for the CURRENT box before it
+  # ever writes the drop-in. This reads canary_read_status's cached verdict
+  # rather than invoking a live cmd_canary (same cached-check family as
+  # up/bake's canary_gate_check below): AC5's own flow is "canary=missing
+  # -> enable refuses -> operator or the timer runs canary -> enable
+  # re-runs and succeeds", and the Migration section describes "canary=
+  # missing in status until the operator or the timer runs it" -- both
+  # read enable as a state CHECK, not a trigger. A live inline run here
+  # would also make every enable call pay the canary's own <=25min cold
+  # gate wall, never budgeted for enable.
+  local canary_verdict canary_age canary_head canary_ts
+  local canary_server_id; canary_server_id="$(state_read server_id)"
+  if [ "${BURST_CANARY_SKIP:-0}" = "1" ]; then
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  canary-skip  (event=enable by=${BURST_CANARY_SKIP_BY:-${SUDO_USER:-${USER:-unknown}}})"
+    canary_verdict="pass"; canary_head=""; canary_ts="$(now_iso)"
+  else
+    read -r canary_verdict canary_age canary_head canary_ts <<<"$(canary_read_status "$canary_server_id")"
+    if [ "$canary_verdict" = "missing" ]; then
+      journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  enable  refused  (cause=canary-missing)"
+      echo "enable refused (cause=canary-missing)" >&2
+      exit 3
+    fi
+    if [ "$canary_verdict" != "pass" ]; then
+      journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  enable  refused  (cause=canary-diverged)"
+      echo "enable refused (cause=canary-diverged)" >&2
+      exit 3
+    fi
+  fi
+
   mkdir -p "$(dirname "$SYSTEMD_DROPIN")"
   printf '[Service]\nEnvironment=BUILD_BURST_ENABLED=1\n' > "$SYSTEMD_DROPIN"
   systemctl --user daemon-reload >/dev/null 2>&1 || true
 
-  journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  enable  done  (proof_ts=$cause_or_ts image_id=$image_id)"
+  # R17: enable.json is the sole sanctioned record pairing this
+  # BUILD_BURST_ENABLED=1 write with the canary verdict that authorized it.
+  # A knob set to 1 with no matching (or stale) record here is what
+  # select-tick.sh's knob-ownership check (R17, a later chained step) alarms
+  # on -- written atomically (tmp + mv) same as canary.json.
+  local enable_json="$STATE_DIR/enable.json" enable_json_tmp
+  enable_json_tmp="$(mktemp "$STATE_DIR/.enable.XXXXXX")"
+  python3 -c '
+import json, sys
+ts, canary_verdict, canary_ts, head, out_path = sys.argv[1:6]
+json.dump({"ts": ts, "canary_verdict": canary_verdict, "canary_ts": canary_ts, "head": head},
+          open(out_path, "w"), indent=2, sort_keys=True)
+' "$(now_iso)" "$canary_verdict" "$canary_ts" "$canary_head" "$enable_json_tmp"
+  mv -f "$enable_json_tmp" "$enable_json"
+
+  journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  enable  done  (proof_ts=$cause_or_ts image_id=$image_id canary=$canary_verdict)"
   echo "enable done: image_id=$image_id"
   exit 0
 }
@@ -3840,10 +3937,12 @@ run_pending_reality_check_if_gate_ready() {
 # `burst-lane.sh canary` proves the box passes the gate, in three variants,
 # against a fixed HEAD — see the PRD's TL;DR. THIS PASS implements the
 # canary command itself (head resolution, baseline, the three variants,
-# canary.json + journal) as a purely additive new subcommand: nothing here
-# is called from cmd_up/cmd_bake/cmd_enable/cmd_status yet (R6/R8 wiring and
-# the daily-cadence/divergence-confirmation state machine of R7 are later
-# chained steps — see the manifest's outcome text for what remains).
+# canary.json + journal) as a purely additive new subcommand. R6/R8 wiring
+# (cmd_up/cmd_bake/cmd_enable/cmd_status all consult it now, via
+# canary_read_status/canary_gate_check just below) landed in the chained step
+# that added this comment; the daily-cadence/divergence-confirmation state
+# machine of R7 is still a later chained step — see the manifest's outcome
+# text for what remains.
 #
 # Variant "delta" is NOT a fourth gate invocation. extend-gate.sh already
 # runs `gate-delta.sh verdict` against the repo's committed
@@ -3892,6 +3991,66 @@ if rows and rows[0].get("status") == "completed":
 else:
     print("none", "")
 ' "$out"
+}
+
+# canary_read_status [server_id] -> stdout "<verdict> <age_h> <head7> <ts>":
+# verdict is pass|diverged|missing, read from that server's canary.json
+# (R5's per-box state, "boxes/<server_id>/canary.json"); "missing" means no
+# canary has ever run for this server_id/image — never treated as a pass.
+# A verdict is "diverged" both when canary.json's own diverged[] is
+# non-empty AND when any variant's own verdict is "block" (a refused/errored
+# variant is not a pass either, even with nothing in diverged[]). Shared by
+# cmd_status (R8) and the enable/up/bake gates below (R6) so there is exactly
+# one place that decides what "the box's canary state" means.
+canary_read_status() {
+  local server_id="${1:-$(state_read server_id)}" cf
+  cf="$(box_path_for "$server_id" canary.json)"
+  python3 -c '
+import calendar, json, sys, time
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    print("missing 0 ------- ")
+    raise SystemExit(0)
+head = (d.get("head") or "")[:7] or "-------"
+ts = d.get("ts", "")
+try:
+    t = time.strptime(ts, "%Y-%m-%dT%H:%M:%SZ")
+    age_h = round((time.time() - calendar.timegm(t)) / 3600.0, 2)
+except Exception:
+    age_h = -1
+diverged = d.get("diverged") or []
+variants = (d.get("variants") or {}).values()
+verdict = "diverged" if (diverged or "block" in variants) else "pass"
+print("%s %s %s %s" % (verdict, age_h, head, ts or "-"))
+' "$cf"
+}
+
+# canary_gate_check <event> -> stdout "<verdict> <age_h> <head7> <ts>",
+# same shape as canary_read_status -- shared by up/bake/enable (R6).
+# Reads the CACHED verdict; it does not invoke a live cmd_canary. A live
+# invocation was this function's first draft and it broke every bake/up
+# selftest written before this PRD existed the moment it landed: none of
+# them fixture $BURST_LANE_CANARY_GATE_LAUNCH/$BURST_LANE_GH/$CANARY_REPO,
+# so a live run fell through to the real $HOME/wintermute/mcphost checkout
+# and the real `gh` CLI/network and hung (caught empirically running
+# tests/bdrift_ac5_bake_refusal_journals_key.sh during this same chained
+# step -- ps showed it stuck for 10+ minutes with no fixture in sight).
+# Every lifecycle event here needs to answer in the time `state_read`
+# takes, not the canary's own <=25min cold gate wall (Non-functional is
+# scoped to the `canary` command itself); the daily timer (R7, not yet
+# wired) and the operator/enable's own "run canary, then enable" flow
+# (Migration section) are what actually keeps this cache warm.
+# BURST_CANARY_SKIP=1 bypasses with a journaled `by=<user>` line (R6's
+# emergency escape hatch) and reports "pass".
+canary_gate_check() {
+  local event="$1"
+  if [ "${BURST_CANARY_SKIP:-0}" = "1" ]; then
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  canary-skip  (event=$event by=${BURST_CANARY_SKIP_BY:-${SUDO_USER:-${USER:-unknown}}})"
+    printf 'pass 0 ------- %s\n' "$(now_iso)"
+    return 0
+  fi
+  canary_read_status "$(state_read server_id)"
 }
 
 # canary_resolve_head <repo> <operator_head> -> stdout "<sha> <source>" on
@@ -4102,7 +4261,7 @@ cmd_canary() {
 
   local server_id; server_id="$(state_read server_id)"
   local image_id; image_id="$(state_read image_id)"
-  local box_dir="$STATE_DIR/boxes/${server_id:-unknown}"
+  local box_dir; box_dir="$(box_path_for "$server_id" "")"; box_dir="${box_dir%/}"
   mkdir -p "$box_dir"
 
   local baseline_dir="" baseline_state="absent"
@@ -4344,6 +4503,15 @@ up_one_box() {
     # it's auditable without a separate `status` call.
     run_slot_cap
     journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  up  slots  (cap=$RUN_SLOT_CAP source=$RUN_SLOT_SOURCE bound=${RUN_SLOT_BOUND:-} cores=${box_cores:-} mem_gb=${box_mem_gb:-} disk_gb=${box_disk_gb:-})"
+    # R6: after gate_ready=true, a CACHED canary-status check -- a non-pass
+    # never fails `up` itself (the box is kept either way, per this
+    # requirement's own wording), it only journals so dispatch is never
+    # enabled blind; R6's "dispatch not enabled" is enforced by cmd_enable's
+    # own canary check above, not by anything here.
+    if [ "${GATE_READY:-false}" = "true" ]; then
+      local up_canary_verdict; read -r up_canary_verdict _ <<<"$(canary_gate_check up)"
+      [ "$up_canary_verdict" = "pass" ] || journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  up  canary-diverged  (verdict=$up_canary_verdict server_id=$aid)"
+    fi
     # PRD-build-fail-loud-evidence-kept AC4: probe_run keeps cmd_verify's
     # stderr (was /dev/null); the verify-failed-after-adopt line below is
     # still this caller's own explicit branch (unchanged shape), now
@@ -4476,6 +4644,12 @@ print(d.get("id",""), d.get("public_net",{}).get("ipv4",{}).get("ip",""))
   # it's auditable without a separate `status` call.
   run_slot_cap
   journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  up  slots  (cap=$RUN_SLOT_CAP source=$RUN_SLOT_SOURCE bound=${RUN_SLOT_BOUND:-} cores=${box_cores:-} mem_gb=${box_mem_gb:-} disk_gb=${box_disk_gb:-})"
+  # R6: see the matching comment on the adopt path above -- same cached
+  # canary_gate_check, same "journal, never fail up" behavior.
+  if [ "${GATE_READY:-false}" = "true" ]; then
+    local up_canary_verdict; read -r up_canary_verdict _ <<<"$(canary_gate_check up)"
+    [ "$up_canary_verdict" = "pass" ] || journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  up  canary-diverged  (verdict=$up_canary_verdict server_id=$id)"
+  fi
   # PRD-build-fail-loud-evidence-kept AC4: same probe_run conversion as
   # the adopt path above.
   probe_run verify -- cmd_verify >/dev/null 2>&1 || journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  up  verify-failed-after-boot  (lane unverified — run falls back local)"

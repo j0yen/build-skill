@@ -40,6 +40,9 @@ pull-sizes           per-box
 evidence             per-box   # symlink into BURST_PROVE_TMP; per-box path, external bytes
 gate-inflight         per-box
 known_hosts           per-box   # today known_hosts.<server_id>
+canary.inflight.lock  per-box   # PRD-build-burst-gate-canary-invariant R1/R6: flock guarding "one canary at a time per box"
+canary.inflight       per-box   # PRD-build-burst-gate-canary-invariant: pid/start_epoch marker while a canary runs against this box
+canary.json           per-box   # PRD-build-burst-gate-canary-invariant R5: reached via box_path_for() (requirement 2/3's multi-box counterpart to box_path()), not $BOX_STATE_DIR -- the $STATE_DIR/canary.json convenience copy below is the lane-wide alias of the SAME name
 # logs/ is split: the per-run log prefixes below are per-box (reached via
 # $BOX_STATE_DIR/logs/<prefix>.*); logs/failed/ and logs/failed-sessions.log
 # (GATE_TOOLS_FAILED_LOG_DIR / GATE_TOOLS_FAILED_SESSIONS_LOG) are the one
@@ -59,6 +62,11 @@ build-fail            lane-wide
 provision.lock        lane-wide
 provision.pid         lane-wide
 decisions.jsonl       lane-wide   # append-only teardown-decision audit trail (server_id per row); same cross-box-story shape as the journal (Non-goals: "moving the journal ... stays one file"), not named in the PRD's own requirement-1 bullets — kept lane-wide by analogy rather than fragmented per box.
+canary-baseline       lane-wide   # PRD-build-burst-gate-canary-invariant R2: local --scope main gate receipts at a given HEAD, keyed by sha (not server_id) -- shared across whichever box the canary next runs against
+canary-runs           lane-wide   # PRD-build-burst-gate-canary-invariant R3: per-run receipt copies, keyed by ts+variant, not server_id
+canary.json           lane-wide   # PRD-build-burst-gate-canary-invariant R5: convenience copy of the latest per-box canary.json (see the per-box entry above for the box_path_for()-reached original)
+enable.json           lane-wide   # PRD-build-burst-gate-canary-invariant R17: {ts, canary_verdict, canary_ts, head} record pairing the BUILD_BURST_ENABLED=1 write with the canary verdict that authorized it
+.enable.XXXXXX        lane-wide   # PRD-build-burst-gate-canary-invariant R17: enable.json's own mktemp tmp-then-mv sibling
 
 # ---- structural --------------------------------------------------------------
 boxes                 structural  # container directory for every per-box dir; only touched by box_path()/migrate_state_layout()/box_ensure_current()/box_activate()

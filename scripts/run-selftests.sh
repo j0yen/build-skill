@@ -85,6 +85,7 @@ SELFTEST_REGISTRY=(
   tests/canary_ac7_inflight.sh
   tests/canary_ac9_no_green_head.sh
   tests/canary_ac11_last_green_tag.sh
+  tests/canary_ac5_ac8_enable_status_gate.sh
 )
 
 usage() { echo "usage: run-selftests.sh <name-or-path>... | --all" >&2; exit 2; }
