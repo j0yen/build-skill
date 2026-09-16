@@ -30,6 +30,12 @@
 #
 # On a clean main checkout, at HEAD, in this order:
 #   scripts/audit.sh                         (if the crate has one)
+#   intent-card-refresh.sh --prd <this branch's own PRD>   (--scope branch
+#     only, PRD-build-intent-card-pregate-refresh — refreshes and commits
+#     agent/intent-card.json BEFORE intake/reviewer-agent below ever read
+#     it, so a branch is never judged against main's last-refreshed card;
+#     a resolution/lint failure blocks with `intent-card-stale (cause=...)`
+#     and skips reviewer-agent entirely — see that block's own comments)
 #   autobuilder intake --validate agent/intent-card.json --project <root>
 #     (writes receipts/intake.json fresh at HEAD — PRD-build-gate-producers;
 #     before that PRD, nothing in this sequence ever passed --project, so
@@ -1237,6 +1243,103 @@ else
   record_phase risk-gate 0 skip
 fi
 
+# 1.5. intent-card pre-gate refresh (--scope branch only) — PRD-build-
+#    intent-card-pregate-refresh R1-R4. Before this PRD, a branch's
+#    agent/intent-card.json was still whatever main last refreshed (post-
+#    land only), so the reviewer-agent step below judged the branch's
+#    diff against a card naming a DIFFERENT PRD — 4 of 6 mcphost branches
+#    carried a `reviewer-agent` block for exactly this reason on
+#    2026-09-16. The PRD path is resolved from the claim/manifest (never
+#    "newest PRD in the directory" — intent-card-refresh.sh's own --check
+#    inference, which this pre-gate call does NOT use): manifest.json's
+#    `.prds[$slug].path`, falling back to the build-queue/ convention on
+#    slug (the same convention gate-patience's own exclude-prd lookup
+#    just above already uses).
+intent_card_stale=false
+# Overridable so tests/ can point at a fixture intent-card-refresh.sh
+# (e.g. one that always exits 5) without touching production behavior —
+# same convention as RUSTBUILD_SCRIPTS/EXTEND_GATE elsewhere in this file.
+INTENT_CARD_REFRESH_BIN="${INTENT_CARD_REFRESH_BIN:-$BUILD_SCRIPTS/intent-card-refresh.sh}"
+if [ "$scope" = branch ]; then
+  _phase_t0=$(date +%s)
+  _icr_prd_dir="${GATE_PATIENCE_PRD_DIR:-$gate_patience_prd_dir}"
+  _icr_prd_path="$_icr_prd_dir/build-queue/PRD-$slug.md"
+  _icr_manifest="${INTENT_CARD_REFRESH_MANIFEST:-$BUILD_SCRIPTS/../state/manifest.json}"
+  if [ -r "$_icr_manifest" ] && command -v jq >/dev/null 2>&1; then
+    _icr_manifest_path="$(jq -r --arg s "$slug" '.prds[$s].path // empty' "$_icr_manifest" 2>/dev/null)"
+    if [ -n "$_icr_manifest_path" ] && [ "$_icr_manifest_path" != null ] && [ -r "$_icr_manifest_path" ]; then
+      _icr_prd_path="$_icr_manifest_path"
+    fi
+  fi
+  if [ ! -r "$_icr_prd_path" ]; then
+    note_block "intent-card-stale (cause=prd-not-found)"
+    intent_card_stale=true
+    record_phase intent-card-refresh $(( $(date +%s) - _phase_t0 )) fail
+  else
+    _icr_args=("$repo" --prd "$_icr_prd_path")
+    [ "$project_rel" = . ] || _icr_args+=(--project-root "$project_rel")
+    _icr_out="$("$INTENT_CARD_REFRESH_BIN" "${_icr_args[@]}" 2>&1)"
+    _icr_rc=$?
+    case "$_icr_rc" in
+      0)
+        # R2/AC1/AC2: commit ONLY when the refresh actually changed
+        # something — a byte-identical rewrite (the script always writes
+        # its files) must not manufacture a commit every gate run. A
+        # pathspec that neither exists on disk NOR is tracked (no
+        # extended-gates.toml in this repo, no amendment file ever
+        # opened) fails `git add`/`git commit -- <pathspec>` ATOMICALLY
+        # for every path in the same invocation, not just the missing
+        # one — filter to paths that are either present now or were
+        # tracked before (a real deletion to stage), never a bare
+        # never-existed name.
+        _icr_candidate_paths=(agent/intent-card.json agent/intent-card.carried.json agent/intent_card_amendment_request.json extended-gates.toml)
+        _icr_existing_paths=()
+        for _icr_p in "${_icr_candidate_paths[@]}"; do
+          if [ -e "$repo/$_icr_p" ] || git -C "$repo" ls-files --error-unmatch -- "$_icr_p" >/dev/null 2>&1; then
+            _icr_existing_paths+=("$_icr_p")
+          fi
+        done
+        if [ "${#_icr_existing_paths[@]}" -gt 0 ] && \
+           [ -n "$(git -C "$repo" status --porcelain -- "${_icr_existing_paths[@]}" 2>/dev/null)" ]; then
+          ( cd "$repo" && git add -- "${_icr_existing_paths[@]}"
+            git -c user.email=jyen.tech@gmail.com -c user.name="Joe Yen" commit -q -m "intent-card: refresh from PRD-$slug" \
+              -- "${_icr_existing_paths[@]}"
+          ) 9>&-
+          journal_line --file "$journal" "$(printf '%s  intent-card  refreshed  (slug=%s prd=%s)' \
+            "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$slug" "$_icr_prd_path")"
+        else
+          journal_line --file "$journal" "$(printf '%s  intent-card  current  (slug=%s)' \
+            "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$slug")"
+        fi
+        record_phase intent-card-refresh $(( $(date +%s) - _phase_t0 )) ok
+        ;;
+      3)
+        note_block "intent-card-stale (cause=malformed-prd)"
+        intent_card_stale=true
+        record_phase intent-card-refresh $(( $(date +%s) - _phase_t0 )) fail
+        ;;
+      4)
+        note_block "intent-card-stale (cause=prd-not-found)"
+        intent_card_stale=true
+        record_phase intent-card-refresh $(( $(date +%s) - _phase_t0 )) fail
+        ;;
+      5)
+        note_block "intent-card-stale (cause=schema)"
+        intent_card_stale=true
+        record_phase intent-card-refresh $(( $(date +%s) - _phase_t0 )) fail
+        ;;
+      *)
+        note_block "intent-card-stale (cause=refresh-failed rc=$_icr_rc)"
+        intent_card_stale=true
+        record_phase intent-card-refresh $(( $(date +%s) - _phase_t0 )) fail
+        ;;
+    esac
+    echo "$_icr_out" >&2
+  fi
+else
+  record_phase intent-card-refresh 0 skip
+fi
+
 # 2. intake — validates agent/intent-card.json against the schema and,
 #    with --project, writes target/autobuilder/receipts/intake.json fresh
 #    at HEAD. Before PRD-build-gate-producers, nothing in this sequence
@@ -1549,8 +1652,19 @@ fi
 # reviewer-agent receipt alongside its in-scope block). `--scope main`
 # keeps the pre-existing skip-on-any-block behavior unchanged (Non-goals:
 # main-scope semantics untouched).
+#
+# PRD-build-intent-card-pregate-refresh R4 (P0, AC3/AC4): the one
+# exception to "branch scope always runs the reviewer regardless of other
+# blocks" above — a STALE card (intent_card_stale, set by the pre-gate
+# refresh step above) means there is nothing true for the reviewer to
+# compare the diff against, so its finding would be noise, not signal.
+# `intent_card_stale` is always false at `--scope main` (the refresh step
+# only runs at branch scope), so main-scope semantics are unaffected; at
+# branch scope with a stale card, blocking_notes already carries the
+# `intent-card-stale` note from that step, so the second disjunct is also
+# false and reviewer-agent is skipped via the same "skipped" branch below.
 _phase_t0=$(date +%s)
-if [ "$scope" = branch ] || [ "${#blocking_notes[@]}" -eq 0 ]; then
+if { [ "$scope" = branch ] && [ "$intent_card_stale" != true ]; } || [ "${#blocking_notes[@]}" -eq 0 ]; then
   reviewer_run_ok=true
   run_reviewer || reviewer_run_ok=false
   # PRD-build-gate-route-parity-ledger requirement 4: the note (and this
