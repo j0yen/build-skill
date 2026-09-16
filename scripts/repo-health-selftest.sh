@@ -220,10 +220,23 @@ EOF
     || notok "AC7: since= timestamp" "$out"
 
   # alert-deliver.sh resolve appends the resolved line the banner then honors.
-  local sbx2; sbx2="$(new_sandbox ac7b)"
-  BUILD_STATE_DIR="$sbx2/state" BUILD_JOURNAL_ROOT="$sbx2/journal" \
-    bash "$SKILL_DIR/scripts/alert-deliver.sh" lock-wait-storm mcphost <(echo "value=200 threshold=100 — test") >/dev/null 2>&1
-  BUILD_STATE_DIR="$sbx2/state" BUILD_JOURNAL_ROOT="$sbx2/journal" \
+  #
+  # NOTIFY_CMD=true is NOT optional here — every direct alert-deliver.sh
+  # call in this file must stub it, or an unset NOTIFY_CMD falls through
+  # to the REAL notify-gh-issue.sh default (gh is authenticated on this
+  # box). This exact omission created two real issues in j0yen/prds
+  # (#7, #8, both "[alarm] mcphost lock-wait-storm", empty body from the
+  # process-substitution evidence file below closing before gh read it)
+  # before being caught and fixed — closed by hand the same session. A
+  # real evidence FILE (not a process substitution) is used now too, for
+  # the same reason: a process substitution's fd can already be gone by
+  # the time a subprocess three calls deep tries to read it.
+  local sbx2 evfile; sbx2="$(new_sandbox ac7b)"
+  evfile="$sbx2/evidence.txt"
+  echo "value=200 threshold=100 — test" > "$evfile"
+  BUILD_STATE_DIR="$sbx2/state" BUILD_JOURNAL_ROOT="$sbx2/journal" NOTIFY_CMD=true \
+    bash "$SKILL_DIR/scripts/alert-deliver.sh" lock-wait-storm mcphost "$evfile" >/dev/null 2>&1
+  BUILD_STATE_DIR="$sbx2/state" BUILD_JOURNAL_ROOT="$sbx2/journal" NOTIFY_CMD=true \
     bash "$SKILL_DIR/scripts/alert-deliver.sh" resolve lock-wait-storm mcphost >/dev/null 2>&1
   local out2; out2="$(BUILD_STATE_DIR="$sbx2/state" bash "$SKILL_DIR/scripts/repo-health-banner.sh")"
   [ -z "$out2" ] && ok "AC7: alert-deliver.sh resolve suppresses the banner line" \
