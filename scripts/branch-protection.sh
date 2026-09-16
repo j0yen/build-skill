@@ -59,6 +59,7 @@ OWNER="${BRANCH_PROTECTION_OWNER:-j0yen}"
 usage() {
   echo "usage: branch-protection.sh enable <repo> [--check <name>]..." >&2
   echo "       branch-protection.sh status <repo>" >&2
+  echo "       branch-protection.sh push <repo> <slug> [--base <branch>]" >&2
 }
 
 die() { local rc="$1"; shift; echo "branch-protection: $*" >&2; exit "$rc"; }
@@ -105,6 +106,23 @@ for path in glob.glob(os.path.join(wf_dir, "*.yml")) + glob.glob(os.path.join(wf
     job_starts = [(m.start(), m.group(1)) for m in re.finditer(r'(?m)^  ([A-Za-z0-9_.-]+):\s*$', body)]
     jobs = [name for _, name in job_starts]
     needs_map = {j: set() for j in jobs}
+    # GitHub's required-status-check `contexts` match the CHECK RUN name,
+    # which for a GitHub Actions job is its `name:` display field when the
+    # job sets one -- NOT the YAML job key (mcphost: job key `gate` posts
+    # its check as "static analysis + core suites"; a required context of
+    # literal `gate` never matches, leaving the PR permanently BLOCKED even
+    # once that job is green -- the exact failure this mapping exists to
+    # avoid, caught live on this PRD's own AC7 landing). A job whose `name:`
+    # is templated (`${{ matrix.* }}`, e.g. the `sandbox` matrix job here)
+    # is never itself terminal in this repo's shape, so the untemplated
+    # display name is only ever needed for non-matrix jobs -- falls back to
+    # the job key when no `name:` is set at all.
+    display_name = {}
+    for i, (start, jname) in enumerate(job_starts):
+        end = job_starts[i + 1][0] if i + 1 < len(job_starts) else len(body)
+        chunk = body[start:end]
+        dn = re.search(r'(?m)^[ \t]+name:[ \t]*(\S.*)$', chunk)
+        display_name[jname] = dn.group(1).strip().strip('"\'') if dn else jname
     for i, (start, jname) in enumerate(job_starts):
         end = job_starts[i + 1][0] if i + 1 < len(job_starts) else len(body)
         chunk = body[start:end]
@@ -129,7 +147,7 @@ for path in glob.glob(os.path.join(wf_dir, "*.yml")) + glob.glob(os.path.join(wf
     needed_by_someone = set()
     for j, needs in needs_map.items():
         needed_by_someone |= needs
-    terminal = [j for j in jobs if j not in needed_by_someone]
+    terminal = [display_name[j] for j in jobs if j not in needed_by_someone]
     workflows[wf_name] = terminal
 
 if not names:
@@ -204,7 +222,9 @@ try:
         state = json.load(fh)
 except (OSError, json.JSONDecodeError):
     state = {}
-state[repo] = {'owner': sys.argv[4], 'required_contexts': contexts, 'enforce_admins': True}
+existing = state.get(repo, {})
+existing.update({'owner': sys.argv[4], 'required_contexts': contexts, 'enforce_admins': True})
+state[repo] = existing
 tmp = state_file + '.tmp'
 with open(tmp, 'w', encoding='utf-8') as fh:
     json.dump(state, fh, indent=2, sort_keys=True)
@@ -259,11 +279,85 @@ if rec and 'push_via_branch' in rec:
   fi
 }
 
+# push_via_branch_for <repo_slug> -> "true"/"false" (default "false" —
+# never assume the branch-only path for a repo `enable` never ran against).
+push_via_branch_for() {
+  local repo_slug="$1" state_file="$STATE_DIR/branch-protection.json"
+  [ -f "$state_file" ] || { echo false; return; }
+  python3 -c "
+import json, sys
+try:
+    with open(sys.argv[1], encoding='utf-8') as fh:
+        state = json.load(fh)
+except (OSError, json.JSONDecodeError):
+    state = {}
+rec = state.get(sys.argv[2]) or {}
+print('true' if rec.get('push_via_branch') else 'false')
+" "$state_file" "$repo_slug"
+}
+
+# cmd_push — AC7 / Technical considerations: the one command SKILL.md's
+# push steps call regardless of whether a repo's main is protected.
+#   branch-protection.sh push <repo> <slug> [--base <branch>]
+# <repo>'s CURRENT HEAD (the commit already made ready to ship — bump,
+# intent-card refresh, whatever the caller already committed) is what
+# gets published:
+#   push_via_branch=false (default, unset): plain `git push origin
+#     HEAD:<base>` (same as the old direct wm-push behaviour).
+#   push_via_branch=true: push HEAD to `refs/heads/loop/<slug>`, open (or
+#     reuse) a PR against <base> via `gh pr create`, and arm
+#     `gh pr merge --auto --squash` -- main only advances once that PR's
+#     required checks go green (AC7). Prints the PR URL on stdout; the
+#     merge itself happens asynchronously (GitHub Actions + auto-merge),
+#     so this returns as soon as the PR/auto-merge is armed, not once
+#     merged -- same "fire the mechanism, don't block the tick on CI wall
+#     time" shape as `gate-launch.sh --wait` vs its no-wait mode.
+cmd_push() {
+  local repo_arg="${1:-}" slug="${2:-}" base="main"
+  shift 2 2>/dev/null || true
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --base) base="${2:?branch-protection: --base needs a value}"; shift 2 ;;
+      *) echo "branch-protection: push: unexpected arg $1" >&2; usage; exit 2 ;;
+    esac
+  done
+  [ -n "$repo_arg" ] && [ -n "$slug" ] || { usage; exit 2; }
+
+  local repo_dir; repo_dir="$(resolve_repo_dir "$repo_arg")" || die 4 "repo not found locally: $repo_arg"
+  local repo_slug; repo_slug="$(basename "$repo_dir")"
+  local via_branch; via_branch="$(push_via_branch_for "$repo_slug")"
+
+  if [ "$via_branch" != "true" ]; then
+    git -C "$repo_dir" push origin "HEAD:$base" || die 5 "direct push to $base failed for $repo_slug"
+    echo "branch-protection: pushed directly to $repo_slug $base"
+    exit 0
+  fi
+
+  local branch="loop/$slug"
+  git -C "$repo_dir" branch -f "$branch" HEAD
+  git -C "$repo_dir" push origin "$branch" || die 5 "push of $branch failed for $repo_slug"
+
+  local pr_url
+  pr_url="$(gh pr list --repo "$OWNER/$repo_slug" --head "$branch" --state open --json url --jq '.[0].url' 2>/dev/null)"
+  if [ -z "$pr_url" ]; then
+    pr_url="$(cd "$repo_dir" && gh pr create --title "loop: $slug" \
+      --body "Automated loop landing for $slug (push-via-branch: $repo_slug main is protected, direct pushes are refused — PRD-build-main-push-gate AC6/AC7)." \
+      --base "$base" --head "$branch" 2>&1)" || die 5 "gh pr create failed for $repo_slug/$branch: $pr_url"
+  fi
+  echo "branch-protection: PR $pr_url"
+
+  local pr_number; pr_number="$(printf '%s' "$pr_url" | grep -oE '[0-9]+$')"
+  gh pr merge "$pr_number" --repo "$OWNER/$repo_slug" --auto --squash \
+    || die 5 "gh pr merge --auto failed for $OWNER/$repo_slug#$pr_number (is auto-merge enabled on the repo? gh repo edit --enable-auto-merge)"
+  echo "branch-protection: auto-merge armed for $OWNER/$repo_slug#$pr_number — main advances once required checks pass"
+}
+
 [ $# -ge 1 ] || { usage; exit 2; }
 cmd="$1"; shift
 case "$cmd" in
   enable) cmd_enable "$@" ;;
   status) cmd_status "$@" ;;
+  push)   cmd_push "$@" ;;
   -h|--help) usage; exit 0 ;;
   *) usage; exit 2 ;;
 esac
