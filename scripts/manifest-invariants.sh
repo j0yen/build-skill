@@ -102,6 +102,7 @@ REPO_HEALTH_EVIDENCE="${REPO_HEALTH_EVIDENCE:-$HERE/repo-health-evidence.sh}"
 REPO_HEALTH_SEED_PRD="${REPO_HEALTH_SEED_PRD:-$HERE/repo-health-seed-prd.sh}"
 REPO_HEALTH_CI="${REPO_HEALTH_CI:-$STATE_DIR/ci-status.json}"
 REPO_HEALTH_OUT="${REPO_HEALTH_OUT:-$STATE_DIR/repo-health.json}"
+DECISIONS="${DECISIONS:-$HERE/decisions.sh}"
 # Test seam (AC1-3/6/9): REPO_HEALTH_AS_OF pins "now"; REPO_HEALTH_JOURNALS
 # is a ':'-separated list of journal fixture files, standing in for the
 # production today+yesterday default repo-health.sh would otherwise
@@ -718,6 +719,17 @@ while IFS= read -r rh_alarm; do
 done < <(python3 -c 'import json,sys
 for a in json.loads(sys.argv[1])["active"]:
     print(json.dumps(a))' "$rh_active_json")
+
+# ---- open decisions: one nudge pass per tick (PRD-build-open-decision-
+# escalation requirement 4) -------------------------------------------------
+# Best-effort, fail-open: decisions.sh nudge owns its own per-id-per-day
+# idempotency (state/alerts/<day>/decision.<id>), so calling it once per
+# live manifest-invariants.sh run is safe even under repeated ticks in the
+# same day. Never allowed to affect this script's own healed/alarmed
+# output or exit code.
+if [ -x "$DECISIONS" ]; then
+  "$DECISIONS" nudge >/dev/null 2>&1 || log "decisions.sh nudge failed (non-fatal)"
+fi
 
 if [ "$format" = json ]; then
   python3 -c 'import json,sys
