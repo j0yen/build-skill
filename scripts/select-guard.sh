@@ -250,6 +250,26 @@ main() {
     fi
   fi
 
+  # Cap-never-unbounded-under-burst (PRD-build-burst-gate-canary-invariant
+  # R14/AC16, 2026-09-16 five-whys): the ONLY way same_target_cap reaches
+  # 999999 in this function is BUILD_DISTINCT_TARGETS=0 (line ~207) — its
+  # old "disable the check" meaning, safe when no burst box is up. Under a
+  # live burst session (gate_ready=true) where the widening block above
+  # never found a usable width (neither `.width` nor `.run_slots.cap` on
+  # the status probe, so cap_source never became "burst"), 999999 stops
+  # meaning "effectively unbounded, fine" and starts meaning "every
+  # same-target candidate this tick admits with zero real limit" — exactly
+  # the 2026-09-16 05:30-05:41Z evidence (39 same-target-admit lines,
+  # cap=999999 source=local, against a 4-slot box). Fail closed instead:
+  # collapse back to cap=1 and mark the source "blocked" so both the
+  # journal and the admit/block decision itself are honest about why.
+  local cap_unbounded_under_burst=0
+  if [ "${gate_ready:-}" = "true" ] && [ "$cap_source" != "burst" ] && [ "$same_target_cap" -eq 999999 ]; then
+    same_target_cap=1
+    cap_source="blocked"
+    cap_unbounded_under_burst=1
+  fi
+
   local same_target_count=0
   if [ -n "$bi" ] && [ -n "$admitted_targets" ]; then
     local t
@@ -262,8 +282,17 @@ main() {
   # owns deduping this to "once per target per tick" if it wants a single
   # summary line per requirement 5's own wording; this script only knows
   # about the one candidate it was asked about).
+  # R14: the tick summary (scripts/serialization-digest.sh reads the same
+  # shared journal select_guard_journal_line writes to) needs a literal
+  # `cap_source=` token distinct from the pre-existing `source=` field —
+  # `source=` alone already meant "local|burst" before this PRD and every
+  # existing consumer (this file's own AC8/AC9 selftests) greps that
+  # literal string; appending cap_source= alongside it, rather than
+  # renaming, keeps both readable without breaking either.
+  local cause_suffix=""
+  [ "$cap_unbounded_under_burst" -eq 1 ] && cause_suffix=" cause=cap-unbounded-under-burst"
   if [ -n "$bi" ]; then
-    echo "select same-target cap=$same_target_cap source=$cap_source target=$bi admitted=$((same_target_count + 1))" >&2
+    echo "select same-target cap=$same_target_cap source=$cap_source cap_source=$cap_source target=$bi admitted=$((same_target_count + 1))$cause_suffix" >&2
     if [ "$same_target_count" -ge "$same_target_cap" ]; then
       # PRD-build-gate-before-land requirement 7 (P1): a same-target-cap
       # block is a "wait" for the tick's `serialization:` summary line
@@ -271,11 +300,11 @@ main() {
       # come from, since select-guard.sh's stderr above is per-invocation,
       # not durable. Written to the SAME shared journal every other build
       # script uses, same isolation-guard.sh default-deny convention.
-      select_guard_journal_line "$slug" same-target-blocked "target=$bi cap=$same_target_cap source=$cap_source admitted_this_tick=$same_target_count"
-      echo "blocked: $slug: same-target: $bi already at cap=$same_target_cap (source=$cap_source, $same_target_count admitted this tick)"
+      select_guard_journal_line "$slug" same-target-blocked "target=$bi cap=$same_target_cap source=$cap_source cap_source=$cap_source admitted_this_tick=$same_target_count$cause_suffix"
+      echo "blocked: $slug: same-target: $bi already at cap=$same_target_cap (source=$cap_source, $same_target_count admitted this tick)$cause_suffix"
       exit 1
     fi
-    select_guard_journal_line "$slug" same-target-admit "target=$bi cap=$same_target_cap source=$cap_source admitted_this_tick=$((same_target_count + 1))"
+    select_guard_journal_line "$slug" same-target-admit "target=$bi cap=$same_target_cap source=$cap_source cap_source=$cap_source admitted_this_tick=$((same_target_count + 1))$cause_suffix"
   fi
 
   local out rc

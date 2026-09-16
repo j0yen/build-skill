@@ -17,6 +17,20 @@
 #         with width 8 and BUILD_SAME_TARGET_CAP_BURST=4: four of five are
 #         admitted, `cap=4 source=burst`; width 2 admits two, `cap=2
 #         source=burst` (min(cap_burst, width) both ways).
+#
+# PRD-build-burst-gate-canary-invariant R14/AC16 (2026-09-16): the same
+# FAKE burst-lane.sh convention, extended to the cap-unbounded-under-burst
+# guard.
+#   AC16a — burst active, gate_ready=true, but the status JSON has NEITHER
+#           `width` NOR `run_slots.cap`, combined with the old compat knob
+#           BUILD_DISTINCT_TARGETS=0 (the only way this repo's cap math
+#           reaches 999999): exactly one of five is admitted, `cap=1
+#           source=blocked cap_source=blocked`, and the other four are
+#           journaled same-target-blocked cause=cap-unbounded-under-burst.
+#   AC16b — regression guard, same fixture shape but `run_slots.cap=4`
+#           present (no `width` key — proves the `.width // .run_slots.cap`
+#           fallback still resolves on its own): four of five admitted,
+#           `cap=4 source=burst`.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -36,6 +50,15 @@ trap '[ -n "${SELECT_GUARD_SATCAP_KEEP:-}" ] || rm -rf "$T"' EXIT
 # this selftest (five candidates x N sub-scenarios) pollutes the real
 # shared journal.
 export SELECT_GUARD_JOURNAL="$T/select-guard-journal.md"
+# PRD-build-journal-single-writer requirement 1 routed select-guard.sh
+# through the shared journal_line, which gives BUILD_JOURNAL_ROOT
+# unconditional priority over SELECT_GUARD_JOURNAL. Under run-selftests.sh
+# — which exports BUILD_JOURNAL_ROOT for its own isolation — that silently
+# redirects select-guard.sh's writes away from $SELECT_GUARD_JOURNAL (same
+# gotcha select-guard-selftest.sh already documents and unsets); AC16a
+# below is the first case in THIS file to read the journal file content
+# rather than just stderr, so it's the first case that would trip on it.
+unset BUILD_JOURNAL_ROOT
 
 git init -q --bare "$T/origin.git"
 git clone -q "$T/origin.git" "$T/clone" >/dev/null 2>&1
@@ -130,6 +153,59 @@ expect "AC9b: two of five admitted (min(4,2)=2)" "[ \"$admitted9b\" -eq 2 ]"
 diag9b="$(BUILD_MAX_BRANCHES=30 "$SG" satcap-mcphost-1 redbaron "$T/clone" 0 "" 2>&1 >/dev/null)"
 expect "AC9b: diagnostic reads cap=2 source=burst" "printf '%s' \"\$diag9b\" | grep -q 'select same-target cap=2 source=burst'"
 unset BURST_LANE_SH BUILD_SAME_TARGET_CAP_BURST
+
+# =========================================================================
+# AC16 — PRD-build-burst-gate-canary-invariant R14: cap never unbounded
+# under burst. mk_fake_burst_no_width prints gate_ready=true with NEITHER
+# `width` NOR `run_slots.cap` (the exact shape a status probe returns when
+# the box hasn't published either key yet); mk_fake_burst_slots_cap prints
+# only `run_slots.cap` (no `width`) as the regression-guard fixture.
+# =========================================================================
+mk_fake_burst_no_width() {
+  cat > "$FAKE/burst-lane.sh" <<'EOF'
+#!/usr/bin/env bash
+if [ "${1:-}" = "status" ] && [ "${2:-}" = "--json" ]; then
+  printf '{"active":true,"gate_ready":"true"}\n'
+  exit 0
+fi
+exit 1
+EOF
+  chmod +x "$FAKE/burst-lane.sh"
+}
+mk_fake_burst_slots_cap() {
+  local cap="$1"
+  cat > "$FAKE/burst-lane.sh" <<EOF
+#!/usr/bin/env bash
+if [ "\${1:-}" = "status" ] && [ "\${2:-}" = "--json" ]; then
+  printf '{"active":true,"gate_ready":"true","run_slots":{"cap":$cap}}\n'
+  exit 0
+fi
+exit 1
+EOF
+  chmod +x "$FAKE/burst-lane.sh"
+}
+
+echo "=== AC16a: burst active, gate_ready=true, no width/run_slots.cap, BUILD_DISTINCT_TARGETS=0 -> 1 admitted, cap=1 source=blocked ==="
+mk_fake_burst_no_width
+export BURST_LANE_SH="$FAKE/burst-lane.sh" BUILD_DISTINCT_TARGETS=0
+admitted16a="$(run_pool)"
+expect "AC16a: exactly one of five admitted (fail closed, not unbounded)" "[ \"$admitted16a\" -eq 1 ]"
+diag16a="$(BUILD_MAX_BRANCHES=30 "$SG" satcap-mcphost-1 redbaron "$T/clone" 0 "" 2>&1 >/dev/null)"
+expect "AC16a: diagnostic reads cap=1 source=blocked cap_source=blocked" "printf '%s' \"\$diag16a\" | grep -q 'cap=1 source=blocked cap_source=blocked'"
+diag16a_block="$(BUILD_MAX_BRANCHES=30 "$SG" satcap-mcphost-1 redbaron "$T/clone" 0 "$TARGET" 2>&1 >/dev/null)"
+expect "AC16a: second candidate's diagnostic names cause=cap-unbounded-under-burst" "printf '%s' \"\$diag16a_block\" | grep -q 'cause=cap-unbounded-under-burst'"
+journal16a="$(cat "$SELECT_GUARD_JOURNAL" 2>/dev/null || true)"
+expect "AC16a: journal has same-target-blocked cause=cap-unbounded-under-burst" "printf '%s' \"\$journal16a\" | grep -q 'same-target-blocked' && printf '%s' \"\$journal16a\" | grep -q 'cause=cap-unbounded-under-burst'"
+unset BURST_LANE_SH BUILD_DISTINCT_TARGETS
+
+echo "=== AC16b: regression guard — same fixture shape, run_slots.cap=4 present -> 4 admitted, cap=4 source=burst ==="
+mk_fake_burst_slots_cap 4
+export BURST_LANE_SH="$FAKE/burst-lane.sh" BUILD_DISTINCT_TARGETS=0 BUILD_SAME_TARGET_CAP_BURST=4
+admitted16b="$(run_pool)"
+expect "AC16b: four of five admitted (run_slots.cap fallback still resolves)" "[ \"$admitted16b\" -eq 4 ]"
+diag16b="$(BUILD_MAX_BRANCHES=30 "$SG" satcap-mcphost-1 redbaron "$T/clone" 0 "" 2>&1 >/dev/null)"
+expect "AC16b: diagnostic reads cap=4 source=burst" "printf '%s' \"\$diag16b\" | grep -q 'select same-target cap=4 source=burst'"
+unset BURST_LANE_SH BUILD_DISTINCT_TARGETS BUILD_SAME_TARGET_CAP_BURST
 
 echo "-----"
 if [ "$fail" -eq 0 ]; then
