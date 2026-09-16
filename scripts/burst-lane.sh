@@ -9075,7 +9075,14 @@ prove_inflight_guard() {
 # — this is the exact operator recovery step the 2026-09-13 incident needed
 # and didn't have (a raw hcloud delete plus a stale session.json left
 # behind after it).
-cmd_down_force() {
+# PRD-build-burst-state-keyed-by-server-v2 requirement 4: force_down_one_box
+# assumes box_context has already been pointed at the box it should tear
+# down — cmd_down_force below calls this once per active box (current-first
+# order from list_active_box_ids) instead of acting on `current` alone, so
+# `down --force` with two boxes up force-deletes both (AC5) instead of only
+# whichever one `current` happened to name. Never exits — the loop in
+# cmd_down_force owns that.
+force_down_one_box() {
   # requirement 2: `--force` is the one caller allowed to override a live
   # prove-inflight marker (explicit operator escalation) — it never blocks
   # on it, but the override is still journaled, not silent.
@@ -9098,40 +9105,49 @@ cmd_down_force() {
   fi
   session_known_hosts_remove
   rm -f "$STATE_FILE" "$SERVED_FILE"
+}
+
+cmd_down_force() {
+  # requirement 4: iterate every box list_active_box_ids knows about
+  # (current-first), not just `current` — a zero-box result (genuinely
+  # nothing tracked anywhere) falls back to the single, pre-multibox
+  # "nothing tracked" line, byte-identical to before this requirement
+  # (Goal 2).
+  local box_ids; box_ids="$(list_active_box_ids)"
+  if [ -z "$box_ids" ]; then
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  down  decision=force-deleted  (server_id=none — nothing tracked)"
+    echo "decision=force-deleted"
+    reap_volumes >/dev/null 2>&1 || true
+    exit 0
+  fi
+  local id
+  while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    box_context "$id"
+    force_down_one_box
+    echo "decision=force-deleted"
+  done <<<"$box_ids"
   # Requirement 6: `down --force` sweeps for a stranded volume too, same as
   # `reap --volumes` — bypassing every keep rule (this function's whole
   # point) includes the volume's used_pct keep-check, not just the box.
   reap_volumes >/dev/null 2>&1 || true
-  echo "decision=force-deleted"
   exit 0
 }
 
-cmd_down() {
-  local more_work=0
-  if [ "${1:-}" = "--force" ]; then
-    cmd_down_force
-  fi
-  # PRD-build-burst-teardown-evidence requirement 7/AC8: a scheduled soft-
-  # down is refused outright — the 2026-09-15 incident's `burst-soft-down-
-  # 0648` one-shot timer deleted a box 3 minutes into its own adoption.
-  # Operators who want a delayed teardown use the TTL; this lane never
-  # schedules its own delete via an external timer again.
-  if [ "${1:-}" = "--at" ]; then
-    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  down  refused  (cause=scheduled-teardown-disabled requested_at=${2:-})"
-    echo "refused: scheduled soft-down is disabled — use the TTL instead" >&2
-    exit 2
-  fi
-  [ "${1:-}" = "--more-work-queued" ] && more_work=1
-
-  # PRD-build-cost-attribution requirement 4: cursor-guarded, so this is a
-  # no-op after the first `down` call of the UTC day — independent of
-  # today's keep/scheduled/deleted decision below, since the wrapper may
-  # call `down` many times a day but the rollup line must land exactly once.
-  maybe_daily_rollup
-
+# PRD-build-burst-state-keyed-by-server-v2 requirement 4: down_one_box is the
+# pre-multibox cmd_down body verbatim, minus flag parsing (cmd_down does that
+# once per invocation, not once per box) — every `exit` below became a
+# `return` so cmd_down's loop can move on to the next box after this one
+# decides. Assumes box_context already points at the box to decide for; $2
+# is the more_work flag cmd_down parsed once for the whole pass. Returns 0
+# for keep/deleted/scheduled/probe-unavailable/prove-inflight, 1 for
+# LEAK-FLAG — cmd_down aggregates these across every box in the pass so one
+# box's LEAK-FLAG never stops the others from being decided.
+down_one_box() {
+  local more_work="${2:-0}"
   if ! state_active; then
     echo "no-active-session"
-    exit 0
+    return 0
   fi
 
   local id boot_epoch; id="$(state_read server_id)"; boot_epoch="$(state_read boot_epoch)"
@@ -9142,13 +9158,13 @@ cmd_down() {
   # bookkeeping) cause.
   if teardown_probe_unavailable_guard down "$id" >/dev/null; then
     echo "decision=keep cause=probe-unavailable"
-    exit 0
+    return 0
   fi
 
   # requirement 2: a live prove owns this box — never delete/schedule out
   # from under it. Checked before the reap sweep below too.
   if prove_inflight_guard down "$id"; then
-    exit 0
+    return 0
   fi
 
   # PRD-build-burst-remote-disk-guard requirement 6: reap runs on every
@@ -9190,7 +9206,7 @@ cmd_down() {
         journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  down  decision=keep  (server_id=$id)"
       fi
       echo "decision=keep"
-      exit 0
+      return 0
     fi
     local result_u hrs_u eur_u served_u alive_u
     if result_u="$(teardown_and_delete "$id" down)"; then
@@ -9199,11 +9215,11 @@ cmd_down() {
       state_clear
       session_known_hosts_remove
       echo "decision=deleted"
-      exit 0
+      return 0
     fi
     journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  down  LEAK-FLAG  (server_id=$id action=page-a-human — destroy failed after 3 retries)"
     echo "LEAK-FLAG: server $id did not confirm destroyed after 3 retries"
-    exit 1
+    return 1
   fi
 
   # No rust work remains anywhere in build-queue/. Schedule deletion for the
@@ -9225,11 +9241,11 @@ cmd_down() {
       state_clear
       session_known_hosts_remove
       echo "decision=deleted"
-      exit 0
+      return 0
     fi
     journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  down  LEAK-FLAG  (server_id=$id action=page-a-human — destroy failed after 3 retries)"
     echo "LEAK-FLAG: server $id did not confirm destroyed after 3 retries"
-    exit 1
+    return 1
   fi
 
   state_write "server_id=$id" "ip=$(state_read ip)" "server_type=$(state_read server_type)" \
@@ -9244,6 +9260,54 @@ cmd_down() {
     "phase=$(state_read_phase)" "phase_epoch=$(state_read phase_epoch)"
   journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  down  decision=scheduled  (server_id=$id teardown_at=$(date -u -d "@$window_start" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "$window_start"))"
   echo "decision=scheduled"
+  return 0
+}
+
+cmd_down() {
+  local more_work=0
+  if [ "${1:-}" = "--force" ]; then
+    cmd_down_force
+  fi
+  # PRD-build-burst-teardown-evidence requirement 7/AC8: a scheduled soft-
+  # down is refused outright — the 2026-09-15 incident's `burst-soft-down-
+  # 0648` one-shot timer deleted a box 3 minutes into its own adoption.
+  # Operators who want a delayed teardown use the TTL; this lane never
+  # schedules its own delete via an external timer again.
+  if [ "${1:-}" = "--at" ]; then
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  down  refused  (cause=scheduled-teardown-disabled requested_at=${2:-})"
+    echo "refused: scheduled soft-down is disabled — use the TTL instead" >&2
+    exit 2
+  fi
+  [ "${1:-}" = "--more-work-queued" ] && more_work=1
+
+  # PRD-build-cost-attribution requirement 4: cursor-guarded, so this is a
+  # no-op after the first `down` call of the UTC day — independent of
+  # today's keep/scheduled/deleted decision below, since the wrapper may
+  # call `down` many times a day but the rollup line must land exactly once.
+  maybe_daily_rollup
+
+  # PRD-build-burst-state-keyed-by-server-v2 requirement 4: iterate every
+  # active box (current-first order from list_active_box_ids) instead of
+  # acting on `current` alone — a zero-box result is the pre-multibox
+  # "nothing active" line, byte-identical to before this requirement
+  # (Goal 2); a single active box runs down_one_box exactly once, through
+  # box_context's own "already current" short-circuit, so the literal
+  # per-box paths and stdout are unchanged too.
+  local box_ids; box_ids="$(list_active_box_ids)"
+  if [ -z "$box_ids" ]; then
+    echo "no-active-session"
+    exit 0
+  fi
+
+  local id rc leak=0
+  while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    box_context "$id"
+    down_one_box "$id" "$more_work"
+    rc=$?
+    [ "$rc" -eq 1 ] && leak=1
+  done <<<"$box_ids"
+  [ "$leak" -eq 1 ] && exit 1
   exit 0
 }
 
@@ -9251,16 +9315,21 @@ cmd_down() {
 # Safety-net TTL check, independent of down's rust-work logic — the backstop
 # against a forgotten box. Intended to be invoked periodically (a systemd
 # timer wiring it up is a follow-on step, not done in this pass).
-cmd_watchdog() {
+# PRD-build-burst-state-keyed-by-server-v2 requirement 4: watchdog_one_box is
+# the pre-multibox cmd_watchdog body verbatim (every `exit` -> `return`) —
+# see down_one_box's own header for the shared per-box convention. Assumes
+# box_context already points at the box to check. Returns 0 for ok/keep/
+# teardown/deferred, 1 for LEAK-FLAG.
+watchdog_one_box() {
   if ! state_active; then
     echo "no-active-session"
-    exit 0
+    return 0
   fi
   # PRD-build-burst-teardown-evidence requirement 3/AC2: same guard as
   # `down` — a probe that cannot answer changes nothing.
   if teardown_probe_unavailable_guard watchdog "$(state_read server_id)" >/dev/null; then
     echo "decision=keep cause=probe-unavailable"
-    exit 0
+    return 0
   fi
   # PRD-build-burst-remote-disk-guard requirement 6: same as `down` — reap
   # runs on every watchdog pass, before the due/not-due decision, never
@@ -9284,13 +9353,13 @@ cmd_watchdog() {
 
   if [ "$due" -eq 0 ]; then
     echo "ok: age=${age}s < ttl=${ttl_secs}s"
-    exit 0
+    return 0
   fi
 
   # requirement 2: a live prove owns this box — never delete out from under
   # it, TTL-due or not; watchdog just gets another pass at it later.
   if prove_inflight_guard watchdog "$id"; then
-    exit 0
+    return 0
   fi
 
   # The watchdog is a teardown path too — same hygiene (dirty sweep, gate
@@ -9310,14 +9379,35 @@ cmd_watchdog() {
     state_clear
     session_known_hosts_remove
     echo "watchdog teardown: $id (${alive}m)"
-    exit 0
+    return 0
   elif [ "$rc" -eq 2 ]; then
     echo "watchdog: teardown deferred (setup-grace)"
-    exit 0
+    return 0
   fi
   journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  watchdog  LEAK-FLAG  (server_id=$id action=page-a-human — destroy failed after 3 retries)"
   echo "LEAK-FLAG: server $id did not confirm destroyed after 3 retries"
-  exit 1
+  return 1
+}
+
+cmd_watchdog() {
+  # PRD-build-burst-state-keyed-by-server-v2 requirement 4: iterate every
+  # active box instead of acting on `current` alone — see cmd_down's own
+  # comment for the zero/one-box byte-identical-behavior rationale.
+  local box_ids; box_ids="$(list_active_box_ids)"
+  if [ -z "$box_ids" ]; then
+    echo "no-active-session"
+    exit 0
+  fi
+  local id rc leak=0
+  while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    box_context "$id"
+    watchdog_one_box
+    rc=$?
+    [ "$rc" -eq 1 ] && leak=1
+  done <<<"$box_ids"
+  [ "$leak" -eq 1 ] && exit 1
+  exit 0
 }
 
 # ---- idle-guard (PRD-build-burst-teardown-lifecycle requirement 1/4) --------
@@ -9335,16 +9425,25 @@ cmd_watchdog() {
 # `burst-lane.sh idle-guard` instead of a raw hcloud call is a follow-on
 # step outside this repo (the existing timer's unit files live under
 # ~/dotfiles, a separate repo this PRD's build_into does not cover).
-cmd_idle_guard() {
+# PRD-build-burst-state-keyed-by-server-v2 requirement 4: idle_guard_one_box
+# is the pre-multibox cmd_idle_guard body verbatim (every `exit` -> `return`)
+# — see down_one_box's own header for the shared per-box convention. Assumes
+# box_context already points at the box to check. Returns 0 for ok/keep/
+# teardown/deferred, 1 for LEAK-FLAG. AC4: with one busy box and one idle
+# box, cmd_idle_guard's loop below calls this once per box, so a busy box's
+# runs_served>=1 correctly makes THIS call a no-op while the idle box's own
+# call still tears it down.
+idle_guard_one_box() {
+  local multi="${1:-0}"
   if ! state_active; then
     echo "no-active-session"
-    exit 0
+    return 0
   fi
   # PRD-build-burst-teardown-evidence requirement 3/AC2: same guard as
   # `down`/`watchdog` — a probe that cannot answer changes nothing.
   if teardown_probe_unavailable_guard idle-guard "$(state_read server_id)" >/dev/null; then
     echo "decision=keep cause=probe-unavailable"
-    exit 0
+    return 0
   fi
   reap_orphans >/dev/null 2>&1 || true
 
@@ -9359,15 +9458,27 @@ cmd_idle_guard() {
     due=1
   fi
   if [ "$due" -eq 0 ]; then
+    # PRD-build-burst-state-keyed-by-server-v2 requirement 4/AC4: a healthy
+    # box's every-poll "not idle" pass stays silent in the journal in the
+    # single-box case (Goal 2 — an idle-guard timer fires often, and this
+    # branch is the common case; journaling it every pass would spam the
+    # live journal for no operator benefit). With more than one box in this
+    # PASS (multi=1, set by cmd_idle_guard's own box count), AC4 needs a
+    # decision line attributable to the box idle-guard chose NOT to touch
+    # too, so a human reading the journal after a mixed busy/idle pass sees
+    # both boxes' outcomes, not just the one that got deleted.
+    if [ "$multi" -eq 1 ]; then
+      journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  idle-guard  decision=keep  (server_id=$id runs_served=$runs_served age_s=$age)"
+    fi
     echo "ok: idle-guard sees no idle condition (runs_served=$runs_served age=${age}s)"
-    exit 0
+    return 0
   fi
 
   # requirement 2: a live prove owns this box (a fixture/human `prove` run
   # against runs_served=0 is exactly the idle shape below) — never delete
   # out from under it.
   if prove_inflight_guard idle-guard "$id"; then
-    exit 0
+    return 0
   fi
 
   local result rc hrs eur served alive teardown_cause
@@ -9379,14 +9490,37 @@ cmd_idle_guard() {
     state_clear
     session_known_hosts_remove
     echo "idle-guard teardown: $id (${alive}m)"
-    exit 0
+    return 0
   elif [ "$rc" -eq 2 ]; then
     echo "idle-guard: teardown deferred (setup-grace)"
-    exit 0
+    return 0
   fi
   journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  idle-guard  LEAK-FLAG  (server_id=$id action=page-a-human — destroy failed after 3 retries)"
   echo "LEAK-FLAG: server $id did not confirm destroyed after 3 retries"
-  exit 1
+  return 1
+}
+
+cmd_idle_guard() {
+  # PRD-build-burst-state-keyed-by-server-v2 requirement 4/AC4: iterate
+  # every active box instead of acting on `current` alone — see cmd_down's
+  # own comment for the zero/one-box byte-identical-behavior rationale.
+  local box_ids; box_ids="$(list_active_box_ids)"
+  if [ -z "$box_ids" ]; then
+    echo "no-active-session"
+    exit 0
+  fi
+  local box_count; box_count="$(wc -l <<<"$box_ids")"
+  local multi=0; [ "$box_count" -gt 1 ] && multi=1
+  local id rc leak=0
+  while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    box_context "$id"
+    idle_guard_one_box "$multi"
+    rc=$?
+    [ "$rc" -eq 1 ] && leak=1
+  done <<<"$box_ids"
+  [ "$leak" -eq 1 ] && exit 1
+  exit 0
 }
 
 # ---- sub-cap (requirement 7 formula) -----------------------------------------

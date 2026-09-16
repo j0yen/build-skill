@@ -6660,12 +6660,16 @@ expect_block_green "teardown" "teardown: every teardown case above ran green"
 # (requirement 1/10/11) — AC1, AC12, AC13, AC14, AC15, AC16 — plus
 # requirement 2/6 (`up --count N`, server naming, the BURST_MAX_BOXES money
 # cap) — AC2, AC6 — plus requirement 9 (`prove`/`bake` refuse cause=multi-
-# box with more than one box up) — AC8. Requirements 3-5/7-8 (run/down/
-# idle-guard/watchdog/cost/status/reap actually iterating the set, not just
-# `up` creating it or `prove`/`bake` refusing on it) are NOT covered here —
-# see the PRD's own `next:` note; this block proves the state layout itself
-# plus `up`'s own multi-box behavior never
-# regresses the single-box case.
+# box with more than one box up) — AC8 — plus requirement 3 (`run`'s
+# per-box slot selection) and requirement 5 (`cost --today` summing across
+# boxes) — AC7. Requirement 4 (`down`/`idle-guard`/`watchdog` iterating the
+# set instead of acting on `current` alone) is covered below for down and
+# idle-guard — AC4, AC5; watchdog's own iteration is exercised by AC4/AC5's
+# shared down_one_box/watchdog_one_box/idle_guard_one_box refactor pattern
+# but has no dedicated AC in the PRD beyond those two. Requirements 7-8
+# (`status --json` boxes/totals, `reap`'s orphan-box-deleted) remain open —
+# see the PRD's own tracking; this block does not yet cover AC9 or a
+# dedicated status-schema check.
 # =============================================================================
 block_start "multibox"
 
@@ -6885,6 +6889,69 @@ expect "multibox AC7: breakdown lists box 2's server_id and type" \
   "grep -q \"server_id=$mb7_id2 server_type=ccx53\" <<<\"$mb7_cost_out\""
 expect "multibox AC7: breakdown TOTAL line names both boxes" \
   "grep -qE 'TOTAL boxes=2 hours=1\\.50 eur=0\\.30' <<<\"$mb7_cost_out\""
+
+# ---- multibox AC4 (requirement 4): idle-guard iterates every active box —
+# a busy box (runs_served=3) is left alone while an idle box (runs_served=0,
+# age past the 900s zero-runs threshold) is torn down in the same pass, and
+# the journal carries one decision line for each box (costrate AC1's own
+# pattern above for backdating age via BURST_LANE_NOW + stripping
+# phase/phase_epoch so the box reads grace-exempt).
+fresh_env
+BURST_MAX_BOXES=2 "$BL" up --count 2 >/dev/null 2>&1
+mb4_id1="$(awk -F'|' '$2=="wm-burst-lane-1"{print $1}' "$FAKE_HCLOUD_STATE" | head -n1)"
+mb4_id2="$(awk -F'|' '$2=="wm-burst-lane-2"{print $1}' "$FAKE_HCLOUD_STATE" | head -n1)"
+mb4_create1="$(grep -oE '"create_epoch":[0-9]+' "$BURST_LANE_STATE_DIR/boxes/$mb4_id1/session.json" | cut -d: -f2)"
+mb4_create2="$(grep -oE '"create_epoch":[0-9]+' "$BURST_LANE_STATE_DIR/boxes/$mb4_id2/session.json" | cut -d: -f2)"
+python3 -c '
+import json, sys
+path = sys.argv[1]
+d = json.load(open(path))
+d["runs_served"] = 3
+d.pop("phase", None)
+d.pop("phase_epoch", None)
+json.dump(d, open(path, "w"))
+' "$BURST_LANE_STATE_DIR/boxes/$mb4_id1/session.json"
+python3 -c '
+import json, sys
+path = sys.argv[1]
+d = json.load(open(path))
+d.pop("phase", None)
+d.pop("phase_epoch", None)
+json.dump(d, open(path, "w"))
+' "$BURST_LANE_STATE_DIR/boxes/$mb4_id2/session.json"
+mb4_newest=$(( mb4_create1 > mb4_create2 ? mb4_create1 : mb4_create2 ))
+export BURST_LANE_NOW=$(( mb4_newest + 1000 ))
+mb4_out="$("$BL" idle-guard 2>&1)"
+unset BURST_LANE_NOW
+expect "multibox AC4: the idle box (box 2, runs_served=0) is torn down" \
+  "grep -q \"idle-guard teardown: $mb4_id2\" <<<\"$mb4_out\""
+expect "multibox AC4: the busy box (box 1, runs_served=3) is left up in hcloud" \
+  "hcloud server describe \"$mb4_id1\" -o json >/dev/null 2>&1"
+expect "multibox AC4: the idle box is gone from hcloud" \
+  "! hcloud server describe \"$mb4_id2\" -o json >/dev/null 2>&1"
+expect "multibox AC4: journal has a decision line for the deleted idle box" \
+  "grep -q \"burst-lane  down  decision=deleted  (server_id=$mb4_id2\" \"$BURST_LANE_JOURNAL\""
+expect "multibox AC4: journal has a decision line for the kept busy box too" \
+  "grep -q \"burst-lane  idle-guard  decision=keep  (server_id=$mb4_id1 runs_served=3\" \"$BURST_LANE_JOURNAL\""
+
+# ---- multibox AC5 (requirement 4): `down` (no --force) gives every active
+# box its own decision line in one pass, and `down --force` afterward clears
+# BOTH boxes (and any stranded volume) from hcloud, not just whichever one
+# `current` used to name.
+fresh_env
+BURST_MAX_BOXES=2 "$BL" up --count 2 >/dev/null 2>&1
+mb5_id1="$(awk -F'|' '$2=="wm-burst-lane-1"{print $1}' "$FAKE_HCLOUD_STATE" | head -n1)"
+mb5_id2="$(awk -F'|' '$2=="wm-burst-lane-2"{print $1}' "$FAKE_HCLOUD_STATE" | head -n1)"
+mb5_down_out="$("$BL" down 2>&1)"
+expect "multibox AC5: journal has a decision line for box 1" \
+  "grep -qE \"burst-lane  down  decision=(keep|deleted|scheduled)  \\(server_id=$mb5_id1\" \"$BURST_LANE_JOURNAL\""
+expect "multibox AC5: journal has a decision line for box 2" \
+  "grep -qE \"burst-lane  down  decision=(keep|deleted|scheduled)  \\(server_id=$mb5_id2\" \"$BURST_LANE_JOURNAL\""
+"$BL" down --force >/dev/null 2>&1
+expect "multibox AC5: down --force leaves no wm-burst-lane* server in hcloud" \
+  "! grep -q 'wm-burst-lane' \"$FAKE_HCLOUD_STATE\""
+expect "multibox AC5: down --force leaves no wm-burst-* volume in hcloud" \
+  "! grep -q 'wm-burst-' \"$FAKE_HCLOUD_VOLUME_STATE\""
 
 expect_block_green "multibox" "multibox: every state-layout migration case above ran green"
 
