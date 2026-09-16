@@ -63,6 +63,9 @@ SELFTEST_REGISTRY=(
   scripts/carbon-lane-install-selftest.sh
   scripts/cli-register-selftest.sh
   scripts/dispatch-distrust-selftest.sh
+  scripts/gate-red-summary-selftest.sh
+  scripts/gate-red-tick-selftest.sh
+  scripts/gates-banner-selftest.sh
   scripts/gatedebt-selftest.sh
   scripts/gatephase-selftest.sh
   scripts/install-hcloud-selftest.sh

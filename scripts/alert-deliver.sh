@@ -3,7 +3,7 @@
 # invariants requirement 4).
 #
 # Usage:
-#   alert-deliver.sh <rule> <repo> <evidence-file> [--value <n>]
+#   alert-deliver.sh <rule> <repo> <evidence-file> [--value <n>] [--comment]
 #   alert-deliver.sh resolve <rule> <repo>
 #
 # Main form: appends one line to state/alerts.banner
@@ -16,6 +16,19 @@
 # on the same day is a silent no-op (exit 0, nothing appended, nothing
 # run) — scripts/lib/alert-marker.sh owns the marker file both this script
 # and manifest-invariants.sh check.
+#
+# `--comment` (PRD-build-gate-red-alarm-invariant R3/R4) bypasses that
+# same-day idempotency gate for THIS call only — for a rule that needs to
+# UPDATE today's already-delivered alarm (a change in what it's alarming
+# about, or an escalation) rather than stay silent until tomorrow. The
+# banner still gains a line and NOTIFY_CMD still runs exactly as the main
+# form does; the only behavioral difference is on the shipped gh-issue
+# default (no custom `$NOTIFY_CMD` set), where `--comment` is forwarded to
+# `notify-gh-issue.sh` so it posts a comment on today's existing issue
+# instead of silently finding-and-skipping it. A custom `$NOTIFY_CMD`
+# (e.g. a test stub) is unaffected by `--comment` beyond the gate itself —
+# no new channel, per this PRD's Non-goals; the caller's own evidence/value
+# already carries whatever changed.
 #
 # Effective NOTIFY_CMD (Operator-authorization, Joe 2026-09-15T14:41:01Z,
 # scope: "default NOTIFY_CMD delivery = gh issue create ... plus
@@ -72,18 +85,20 @@ fi
 
 rule="${1:-}"; repo="${2:-}"; evidence_file="${3:-}"
 [ -n "$rule" ] && [ -n "$repo" ] && [ -n "$evidence_file" ] || \
-  die "usage: alert-deliver.sh <rule> <repo> <evidence-file> [--value <n>]" 2
+  die "usage: alert-deliver.sh <rule> <repo> <evidence-file> [--value <n>] [--comment]" 2
 shift 3
 
 value=""
+comment=false
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --value) value="$2"; shift 2 ;;
+    --comment) comment=true; shift ;;
     *) die "unknown argument: $1" 2 ;;
   esac
 done
 
-if alert_marker_exists "$rule" "$repo"; then
+if [ "$comment" = false ] && alert_marker_exists "$rule" "$repo"; then
   log "already delivered today: rule=$rule repo=$repo (idempotent no-op)"
   exit 0
 fi
@@ -111,6 +126,7 @@ if [ -n "${NOTIFY_CMD:-}" ]; then
   effective_cmd="$NOTIFY_CMD"
 elif command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
   effective_cmd="$NOTIFY_GH_ISSUE $rule $repo $evidence_file"
+  [ "$comment" = true ] && effective_cmd="$effective_cmd --comment"
 fi
 
 if [ -n "$effective_cmd" ]; then

@@ -603,6 +603,20 @@ fi
 
 if [ "$DRY_RUN" = false ]; then
   journal_line --file "$JOURNAL" "$(date -u +%Y-%m-%dT%H:%M:%SZ)  select-tick  admitted=$admitted_count skipped=$skipped_count pool=$pool_count cap=$limit distinct_targets=$distinct_targets burst_session=$burst_session sub_cap=$same_target_cap pinned=$pinned_count lane=$LANE_ARG"
+
+  # PRD-build-gate-red-alarm-invariant R2: every tick computes and journals
+  # the gate-red aggregate directly after its own tick-summary line above —
+  # a red gate must never again go unreported the way six mcphost branches
+  # did for 7h20m on 2026-09-16 with nothing anywhere saying "0 green, 6
+  # red" (see that PRD's TL;DR / j0yen/prds#9). GATE_RED_TICK_JOURNAL pins
+  # the write to this SAME $JOURNAL (see gate-red-tick.sh's own header for
+  # why that matters under an isolated/overridden JOURNAL). Best-effort:
+  # gate-red-tick.sh always exits 0 and journals its own failures rather
+  # than ever failing a tick over an alarm-plumbing problem.
+  GATE_RED_TICK="${GATE_RED_TICK:-$HERE/gate-red-tick.sh}"
+  if [ -x "$GATE_RED_TICK" ]; then
+    GATE_RED_TICK_JOURNAL="$JOURNAL" "$GATE_RED_TICK" >/dev/null 2>&1
+  fi
 fi
 
 exit 0

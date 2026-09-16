@@ -4,15 +4,26 @@
 # 2026-09-15T14:41:01Z: "default NOTIFY_CMD delivery = gh issue create in
 # j0yen/prds ... ship this as the default notifier, not a stub").
 #
-# Usage: notify-gh-issue.sh <rule> <repo> <evidence-file>
+# Usage: notify-gh-issue.sh <rule> <repo> <evidence-file> [--comment]
 #
-# Runs `gh issue create -R j0yen/prds --label alarm --title "[alarm]
-# <repo> <rule> <day>" --body-file <evidence-file>`. Idempotent per
-# (repo, rule, UTC day): searches OPEN issues in j0yen/prds for that exact
-# title first — a hit means today's issue already exists, so this exits 0
-# without creating a second one. Journals `notify gh-issue url=<url>` (a
-# newly created issue) or `notify gh-issue existing url=<url>` (found, not
-# created) via scripts/lib/journal.sh.
+# Default (no --comment): runs `gh issue create -R j0yen/prds --label
+# alarm --title "[alarm] <repo> <rule> <day>" --body-file <evidence-file>`.
+# Idempotent per (repo, rule, UTC day): searches OPEN issues in j0yen/prds
+# for that exact title first — a hit means today's issue already exists,
+# so this exits 0 without creating a second one. Journals `notify gh-issue
+# url=<url>` (a newly created issue) or `notify gh-issue existing
+# url=<url>` (found, not created) via scripts/lib/journal.sh.
+#
+# `--comment` (PRD-build-gate-red-alarm-invariant R3/R4): the caller
+# (alert-deliver.sh's own `--comment` pass-through) already knows today's
+# alarm needs an UPDATE, not silence-until-tomorrow — a changed set of red
+# slugs/families, or an escalation crossing a streak threshold. Finds
+# today's open issue by the same title lookup and runs `gh issue comment
+# <url> --body-file <evidence-file>`, journaling `notify gh-issue-comment
+# url=<url>`. If no matching open issue exists yet (the marker/caller
+# thought one did, but it doesn't — e.g. a human closed it), falls back to
+# the plain create path above rather than erroring, so an update request
+# never silently drops the alarm.
 #
 # Called by alert-deliver.sh with the banner line already on stdin (this
 # script ignores stdin — the evidence FILE is the body, not the banner
@@ -41,9 +52,17 @@ source "$HERE/lib/journal.sh"
 
 rule="${1:-}"; repo="${2:-}"; evidence_file="${3:-}"
 [ -n "$rule" ] && [ -n "$repo" ] && [ -n "$evidence_file" ] || {
-  echo "usage: notify-gh-issue.sh <rule> <repo> <evidence-file>" >&2
+  echo "usage: notify-gh-issue.sh <rule> <repo> <evidence-file> [--comment]" >&2
   exit 2
 }
+shift 3 || true
+comment_mode=false
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --comment) comment_mode=true; shift ;;
+    *) echo "notify-gh-issue: unknown argument: $1" >&2; exit 2 ;;
+  esac
+done
 
 if ! command -v gh >/dev/null 2>&1 || ! gh auth status >/dev/null 2>&1; then
   echo "notify-gh-issue: gh not available/authenticated — skipping" >&2
@@ -67,9 +86,21 @@ existing_url="$(gh issue list -R "$REPO" --state open --limit 100 \
   --json title,url --jq ".[] | select(.title == \"$title\") | .url" 2>/dev/null | head -1)"
 
 if [ -n "$existing_url" ]; then
+  if [ "$comment_mode" = true ]; then
+    comment_out="$(gh issue comment "$existing_url" -R "$REPO" --body-file "$evidence_file" 2>&1)"
+    comment_rc=$?
+    if [ "$comment_rc" -eq 0 ]; then
+      journal_line "$now  $repo  notify  gh-issue-comment url=$existing_url  (rule=$rule)"
+    else
+      journal_line "$now  $repo  notify  gh-issue-comment-failed  (rule=$rule rc=$comment_rc err=\"$(printf '%s' "$comment_out" | tr '\n' ' ' | head -c200)\")"
+    fi
+    exit 0
+  fi
   journal_line "$now  $repo  notify  gh-issue existing url=$existing_url  (rule=$rule)"
   exit 0
 fi
+# --comment with no existing issue found: fall through to the plain
+# create path below rather than dropping the update on the floor.
 
 # Best-effort: create the `alarm` label if it doesn't exist yet (a fresh
 # j0yen/prds has never needed it before this PRD).

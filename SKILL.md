@@ -3324,3 +3324,19 @@ The kernel tier (`memlog`, `provfs`, `agentns`) is opt-in at boot via
 `linux-wintermute`. Don't depend on it from the tick logic — `provfs`
 xattrs and `agentns` session ids are nice-to-have provenance, not
 required for any Phase 4 action.
+
+## Handoff
+
+**Start every handoff memory with the current gate verdict (R8,
+PRD-build-gate-red-alarm-invariant).** Run `scripts/handoff-header.sh`
+and put its output — the current `GATES(<h>h): green=<n> red=<n> ...`
+line — as the FIRST line of any handoff memory or note you write (a
+`project_handoff_<date>.md`-style memory, or an equivalent end-of-session
+summary). A human resuming a session, or a fresh Claude picking up mid-
+incident, must see the gate verdict before anything else — this is the
+same "first screen carries the verdict" invariant `gates-banner.sh`
+enforces for a live SessionStart (see Phase 1's gate-red aggregate,
+computed every tick by `scripts/gate-red-summary.sh` and journaled by
+`scripts/gate-red-tick.sh`). `handoff-header.sh` prints nothing (exit 0)
+if no tick has run yet on this host — in that case, note the gate state
+as unknown rather than omitting the line entirely.
