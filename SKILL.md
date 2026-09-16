@@ -1997,6 +1997,24 @@ end-of-pool.
 
 ### Dispatch
 
+**Escalating an operator decision (PRD-build-open-decision-escalation).**
+A branch that would otherwise write "Joe to decide", "(Joe)", or an
+equivalent open question straight into a handoff memory, a vision
+footnote, or its own `iter_log`/`blocked:` prose MUST also run
+`scripts/decisions.sh open "<question>" --owner joe [--repo <repo>]
+[--blocks <slug>,...]` — a decision that only lives in prose is
+structurally invisible to the next session and to every other blocked
+PRD (this is exactly the failure PRD-build-open-decision-escalation's
+Grounding traces: seven `(Joe)` questions across three days, zero
+surfaced by any banner). The row, not the prose, is now the record: the
+prose can still explain the question in context, but `decisions.sh open`
+is what makes it show up at the next SessionStart (`decisions-banner.sh`)
+and get nudged once a day (`decisions.sh nudge`, wired into
+`manifest-invariants.sh`). When Joe answers, `decisions.sh close <id>
+"<answer>"` appends the answer to every blocked slug's manifest
+`iter_log` automatically — a coordinator never needs to hand-copy the
+answer into each blocked PRD.
+
 Issue every entry of `select-tick.sh`'s `admitted[]` as **parallel Agent
 tool calls in a single tool-use message**, one Agent call per PRD. Use
 `subagent_type=general-purpose` unless the PRD frontmatter declares
