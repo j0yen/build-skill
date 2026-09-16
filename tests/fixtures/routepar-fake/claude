@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Fake `claude` CLI for routepar-selftest.sh — stands in for the headless
+# Sonnet review spawn inside extend-gate.sh's run_reviewer. Decision is
+# controllable via FAKE_REVIEWER_DECISION (default "pass") so tests can
+# drive both the "producer passes" and "producer fails" halves of AC4
+# without a real network call or model spend. FAKE_REVCLAUDE_RC forces
+# the invocation itself to fail (the mechanism-failure half of AC4, which
+# never even reaches the JSON below).
+set -uo pipefail
+if [ "${FAKE_REVCLAUDE_RC:-0}" != "0" ]; then
+  echo "fake claude: forced failure" >&2
+  exit "$FAKE_REVCLAUDE_RC"
+fi
+decision="${FAKE_REVIEWER_DECISION:-pass}"
+cat <<EOF
+{"schema":"autobuilder.reviewer_agent_receipt.v1","head_sha":"fake","intent_card_sha":"fake","decision":"$decision","block_reasons":[],"concern_reasons":[],"falsification":{"test_audit":"ok","panic_audit":"ok","unsafe_audit":"ok","public_api_audit":"ok","deps_audit":"ok","drift_audit":"ok","counter_attack":{"description":"n/a","test_skeleton":"n/a"}}}
+EOF
+exit 0

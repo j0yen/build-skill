@@ -1140,6 +1140,21 @@ if [ -x "$BURST_LANE_SH" ]; then
   fi
 fi
 
+# --- PRD-build-gate-route-parity-ledger (R1) -------------------------------
+# One route decision for this whole gate invocation, from
+# cargo-route.sh's own cargo_route_current() (the shim's own decision, not
+# a second guess — see that function's header) — every one of this run's
+# 25 producer receipts is stamped with it below (the "receipt route
+# stamp" sweep, right before the final `autobuilder gate` tally), and the
+# tick journal's own `gate` line carries it as `route=<value>` plus the
+# `routed=<n>/<receipts>` count derived from the same stamp.
+if command -v cargo_route_current >/dev/null 2>&1; then
+  GATE_ROUTE="$(cargo_route_current 2>/dev/null || echo local)"
+else
+  GATE_ROUTE="local"
+fi
+[ -n "$GATE_ROUTE" ] || GATE_ROUTE="local"
+
 t0=$(date +%s)
 blocking_notes=()
 note_block() { blocking_notes+=("$1"); echo "extend-gate: $1" >&2; }
@@ -1187,12 +1202,34 @@ fi
 # 1. audit.sh, when the crate has one. Feeds the risk-gate receipt; a
 #    non-zero exit here is logged but does not abort the run — the final
 #    `autobuilder gate` is authoritative (see file header).
+# PRD-build-gate-route-parity-ledger requirement 5 (R5/AC5): the block note
+# used to read a flat "exited non-zero" with no finding count and no
+# receipt path — a human had to open the receipt by hand to learn there
+# were 2 BLOCKING findings, or that the receipt itself was empty/
+# unreadable. Parsed the same way audit-checks.sh itself counts BLOCKING
+# findings (`jq -s '[.[] | select(.severity=="blocking")] | length'` —
+# the findings file is one JSON object per line, hence the slurp).
 _phase_t0=$(date +%s)
+risk_gate_receipt="$project_abs/target/autobuilder/receipts/risk-gate.json"
+risk_gate_receipt_rel="target/autobuilder/receipts/risk-gate.json"
+[ "$project_rel" = "." ] || risk_gate_receipt_rel="$project_rel/target/autobuilder/receipts/risk-gate.json"
 if [ -x "$repo/scripts/audit.sh" ]; then
   if ( cd "$repo" && ./scripts/audit.sh ) 9>&-; then
     record_phase risk-gate $(( $(date +%s) - _phase_t0 )) ok
   else
-    note_block "risk-gate — scripts/audit.sh exited non-zero (see risk-gate receipt for detail)"
+    _rg_blocking=""
+    if [ -s "$risk_gate_receipt" ]; then
+      _rg_blocking="$(jq -s '[.[] | select(.severity=="blocking")] | length' "$risk_gate_receipt" 2>/dev/null)"
+    fi
+    case "$_rg_blocking" in
+      ''|null)
+        _rg_bytes="$(wc -c < "$risk_gate_receipt" 2>/dev/null | tr -d '[:space:]')"
+        note_block "risk-gate — receipt unreadable (${_rg_bytes:-0} bytes)"
+        ;;
+      *)
+        note_block "risk-gate — ${_rg_blocking} BLOCKING finding(s), receipt $risk_gate_receipt_rel"
+        ;;
+    esac
     record_phase risk-gate $(( $(date +%s) - _phase_t0 )) fail
   fi
 else
@@ -1312,15 +1349,29 @@ fi
 # 6. reviewer-agent: prepare, spawn the independent review headlessly via
 #    `claude -p --model sonnet` (same tier /rustbuild routes it to; the
 #    autobuilder binary cannot spawn a Claude subagent itself), finalize.
+#
+# PRD-build-gate-route-parity-ledger requirement 4 (R4/AC4): a mechanism
+# failure in THIS run (prepare/claude/prompt/invocation/JSON-parse all
+# return here BEFORE `finalize` ever runs, so reviewer-agent.json on disk
+# is whatever the LAST successful run left — often a pass) used to call
+# note_block unconditionally, so a 25/25-pass gate line still carried a
+# "reviewer-agent — subagent did not return" note (09-15 22:48:50Z).
+# note_block moved out of this function — it only ever records the reason
+# in $_reviewer_fail_note now; the call site below decides whether that
+# reason is worth a note by reading reviewer-agent.json's own `.decision`
+# fresh off disk, so the note tracks the PRODUCER's verdict, never this
+# run's own plumbing trouble alone.
+_reviewer_fail_note=""
 run_reviewer() {
+  _reviewer_fail_note=""
   ( cd "$repo" && autobuilder reviewer-agent prepare --project "$project_rel" --base "$base_ref" ) 9>&- \
-    || { note_block "reviewer-agent — prepare exited non-zero"; return 1; }
+    || { _reviewer_fail_note="reviewer-agent — prepare exited non-zero"; return 1; }
   local req="$project_abs/target/autobuilder/review-request.json"
-  [ -f "$req" ] || { note_block "reviewer-agent — prepare did not write $req"; return 1; }
+  [ -f "$req" ] || { _reviewer_fail_note="reviewer-agent — prepare did not write $req"; return 1; }
   command -v claude >/dev/null 2>&1 \
-    || { note_block "reviewer-agent — claude CLI not on \$PATH (needed to spawn the independent review subagent)"; return 1; }
+    || { _reviewer_fail_note="reviewer-agent — claude CLI not on \$PATH (needed to spawn the independent review subagent)"; return 1; }
   [ -f "$REVIEWER_PROMPT" ] \
-    || { note_block "reviewer-agent — missing prompt $REVIEWER_PROMPT"; return 1; }
+    || { _reviewer_fail_note="reviewer-agent — missing prompt $REVIEWER_PROMPT"; return 1; }
 
   local out="$project_abs/target/autobuilder/review-output.json"
   local raw="$project_abs/target/autobuilder/review-output.raw.txt"
@@ -1336,7 +1387,7 @@ schema autobuilder.reviewer_agent_receipt.v1:
 {\"schema\":\"autobuilder.reviewer_agent_receipt.v1\",\"head_sha\":\"...\",\"intent_card_sha\":\"...\",\"decision\":\"pass|concern|block\",\"block_reasons\":[...],\"concern_reasons\":[{\"id\":\"...\",\"note\":\"...\"}],\"falsification\":{\"test_audit\":\"...\",\"panic_audit\":\"...\",\"unsafe_audit\":\"...\",\"public_api_audit\":\"...\",\"deps_audit\":\"...\",\"drift_audit\":\"...\",\"counter_attack\":{\"description\":\"...\",\"test_skeleton\":\"...\"}}}"
 
   if ! ( cd "$repo" && claude -p "$prompt" --model sonnet --permission-mode bypassPermissions --output-format text ) 9>&- >"$raw" 2>"$raw.err"; then
-    note_block "reviewer-agent — claude -p subagent invocation failed (see $raw.err)"
+    _reviewer_fail_note="reviewer-agent — claude -p subagent invocation failed (see $raw.err)"
     return 1
   fi
   if ! python3 -c "
@@ -1348,11 +1399,11 @@ if not m:
 obj = json.loads(m.group(0))
 json.dump(obj, open('$out', 'w'))
 " 2>>"$raw.err"; then
-    note_block "reviewer-agent — subagent did not return valid JSON (see $raw)"
+    _reviewer_fail_note="reviewer-agent — subagent did not return valid JSON (see $raw)"
     return 1
   fi
   ( cd "$repo" && autobuilder reviewer-agent finalize --project "$project_rel" --input "$out" ) 9>&- \
-    || { note_block "reviewer-agent — finalize rejected the subagent's output"; return 1; }
+    || { _reviewer_fail_note="reviewer-agent — finalize rejected the subagent's output"; return 1; }
 }
 
 # 7. ci-checks — needs `gh` authenticated against the pushed HEAD.
@@ -1500,10 +1551,23 @@ fi
 # main-scope semantics untouched).
 _phase_t0=$(date +%s)
 if [ "$scope" = branch ] || [ "${#blocking_notes[@]}" -eq 0 ]; then
-  if run_reviewer; then
-    record_phase reviewer $(( $(date +%s) - _phase_t0 )) ok
-  else
+  reviewer_run_ok=true
+  run_reviewer || reviewer_run_ok=false
+  # PRD-build-gate-route-parity-ledger requirement 4: the note (and this
+  # phase's own ok/fail) tracks reviewer-agent.json's OWN `.decision` field
+  # fresh off disk, not run_reviewer()'s bash return code — a mechanism
+  # failure that never reached `finalize` leaves whatever decision the
+  # LAST successful review wrote (see run_reviewer's own header comment).
+  reviewer_agent_receipt="$project_abs/target/autobuilder/receipts/reviewer-agent.json"
+  reviewer_decision="$(jq -r '.decision // empty' "$reviewer_agent_receipt" 2>/dev/null)"
+  if [ "$reviewer_decision" = "block" ]; then
+    note_block "${_reviewer_fail_note:-reviewer-agent — decision=block (see $reviewer_agent_receipt)}"
     record_phase reviewer $(( $(date +%s) - _phase_t0 )) fail
+  else
+    if ! $reviewer_run_ok; then
+      echo "extend-gate: ${_reviewer_fail_note:-reviewer-agent — mechanism failure} (suppressed — reviewer-agent's last recorded decision is '${reviewer_decision:-none}', not block)" >&2
+    fi
+    record_phase reviewer $(( $(date +%s) - _phase_t0 )) ok
   fi
 else
   echo "extend-gate: reviewer skipped — ${#blocking_notes[@]} block(s) already recorded (no Sonnet spend on a red gate)"
@@ -1516,6 +1580,44 @@ else
   journal_line --file "$journal" "$(date -u +%FT%TZ)  gate  ${repo##*/}  reviewer-skipped  (blocks=${#blocking_notes[@]} head=${head_now:0:7})"
   record_phase reviewer 0 skip
 fi
+
+# --- PRD-build-gate-route-parity-ledger requirement 1 (R1/AC1) ------------
+# Stamp every producer receipt this run has written or refreshed so far
+# with `"route": "<GATE_ROUTE>"` — one sweep, after every producer above
+# (steps 1-8, including the 17 extended-receipts producers, all of which
+# land in the same receipts/ dir) has had its chance to write/refresh its
+# own receipt, and BEFORE the final `autobuilder gate` tally reads them
+# fresh off disk. Never touches a producer's pass/fail verdict, never
+# renames an existing key (Technical considerations) — jq's `.route = $r`
+# only ever adds or overwrites this one key. A receipt jq can't parse (or
+# a write that races a producer still holding the file) is skipped, not
+# fatal — a missing route on one stale/malformed file is a --parity
+# `route=unknown` line (Migration/compatibility), never a gate abort.
+# PRD-build-gate-phase-timing's own invariant (that PRD's AC4: "the sum
+# of phase seconds is within 5% of wall or the line carries
+# unattributed:<s>") applies to every script second, this sweep included
+# — it gets its own timed phase (record_phase below) rather than landing
+# as silent unattributed time between "reviewer" and "gate".
+_phase_t0=$(date +%s)
+receipts_dir="$project_abs/target/autobuilder/receipts"
+routed_n=0
+receipts_total=0
+if [ -d "$receipts_dir" ]; then
+  for _rf in "$receipts_dir"/*.json; do
+    [ -f "$_rf" ] || continue
+    _rf_tmp="$(mktemp "${TMPDIR:-/tmp}/extend-gate-route-stamp.XXXXXX")"
+    if jq --arg route "$GATE_ROUTE" '.route = $route' "$_rf" > "$_rf_tmp" 2>/dev/null; then
+      mv "$_rf_tmp" "$_rf"
+    else
+      rm -f "$_rf_tmp" 2>/dev/null || true
+    fi
+    receipts_total=$((receipts_total + 1))
+    case "$GATE_ROUTE" in burst:*) routed_n=$((routed_n + 1)) ;; esac
+  done
+fi
+routed_field="routed=$routed_n/$receipts_total"
+record_phase route-stamp $(( $(date +%s) - _phase_t0 )) ok
+
 _phase_t0=$(date +%s)
 gate_out="$(exec 9>&-; cd "$repo" && autobuilder gate --project "$project_rel" 2>&1)"
 gate_rc=$?
@@ -1564,7 +1666,17 @@ fi
 wall=$(( $(date +%s) - t0 ))
 blockers_csv=""
 if [ "${#blocking_notes[@]}" -gt 0 ]; then
-  blockers_csv="$(IFS='|'; echo "${blocking_notes[*]}")"
+  # PRD-build-gate-route-parity-ledger requirement 2 (R2/AC2): each
+  # blocking producer's own name (the text before the first " — ") is
+  # suffixed "@<route>" — one route for the whole run (GATE_ROUTE, R1),
+  # never a per-producer re-guess — so a journal reader can tell "was this
+  # block caused by the box" without a triage session. Detail text after
+  # the em dash is untouched.
+  _blocking_routed=()
+  for _bn in "${blocking_notes[@]}"; do
+    _blocking_routed+=("$(printf '%s' "$_bn" | sed -E "s/^([^ ]+) — /\\1@${GATE_ROUTE} — /")")
+  done
+  blockers_csv="$(IFS='|'; echo "${_blocking_routed[*]}")"
 fi
 
 # PRD-build-branch-gate-scope-artifacts requirement 4 (AC5): names of the
@@ -1677,9 +1789,10 @@ if $record_baseline; then
   # (requirement 1, AC1).
   scope_prefix=""
   [ "$scope" = branch ] && scope_prefix="scope=branch slug=$slug "
-  journal_line --file "$journal" "$(printf '%s  gate  %s  record-baseline  (%shead=%s base=%s %s wall=%ss %s lock_wait=%ss cargo=burst:%s/local:%s)' \
+  journal_line --file "$journal" "$(printf '%s  gate  %s  record-baseline  (%shead=%s base=%s %s wall=%ss %s lock_wait=%ss cargo=burst:%s/local:%s %s route=%s)' \
     "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$crate_name" "$scope_prefix" "$head_now" "$journal_base_field" \
-    "${summary:-gate: no-summary-line}" "$wall" "$phases_field" "$lock_wait" "$route_burst_n" "$route_local_n")"
+    "${summary:-gate: no-summary-line}" "$wall" "$phases_field" "$lock_wait" "$route_burst_n" "$route_local_n" \
+    "$routed_field" "$GATE_ROUTE")"
   if $route_mismatch; then
     journal_line --file "$journal" "$(printf '%s  gate  route-mismatch  (intended=%s burst=%s local=%s cause=%s)' \
       "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$route_intended" "$route_burst_n" "$route_local_n" "${route_first_local_cause:-unknown}")"
@@ -1733,10 +1846,17 @@ fi
 # stayed local.
 scope_prefix=""
 [ "$scope" = branch ] && scope_prefix="scope=branch slug=$slug "
-journal_line --file "$journal" "$(printf '%s  gate  %s  %s  (%shead=%s base=%s %s blocking=%s wall=%ss %s lock_wait=%ss cargo=burst:%s/local:%s)%s' \
+# PRD-build-gate-route-parity-ledger requirement 2 (R2/AC2): `routed=<n>/
+# <receipts>` and `route=<value>` are appended at the very end, after the
+# pre-existing cargo=burst:.../local:... field — existing fields keep
+# their exact order and position (lane-status.sh's branch_gates_stats
+# greps `(scope=branch ` immediately after the opening paren; nothing here
+# moves), so a parser reading only the pre-existing fields sees byte-
+# identical output up to this addition.
+journal_line --file "$journal" "$(printf '%s  gate  %s  %s  (%shead=%s base=%s %s blocking=%s wall=%ss %s lock_wait=%ss cargo=burst:%s/local:%s %s route=%s)%s' \
   "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$crate_name" "$outcome" "$scope_prefix" "$head_now" "$journal_base_field" \
   "${summary:-gate: no-summary-line}" "${blockers_csv:-none}" "$wall" "$phases_field" "$lock_wait" \
-  "$route_burst_n" "$route_local_n" "$journal_suffix")"
+  "$route_burst_n" "$route_local_n" "$routed_field" "$GATE_ROUTE" "$journal_suffix")"
 
 # A route mismatch is a journaled guard event, never a block (Non-goals) —
 # the verdict computed above is unaffected either way (requirement 4, AC4).
@@ -1774,6 +1894,7 @@ jq -n --arg head "$head_now" --arg tree "$tree_now" --arg hash "$self_hash" --ar
      --argjson phases "$phases_json" --argjson wall_s "$wall" \
      --arg scope "$scope" --arg slug "$slug" \
      --argjson deferred "$deferred_json" \
+     --arg gate_route "$GATE_ROUTE" --argjson routed_n "$routed_n" --argjson receipts_total "$receipts_total" \
      --argjson over "$phase_over_tolerance" --argjson unattr "$phase_unattributed" '
   {
     head_sha: $head,
@@ -1785,6 +1906,8 @@ jq -n --arg head "$head_now" --arg tree "$tree_now" --arg hash "$self_hash" --ar
     new_blocks: ($new | if . == "" then [] else split(",") end),
     inherited_blocks: ($inh | if . == "" then [] else split(",") end),
     cargo_route: {intended: $intended, burst: $burst, local: $local, passthrough: $passthrough, host: $host},
+    route: $gate_route,
+    routed: {n: $routed_n, receipts: $receipts_total},
     blocks: $attribution.blocks,
     attribution: {in_scope: $attribution.in_scope, inherited: $attribution.inherited},
     phases: $phases,

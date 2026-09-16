@@ -3,6 +3,26 @@
 # marker + systemd, never from narration. PRD-build-gate-launch-survives-tick.
 #
 # usage: gate-status.sh <slug>
+#         gate-status.sh --parity [--since <iso>] [--producer <name>]
+#                         [--json] [--min-runs <n>] [--diff-local]
+#
+# --parity (PRD-build-gate-route-parity-ledger, R3/R7/R8/R9): reads tick
+# journal `gate` lines (default $HOME/brain/journal/build/*.md, override
+# with GATE_STATUS_JOURNAL_DIR) and prints a producer x route table —
+# runs, pass, block, pass_rate, last_block_ts — from the same `phases=`
+# and `route=` fields extend-gate.sh's own gate line now carries, so a
+# night on the burst box is attributable to route without a hand triage.
+# --since <iso>: only gate lines at or after this UTC timestamp (string
+# comparison — journal timestamps are already zero-padded ISO8601, so
+# lexicographic order is chronological order). --producer <name>: only
+# that producer's rows. --json: an array of objects instead of a table.
+# --min-runs <n> (default 3): rows tag `eligible_for_worst` false below
+# this run count (lane-status.sh's "worst producer" pick honors this; the
+# plain table still lists every row it has). --diff-local: instead of the
+# full table, print producers whose burst pass_rate is more than 0.15
+# below their own local pass_rate, both routes at >= --min-runs. This
+# mode is a report, never a gate — always exits 0 (a --parity report is
+# read-only, same contract as the plain <slug> invocation below).
 #
 # Prints exactly one of:
 #   running        marker exists, `systemctl --user is-active` says the
@@ -32,6 +52,35 @@ STATE_DIR="${BUILD_STATE_DIR:-$SKILL_DIR/state}"
 INFLIGHT_DIR="$STATE_DIR/gate-inflight"
 SYSTEMCTL="${GATE_STATUS_SYSTEMCTL:-systemctl}"
 JQ="${JQ:-jq}"
+
+if [ "${1:-}" = "--parity" ]; then
+  shift
+  PARITY_PY="${GATE_PARITY_PY:-$HERE/gate-parity.py}"
+  [ -r "$PARITY_PY" ] || { echo "gate-status: missing $PARITY_PY" >&2; exit 2; }
+  command -v python3 >/dev/null 2>&1 || { echo "gate-status: python3 not on \$PATH" >&2; exit 2; }
+  journal_dir="${GATE_STATUS_JOURNAL_DIR:-$HOME/brain/journal/build}"
+  py_args=()
+  as_json_flag=false
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --since) py_args+=(--since "${2:?--since needs a value}"); shift 2 ;;
+      --producer) py_args+=(--producer "${2:?--producer needs a value}"); shift 2 ;;
+      --json) py_args+=(--json); as_json_flag=true; shift ;;
+      --min-runs) py_args+=(--min-runs "${2:?--min-runs needs a value}"); shift 2 ;;
+      --diff-local) py_args+=(--diff-local); shift ;;
+      *) echo "usage: gate-status.sh --parity [--since <iso>] [--producer <name>] [--json] [--min-runs <n>] [--diff-local]" >&2; exit 2 ;;
+    esac
+  done
+  shopt -s nullglob
+  parity_files=("$journal_dir"/*.md)
+  shopt -u nullglob
+  if [ "${#parity_files[@]}" -eq 0 ]; then
+    if $as_json_flag; then echo '[]'; else echo "gate-status --parity: no journal files under $journal_dir"; fi
+    exit 0
+  fi
+  cat "${parity_files[@]}" | python3 "$PARITY_PY" "${py_args[@]}"
+  exit 0
+fi
 
 slug="${1:-}"
 if [ -z "$slug" ]; then

@@ -82,3 +82,81 @@ cargo_route_export_path() {
   esac
   export PATH
 }
+
+# ---- cargo_route_current (PRD-build-gate-route-parity-ledger) ------------
+# The per-run "where did this call actually go" verdict — distinct from
+# cargo_route_path_prefix() above, which only answers "is the shim
+# reachable at all" (the declared policy). cargo_route_current() answers
+# the narrower question a receipt/journal line needs: local, or
+# burst:<server_id>. It re-derives the SAME three inputs
+# burst-lane-bin/cargo's own routing `if` (see that file) actually
+# branches on, rather than a second, independent guess:
+#   1. burst_configured()      — is burst even the declared policy right
+#                                 now (same predicate cargo_route_path_
+#                                 prefix() already gates on).
+#   2. BURST_LANE=1             — the shim's own arm/disarm flag; unset
+#                                 (or a bare shell / a /build dispatch
+#                                 that never armed it, BURST_LANE_DISPATCH
+#                                 set or not) takes the exact fallthrough
+#                                 branch the shim's `else` clause does
+#                                 (cause=burst-lane-disabled, local).
+#   3. session.json / `status --json` — a live, active session with a
+#                                 resolvable server_id, the same call the
+#                                 shim itself makes before it execs into
+#                                 burst-lane.sh run.
+# BURST_LANE_DISPATCH is not itself branched on inside the shim (verified
+# against burst-lane-bin/cargo and cmd_run — neither reads it) — its role
+# here is purely descriptive of the fixture this function's own selftest
+# calls "burst-refused": a dispatched /build branch (BURST_LANE_DISPATCH=1)
+# that never armed BURST_LANE=1 lands in exactly the same fallthrough as
+# case 2 above, local, same as the shim would. Documented rather than
+# coded as a separate branch so this function never diverges from the
+# shim's actual `if` by inventing a gate the shim itself doesn't have.
+#
+# cargo_route_session_id -> stdout the active session's server_id, rc 1
+# if there is no active session (mirrors the shim's own `status` check:
+# "$status_out" != "no active session" && -n "$status_out"). Prefers a
+# fixture override ($CARGO_ROUTE_STATUS_JSON — same convention as this
+# repo's other env-seam overrides, e.g. BURST_LANE_NOW) so a selftest can
+# supply a canned `status --json` payload without a real box, hcloud, or
+# ssh in the loop; falls back to the real burst-lane.sh status --json.
+cargo_route_session_id() {
+  local json
+  if [ -n "${CARGO_ROUTE_STATUS_JSON:-}" ]; then
+    json="$CARGO_ROUTE_STATUS_JSON"
+  else
+    local wrapper="$(cargo_route_scripts_dir)/burst-lane.sh"
+    [ -x "$wrapper" ] || return 1
+    json="$("$wrapper" status --json 2>/dev/null)" || return 1
+  fi
+  case "$json" in *'"active":true'*) : ;; *) return 1 ;; esac
+  local id
+  if command -v jq >/dev/null 2>&1; then
+    id="$(printf '%s' "$json" | jq -r '.server_id // empty' 2>/dev/null)"
+  else
+    id="$(printf '%s' "$json" | sed -n 's/.*"server_id":"\{0,1\}\([^,"}]*\)"\{0,1\}.*/\1/p')"
+  fi
+  [ -n "$id" ] || return 1
+  printf '%s' "$id"
+}
+
+# cargo_route_current -> stdout "local" or "burst:<server_id>", rc always 0
+# (a route resolver never fails the caller — an unresolvable session is
+# "local", not an error, same as the shim's own fallthrough).
+cargo_route_current() {
+  if ! burst_configured; then
+    printf 'local'
+    return 0
+  fi
+  if [ "${BURST_LANE:-0}" != "1" ]; then
+    printf 'local'
+    return 0
+  fi
+  local sid
+  if sid="$(cargo_route_session_id)" && [ -n "$sid" ]; then
+    printf 'burst:%s' "$sid"
+  else
+    printf 'local'
+  fi
+  return 0
+}

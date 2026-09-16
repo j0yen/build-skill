@@ -394,6 +394,35 @@ cmd_report() {
       [ "$gst" = "lost" ] && echo "  lost: $gslug"
     done
   fi
+
+  echo
+  echo "== burst gate parity, last 24h (PRD-build-gate-route-parity-ledger) =="
+  if [ -x "$GATE_STATUS" ]; then
+    local since_24h parity_json burst_line
+    since_24h="$(date -u -d '-24 hours' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -v-24H +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)"
+    parity_json="$(GATE_STATUS_JOURNAL_DIR="$journal_dir" "$GATE_STATUS" --parity --since "$since_24h" --json 2>/dev/null)"
+    burst_line="$(printf '%s' "${parity_json:-[]}" | python3 -c '
+import json, sys
+try:
+    rows = json.load(sys.stdin)
+except Exception:
+    rows = []
+burst = [r for r in rows if isinstance(r.get("route"), str) and r["route"].startswith("burst:")]
+runs = sum(r["runs"] for r in burst)
+passn = sum(r["pass"] for r in burst)
+eligible = [r for r in burst if r.get("eligible_for_worst")]
+if eligible:
+    worst = min(eligible, key=lambda r: r["pass_rate"])
+    print("burst gate parity: %d runs, %d pass, worst producer=%s %.2f" % (runs, passn, worst["producer"], worst["pass_rate"]))
+elif burst:
+    print("burst gate parity: %d runs, %d pass, worst producer=none (all below min-runs)" % (runs, passn))
+else:
+    print("burst gate parity: no burst-routed gate runs in the last 24h")
+' 2>/dev/null)"
+    echo "${burst_line:-burst gate parity: unavailable (gate-status --parity failed)}"
+  else
+    echo "(gate-status.sh not found at $GATE_STATUS)"
+  fi
 }
 
 main() {
