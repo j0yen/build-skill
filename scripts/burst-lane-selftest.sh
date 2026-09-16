@@ -6855,6 +6855,37 @@ mb8_boxes_after="$(find "$BURST_LANE_STATE_DIR/boxes" -maxdepth 1 -mindepth 1 -t
 expect "multibox AC8: no box was modified (same box set before/after the refused calls)" \
   "[ \"$mb8_boxes_before\" = \"$mb8_boxes_after\" ]"
 
+# ---- multibox AC7 (requirement 5): with two boxes, each carrying its own
+# cost.jsonl row for today, `cost --today` sums to their total and prints a
+# per-box breakdown naming both server_ids and types. fresh_env's own
+# BURST_LANE_COST_LEDGER override (a single fixed path, there so every
+# EXISTING single-box cost fixture in this file keeps working unchanged)
+# is unset for this block only — with it still exported, box_context's
+# per-box default (`$BOX_STATE_DIR/cost.jsonl`) never gets a chance to
+# apply, and both boxes would read the exact same file, proving nothing
+# about per-box distinctness.
+fresh_env
+unset BURST_LANE_COST_LEDGER
+BURST_MAX_BOXES=2 "$BL" up --count 2 >/dev/null 2>&1
+mb7_id1="$(awk -F'|' '$2=="wm-burst-lane-1"{print $1}' "$FAKE_HCLOUD_STATE" | head -n1)"
+mb7_id2="$(awk -F'|' '$2=="wm-burst-lane-2"{print $1}' "$FAKE_HCLOUD_STATE" | head -n1)"
+mb7_today="$(date -u +%Y-%m-%d)"
+cat > "$BURST_LANE_STATE_DIR/boxes/$mb7_id1/cost.jsonl" <<JSON
+{"date":"${mb7_today}T01:00:00Z","hours":0.5,"eur":0.10,"prds":[],"session_id":"$mb7_id1","server_type":"ccx43"}
+JSON
+cat > "$BURST_LANE_STATE_DIR/boxes/$mb7_id2/cost.jsonl" <<JSON
+{"date":"${mb7_today}T01:00:00Z","hours":1.0,"eur":0.20,"prds":[],"session_id":"$mb7_id2","server_type":"ccx53"}
+JSON
+mb7_cost_out="$("$BL" cost --today 2>&1)"
+expect "multibox AC7: cost --today totals 0.30 across both boxes" \
+  "grep -qE 'hours=1\\.50 eur=0\\.30' <<<\"$mb7_cost_out\""
+expect "multibox AC7: breakdown lists box 1's server_id and type" \
+  "grep -q \"server_id=$mb7_id1 server_type=ccx43\" <<<\"$mb7_cost_out\""
+expect "multibox AC7: breakdown lists box 2's server_id and type" \
+  "grep -q \"server_id=$mb7_id2 server_type=ccx53\" <<<\"$mb7_cost_out\""
+expect "multibox AC7: breakdown TOTAL line names both boxes" \
+  "grep -qE 'TOTAL boxes=2 hours=1\\.50 eur=0\\.30' <<<\"$mb7_cost_out\""
+
 expect_block_green "multibox" "multibox: every state-layout migration case above ran green"
 
 echo "=== $([ $fail -eq 0 ] && echo PASS || echo FAIL) ==="

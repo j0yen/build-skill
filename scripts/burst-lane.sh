@@ -845,13 +845,171 @@ count_active_boxes() {
   echo "$n"
 }
 
+# list_active_box_ids: one server_id per line, `current`-first (requirement
+# 3's own ordering rule), then every other box carrying a live session.json —
+# the same liveness test count_active_boxes() uses, excluding the "pending"
+# scratch placeholder and "_orphan-*" migration residue. Lane-wide iteration
+# primitive shared by `run`'s box selection (requirement 3) and, in later
+# steps, `down`/`idle_guard`/`watchdog`/`cost`/`reap` (requirements 4/5/8).
+list_active_box_ids() {
+  local cur_id="" d id
+  if [ -L "$STATE_DIR/current" ]; then
+    cur_id="$(basename "$(readlink "$STATE_DIR/current" 2>/dev/null)" 2>/dev/null)"
+  fi
+  if [ -n "$cur_id" ] && [ -f "$STATE_DIR/boxes/$cur_id/session.json" ]; then
+    printf '%s\n' "$cur_id"
+  fi
+  for d in "$STATE_DIR"/boxes/*/; do
+    [ -d "$d" ] || continue
+    id="$(basename "$d")"
+    case "$id" in pending|_orphan-*) continue ;; esac
+    [ "$id" = "$cur_id" ] && continue
+    [ -f "${d}session.json" ] && printf '%s\n' "$id"
+  done
+}
+
+# list_all_box_ids: one server_id per line, every boxes/<id>/ directory
+# (excluding "pending"/"_orphan-*") REGARDLESS of whether it still carries a
+# live session.json — unlike list_active_box_ids above, a torn-down box's
+# directory is never deleted (requirement 8's own reap rule only deletes an
+# hcloud resource with NO boxes/<id>/ dir, never the dir itself), so its
+# cost.jsonl history is still real spend that happened today. Requirement
+# 5's own iteration primitive: `cost --today`/`cost --by-prd` must sum every
+# box that billed anything today, active or already torn down, not just
+# whichever one(s) are up right now.
+list_all_box_ids() {
+  local d id
+  for d in "$STATE_DIR"/boxes/*/; do
+    [ -d "$d" ] || continue
+    id="$(basename "$d")"
+    case "$id" in pending|_orphan-*) continue ;; esac
+    printf '%s\n' "$id"
+  done
+}
+
+# box_context <server_id>: repoint every per-box global at boxes/<id> — the
+# same right-hand sides the top-level assignments above compute from
+# BOX_STATE_DIR, recomputed against an EXPLICIT id instead of the `current`
+# symlink. This is the multi-box counterpart to box_path()'s single-box
+# resolution: box_path() (and every function that only ever reads
+# $BOX_STATE_DIR/$STATE_FILE/etc.) keeps working unchanged, it simply now
+# resolves against whichever box this call last selected. Never repoints
+# `current` itself — selecting a box for one run does not make it "the"
+# box. Used by requirement 3 (`run`'s per-box selection) and, in later
+# steps, by requirements 4/5/8's own per-box iteration.
+# box_context_at <root>: the shared implementation — repoints every
+# per-box global at whatever directory <root> names, literally. Split out
+# from box_context() so a caller that resolved to the box `current` ALREADY
+# points at can pass "$STATE_DIR/current" itself (see box_context below) —
+# preserving the exact literal path string every pre-multibox caller/test
+# already depends on (e.g. ssh/rsync's UserKnownHostsFile carrying
+# ".../current/known_hosts.<id>", not ".../boxes/<id>/known_hosts.<id>" —
+# the same file either way, but a different STRING, and bursthyg AC1's own
+# literal-path check caught exactly this when an earlier version of
+# select_run_box called box_context() unconditionally even for the box that
+# was already `current`).
+box_context_at() {
+  BOX_STATE_DIR="$1"
+  STATE_FILE="$BOX_STATE_DIR/session.json"
+  PROOF_STATE_FILE="$BOX_STATE_DIR/proof.json"
+  COST_LEDGER="${BURST_LANE_COST_LEDGER:-$BOX_STATE_DIR/cost.jsonl}"
+  SERVED_FILE="$BOX_STATE_DIR/prds_served"
+  TEARDOWN_CAUSE_FILE="$BOX_STATE_DIR/.last-teardown-cause"
+  PROBE_UNAVAILABLE_MARK_FILE="$BOX_STATE_DIR/.probe-unavailable-last"
+  DIRTY_DIR="$BOX_STATE_DIR/dirty"
+  PULLSZ_DIR="$BOX_STATE_DIR/pull-sizes"
+  REMOTE_DIRS_FILE="$BOX_STATE_DIR/remote-dirs.json"
+  REMOTE_DIRS_LOCK="$BOX_STATE_DIR/remote-dirs.lock"
+  GATE_TOOLS_STATE_FILE="$BOX_STATE_DIR/gate-tools.json"
+  UP_LOCK_FILE="$BOX_STATE_DIR/up.lock"
+  UP_PID_FILE="$BOX_STATE_DIR/up.pid"
+  PROVE_INFLIGHT_FILE="$BOX_STATE_DIR/prove.inflight"
+  INFLIGHT_LOG="$BOX_STATE_DIR/inflight.log"
+  EVIDENCE_DIR="$BOX_STATE_DIR/evidence"
+  VOLUME_STATE_FILE="$BOX_STATE_DIR/volume.json"
+  RUN_LOCK="$BOX_STATE_DIR/run.lock"
+  GATE_INFLIGHT_DIR="$BOX_STATE_DIR/gate-inflight"
+  ATTR_LEDGER="${BURST_LANE_ATTR_LEDGER:-$BOX_STATE_DIR/attribution.jsonl}"
+}
+
+# box_context <server_id>: resolve to boxes/<id> EXPLICITLY, except when
+# <id> is the box `current` already points at — then resolve through
+# "$STATE_DIR/current" itself instead, so the literal path never changes
+# for the common case (one box, or a multi-box run that happened to land
+# on `current`). Never repoints `current` itself — selecting a box for one
+# run does not make it "the" box. Used by requirement 3 (`run`'s per-box
+# selection) and, in later steps, by requirements 4/5/8's own per-box
+# iteration.
+box_context() {
+  local id="$1"
+  [ -n "$id" ] || return 0
+  if [ -L "$STATE_DIR/current" ] && [ "$(basename "$(readlink "$STATE_DIR/current" 2>/dev/null)" 2>/dev/null)" = "$id" ]; then
+    box_context_at "$STATE_DIR/current"
+  else
+    box_context_at "$STATE_DIR/boxes/$id"
+  fi
+}
+
+# select_run_box: requirement 3 — the first box (current-first order) whose
+# slot table has a free slot, ACQUIRED atomically in the same non-blocking
+# pass that finds it (never a peek-then-release hint — an earlier version
+# of this function only peeked, and every one of N simultaneous callers saw
+# the same instant of "free" on the first box, so all of them piled onto
+# ITS blocking wait once the real acquisition ran a moment later; caught by
+# this PRD's own multibox AC3 concurrency fixture: 12 runs all landed on
+# one box instead of splitting 4+4 across two). Leaves box_context pointed
+# at whichever box actually granted the slot, and sets SLOT_HELD/
+# SLOT_INDEX exactly as acquire_run_slot always has (the caller reads
+# $SLOT_HELD immediately after calling this, same as before). When no box
+# is active yet at all this is a no-op (the caller's auto-`up` path runs
+# first and guarantees at least one box exists before this is ever
+# called). Falls back to a BLOCKING wait on `current`'s own table, "as
+# today", only when every active box's table was full at this pass's
+# snapshot — delegates to the ordinary acquire_run_slot for that case, so
+# the 120s slot-wait journal line and the sleep-2 retry cadence are
+# byte-identical to single-box behavior.
+select_run_box() {  # $1 = worktree (passed through to acquire_run_slot's own journal on the fallback path)
+  local id cap i j held any=0
+  while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    any=1
+    box_context "$id"
+    run_slot_cap; cap="$RUN_SLOT_CAP"
+    mkdir -p "$BOX_STATE_DIR/slots" 2>/dev/null || true
+    for i in $(seq 1 "$cap"); do
+      exec 202>"$BOX_STATE_DIR/slots/$i.lock"
+      if flock -n 202; then
+        held=0
+        for j in $(seq 1 "$cap"); do
+          [ "$j" = "$i" ] && { held=$((held+1)); continue; }
+          ( exec 210>"$BOX_STATE_DIR/slots/$j.lock"; flock -n 210 ) 2>/dev/null || held=$((held+1))
+        done
+        SLOT_HELD="$held/$cap"; SLOT_INDEX="$i"
+        return 0
+      fi
+    done
+  done < <(list_active_box_ids)
+  # Requirement 3's documented fallback: no active box had a slot free at
+  # this pass's snapshot -> pin to `current` and BLOCK on its own table,
+  # exactly as the single-box lane always has (acquire_run_slot's own
+  # sleep-2 retry loop, journaled after 120s).
+  if [ "$any" -eq 1 ] && [ -L "$STATE_DIR/current" ]; then
+    box_context "$(basename "$(readlink "$STATE_DIR/current")")"
+  fi
+  acquire_run_slot "$1"
+}
+
 # box_activate <server_id>: point `current` at boxes/<id>, creating it if
 # needed, folding forward whatever transient content was already sitting
 # at `current` (the startup "pending" placeholder, or a plain directory —
 # see box_point_current_at above for why that case needs care), and
 # carrying the persistent volume's own state forward (see
 # box_carry_forward_volume_state above) before the old box's directory is
-# left behind as inert history.
+# left behind as inert history. Defined last in this block (after
+# list_active_box_ids/box_context/select_run_box) so the tripwire's
+# box_path()/box_activate() license region — BOX_STATE_DIR= through this
+# function's own closing brace — still covers every "boxes/" literal those
+# three helpers spell.
 box_activate() {
   box_carry_forward_volume_state "$1"
   box_point_current_at "$1"
@@ -5837,11 +5995,22 @@ cmd_run() {
     exit 3
   fi
 
-  # Global lock (201) held ONLY for session ensure/verify — the old
-  # whole-run hold serialized the box to width-1 (2026-09-10 5-whys).
+  # Global lock (201) held ONLY for session ensure — the old whole-run hold
+  # serialized the box to width-1 (2026-09-10 5-whys). Phase 1: make sure
+  # AT LEAST ONE box is active, exactly as before this PRD (auto-`up`
+  # unconditionally targets `current` — with no box yet, that is the only
+  # box there is about to be). Requirement 3's own box SELECTION (which of
+  # possibly several active boxes this run actually uses) is phase 2,
+  # below, deliberately kept separate: selecting/acquiring a slot before a
+  # box exists at all is meaningless, and folding the two phases together
+  # is what made an earlier version of this change race (every one of N
+  # simultaneous launches saw the same box's slot table as "free" for the
+  # instant its own hint-only peek held it, then all serialized onto that
+  # one box's blocking wait once the real acquisition found it already
+  # taken — caught by this PRD's own multibox AC3 fixture, all 12 runs
+  # landing on one box instead of splitting 4+4).
   exec 201>"$RUN_LOCK"
   flock 201
-
   if ! state_active; then
     local up_out; up_out="$(cmd_up 2>&1)"; local up_rc=$?
     if [ "$up_rc" -ne 0 ]; then
@@ -5856,7 +6025,27 @@ cmd_run() {
       exit 3
     fi
   fi
+  flock -u 201
 
+  # Phase 2 (requirement 3): now that at least one box is active, pick the
+  # first box (current-first order) whose slot table has a free slot RIGHT
+  # NOW, acquiring it atomically in the same non-blocking pass (never a
+  # peek-then-release hint) — see select_run_box's own header for why a
+  # hint-only version was wrong. Falls back to a BLOCKING wait on
+  # `current`'s own table, "as today", only when every active box's table
+  # was full at this pass's snapshot. Leaves box_context pointed at
+  # whichever box actually granted the slot, and sets SLOT_HELD/SLOT_INDEX
+  # exactly as the old single-box acquire_run_slot always did.
+  select_run_box "$worktree"
+  local slot_held="$SLOT_HELD"
+
+  # Session lock re-acquired against the box phase 2 actually selected
+  # (never `current` unconditionally any more) — this is the fd every
+  # later per-box read/write in this function assumes is already held for
+  # the read-modify-write it does; verify happens here, once, against that
+  # SAME box.
+  exec 201>"$RUN_LOCK"
+  flock 201
   local id ip; id="$(state_read server_id)"; ip="$(state_read ip)"
   if [ "$(state_read verified)" != "true" ]; then
     # PRD-build-fail-loud-evidence-kept AC4: this was the truly silent
@@ -5873,9 +6062,6 @@ cmd_run() {
     fi
   fi
   flock -u 201
-
-  acquire_run_slot "$worktree"
-  local slot_held="$SLOT_HELD"
   # Same-worktree runs still serialize: two --delete syncs of one remote dir
   # would shred each other. Different worktrees hold different locks.
   mkdir -p "$BOX_STATE_DIR/locks" 2>/dev/null || true
@@ -8372,11 +8558,18 @@ destroy_verify() {  # $1 = server id -> 0 on verified-gone, 1 on still-present a
 
 ledger_append() {  # $1=hours $2=eur $3=session_id (PRD-build-cost-attribution,
                     # additive — old readers keying on hours/eur/prds are
-                    # unaffected); reads $SERVED_FILE (requirement 13: PRD
-                    # slugs this session served), one row per session
+                    # unaffected); $4=server_type (PRD-build-burst-state-
+                    # keyed-by-server-v2 requirement 5: cost.jsonl rows carry
+                    # server_id AND server_type so a multi-box `cost --today`
+                    # can print a per-box type alongside its id — optional,
+                    # falls back to cost_rate_eur's own state_read when
+                    # omitted, same as every pre-existing caller); reads
+                    # $SERVED_FILE (requirement 13: PRD slugs this session
+                    # served), one row per session
+  local stype="${4:-$(state_read server_type 2>/dev/null)}"
   python3 -c '
 import json, sys
-date, hours, eur, sid, served_path = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
+date, hours, eur, sid, served_path, stype = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6]
 prds = []
 try:
     with open(served_path) as f:
@@ -8386,8 +8579,10 @@ except OSError:
 row = {"date": date, "hours": float(hours), "eur": float(eur), "prds": prds}
 if sid:
     row["session_id"] = sid
+if stype:
+    row["server_type"] = stype
 print(json.dumps(row))
-' "$(now_iso)" "$1" "$2" "${3:-}" "$SERVED_FILE" >> "$COST_LEDGER"
+' "$(now_iso)" "$1" "$2" "${3:-}" "$SERVED_FILE" "$stype" >> "$COST_LEDGER"
 }
 
 # ---- teardown proration (PRD-build-cost-attribution requirement 2) ----------
@@ -9334,35 +9529,83 @@ cmd_cost() {
     return $?
   fi
   [ "${1:-}" = "--today" ] || { echo "usage: burst-lane.sh cost --today | cost --by-prd [--today|--session <id>]" >&2; exit 2; }
-  [ -f "$COST_LEDGER" ] || { echo "hours=0.00 eur=0.00"; exit 0; }
   local today; today="$(date -u -d "@$(now_epoch)" +%Y-%m-%d 2>/dev/null || date -u +%Y-%m-%d)"
+
+  # PRD-build-burst-state-keyed-by-server-v2 requirement 5: sum across every
+  # box that ever billed today — list_all_box_ids (active or already torn
+  # down; a box's cost.jsonl history outlives its own teardown, see that
+  # helper's header) — not just `current`. Zero box directories at all
+  # (genuinely fresh state, no box has ever existed) falls back to the
+  # pre-multibox "no ledger yet" one-liner, byte-identical to before this
+  # requirement (Goal 2).
+  local box_ids; box_ids="$(list_all_box_ids)"
+  if [ -z "$box_ids" ]; then
+    [ -f "$COST_LEDGER" ] || { echo "hours=0.00 eur=0.00"; exit 0; }
+    box_ids="$(basename "$(readlink -f "$STATE_DIR/current" 2>/dev/null)" 2>/dev/null)"
+  fi
+
+  local cost_args=() bid
+  while IFS= read -r bid; do
+    [ -n "$bid" ] || continue
+    box_context "$bid"
+    cost_args+=("$bid" "$COST_LEDGER" "$(state_read server_type)")
+  done <<<"$box_ids"
+
   python3 -c '
 import json, sys
-today, path = sys.argv[1], sys.argv[2]
-hours = eur = 0.0
+
+today = sys.argv[1]
+triples = sys.argv[2:]
+total_hours = total_eur = 0.0
 prds = []
-for line in open(path):
-    line = line.strip()
-    if not line:
-        continue
+rows = []
+for i in range(0, len(triples), 3):
+    bid, path, stype = triples[i], triples[i + 1], triples[i + 2]
+    bh = be = 0.0
     try:
-        d = json.loads(line)
-    except ValueError:
+        fh = open(path)
+    except OSError:
+        rows.append((bid, stype or "unknown", bh, be))
         continue
-    # Requirement 2/3 (PRD-build-cost-attribution): kind:"slug" rows are the
-    # per-slug proration of a session-total row already counted below —
-    # summing them here too would double the day total.
-    if d.get("kind") == "slug":
-        continue
-    if d.get("date", "").startswith(today):
-        hours += float(d.get("hours", 0))
-        eur += float(d.get("eur", 0))
-        for p in d.get("prds", []) or []:
-            if p not in prds:
-                prds.append(p)
+    with fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                d = json.loads(line)
+            except ValueError:
+                continue
+            # Requirement 2/3 (PRD-build-cost-attribution): kind:"slug" rows
+            # are the per-slug proration of a session-total row already
+            # counted below — summing them here too would double the day
+            # total.
+            if d.get("kind") == "slug":
+                continue
+            if not str(d.get("date", "")).startswith(today):
+                continue
+            bh += float(d.get("hours", 0) or 0)
+            be += float(d.get("eur", 0) or 0)
+            for p in d.get("prds", []) or []:
+                if p not in prds:
+                    prds.append(p)
+            row_stype = d.get("server_type")
+            if row_stype:
+                stype = row_stype
+    total_hours += bh
+    total_eur += be
+    rows.append((bid, stype or "unknown", bh, be))
+
 prds_str = ",".join(prds) if prds else "none"
-print(f"hours={hours:.2f} eur={eur:.2f} prds={prds_str}")
-' "$today" "$COST_LEDGER"
+print(f"hours={total_hours:.2f} eur={total_eur:.2f} prds={prds_str}")
+# Requirement 5 / AC7: a per-box breakdown, only once there is more than
+# one box to break down — the single-box case prints exactly the one line
+# above, byte-identical to every caller of this command before this PRD.
+if len(rows) > 1:
+    for bid, stype, bh, be in rows:
+        print(f"  server_id={bid} server_type={stype} hours={bh:.2f} eur={be:.2f}")
+    print(f"  TOTAL boxes={len(rows)} hours={total_hours:.2f} eur={total_eur:.2f}")
+' "$today" "${cost_args[@]}"
   # PRD-build-burst-persistent-volume requirement 7: the volume's monthly
   # line beside the box-hours line above — billed whether attached or not
   # (Technical considerations), so this is a pure BURST_VOLUME_GB *

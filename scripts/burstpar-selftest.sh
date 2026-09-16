@@ -122,9 +122,17 @@ read -r peak starts <<<"$(peak_of "$SPAN_LOG")"
 [ "$peak" = "4" ] 2>/dev/null && ok "AC1: different-worktree runs overlap in time (peak=$peak of 12)" || bad "AC1: no real parallelism observed (peak=$peak)"
 
 # --- AC4: counters exact after 12 concurrent completed runs ------------
-runs=$(python3 -c "import json;print(json.load(open('$T/state/session.json'))['runs_served'])" 2>/dev/null)
+# PRD-build-burst-state-keyed-by-server-v2 requirement 1: session.json and
+# attribution.jsonl are per-box now (boxes/<id>/, reached through the
+# `current` symlink this fixture's very first invocation creates via
+# migrate_state_layout) — never top-level anymore. Read through
+# $T/state/current/ so this suite still proves what it always proved
+# instead of silently reading a file that no longer exists (regression
+# caught 2026-09-15: both checks read runs=/rows=0 against the old
+# top-level paths post-migration).
+runs=$(python3 -c "import json;print(json.load(open('$T/state/current/session.json'))['runs_served'])" 2>/dev/null)
 [ "$runs" = "12" ] && ok "AC4: runs_served increased by exactly 12" || bad "AC4: runs_served=$runs want 12"
-rows=$(wc -l < "$T/state/attribution.jsonl" 2>/dev/null || echo 0)
+rows=$(wc -l < "$T/state/current/attribution.jsonl" 2>/dev/null || echo 0)
 [ "$rows" = "12" ] && ok "AC4: exactly 12 attribution rows exist" || bad "AC4: attribution rows=$rows want 12"
 
 # --- AC2: same worktree serializes: second starts only after first's
@@ -190,5 +198,125 @@ if grep -q "concurrent=3/4" <<<"$status_out"; then
 else
   bad "AC6: status did not report 3/4 (got: $status_out)"
 fi
+
+
+# ---- multibox AC3 (PRD-build-burst-state-keyed-by-server-v2 requirement
+# 3 / AC3): two ready boxes, cap 4 each (same "box_cores unparseable ->
+# default 4" path AC1/AC3 above already exercise — this fixture's
+# session.json omits box_cores/mem/disk on purpose), 12 runs distributed
+# across them by select_run_box (current-first order, first box with a
+# free slot) reach peak concurrency 8 (4 per box), all 12 complete, and
+# each attribution row names its own box (session_id 201 or 202). A
+# DEDICATED state dir + two distinct fake-ssh target IPs (never
+# 127.0.0.1, this file's single-box fixture's own ip) so this block can
+# attribute each span to its box without disturbing the single-box
+# sections above — this PRD's Goal 2 (zero behavior change for callers
+# that never pass --count) is what those sections already prove; this
+# block proves the NEW multi-box path side by side, never touching the
+# old one's state.
+MB="$(mktemp -d "${TMPDIR:-/tmp}/burstpar-mb.XXXXXX")" || exit 2
+mkdir -p "$MB/boxes/201" "$MB/boxes/202"
+for i in $(seq 1 12); do mkdir -p "$MB/w$i"; done
+seed_mb_box() {  # $1=id $2=ip
+  cat > "$MB/boxes/$1/session.json" <<JSON
+{"server_id":$1,"ip":"$2","server_type":"test","boot_ts":"2026-01-01T00:00:00Z","boot_epoch":1,"ttl_hours":6,"hard_ttl_hours":12,"runs_served":0,"sandbox_ok":"true","teardown_scheduled":"false","teardown_epoch":"","verified":"true"}
+JSON
+}
+seed_mb_box 201 127.0.0.11
+seed_mb_box 202 127.0.0.12
+ln -sfn boxes/201 "$MB/current"
+
+MB_SPAN="$MB/spans.log"
+cat > "$MB/ssh" <<EOF2
+#!/usr/bin/env bash
+cmd="\${!#}"
+case "\$cmd" in
+  *"[ -d"*) exit 0 ;;
+  *meminfo*) exit 0 ;;
+esac
+target="\${@: -2:1}"
+ip="\${target#*@}"
+echo "start \$ip \$\$ \$(date +%s.%N)" >> "$MB_SPAN"
+sleep 0.8
+echo "end \$ip \$\$ \$(date +%s.%N)" >> "$MB_SPAN"
+exit 0
+EOF2
+chmod +x "$MB/ssh"
+
+: > "$MB_SPAN"
+mb3_pids=()
+for i in $(seq 1 12); do
+  BURST_LANE_STATE_DIR="$MB" BURST_LANE_JOURNAL="$MB/journal.log" BURST_LANE_SSH_BIN="$MB/ssh" \
+    BURST_MAX_CONCURRENT_RUNS=4 \
+    bash "$BL" run "$MB/w$i" -- cargo build >"$MB/out.$i.log" 2>&1 &
+  mb3_pids+=($!)
+done
+mb3_rc_bad=0
+for p in "${mb3_pids[@]}"; do wait "$p" || mb3_rc_bad=$((mb3_rc_bad+1)); done
+[ "$mb3_rc_bad" = "0" ] && ok "multibox AC3: all 12 runs exit 0 across two boxes" || bad "multibox AC3: $mb3_rc_bad of 12 runs exited nonzero"
+
+mb3_peaks="$(python3 - "$MB_SPAN" <<'PY'
+import sys
+ev=[]
+for line in open(sys.argv[1]):
+    parts=line.split()
+    if len(parts) < 4:
+        continue
+    k, ip, pid, ts = parts[0], parts[1], parts[2], parts[3]
+    ev.append((float(ts), 1 if k == "start" else -1, ip))
+ev.sort()
+cur = peak = starts = 0
+cur_ip = {}
+peak_ip = {}
+for ts, d, ip in ev:
+    cur += d
+    peak = max(peak, cur)
+    if d == 1:
+        starts += 1
+    cur_ip[ip] = cur_ip.get(ip, 0) + d
+    peak_ip[ip] = max(peak_ip.get(ip, 0), cur_ip[ip])
+for ip in sorted(peak_ip):
+    print("IP", ip, peak_ip[ip])
+print("TOTAL", peak, starts)
+PY
+)"
+mb3_total_peak="$(awk '$1=="TOTAL"{print $2}' <<<"$mb3_peaks")"
+mb3_total_starts="$(awk '$1=="TOTAL"{print $3}' <<<"$mb3_peaks")"
+mb3_peak_11="$(awk '$1=="IP" && $2=="127.0.0.11"{print $3}' <<<"$mb3_peaks")"
+mb3_peak_12="$(awk '$1=="IP" && $2=="127.0.0.12"{print $3}' <<<"$mb3_peaks")"
+[ "$mb3_total_starts" = "12" ] && ok "multibox AC3: all 12 runs actually started (starts=12)" \
+  || bad "multibox AC3: expected 12 starts, saw $mb3_total_starts"
+[ "$mb3_total_peak" = "8" ] && ok "multibox AC3: peak concurrency is 8 across both boxes" \
+  || bad "multibox AC3: expected combined peak 8, saw $mb3_total_peak"
+[ "$mb3_peak_11" = "4" ] && ok "multibox AC3: box 201 (127.0.0.11) reached its own cap of 4" \
+  || bad "multibox AC3: box 201 peak=$mb3_peak_11 want 4"
+[ "$mb3_peak_12" = "4" ] && ok "multibox AC3: box 202 (127.0.0.12) reached its own cap of 4" \
+  || bad "multibox AC3: box 202 peak=$mb3_peak_12 want 4"
+
+mb3_attr_201="$(wc -l < "$MB/boxes/201/attribution.jsonl" 2>/dev/null || echo 0)"
+mb3_attr_202="$(wc -l < "$MB/boxes/202/attribution.jsonl" 2>/dev/null || echo 0)"
+[ "$((mb3_attr_201 + mb3_attr_202))" = "12" ] && ok "multibox AC3: 12 attribution rows total, split across both boxes' own ledgers" \
+  || bad "multibox AC3: attribution rows 201=$mb3_attr_201 202=$mb3_attr_202 (want sum 12)"
+mb3_attr_201_bad="$(python3 -c "
+import json,sys
+n=0
+for line in open(sys.argv[1]):
+    if json.loads(line).get('session_id') != '201':
+        n+=1
+print(n)
+" "$MB/boxes/201/attribution.jsonl" 2>/dev/null || echo 99)"
+mb3_attr_202_bad="$(python3 -c "
+import json,sys
+n=0
+for line in open(sys.argv[1]):
+    if json.loads(line).get('session_id') != '202':
+        n+=1
+print(n)
+" "$MB/boxes/202/attribution.jsonl" 2>/dev/null || echo 99)"
+[ "${mb3_attr_201_bad:-99}" = "0" ] && [ "${mb3_attr_202_bad:-99}" = "0" ] && \
+  ok "multibox AC3: every attribution row's session_id names its own box (201/202, never crossed)" \
+  || bad "multibox AC3: cross-attributed rows found (201 mismatches=$mb3_attr_201_bad, 202 mismatches=$mb3_attr_202_bad)"
+
+rm -rf "$MB" 2>/dev/null || true
 
 exit $fail
