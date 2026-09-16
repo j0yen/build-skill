@@ -15,6 +15,7 @@
 #
 # Usage:
 #   main-push-gate.sh <repo> [--gated <sha>] [--head <sha>] [--changed <paths>]
+#                     [--writer-slug <slug>] [--project-root <rel>]
 #
 #   <repo>      Absolute path to a build_into repo, or a bare name resolved
 #               against ~/wintermute/<name> (the fleet's repo-root
@@ -24,7 +25,9 @@
 #               (extend-gate.sh's own verdict cache — real repos like
 #               mcphost already carry `head`/`head_sha` in this file, so no
 #               cross-repo receipt-schema change was needed; see the PRD's
-#               Technical considerations).
+#               Technical considerations) — or, when --project-root <rel> is
+#               given, <repo>/<rel>/target/autobuilder/last-verdict.json
+#               instead (below).
 #   --head      The sha about to be pushed. Defaults to <repo>'s current
 #               HEAD (git rev-parse HEAD).
 #   --changed   Comma- or whitespace-separated list of paths, overriding
@@ -38,6 +41,24 @@
 #               commit-gate). Purely cosmetic — omitting it just leaves
 #               that field `writer=unknown`; the gated-repo check itself
 #               (below) runs regardless.
+#   --project-root <rel>   Path, relative to <repo>, of the Cargo crate root
+#               when it is nested under a subdirectory (the autobuilder-
+#               source-unify-style layout: <repo>/autobuilder/Cargo.toml,
+#               not <repo>/Cargo.toml — PRD-build-main-push-gate-nested-
+#               project-root). Same spelling/shape as extend-gate.sh's own
+#               --project-root. When given, every place this script would
+#               read <repo>/target/autobuilder/last-verdict.json (the
+#               --gated default AND the gated-repo branch-verdict check
+#               below) instead reads <repo>/<rel>/target/autobuilder/
+#               last-verdict.json — the path a nested crate's own gate
+#               actually writes to. Validated against a Cargo.toml at that
+#               path; fails loud (never silently falls back to repo root)
+#               if it's missing. Omitted: behavior is byte-identical to
+#               before this flag existed (additive only, not a rewrite —
+#               this PRD's Non-goals). Does NOT affect
+#               <repo>/.buildloop/ci-equivalent.toml resolution, which
+#               stays at the repo root regardless (out of this PRD's
+#               scope).
 #
 # Gated-repo branch-verdict check (PRD-build-cross-repo-commit-gate
 # requirement 3): when <repo> is registered as some OTHER rust-extend
@@ -90,7 +111,7 @@ source "$HERE/lib/journal.sh"
 CHECK_TIMEOUT_SECS="${MAIN_PUSH_GATE_TIMEOUT:-900}"   # 15 minutes (AC9)
 
 usage() {
-  echo "usage: main-push-gate.sh <repo> [--gated <sha>] [--head <sha>] [--changed <paths>] [--writer-slug <slug>]" >&2
+  echo "usage: main-push-gate.sh <repo> [--gated <sha>] [--head <sha>] [--changed <paths>] [--writer-slug <slug>] [--project-root <rel>]" >&2
 }
 
 die() {
@@ -104,13 +125,15 @@ gated_want=""
 head_want=""
 changed_override=""
 writer_slug=""
+project_root_override=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --gated)       gated_want="${2:?main-push-gate: --gated needs a value}"; shift 2 ;;
-    --head)        head_want="${2:?main-push-gate: --head needs a value}"; shift 2 ;;
-    --changed)     changed_override="${2:?main-push-gate: --changed needs a value}"; shift 2 ;;
-    --writer-slug) writer_slug="${2:?main-push-gate: --writer-slug needs a value}"; shift 2 ;;
+    --gated)        gated_want="${2:?main-push-gate: --gated needs a value}"; shift 2 ;;
+    --head)         head_want="${2:?main-push-gate: --head needs a value}"; shift 2 ;;
+    --changed)      changed_override="${2:?main-push-gate: --changed needs a value}"; shift 2 ;;
+    --writer-slug)  writer_slug="${2:?main-push-gate: --writer-slug needs a value}"; shift 2 ;;
+    --project-root) project_root_override="${2:?main-push-gate: --project-root needs a value}"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     --) shift ;;
     -*) echo "main-push-gate: unknown flag $1" >&2; usage; exit 2 ;;
@@ -138,6 +161,23 @@ else
 fi
 
 slug="$(basename "$repo")"
+
+# --- resolve --project-root (PRD-build-main-push-gate-nested-project-root) ---
+# Same explicit-only handling as extend-gate.sh's own --project-root: no
+# auto-detection (that's extend-gate.sh's find_cargo_root, a second source
+# of truth this PRD deliberately does not duplicate) — just validate the
+# given relative path has a Cargo.toml, fail loud if not (AC4), and use it
+# to resolve every last-verdict.json read below. Omitted entirely: verdict_dir
+# stays "$repo" and every read is byte-identical to before this flag existed.
+verdict_dir="$repo"
+project_rel="."
+if [ -n "$project_root_override" ]; then
+  project_abs="$repo/$project_root_override"
+  [ -f "$project_abs/Cargo.toml" ] || die 2 "no Cargo.toml at --project-root $project_root_override (looked in $project_abs)"
+  verdict_dir="$project_abs"
+  project_rel="$project_root_override"
+  echo "main-push-gate: project-root: $project_rel (looked in $project_abs)"
+fi
 
 emit() {
   # emit <outcome> <gated> <head> <delta_n> <check> <rc> <wall>
@@ -170,7 +210,7 @@ fi
 # fresh verdict is refused before spending any wall time on a cargo run.
 gated_targets_sh="$SKILL_DIR/scripts/gated-targets.sh"
 if [ -x "$gated_targets_sh" ] && "$gated_targets_sh" is-gated "$repo" >/dev/null 2>&1; then
-  branch_verdict_file="$repo/target/autobuilder/last-verdict.json"
+  branch_verdict_file="$verdict_dir/target/autobuilder/last-verdict.json"
   branch_head="" branch_verdict=""
   if [ -f "$branch_verdict_file" ] && command -v jq >/dev/null 2>&1; then
     branch_head="$(jq -r '.head // .head_sha // empty' "$branch_verdict_file" 2>/dev/null)"
@@ -203,7 +243,7 @@ if [ -n "$gated_want" ]; then
     die 5 "--gated $gated_want does not resolve to a commit in $repo"
   fi
 else
-  verdict_file="$repo/target/autobuilder/last-verdict.json"
+  verdict_file="$verdict_dir/target/autobuilder/last-verdict.json"
   if [ -f "$verdict_file" ]; then
     gated_now="$(python3 -c '
 import json, sys
