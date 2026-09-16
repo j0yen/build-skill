@@ -775,23 +775,39 @@ read it before assuming a step is "the last one this tick".
   `last_error=main-push-unknown` (exit 5), and do NOT call `wm-push`. Counts
   as one tick action when it stops the chain here; otherwise folds into the
   same step as `push`.
-- **push** [rust-extend only]: `wm-push --slug <slug>` from inside
-  `<build_into>`. `wm-push` (installed at `~/.local/bin/wm-push` per
-  PRD-build-push-allowlist) wraps `git push origin <branch>` with a
-  slug-regex + allow-list + origin-URL match + branch-equals-current
-  + fast-forward + ≥1-commit-ahead guard, and has a settings.json
-  allow rule (`Bash(wm-push:*)`) so it doesn't trigger the auto-mode
-  classifier on every tick. **If `wm-push` is not on `$PATH`, do NOT
+- **push** [rust-extend only]: **check `scripts/branch-protection.sh
+  status <repo>`'s `push_via_branch` field (or read
+  `state/branch-protection.json` directly) before choosing how to push —
+  PRD-build-main-push-gate AC6/AC7: a repo whose main is protected with
+  required status checks refuses a direct push outright (verified live
+  against mcphost, `GH006 Protected branch update failed`), so `wm-push`'s
+  plain `git push origin <branch>` is no longer safe to assume
+  universally.** Run `scripts/branch-protection.sh push <repo> <slug>` —
+  it reads that same state and does the right thing either way: a repo
+  with no recorded protection (or `push_via_branch: false`) gets the
+  historical direct push; `push_via_branch: true` pushes `HEAD` to
+  `refs/heads/loop/<slug>`, opens (or reuses) a PR against `main`, and
+  arms `gh pr merge --auto --squash` — main only advances once that PR's
+  required checks go green (AC7), and this step's own job is done the
+  moment auto-merge is armed (do not block the tick waiting for CI wall
+  time; the next tick's `main-push-gate.sh`/reconcile will see the merge
+  once it lands). Falls back to `wm-push --slug <slug>` (installed at
+  `~/.local/bin/wm-push` per PRD-build-push-allowlist, same slug-regex +
+  allow-list + fast-forward + ≥1-commit-ahead guards) for a repo where
+  `branch-protection.sh` itself isn't usable (e.g. `gh` unavailable) and
+  protection is not recorded as enabled; **if neither is available, do NOT
   defer to a human — push directly:** verify clean tree + branch ==
-  current + fast-forward + ≥1 commit ahead inline, then run
-  `git push origin <branch>`, and log `wm-push-fallback-direct` to the
-  journal. Only set `next: investigate-push-guard-failure` if those
-  inline guards genuinely fail (a correctness stop, not a permission
-  gate) — same if `wm-push` itself exits 2 with a guard rejection. New
-  slugs need to be added to the `ALLOW` array near the top of `wm-push`
-  — keep it in sync with `wm-publish`'s ALLOW and `~/wintermute/REPOS.md`.
-  Counts as one tick action.
-  # After wm-push succeeds: answerable-emit.sh push <repo> "v<ver> — <one-line>" false
+  current + fast-forward + ≥1 commit ahead inline, then run `git push
+  origin <branch>`, and log `wm-push-fallback-direct` to the journal. Only
+  set `next: investigate-push-guard-failure` if those inline guards
+  genuinely fail (a correctness stop, not a permission gate) — same if
+  `wm-push` itself exits 2 with a guard rejection, or `branch-protection.sh
+  push` exits 5 (push/PR/auto-merge failed for a reason other than the
+  expected "protected, needs a branch"). New slugs need to be added to the
+  `ALLOW` array near the top of `wm-push` — keep it in sync with
+  `wm-publish`'s ALLOW and `~/wintermute/REPOS.md`. Counts as one tick
+  action.
+  # After push succeeds (direct or auto-merge armed): answerable-emit.sh push <repo> "v<ver> — <one-line>" false
 - **gate** [rust-extend only — the PRD's non-goals exclude python-* (already
   gated by `pybuilder gate ready`) and kernel-extend (gated by `makepkg`,
   no autobuilder receipts)] — the SOLO `wm-buildtree land` path only (a
@@ -2618,8 +2634,11 @@ python-specific contract.
    intent-card-refresh.sh ran> [--changed "<its 'changed:' stdout line>"]`
    first — same reasoning and same exit-code contract as the non-shared
    rust-extend push step above (the refresh commit is what's about to be
-   pushed, and it is not what the gate tested). Exit 0: `wm-push --slug
-   <repo>` once, then `worktree-extend.sh cleanup <repo> <slug>
+   pushed, and it is not what the gate tested). Exit 0: `scripts/branch-
+   protection.sh push <repo> <slug>` once (same push_via_branch switch as
+   the non-shared push step — a protected `main`, e.g. mcphost since this
+   PRD's live AC6/AC7 landing, refuses a direct push outright), then
+   `worktree-extend.sh cleanup <repo> <slug>
    --drop-branch`. Exit 4/5, same as any other deferred branch (dirty
    target / conflict / red gate): run `cleanup` WITHOUT `--drop-branch` so
    the next tick resumes the same branch via `add`, leave the PRD

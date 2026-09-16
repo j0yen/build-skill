@@ -74,8 +74,17 @@ jobs:
 EOF
 
 resolved_ci="$(resolve_checks "$ROOT" ci | sort)"
-expect "flow-style needs: ci resolves to gate + sandbox-required" \
-  '[ "$resolved_ci" = "$(printf "gate\nsandbox-required")" ]'
+# gate has no `name:` (falls back to its job key); sandbox-required DOES
+# set one -- GitHub's required-status-check contexts match the check
+# run's DISPLAY name (the job's `name:` field when set), not the YAML job
+# key, so the resolved context here must be "sandbox suites (all
+# shards)", never the literal key "sandbox-required" (the real mcphost
+# bug this fixture reproduces: a required context of `gate`/
+# `sandbox-required` left the AC7 PR permanently BLOCKED even after both
+# jobs went green, because neither job posts a check run by that literal
+# name).
+expect "flow-style needs: ci resolves to gate + sandbox-required's DISPLAY name" \
+  '[ "$resolved_ci" = "$(printf "gate\nsandbox suites (all shards)" | sort)" ]'
 
 resolved_deploy="$(resolve_checks "$ROOT" deploy | sort)"
 expect "block-list needs: deploy resolves to publish only" \
@@ -86,7 +95,7 @@ expect "unresolvable name passes through as a literal context" \
   '[ "$resolved_literal" = "some-context-name" ]'
 
 resolved_all="$(resolve_checks "$ROOT" | sort)"
-expect "no name given resolves every workflow's terminal jobs" \
-  '[ "$resolved_all" = "$(printf "gate\npublish\nsandbox-required")" ]'
+expect "no name given resolves every workflow's terminal jobs (by display name)" \
+  '[ "$resolved_all" = "$(printf "gate\npublish\nsandbox suites (all shards)" | sort)" ]'
 
 exit "$fail"
