@@ -51,7 +51,9 @@ BURST_ENV="${GATE_LAUNCH_BURST_ENV:-$HOME/.config/wm-burst/.env}"
 SYSTEMD_RUN="${GATE_LAUNCH_SYSTEMD_RUN:-systemd-run}"
 SYSTEMCTL="${GATE_LAUNCH_SYSTEMCTL:-systemctl}"
 JQ="${JQ:-jq}"
-journal="${GATE_LAUNCH_JOURNAL:-$HOME/brain/journal/build/$(date -u +%Y-%m-%d).md}"
+# shellcheck source=lib/journal.sh
+source "$HERE/lib/journal.sh"
+journal="${GATE_LAUNCH_JOURNAL:-$(journal_root)/$(date -u +%Y-%m-%d).md}"
 
 die() { echo "gate-launch: $2" >&2; exit "${1:-4}"; }
 usage() {
@@ -59,10 +61,13 @@ usage() {
   exit 4
 }
 now_iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+# PRD-build-journal-single-writer requirement 1: routed through journal_line
+# instead of a private printf >>. GATE_LAUNCH_JOURNAL is now a legacy alias
+# journal_line itself understands (scripts/lib/journal.sh), so this still
+# honors the same override gate-launch-selftest.sh already sets.
 jlog() {
   local slug_for_log="$1" msg="$2"
-  mkdir -p "$(dirname "$journal")" 2>/dev/null || true
-  printf '%s  %s  gate  %s\n' "$(now_iso)" "$slug_for_log" "$msg" >> "$journal"
+  journal_line --file "$journal" "$(printf '%s  %s  gate  %s' "$(now_iso)" "$slug_for_log" "$msg")"
 }
 
 [ -x "$EXTEND_GATE" ] || die 2 "missing $EXTEND_GATE"

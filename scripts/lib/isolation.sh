@@ -115,3 +115,36 @@ isolation_apply() {
 
   return 0
 }
+
+# selftest_init — PRD-build-journal-single-writer requirement 3: the one
+# prelude line a `scripts/*selftest*.sh` or `tests/*.sh` file sources
+# before running anything under test, replacing each file's own hand-
+# rolled `BUILD_TEST_ROOT="$(mktemp -d ...)"; export BUILD_TEST=1; export
+# BUILD_TEST_ROOT; isolation_apply` block (the exact four lines
+# run-selftests.sh itself already carries) with a single call. Mints a
+# fresh per-run BUILD_TEST_ROOT (same /mnt/data/jsy/tmp/bs-test.XXXXXX
+# convention run-selftests.sh uses — real disk, never /tmp tmpfs; see
+# self_selftest_tmpfs_disk_guard), sets BUILD_TEST=1 and BUILD_TEST_ROOT,
+# then delegates to isolation_apply for BUILD_JOURNAL_ROOT,
+# BUILD_TEST_REAL_HOME, and the rest of the override set documented
+# above. Idempotent: a caller that already exported BUILD_TEST_ROOT
+# itself (e.g. run-selftests.sh, which still does its own setup so every
+# test it execs inherits ONE shared root instead of each test minting a
+# throwaway of its own) is left alone — selftest_init only mints a root
+# when none is set yet, so a selftest sourcing this AS WELL AS being
+# invoked through run-selftests.sh still shares run-selftests.sh's root
+# rather than silently isolating itself into a second one.
+#
+# Returns non-zero (and prints to stderr) on mktemp failure; a caller
+# should treat that as fatal, same as isolation_apply's own failure mode.
+selftest_init() {
+  if [ -z "${BUILD_TEST_ROOT:-}" ]; then
+    BUILD_TEST_ROOT="$(mktemp -d "${TMPDIR:-/mnt/data/jsy/tmp}/bs-test.XXXXXX")" || {
+      echo "isolation.sh: selftest_init: mktemp -d failed" >&2
+      return 1
+    }
+    export BUILD_TEST_ROOT
+  fi
+  export BUILD_TEST=1
+  isolation_apply
+}

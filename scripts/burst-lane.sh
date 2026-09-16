@@ -308,7 +308,11 @@ TEARDOWN_CAUSE_FILE="$BOX_STATE_DIR/.last-teardown-cause"
 DECISIONS_LEDGER="${BURST_LANE_DECISIONS_LEDGER:-$STATE_DIR/decisions.jsonl}"
 PROBE_UNAVAILABLE_MARK_FILE="$BOX_STATE_DIR/.probe-unavailable-last"
 ENV_FILE="${BURST_LANE_ENV_FILE:-$HOME/.config/wm-burst/.env}"
-JOURNAL="${BURST_LANE_JOURNAL:-$HOME/brain/journal/build/burst-lane.log}"
+# PRD-build-journal-single-writer requirement 1: default composes off
+# journal_root() (scripts/lib/journal.sh, sourced above) instead of a
+# literal brain/journal path, so BUILD_JOURNAL_ROOT redirects it too.
+# BURST_LANE_JOURNAL remains a legacy alias journal_line itself honors.
+JOURNAL="${BURST_LANE_JOURNAL:-$(journal_root)/burst-lane.log}"
 PRD_DIR="${BURST_LANE_PRD_DIR:-$HOME/Documents/PRDs}"
 # PRD-build-cost-attribution: per-run attribution ledger (requirement 1),
 # the known-repo root used to split a worktree basename into <repo>/<slug>
@@ -347,7 +351,12 @@ REMOTE_DIRS_LOCK="$BOX_STATE_DIR/remote-dirs.lock"
 BUILD_FAIL_DIR="$STATE_DIR/build-fail"
 ATTR_REPOS_DIR="${BURST_LANE_REPOS_DIR:-$HOME/wintermute}"
 ROLLUP_CURSOR="$STATE_DIR/.rollup-cursor"
-TICK_JOURNAL_DIR="${BURST_LANE_TICK_JOURNAL_DIR:-$HOME/brain/journal/build}"
+# PRD-build-journal-single-writer requirement 1: default composes off
+# journal_root() instead of a literal brain/journal path — the two direct
+# `>>` appends below (gate-journal fold, once-a-day rollup line) now route
+# through journal_line too, closing the two writers this variable actually
+# fed (found alongside the five named in the PRD's engineering target).
+TICK_JOURNAL_DIR="${BURST_LANE_TICK_JOURNAL_DIR:-$(journal_root)}"
 # PRD-build-burst-parity-cadence requirement 2: parity's own load-deferral
 # wait bound — distinct from cargo-budget.sh's CARGO_BUDGET_WAIT_MAX, which
 # only gates the LOCAL cargo invocation. This gates the WHOLE parity attempt
@@ -7107,8 +7116,7 @@ cmd_gate() {
   local pulled_journal="$repo/target/autobuilder/gate-journal.md"
   if [ -s "$pulled_journal" ]; then
     local tj_today; tj_today="$(date -u -d "@$(now_epoch)" +%Y-%m-%d 2>/dev/null || date -u +%Y-%m-%d)"
-    mkdir -p "$TICK_JOURNAL_DIR" 2>/dev/null || true
-    cat "$pulled_journal" >> "$TICK_JOURNAL_DIR/$tj_today.md"
+    journal_line --file "$TICK_JOURNAL_DIR/$tj_today.md" "$(cat "$pulled_journal")"
     rm -f "$pulled_journal"
     "$SSH_BIN" $(ssh_kh_args) -i "$SSH_KEY" "$REMOTE_USER@$ip" "rm -f $remote_journal" 2>/dev/null || true
   fi
@@ -8517,8 +8525,7 @@ print(sum(1 for v in first_warm.values() if v))
   case "$rollup_local_free" in ''|*[!0-9]*) rollup_local_free="null" ;; esac
   line="$line redbaron_free_gb=${rollup_local_free}"
 
-  mkdir -p "$TICK_JOURNAL_DIR" 2>/dev/null || true
-  printf '%s\n' "$line" >> "$TICK_JOURNAL_DIR/$today.md"
+  journal_line --file "$TICK_JOURNAL_DIR/$today.md" "$line"
   printf '%s\n' "$today" > "$ROLLUP_CURSOR"
 }
 

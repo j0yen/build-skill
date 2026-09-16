@@ -31,9 +31,18 @@
 #   GATE_WEDGE_JOURNAL    file   (was gate-wedge.sh's own JOURNAL, <date>.md)
 #   SELECT_GUARD_JOURNAL  file   (was select-guard.sh's own journal var)
 #   CARGO_BUDGET_JOURNAL  file   (was cargo-budget.sh's own jf)
+#   TICK_RUN_JOURNAL      file   (was tick-run.sh's own JOURNAL, <date>.md)
+#   GATE_LAUNCH_JOURNAL   file   (was gate-launch.sh's own journal var)
+#   EXTEND_GATE_JOURNAL   file   (was extend-gate.sh's own journal var)
 #   JOURNAL_DIR           dir
 #   BUILD_JOURNAL_DIR      dir
 #   TICK_JOURNAL_DIR       dir
+#
+# TICK_RUN_JOURNAL/GATE_LAUNCH_JOURNAL/EXTEND_GATE_JOURNAL added by
+# PRD-build-journal-single-writer requirement 1 — same shape as
+# SELECT_GUARD_JOURNAL above, generalized to all five direct writers so
+# the wide existing selftest suite that already isolates via these names
+# keeps working unchanged once the writers route through journal_line.
 #
 # Tripwire (requirement 3): a write that would otherwise land at the
 # UNMODIFIED production default (no BUILD_JOURNAL_ROOT, no legacy alias
@@ -46,7 +55,7 @@
 # itself-journaled escape hatch (scripts/lib/isolation.sh; Goals) for the
 # rare case a fixture must legitimately target the production root.
 
-_JOURNAL_LEGACY_FILE_VARS="BURST_LANE_JOURNAL GATE_WEDGE_JOURNAL SELECT_GUARD_JOURNAL CARGO_BUDGET_JOURNAL"
+_JOURNAL_LEGACY_FILE_VARS="BURST_LANE_JOURNAL GATE_WEDGE_JOURNAL SELECT_GUARD_JOURNAL CARGO_BUDGET_JOURNAL TICK_RUN_JOURNAL GATE_LAUNCH_JOURNAL EXTEND_GATE_JOURNAL"
 _JOURNAL_LEGACY_DIR_VARS="JOURNAL_DIR BUILD_JOURNAL_DIR TICK_JOURNAL_DIR"
 
 journal_root() {
@@ -59,6 +68,13 @@ journal_root() {
 _journal_legacy_active_name() {
   [ -n "${BUILD_JOURNAL_ROOT:-}" ] && return 0
   local name
+  # Local, default-whitespace IFS — a caller further up the stack (e.g.
+  # select-guard.sh's `local IFS=','` still in scope across its own
+  # journal_line call) must never make this unquoted word-split treat the
+  # whole space-separated list as one name. Verified live: without this,
+  # select-guard-same-target-cap-selftest.sh's IFS=',' scope broke this
+  # exact loop with "invalid variable name".
+  local IFS=$' \t\n'
   for name in $_JOURNAL_LEGACY_FILE_VARS $_JOURNAL_LEGACY_DIR_VARS; do
     if [ -n "${!name:-}" ]; then
       printf '%s\n' "$name"

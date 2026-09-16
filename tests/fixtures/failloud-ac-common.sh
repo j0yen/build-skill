@@ -17,6 +17,14 @@ run_suite_and_expect_labels() {  # $@ = "ok  <label>" line or stable substring, 
   here="$(cd "$(dirname "${BASH_SOURCE[1]}")" && pwd)"
   suite="$here/../scripts/failloud-selftest.sh"
   [ -x "$suite" ] || { echo "FAIL: $suite not executable" >&2; return 2; }
+  # PRD-build-journal-single-writer requirement 3: structural isolation
+  # exported into the child `bash "$suite"` process below, belt-and-
+  # suspenders alongside failloud-selftest.sh's own per-case
+  # BUILD_JOURNAL_ROOT/SELECT_GUARD_JOURNAL overrides (not every one of
+  # its internal cases sets its own).
+  # shellcheck source=../../scripts/lib/isolation.sh
+  source "$here/../scripts/lib/isolation.sh"
+  selftest_init || { echo "FAIL: failloud-ac-common: selftest_init failed" >&2; return 2; }
   out="$(bash "$suite" 2>&1)"; rc=$?
   if [ "$rc" -ne 0 ]; then
     echo "FAIL: failloud-selftest.sh exited $rc" >&2

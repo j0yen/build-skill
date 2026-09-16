@@ -87,6 +87,8 @@ LANE_PREDICATE="$HERE/lane-predicate.sh"
 source "$HERE/lib/depends-gate.sh"
 # shellcheck source=lib/probe.sh
 source "$HERE/lib/probe.sh"
+# shellcheck source=lib/journal.sh
+source "$HERE/lib/journal.sh"
 
 die() { echo "select-guard: $*" >&2; exit "${2:-4}"; }
 usage() { echo "usage: select-guard.sh <slug> [lane-name] [prd-dir] [branch-count] [admitted-targets]" >&2; exit 4; }
@@ -96,19 +98,22 @@ usage() { echo "usage: select-guard.sh <slug> [lane-name] [prd-dir] [branch-coun
 # digest (scripts/serialization-digest.sh) can compute `waits=<n>` from
 # the shared journal alone, the same way it reads extend-gate.sh's and
 # worktree-extend.sh's own journal lines for the gate/land counters.
-# Same override + isolation-guard.sh default-deny convention every other
-# build script's journal write uses (EXTEND_GATE_JOURNAL,
-# WORKTREE_EXTEND_JOURNAL, ...); best-effort — never blocks selection.
+# PRD-build-journal-single-writer requirement 1: routed through the one
+# journal_line (scripts/lib/journal.sh) instead of a private printf >>
+# writer — journal_line already honors SELECT_GUARD_JOURNAL as a legacy
+# alias (same override this function always accepted) and BUILD_TEST=1 /
+# BUILD_JOURNAL_ROOT for isolation, plus its own production fixture-shaped
+# refusal. The isolation-guard.sh pre-check below is kept as a second,
+# independent belt-and-suspenders layer against a resolved live path.
 select_guard_journal_line() {
   local slug="$1" outcome="$2" detail="$3"
-  local journal="${SELECT_GUARD_JOURNAL:-$HOME/brain/journal/build/$(date -u +%Y-%m-%d).md}"
+  local journal_probe="${SELECT_GUARD_JOURNAL:-$(journal_root)/$(date -u +%Y-%m-%d).md}"
   if [ -r "$HERE/isolation-guard.sh" ]; then
     # shellcheck source=isolation-guard.sh
     source "$HERE/isolation-guard.sh"
-    isolation_guard_path "$journal" "select-guard.sh"
+    isolation_guard_path "$journal_probe" "select-guard.sh"
   fi
-  mkdir -p "$(dirname "$journal")" 2>/dev/null || return 0
-  printf '%s  select  %s  %s  (%s)\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$slug" "$outcome" "$detail" >>"$journal" 2>/dev/null || true
+  journal_line "$(printf '%s  select  %s  %s  (%s)' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$slug" "$outcome" "$detail")" || true
 }
 
 # select_guard_journal_gated — PRD-build-select-guard-depends-before-slot
@@ -122,14 +127,13 @@ select_guard_journal_line() {
 # Same override/isolation-guard.sh convention as select_guard_journal_line.
 select_guard_journal_gated() {
   local slug="$1" reason="$2"
-  local journal="${SELECT_GUARD_JOURNAL:-$HOME/brain/journal/build/$(date -u +%Y-%m-%d).md}"
+  local journal_probe="${SELECT_GUARD_JOURNAL:-$(journal_root)/$(date -u +%Y-%m-%d).md}"
   if [ -r "$HERE/isolation-guard.sh" ]; then
     # shellcheck source=isolation-guard.sh
     source "$HERE/isolation-guard.sh"
-    isolation_guard_path "$journal" "select-guard.sh"
+    isolation_guard_path "$journal_probe" "select-guard.sh"
   fi
-  mkdir -p "$(dirname "$journal")" 2>/dev/null || return 0
-  printf 'select: %s gated (%s) slot-not-consumed\n' "$slug" "$reason" >>"$journal" 2>/dev/null || true
+  journal_line "$(printf 'select: %s gated (%s) slot-not-consumed' "$slug" "$reason")" || true
 }
 
 # Same build_into parser as lane-predicate.sh's read_field (PRD-build-

@@ -127,6 +127,8 @@ command -v python3 >/dev/null 2>&1 || die "python3 not on PATH"
 
 # shellcheck source=lib/alert-marker.sh
 source "$HERE/lib/alert-marker.sh"
+# shellcheck source=lib/journal.sh
+source "$HERE/lib/journal.sh"
 
 report_mode=false
 format=table
@@ -505,6 +507,38 @@ for a in json.loads(sys.argv[2]):
 for a in json.loads(sys.argv[1])["active"]:
     print(json.dumps(a))' "$rh_active_json")
   fi
+
+  # PRD-build-journal-single-writer requirement 5: the corpus tripwire.
+  # Runs lint-journal-fixtures.sh --corpus <today> and, on count > 0,
+  # journals one line + raises a docket alarm — the one exception to this
+  # block's own "no writes at all" comment above (journal/docket are not
+  # the manifest; this is what makes the leak visible the same day
+  # instead of nine hours later from a status sweep's grep). count 0
+  # journals nothing.
+  lint_bin="$HERE/lint-journal-fixtures.sh"
+  if [ -x "$lint_bin" ]; then
+    corpus_today="$(date -u +%F)"
+    corpus_out="$("$lint_bin" --corpus "$corpus_today" 2>/dev/null || true)"
+    corpus_total="$(printf '%s\n' "$corpus_out" | sed -n 's/.*fixture-lines-total=\([0-9]*\).*/\1/p' | tail -n1)"
+    case "$corpus_total" in ''|*[!0-9]*) corpus_total=0 ;; esac
+    if [ "$corpus_total" -gt 0 ]; then
+      corpus_first="$(grep -E "^${corpus_today}" "$HOME/brain/journal/build/$corpus_today.md" 2>/dev/null | head -n1 | awk '{print $1}')"
+      corpus_top3="$(printf '%s\n' "$corpus_out" | grep -vE 'fixture-lines-total=' | sed -E 's/^lint-journal-fixtures: //' | awk -F'  ' '{print $1}' | head -n3 | paste -sd, -)"
+      # BUILD_TEST_ALLOW_PROD=1: this line legitimately reports ABOUT
+      # fixture-shaped content (its own tokens= field routinely embeds a
+      # /tmp/ target or a step=ac<N> token, quoting the very leak it's
+      # naming) — journal_line's own production tripwire would otherwise
+      # refuse this exact alarm line, the one write that must always land.
+      BUILD_TEST_ALLOW_PROD=1 journal_line "$(printf '%s  journal  fixture-leak  (count=%s first=%s tokens=%s)' \
+        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$corpus_total" "${corpus_first:-unknown}" "${corpus_top3:-none}")"
+      if command -v docket >/dev/null 2>&1; then
+        docket report --run "$DOCKET_RUN" --key "manifest-invariant-fixture-leak" \
+          --title "fixture-shaped lines in production journal (count=$corpus_total)" --severity warn \
+          >/dev/null 2>&1 || log "docket report failed for manifest-invariant-fixture-leak (fail-open, journal line already written)"
+      fi
+    fi
+  fi
+
   exit 0
 fi
 

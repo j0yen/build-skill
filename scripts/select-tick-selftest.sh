@@ -32,6 +32,21 @@ ST="$HERE/select-tick.sh"
 SCHEMA="$HERE/select-tick.schema.json"
 JQ="${JQ:-$(command -v jq 2>/dev/null || echo /usr/bin/jq)}"
 
+# PRD-build-journal-single-writer requirement 3: the structural prelude,
+# sourced before select-tick.sh (or anything it shells out to, including
+# select-guard.sh) ever runs. This selftest already isolates select-
+# tick.sh's OWN journal via SELECT_TICK_JOURNAL below — what it never did
+# before this PRD was isolate select-guard.sh's, which select-tick.sh
+# calls internally and which reads a DIFFERENT env var
+# (SELECT_GUARD_JOURNAL) that this file never set. selftest_init's
+# BUILD_TEST=1 + BUILD_JOURNAL_ROOT is structural, so it covers
+# select-guard.sh (and anything else this selftest transitively invokes)
+# without this file needing to know every callee's own override name —
+# exactly the 2026-09-15 leak this PRD exists to close.
+# shellcheck source=lib/isolation.sh
+source "$HERE/lib/isolation.sh"
+selftest_init || { echo "select-tick-selftest: selftest_init failed" >&2; exit 1; }
+
 FAILED=0
 fail() { echo "FAIL: $*" >&2; FAILED=1; }
 pass() { echo "ok: $*"; }

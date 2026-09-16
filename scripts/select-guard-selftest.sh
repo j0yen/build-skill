@@ -25,6 +25,17 @@ mkdir -p "$JOURNAL_DIR"
 # every same-target admit/block decision — isolate it same as JOURNAL_DIR
 # above, or every run of this selftest pollutes the real shared journal.
 export SELECT_GUARD_JOURNAL="$ROOT/select-guard-journal.md"
+# PRD-build-journal-single-writer requirement 1 routed select-guard.sh
+# through the shared journal_line, which gives BUILD_JOURNAL_ROOT
+# unconditional priority over SELECT_GUARD_JOURNAL (scripts/lib/journal.sh:
+# "never consulted when BUILD_JOURNAL_ROOT itself is set"). Under
+# run-selftests.sh — which exports BUILD_JOURNAL_ROOT for its own
+# isolation — that silently redirected select-guard.sh's writes away from
+# $SELECT_GUARD_JOURNAL, the exact file selslot_d below asserts against;
+# this selftest passed standalone but failed under the runner until this
+# unset (verified live: `run-selftests.sh scripts/select-guard-selftest.sh`
+# failed selslot_d before this fix, passed after).
+unset BUILD_JOURNAL_ROOT
 
 git init -q --bare "$ROOT/origin.git"
 git clone -q "$ROOT/origin.git" "$ROOT/clone"
