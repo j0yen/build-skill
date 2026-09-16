@@ -235,7 +235,23 @@ source "$HERE/lib/journal.sh"
 source "$HERE/lib/probe.sh"
 
 STATE_DIR="${BURST_LANE_STATE_DIR:-$SKILL_DIR/state/burst-lane}"
-STATE_FILE="$STATE_DIR/session.json"
+# PRD-build-burst-state-keyed-by-server-v2 requirement 1: state layout.
+# Every PER-BOX path (classified in scripts/burst-state-surface.txt) lives
+# under $STATE_DIR/boxes/<server_id>/ and resolves through box_path() below
+# — no other function in this file constructs a "boxes/" path by hand
+# (checked mechanically by the tripwire selftest, requirement 10).
+# $STATE_DIR/current is a symlink to the box most recently made ready
+# (`box_activate` below repoints it); BOX_STATE_DIR is that symlink's own
+# path, so every existing single-box caller that read
+# "$STATE_DIR/<name>" before this PRD reads "$BOX_STATE_DIR/<name>" now and
+# — because `current` always resolves to exactly one real box directory —
+# sees byte-identical behavior in the single-box case. Multi-box selection
+# (an explicit --box <id>, iterating every box) is requirement 2/3
+# territory and is NOT wired here — box_path only ever resolves the single
+# ACTIVE box via `current`, same as BOX_STATE_DIR.
+BOX_STATE_DIR="$STATE_DIR/current"
+box_path() { printf '%s/%s\n' "$BOX_STATE_DIR" "$1"; }
+STATE_FILE="$BOX_STATE_DIR/session.json"
 # PRD-build-burst-dispatch-reenable requirement 1: the baked-image record —
 # `image_id`/`created`/`base_image_id`/`build_skill_sha`/`gate_tool_versions`
 # plus a capped `baked_history` (oldest-first, <=2 entries) used to journal
@@ -256,7 +272,7 @@ CURRENT_BOOT_IMAGE_SOURCE=""
 # `enable`). requirement 4/6: the systemd drop-in `enable` writes/`disable`
 # removes/`status` reports the existence of; overridable so a selftest
 # never touches this host's REAL ~/.config/systemd/user tree.
-PROOF_STATE_FILE="$STATE_DIR/proof.json"
+PROOF_STATE_FILE="$BOX_STATE_DIR/proof.json"
 # PRD-build-burst-dispatch-reenable requirement 7: the image_id `up` resolved
 # (resolve_boot_image) the last time a session started — plain text, not
 # JSON, since it is only ever compared for equality. Absent file == "no
@@ -265,7 +281,7 @@ PROOF_STATE_FILE="$STATE_DIR/proof.json"
 # refresh_parity_baseline_on_image_change.
 PARITY_BASELINE_IMAGE_FILE="$STATE_DIR/parity-baseline-image"
 SYSTEMD_DROPIN="${BURST_LANE_SYSTEMD_DROPIN:-$HOME/.config/systemd/user/claude-build.service.d/burst.conf}"
-COST_LEDGER="${BURST_LANE_COST_LEDGER:-$STATE_DIR/cost.jsonl}"
+COST_LEDGER="${BURST_LANE_COST_LEDGER:-$BOX_STATE_DIR/cost.jsonl}"
 # PRD-build-burst-dispatch-reenable requirement 5 (auto-disable, trigger b):
 # the €/day ceiling on deleted-box cost with no routed run this day — read
 # by check_auto_disable() below, never by cmd_enable (enable only ever
@@ -275,13 +291,13 @@ BURST_AUTO_DISABLE_EUR_PER_DAY="${BURST_AUTO_DISABLE_EUR_PER_DAY:-2.00}"
 # deduped. Reset on a fresh boot/adopt (alongside runs_served=0), appended
 # to (deduped) by every routed `run`, read into the cost-ledger row at
 # teardown, then cleared with the rest of the session state.
-SERVED_FILE="$STATE_DIR/prds_served"
+SERVED_FILE="$BOX_STATE_DIR/prds_served"
 # PRD-build-burst-teardown-lifecycle requirement 3: a scratch file, not a
 # shell variable — teardown_and_delete runs inside every caller's own
 # `$(...)` command substitution, which is a SUBSHELL; a plain variable set
 # there never reaches the parent shell that reads it back afterward. A file
 # survives that boundary the same way $SERVED_FILE etc. already do.
-TEARDOWN_CAUSE_FILE="$STATE_DIR/.last-teardown-cause"
+TEARDOWN_CAUSE_FILE="$BOX_STATE_DIR/.last-teardown-cause"
 # PRD-build-burst-teardown-evidence requirement 1: the append-only decision
 # trail teardown_decision() writes one row to on every call (ts, server_id,
 # caller, decision, cause, evidence) — this is what `why-down` replays.
@@ -290,7 +306,7 @@ TEARDOWN_CAUSE_FILE="$STATE_DIR/.last-teardown-cause"
 # so a probe outage that lasts all day journals once, not once per caller
 # invocation.
 DECISIONS_LEDGER="${BURST_LANE_DECISIONS_LEDGER:-$STATE_DIR/decisions.jsonl}"
-PROBE_UNAVAILABLE_MARK_FILE="$STATE_DIR/.probe-unavailable-last"
+PROBE_UNAVAILABLE_MARK_FILE="$BOX_STATE_DIR/.probe-unavailable-last"
 ENV_FILE="${BURST_LANE_ENV_FILE:-$HOME/.config/wm-burst/.env}"
 JOURNAL="${BURST_LANE_JOURNAL:-$HOME/brain/journal/build/burst-lane.log}"
 PRD_DIR="${BURST_LANE_PRD_DIR:-$HOME/Documents/PRDs}"
@@ -299,15 +315,15 @@ PRD_DIR="${BURST_LANE_PRD_DIR:-$HOME/Documents/PRDs}"
 # (attribution_slug_for below), the once-per-day rollup cursor (requirement
 # 4), and the tick journal directory that rollup line lands in — distinct
 # from $JOURNAL above, which is this script's own flat log.
-ATTR_LEDGER="${BURST_LANE_ATTR_LEDGER:-$STATE_DIR/attribution.jsonl}"
+ATTR_LEDGER="${BURST_LANE_ATTR_LEDGER:-$BOX_STATE_DIR/attribution.jsonl}"
 # PRD-build-burst-pull-on-demand: lazy-pull state. DIRTY_DIR holds one
 # marker per worktree (keyed like remote_path_for()'s sha1 scheme) recording
 # that a completed remote `run` left target/ (or .pybuilder/) ahead of the
 # local worktree; PULLSZ_DIR remembers the last ACTUAL pull's byte count per
 # worktree (survives marker clears) so a skipped pull's telemetry can still
 # print an `estimate: true` bytes_saved figure instead of a bare zero.
-DIRTY_DIR="$STATE_DIR/dirty"
-PULLSZ_DIR="$STATE_DIR/pull-sizes"
+DIRTY_DIR="$BOX_STATE_DIR/dirty"
+PULLSZ_DIR="$BOX_STATE_DIR/pull-sizes"
 # PRD-build-burst-path-deps-workspaces requirement 3: the lane-owned
 # directory manifest — every directory `run` creates under $REMOTE_ROOT that
 # does NOT correspond one-to-one with a local worktree (today, concretely,
@@ -320,8 +336,8 @@ PULLSZ_DIR="$STATE_DIR/pull-sizes"
 # a live worktree needed the very next run). Plain JSON object, one lock
 # file guarding read-modify-write the same way STATE_FILE's flock 201
 # guards session state.
-REMOTE_DIRS_FILE="$STATE_DIR/remote-dirs.json"
-REMOTE_DIRS_LOCK="$STATE_DIR/remote-dirs.lock"
+REMOTE_DIRS_FILE="$BOX_STATE_DIR/remote-dirs.json"
+REMOTE_DIRS_LOCK="$BOX_STATE_DIR/remote-dirs.lock"
 # PRD-build-burst-path-deps-workspaces requirement 4: per-worktree repeat
 # guard for identical consecutive build-failed causes — one small JSON file
 # per worktree (same sha1-hash8 keying as dirty_marker_file()) recording the
@@ -353,7 +369,7 @@ CARGO_BUDGET_SH="${BURST_LANE_CARGO_BUDGET_SH:-$SKILL_DIR/scripts/cargo-budget.s
 # read-only alongside them but aren't "versioned" the same way. Overridable
 # so offline tests never touch the real ~/.cargo/bin or ~/.claude/skills.
 GATE_TOOLS_LIST="autobuilder jq gh mold cargo-deny cargo-nextest uv claude"
-GATE_TOOLS_STATE_FILE="$STATE_DIR/gate-tools.json"
+GATE_TOOLS_STATE_FILE="$BOX_STATE_DIR/gate-tools.json"
 # PRD-build-burst-provision-forensics: per-tool failure evidence, pruned to
 # the newest N sessions (requirement 2) — a flat dir keyed
 # "<session_id>-<tool>.log" plus an append-only ledger of which session_id
@@ -385,14 +401,14 @@ _GT_CURRENT_TOOL=""
 # its journal line; it is never itself part of the mutual-exclusion logic.
 PROVISION_LOCK_FILE="$STATE_DIR/provision.lock"
 PROVISION_PID_FILE="$STATE_DIR/provision.pid"
-UP_LOCK_FILE="$STATE_DIR/up.lock"
-UP_PID_FILE="$STATE_DIR/up.pid"
+UP_LOCK_FILE="$BOX_STATE_DIR/up.lock"
+UP_PID_FILE="$BOX_STATE_DIR/up.pid"
 # PRD-build-burst-prove-inflight-guard requirement 1: cmd_prove's own
 # in-flight marker — present from just before its `up` call until its EXIT
 # trap fires, so down/idle-guard/watchdog (all three autonomous deleters)
 # can see a prove is live before deciding to tear the box down under it
 # (2026-09-15: box 165981910 deleted between prove's `up` and `run`).
-PROVE_INFLIGHT_FILE="$STATE_DIR/prove.inflight"
+PROVE_INFLIGHT_FILE="$BOX_STATE_DIR/prove.inflight"
 # requirement 4: reap's orphan sweep. INFLIGHT_LOG is an append-only
 # "<epoch> <pid> <kind>" ledger, one row per provision/up invocation that
 # got far enough to acquire its lock — reap prunes rows whose pid is dead
@@ -400,7 +416,7 @@ PROVE_INFLIGHT_FILE="$STATE_DIR/prove.inflight"
 # BURST_ORPHAN_AGE_S, and not the CURRENT lock holder for that kind (read
 # fresh from up.pid/provision.pid, never trusted from the ledger row
 # itself).
-INFLIGHT_LOG="$STATE_DIR/inflight.log"
+INFLIGHT_LOG="$BOX_STATE_DIR/inflight.log"
 BURST_ORPHAN_AGE_S="${BURST_ORPHAN_AGE_S:-600}"
 # PRD-build-burst-gate-tools-toolchain requirement 1: cargo-based installs
 # pin BOTH the toolchain and the crate version in one table, because the
@@ -455,7 +471,7 @@ KH_SESSION_ID=""
 session_known_hosts_file() {  # -> stdout path for $1 (session id) or the
                                # active session's own server_id
   local sid="${1:-${KH_SESSION_ID:-$(state_read server_id 2>/dev/null)}}"
-  echo "$STATE_DIR/known_hosts.${sid:-none}"
+  echo "$BOX_STATE_DIR/known_hosts.${sid:-none}"
 }
 
 ssh_kh_args() {  # -> stdout "-o UserKnownHostsFile=<path> -o StrictHostKeyChecking=accept-new"
@@ -557,14 +573,14 @@ BURST_PULL_MAX_ATTEMPTS="${BURST_PULL_MAX_ATTEMPTS:-8}"
 # the PRD's acceptance criteria without actually storing bytes there.
 BURST_PROVE_TMP="${BURST_PROVE_TMP:-${TMPDIR:-/mnt/data/jsy/tmp}}"
 EVIDENCE_ROOT="${BURST_EVIDENCE_ROOT:-$BURST_PROVE_TMP/burst-lane-evidence}"
-EVIDENCE_DIR="$STATE_DIR/evidence"
+EVIDENCE_DIR="$BOX_STATE_DIR/evidence"
 # Requirement 3: how many evidence sets `reap` keeps, newest first.
 BURST_EVIDENCE_KEEP="${BURST_EVIDENCE_KEEP:-3}"
 # Persistent across sessions (NOT cleared by state_clear/`down`'s delete —
 # the volume, and the fact that its last detach failed, outlive the box that
 # was attached to it). volume_state_write's own key=value convention mirrors
 # state_write's.
-VOLUME_STATE_FILE="$STATE_DIR/volume.json"
+VOLUME_STATE_FILE="$BOX_STATE_DIR/volume.json"
 
 # ---- setup-grace + cold-volume policy (PRD-build-burst-teardown-lifecycle) --
 # BURST_SETUP_GRACE_MIN: minutes an autonomous teardown caller (anything
@@ -612,6 +628,177 @@ authz_refuse_if_missing() {  # $1=subcommand name -> 0 ok to proceed, 1 refused 
 }
 
 mkdir -p "$STATE_DIR" 2>/dev/null || true
+
+# ---- state layout migration (PRD-build-burst-state-keyed-by-server-v2
+# requirement 1) -------------------------------------------------------------
+# migrate_state_layout: one-time (per top-level residue) move of every
+# PER-BOX name (scripts/burst-state-surface.txt) from $STATE_DIR/<name>
+# into $STATE_DIR/boxes/<server_id>/<name>, then points $STATE_DIR/current
+# at it. Idempotent — a second call with nothing left at the top level is a
+# no-op (checked by the `found` scan below, not by a separate marker file,
+# so a crash mid-migration is safely resumed by the next invocation, real
+# or a selftest's). Never deletes anything, only `mv`s.
+# box_point_current_at <server_id>: make $STATE_DIR/current a symlink to
+# boxes/<id>, no matter what `current` was before this call — absent, a
+# symlink to some other (or the startup "pending") box, or a plain real
+# directory (a fixture writing fixture state under current/ before any
+# real box existed this invocation, or this same process's own
+# up.lock/up.pid/inflight.log written before the id was known — see
+# box_ensure_current). `ln -sfn` alone cannot turn an existing real
+# directory into a symlink — it silently nests the new link INSIDE it
+# instead, stranding whatever was already there (the exact bug this
+# closes: a real `current/` directory left `up.pid` unreachable through
+# the symlink forever). A symlink to a DIFFERENT, already-real box is left
+# alone — that is genuine prior-session history, never folded into a new
+# one; only a real directory or the "pending" placeholder gets folded
+# forward.
+box_point_current_at() {
+  local id="$1"
+  [ -n "$id" ] || return 0
+  mkdir -p "$STATE_DIR/boxes/$id" 2>/dev/null || true
+  if [ -e "$STATE_DIR/current" ] && [ ! -L "$STATE_DIR/current" ]; then
+    ( cd "$STATE_DIR/current" 2>/dev/null \
+        && find . -mindepth 1 -maxdepth 1 -exec mv -n {} "$STATE_DIR/boxes/$id/" \; ) 2>/dev/null || true
+    rm -rf "$STATE_DIR/current" 2>/dev/null || true
+  elif [ -L "$STATE_DIR/current" ] && [ "$(readlink "$STATE_DIR/current" 2>/dev/null)" = "boxes/pending" ] \
+         && [ "$id" != "pending" ] && [ -d "$STATE_DIR/boxes/pending" ]; then
+    ( cd "$STATE_DIR/boxes/pending" 2>/dev/null \
+        && find . -mindepth 1 -maxdepth 1 -exec mv -n {} "$STATE_DIR/boxes/$id/" \; ) 2>/dev/null || true
+    rmdir "$STATE_DIR/boxes/pending" 2>/dev/null || true
+  fi
+  ln -sfn "boxes/$id" "$STATE_DIR/current"
+}
+
+migrate_state_layout() {
+  [ -d "$STATE_DIR" ] || return 0
+  local id="" jqbin; jqbin="$(command -v jq 2>/dev/null || true)"
+  if [ -f "$STATE_DIR/session.json" ]; then
+    if [ -n "$jqbin" ]; then
+      id="$("$jqbin" -r '.server_id // empty' "$STATE_DIR/session.json" 2>/dev/null)"
+    else
+      id="$(grep -oE '"server_id":"?[^,"}]*"?' "$STATE_DIR/session.json" 2>/dev/null \
+              | head -n1 | sed -E 's/^[^:]*:"?([^",}]*)"?$/\1/')"
+    fi
+  fi
+  if [ -z "$id" ]; then
+    # requirement 1 migration rule: no top-level session.json (box already
+    # deleted, or a crash before one was ever written) — fall back to the
+    # known_hosts.<id> suffix, the other clue the PRD names.
+    local kh
+    for kh in "$STATE_DIR"/known_hosts.*; do
+      [ -e "$kh" ] || continue
+      local cand="${kh##*/known_hosts.}"
+      [ "$cand" = "none" ] && continue
+      id="$cand"; break
+    done
+  fi
+
+  # Snapshot every top-level per-box entry that actually exists before
+  # moving anything, so the journaled moved=<n> count is exact and stable.
+  local perbox_names=(session.json volume.json proof.json run.lock cost.jsonl \
+    attribution.jsonl prds_served gate-tools.json remote-dirs.json remote-dirs.lock \
+    up.lock up.pid prove.inflight inflight.log .last-teardown-cause .probe-unavailable-last)
+  local perbox_dirs=(slots locks dirty pull-sizes evidence gate-inflight)
+  # requirement 1's "logs/{...}" bullet — only these prefixes are per-box;
+  # logs/failed/ and logs/failed-sessions.log (GATE_TOOLS_FAILED_*) stay
+  # lane-wide and are deliberately never matched here.
+  local log_prefixes="run-remote rsync-up rsync-gate rsync-parity pathdep-rsync pull-fail prove gate-tools-install gate-tools-apt-update"
+  local found=() name f
+  for name in "${perbox_names[@]}"; do
+    for f in "$STATE_DIR/$name" "$STATE_DIR/$name".backup "$STATE_DIR/$name".stale-* "$STATE_DIR/$name".deleted-*; do
+      [ -e "$f" ] && found+=("$f")
+    done
+  done
+  for name in "${perbox_dirs[@]}"; do
+    [ -e "$STATE_DIR/$name" ] && found+=("$STATE_DIR/$name")
+  done
+  for f in "$STATE_DIR"/known_hosts.*; do
+    [ -e "$f" ] && found+=("$f")
+  done
+  if [ -d "$STATE_DIR/logs" ]; then
+    local pfx
+    for pfx in $log_prefixes; do
+      for f in "$STATE_DIR/logs/$pfx".*; do
+        [ -e "$f" ] && found+=("$f")
+      done
+    done
+  fi
+  [ "${#found[@]}" -gt 0 ] || return 0
+
+  local dest
+  if [ -n "$id" ]; then dest="$STATE_DIR/boxes/$id"
+  else dest="$STATE_DIR/boxes/_orphan-$(now_epoch)"
+  fi
+  mkdir -p "$dest" 2>/dev/null || true
+
+  local moved=0 src rel
+  for src in "${found[@]}"; do
+    rel="${src#"$STATE_DIR"/}"
+    mkdir -p "$dest/$(dirname "$rel")" 2>/dev/null || true
+    mv -f "$src" "$dest/$rel" 2>/dev/null && moved=$((moved + 1))
+  done
+
+  if [ -n "$id" ]; then
+    box_point_current_at "$id"
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  state  migrated  (server_id=$id moved=$moved)"
+  else
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  state  migrated-orphan  (dest=$(basename "$dest") moved=$moved)"
+  fi
+}
+
+# box_ensure_current: guarantee $STATE_DIR/current exists as a real symlink
+# before the first per-box path of this invocation is used — migration
+# above already sets it when a real server_id was found; this covers the
+# remaining "genuinely fresh, or already fully torn down" case so nothing
+# downstream (e.g. cmd_up's UP_LOCK_FILE) ever races `mkdir -p` into
+# creating `current` itself as a plain directory. cmd_up's box_activate
+# repoints this at the real server_id the instant one is known (adopt or
+# fresh-create); anything this process writes before that (up.lock,
+# up.pid, inflight.log) lands in the disposable "pending" box and is
+# folded into the real one by box_activate.
+box_ensure_current() {
+  if [ ! -e "$STATE_DIR/current" ] && [ ! -L "$STATE_DIR/current" ]; then
+    mkdir -p "$STATE_DIR/boxes/pending" 2>/dev/null || true
+    ln -sfn "boxes/pending" "$STATE_DIR/current" 2>/dev/null || true
+  fi
+}
+
+# box_carry_forward_volume_state <new server id>: volume.json is the one
+# per-box name (requirement 1's own classification) whose SUBJECT — the
+# persistent Hetzner volume PRD-build-burst-persistent-volume introduced —
+# outlives the box it happens to be filed under: the same volume reattaches
+# to whatever box replaces a deleted one. Left purely per-box, a
+# volume_dirty=true flag set by the box that just got torn down would
+# vanish into that now-orphaned box's directory the moment `current`
+# repoints at a brand-new box id, silently dropping the "fsck before
+# mount" signal the persistent-volume PRD depends on (Goal 2: zero
+# behavior change for single-box callers). Called BEFORE box_activate
+# repoints `current`, while it still names the box that just went away.
+box_carry_forward_volume_state() {
+  local new_id="$1" old_dir
+  old_dir="$(readlink -f "$STATE_DIR/current" 2>/dev/null || true)"
+  [ -n "$old_dir" ] && [ -f "$old_dir/volume.json" ] || return 0
+  [ "$old_dir" = "$STATE_DIR/boxes/$new_id" ] && return 0
+  local new_dir="$STATE_DIR/boxes/$new_id"
+  [ -f "$new_dir/volume.json" ] && return 0   # never clobber a box that already has its own
+  mkdir -p "$new_dir" 2>/dev/null || true
+  cp -p "$old_dir/volume.json" "$new_dir/volume.json" 2>/dev/null || true
+}
+
+# box_activate <server_id>: point `current` at boxes/<id>, creating it if
+# needed, folding forward whatever transient content was already sitting
+# at `current` (the startup "pending" placeholder, or a plain directory —
+# see box_point_current_at above for why that case needs care), and
+# carrying the persistent volume's own state forward (see
+# box_carry_forward_volume_state above) before the old box's directory is
+# left behind as inert history.
+box_activate() {
+  box_carry_forward_volume_state "$1"
+  box_point_current_at "$1"
+}
+
+migrate_state_layout
+box_ensure_current
 
 # ---- config -------------------------------------------------------------
 load_env() {
@@ -1606,7 +1793,7 @@ GATE_TOOLS_MISSING=""
 GATE_TOOLS_RC_SUMMARY=""
 provision_gate_tools() {  # $1=ip
   local ip="$1" probe_out name ver
-  mkdir -p "$STATE_DIR/logs" 2>/dev/null || true
+  mkdir -p "$BOX_STATE_DIR/logs" 2>/dev/null || true
 
   probe_out="$(gate_tools_probe "$ip")"
   local pre_probe_rc=$?
@@ -1630,7 +1817,7 @@ provision_gate_tools() {  # $1=ip
     [ "$ver" = "MISSING" ] && gate_tools_is_apt "$name" && need_apt_update=1
   done
   if [ "$need_apt_update" = "1" ]; then
-    local apt_log="$STATE_DIR/logs/gate-tools-apt-update.$$.log" apt_rc=0
+    local apt_log="$BOX_STATE_DIR/logs/gate-tools-apt-update.$$.log" apt_rc=0
     # Requirement 3: apt-get is root's job, never build's — hardcoded root@,
     # not $REMOTE_USER@, regardless of which user the rest of this function
     # routes to.
@@ -1702,7 +1889,7 @@ provision_gate_tools() {  # $1=ip
     fi
     local start_ts rc secs err_log err_line
     start_ts="$(now_epoch)"
-    err_log="$STATE_DIR/logs/gate-tools-install.$$-$name.log"
+    err_log="$BOX_STATE_DIR/logs/gate-tools-install.$$-$name.log"
     rc=0
     _GT_CURRENT_TOOL="$name"
     # PRD-build-burst-dispatch-reenable requirement 2: a baked image is
@@ -2097,7 +2284,7 @@ print(json.dumps({
     "prove_last": prove_last,
     "evidence": evidence,
 }))
-' "$img_id" "$img_source" "$SNAPSHOT_STATE_FILE" "$PROOF_STATE_FILE" "$SYSTEMD_DROPIN" "$STATE_DIR/logs" "$(evidence_status_json "$EVIDENCE_DIR")"
+' "$img_id" "$img_source" "$SNAPSHOT_STATE_FILE" "$PROOF_STATE_FILE" "$SYSTEMD_DROPIN" "$BOX_STATE_DIR/logs" "$(evidence_status_json "$EVIDENCE_DIR")"
 }
 
 # Same fields, one text-mode summary line (requirement 6: "text and --json").
@@ -2406,11 +2593,11 @@ PROVE_LOCAL_TARGET=""
 # <=240-char rendering of the log's last 3 non-empty lines for a journal
 # line — same forensics for a clean step failure as for an abort.
 prove_step_log_path() {  # $1=step
-  printf '%s' "$STATE_DIR/logs/prove.${PROVE_START_EPOCH}.$1.log"
+  printf '%s' "$BOX_STATE_DIR/logs/prove.${PROVE_START_EPOCH}.$1.log"
 }
 
 prove_write_step_log() {  # $1=step $2=content
-  mkdir -p "$STATE_DIR/logs" 2>/dev/null || true
+  mkdir -p "$BOX_STATE_DIR/logs" 2>/dev/null || true
   printf '%s\n' "$2" > "$(prove_step_log_path "$1")" 2>/dev/null || true
 }
 
@@ -2429,7 +2616,7 @@ prove_log_tail() {  # $1=step -> collapsed last 3 non-empty lines, <=240 chars
 # there never survives back to cmd_prove; a file keyed by this same prove's
 # PROVE_START_EPOCH does.
 prove_remote_date_path() {
-  printf '%s' "$STATE_DIR/logs/prove.${PROVE_START_EPOCH}.remote-date"
+  printf '%s' "$BOX_STATE_DIR/logs/prove.${PROVE_START_EPOCH}.remote-date"
 }
 
 # Requirement 12: the assert step's own diagnosis, computed once when the
@@ -2667,7 +2854,7 @@ prove_preserve_evidence() {
   # in-progress reads of these paths are unaffected.
   mkdir -p "$dir/logs" 2>/dev/null || true
   local f
-  for f in "$STATE_DIR"/logs/prove."${PROVE_START_EPOCH:-0}".*.log; do
+  for f in "$BOX_STATE_DIR"/logs/prove."${PROVE_START_EPOCH:-0}".*.log; do
     [ -f "$f" ] && cp -p "$f" "$dir/logs/" 2>/dev/null
   done
   [ -f "$PROOF_STATE_FILE" ] && cp -p "$PROOF_STATE_FILE" "$dir/proof.json" 2>/dev/null
@@ -3440,6 +3627,7 @@ cmd_up() {
   local adopt; adopt="$(find_by_name "$SERVER_NAME" 2>/dev/null || true)"
   if [ -n "$adopt" ]; then
     local aid aip; aid="${adopt%% *}"; aip="${adopt##* }"
+    box_activate "$aid"
     session_known_hosts_reset "$aid"
     box_bootstrap "$aip"
     volume_ensure "$aip" "$aid"
@@ -3537,6 +3725,7 @@ print(d.get("id",""), d.get("public_net",{}).get("ipv4",{}).get("ip",""))
     echo "fallback: could not parse server id from hcloud output"
     exit 3
   fi
+  box_activate "$id"
   # Requirement 9 (PRD-build-burst-prove-forensics): Hetzner starts billing
   # the instant `server create` returns this id, not when `up` finishes
   # setup and writes boot_epoch below — snapshot it now so every cost/age
@@ -4605,7 +4794,7 @@ with open(path, "a") as fh:
 }
 
 # ---- run --------------------------------------------------------------------
-RUN_LOCK="$STATE_DIR/run.lock"
+RUN_LOCK="$BOX_STATE_DIR/run.lock"
 
 # PRD-build-burst-parallel-runs: remote dirs are disjoint PER LOCAL PATH, not
 # per basename — ~/repos/synthorg and a worktree both named "synthorg" must
@@ -4628,7 +4817,7 @@ dep_remote_path_for() {  # $1=dep local abs dir -> stdout remote dir
   printf '%s/deps/%s-%s\n' "$REMOTE_ROOT" "$(basename "$1")" "$wkey"
 }
 worktree_lock_key() { printf '%s' "$1" | sha1sum | cut -c1-16; }
-wt_lock_file() { printf '%s/locks/wt-%s.lock\n' "$STATE_DIR" "$(worktree_lock_key "$1")"; }
+wt_lock_file() { printf '%s/locks/wt-%s.lock\n' "$BOX_STATE_DIR" "$(worktree_lock_key "$1")"; }
 
 # ---- workspace detection (PRD-build-burst-path-deps-workspaces req 1) -----
 # `run`'s local read of the crate's own workspace_root, via a real `cargo
@@ -5184,8 +5373,8 @@ do_marker_pull() {  # $1=worktree $2=trigger(local-read|explicit|teardown) -> rc
       pf_stats="$(printf '%s\n' "$bytes" | tail -n +2)"
     fi
     pf_wkey="$(printf '%s' "$worktree" | sha1sum | cut -c1-8)"
-    mkdir -p "$STATE_DIR/logs" 2>/dev/null || true
-    pf_log="$STATE_DIR/logs/pull-fail.$pf_wkey.$(now_epoch).log"
+    mkdir -p "$BOX_STATE_DIR/logs" 2>/dev/null || true
+    pf_log="$BOX_STATE_DIR/logs/pull-fail.$pf_wkey.$(now_epoch).log"
     printf '%s\n' "$pf_stats" > "$pf_log" 2>/dev/null || true
     pf_err="$(printf '%s\n' "$pf_stats" | awk 'NF{l=$0} END{print l}')"
     pf_err="${pf_err:0:160}"
@@ -5336,9 +5525,9 @@ run_slot_cap() {
 count_held_slots() {  # -> stdout "<held>/<cap>"
   run_slot_cap
   local cap="$RUN_SLOT_CAP" held=0 j
-  mkdir -p "$STATE_DIR/slots" 2>/dev/null || true
+  mkdir -p "$BOX_STATE_DIR/slots" 2>/dev/null || true
   for j in $(seq 1 "$cap"); do
-    ( exec 211>"$STATE_DIR/slots/$j.lock"; flock -n 211 ) 2>/dev/null || held=$((held+1))
+    ( exec 211>"$BOX_STATE_DIR/slots/$j.lock"; flock -n 211 ) 2>/dev/null || held=$((held+1))
   done
   printf '%s/%s\n' "$held" "$cap"
 }
@@ -5362,7 +5551,7 @@ acquire_run_slot() {
   # index above cap that some earlier, wider-cap acquisition still holds).
   run_slot_cap
   local cap="$RUN_SLOT_CAP" i waited=0
-  mkdir -p "$STATE_DIR/slots" 2>/dev/null || true
+  mkdir -p "$BOX_STATE_DIR/slots" 2>/dev/null || true
   # PRD-build-burst-selftest-drift-and-bake-gate requirement 2: a test-only
   # escape hatch so burstpar-selftest.sh can prove its own peak-overlap
   # counter actually fails when the concurrency contract is violated,
@@ -5373,7 +5562,7 @@ acquire_run_slot() {
   # lock file, so concurrent callers all "acquire" at once with no
   # serialization at all.
   if [ "${BURST_LANE_TEST:-}" = 1 ] && [ "${BURSTPAR_TEST_BREAK_SLOTS:-}" = 1 ]; then
-    exec 202>"$STATE_DIR/slots/broken-$$.lock"
+    exec 202>"$BOX_STATE_DIR/slots/broken-$$.lock"
     flock 202
     SLOT_HELD="broken/$cap"
     SLOT_INDEX="broken-$$"
@@ -5381,12 +5570,12 @@ acquire_run_slot() {
   fi
   while :; do
     for i in $(seq 1 "$cap"); do
-      exec 202>"$STATE_DIR/slots/$i.lock"
+      exec 202>"$BOX_STATE_DIR/slots/$i.lock"
       if flock -n 202; then
         local held=0 j
         for j in $(seq 1 "$cap"); do
           [ "$j" = "$i" ] && { held=$((held+1)); continue; }
-          ( exec 210>"$STATE_DIR/slots/$j.lock"; flock -n 210 ) 2>/dev/null || held=$((held+1))
+          ( exec 210>"$BOX_STATE_DIR/slots/$j.lock"; flock -n 210 ) 2>/dev/null || held=$((held+1))
         done
         SLOT_HELD="$held/$cap"
         SLOT_INDEX="$i"
@@ -5485,8 +5674,8 @@ cmd_run() {
   local slot_held="$SLOT_HELD"
   # Same-worktree runs still serialize: two --delete syncs of one remote dir
   # would shred each other. Different worktrees hold different locks.
-  mkdir -p "$STATE_DIR/locks" 2>/dev/null || true
-  exec 203>"$STATE_DIR/locks/wt-$(worktree_lock_key "$worktree").lock"
+  mkdir -p "$BOX_STATE_DIR/locks" 2>/dev/null || true
+  exec 203>"$BOX_STATE_DIR/locks/wt-$(worktree_lock_key "$worktree").lock"
   flock 203
 
   # PRD-build-burst-path-deps-workspaces requirement 1: when this worktree
@@ -5595,7 +5784,7 @@ cmd_run() {
     while IFS= read -r pd_d; do [ -n "$pd_d" ] && pathdeps+=("$pd_d"); done \
       < <(python3 "$HERE/burst-lane-pathdeps.py" discover "$worktree_abs/Cargo.toml" "$ws_root" 2>/dev/null)
   fi
-  mkdir -p "$STATE_DIR/logs" 2>/dev/null || true
+  mkdir -p "$BOX_STATE_DIR/logs" 2>/dev/null || true
   if [ "${#pathdeps[@]}" -gt 0 ]; then
     map_file="$(mktemp)"; : > "$map_file"
     printf '%s\t%s\n' "$worktree_abs" "$remote_path" >> "$map_file"
@@ -5603,7 +5792,7 @@ cmd_run() {
     for pd_dep in "${pathdeps[@]}"; do
       printf '%s\t%s\n' "$pd_dep" "$(dep_remote_path_for "$pd_dep")" >> "$map_file"
     done
-    local pd_log="$STATE_DIR/logs/pathdep-rsync.$$.log" pd_rc=0 pd_err
+    local pd_log="$BOX_STATE_DIR/logs/pathdep-rsync.$$.log" pd_rc=0 pd_err
     for pd_dep in "${pathdeps[@]}"; do
       pd_remote="$(dep_remote_path_for "$pd_dep")"
       pd_rc=0
@@ -5646,7 +5835,7 @@ cmd_run() {
   # workspace root when the worktree is a member, else the worktree itself,
   # byte-identical to today) so a workspace member's own siblings arrive as
   # part of this ONE copy rather than needing a second, colliding one.
-  local up_log="$STATE_DIR/logs/rsync-up.$$.log" rsync_up_rc=0
+  local up_log="$BOX_STATE_DIR/logs/rsync-up.$$.log" rsync_up_rc=0
   "$RSYNC_BIN" -az --delete --exclude target --exclude .git --exclude .venv \
         --rsync-path="mkdir -p '$remote_path' && rsync" \
         -e "$SSH_BIN $(ssh_kh_args) -i $SSH_KEY" \
@@ -5736,7 +5925,7 @@ cmd_run() {
     remote_date_iso="$("$SSH_BIN" -o BatchMode=yes -o ConnectTimeout=5 $SSH_RUN_KEEPALIVE_OPTS $(ssh_kh_args) \
         -i "$SSH_KEY" "$REMOTE_USER@$ip" "date -u +%Y-%m-%dT%H:%M:%SZ" 2>/dev/null)"
     if [ -n "$remote_date_iso" ]; then
-      mkdir -p "$STATE_DIR/logs" 2>/dev/null || true
+      mkdir -p "$BOX_STATE_DIR/logs" 2>/dev/null || true
       printf '%s' "$remote_date_iso" > "$(prove_remote_date_path)" 2>/dev/null || true
     fi
     # BURST_PROVE_TEST_MARKER_EPOCH: offline-only hook (grep the tree — only
@@ -5749,7 +5938,7 @@ cmd_run() {
   fi
   local remote_cmd="cd $remote_cwd && export PATH=$GATE_TOOLS_REMOTE_BIN_DIR:\$PATH:$ROOT_CARGO_HOME/bin:/root/.local/bin RUSTUP_HOME=$ROOT_RUSTUP_HOME CARGO_HOME=$RUN_CARGO_HOME CARGO_TARGET_DIR=$remote_path/target RUSTC_WRAPPER=sccache SCCACHE_DIR=$REMOTE_SCCACHE_DIR SCCACHE_CACHE_SIZE=${BURST_SCCACHE_GB}G SCCACHE_IDLE_TIMEOUT=0; $(remote_sccache_guard); ${marker_cmd}$first $*"
   local rc=0
-  local remote_out_log="$STATE_DIR/logs/run-remote.$$.log"
+  local remote_out_log="$BOX_STATE_DIR/logs/run-remote.$$.log"
   "$SSH_BIN" $SSH_RUN_KEEPALIVE_OPTS $(ssh_kh_args) -i "$SSH_KEY" "$REMOTE_USER@$ip" "$remote_cmd" 2>&1 | tee "$remote_out_log"
   rc="${PIPESTATUS[0]}"
   t_remote_end="$(now_fractional)"
@@ -5939,7 +6128,7 @@ cmd_sync_back() {
 cmd_pull() {
   local worktree="${1:-}"
   [ -n "$worktree" ] && [ -d "$worktree" ] || { echo "usage: burst-lane.sh pull <worktree>" >&2; exit 2; }
-  mkdir -p "$STATE_DIR/locks" 2>/dev/null || true
+  mkdir -p "$BOX_STATE_DIR/locks" 2>/dev/null || true
   exec 205>"$(wt_lock_file "$worktree")"
   if ! flock -n 205; then
     journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  pull  refused  (worktree=$worktree cause=worktree-busy — a live run holds this worktree's lock)"
@@ -6385,13 +6574,13 @@ cmd_parity() {
   # Serialize against a live `run`/`parity` on the SAME worktree — same lock
   # `run`/`pull` already use, so a parity rsync-up never interleaves with a
   # live compile's own rsync of the same remote dir.
-  mkdir -p "$STATE_DIR/locks" 2>/dev/null || true
+  mkdir -p "$BOX_STATE_DIR/locks" 2>/dev/null || true
   exec 206>"$(wt_lock_file "$repo")"
   flock 206
 
   local remote_path; remote_path="$(remote_path_for "$repo")"
-  mkdir -p "$STATE_DIR/logs" 2>/dev/null || true
-  local up_log="$STATE_DIR/logs/rsync-parity.$$.log" rsync_up_rc=0
+  mkdir -p "$BOX_STATE_DIR/logs" 2>/dev/null || true
+  local up_log="$BOX_STATE_DIR/logs/rsync-parity.$$.log" rsync_up_rc=0
   "$RSYNC_BIN" -az --delete --exclude target --exclude .git --exclude .venv \
         --rsync-path="mkdir -p '$remote_path' && rsync" \
         -e "$SSH_BIN $(ssh_kh_args) -i $SSH_KEY" \
@@ -6626,7 +6815,7 @@ json.dump(out, open(sys.argv[4], "w"), indent=2)
 # PRD's budget figures this pass does not yet read — 1800s (30 min, this
 # PRD's own "expected gate wall" target) is a reasonable default until
 # that's wired. GATE_WAIT_POLL_S is the poll interval while waiting.
-GATE_INFLIGHT_DIR="$STATE_DIR/gate-inflight"
+GATE_INFLIGHT_DIR="$BOX_STATE_DIR/gate-inflight"
 GATE_WALL_BUDGET_S="${BURST_LANE_GATE_WALL_BUDGET_S:-1800}"
 GATE_WAIT_POLL_S="${BURST_LANE_GATE_WAIT_POLL_S:-2}"
 
@@ -6841,13 +7030,13 @@ cmd_gate() {
   # not here.
   acquire_run_slot "$repo"
 
-  mkdir -p "$STATE_DIR/locks" 2>/dev/null || true
+  mkdir -p "$BOX_STATE_DIR/locks" 2>/dev/null || true
   exec 212>"$(wt_lock_file "$repo")"
   flock 212
 
   local remote_path; remote_path="$(remote_path_for "$repo")"
-  mkdir -p "$STATE_DIR/logs" 2>/dev/null || true
-  local up_log="$STATE_DIR/logs/rsync-gate.$$.log" rsync_up_rc=0
+  mkdir -p "$BOX_STATE_DIR/logs" 2>/dev/null || true
+  local up_log="$BOX_STATE_DIR/logs/rsync-gate.$$.log" rsync_up_rc=0
   "$RSYNC_BIN" -az --delete --exclude target --exclude .git --exclude .venv \
         --rsync-path="mkdir -p '$remote_path' && rsync" \
         -e "$SSH_BIN $(ssh_kh_args) -i $SSH_KEY" \
@@ -6974,7 +7163,7 @@ cmd_ensure_fresh() {
     echo "clean"
     exit 0
   fi
-  mkdir -p "$STATE_DIR/locks" 2>/dev/null || true
+  mkdir -p "$BOX_STATE_DIR/locks" 2>/dev/null || true
   exec 204>"$(wt_lock_file "$worktree")"
   flock 204
   if ! is_dirty "$worktree"; then
@@ -6999,7 +7188,7 @@ cmd_ensure_fresh() {
 # still in flight right as the box is about to die) is left alone and
 # journaled — never aborts the rest of the sweep.
 sweep_dirty_worktrees() {  # $1=caller (down|watchdog)
-  mkdir -p "$DIRTY_DIR" "$STATE_DIR/locks" 2>/dev/null || true
+  mkdir -p "$DIRTY_DIR" "$BOX_STATE_DIR/locks" 2>/dev/null || true
   # Money guard (Joe 2026-09-11): pulls at teardown are optional and bounded. With the loop stopped
   # nothing will read them, and on 09-11 a sweep that pulled worktrees back for 10+ min kept a
   # billed box alive past a forced delete. Skip entirely when the loop is inactive; cap each pull.
@@ -7338,7 +7527,7 @@ reap_deps_manifest_dirs() {  # $1=ip $2=inflight_names(newline list) -> stdout "
 
 reap_orphans() {
   local reaped_dirs=0 reaped_bytes=0
-  mkdir -p "$DIRTY_DIR" "$STATE_DIR/locks" 2>/dev/null || true
+  mkdir -p "$DIRTY_DIR" "$BOX_STATE_DIR/locks" 2>/dev/null || true
   if ! state_active; then
     reap_finish 0 0
     return 0
@@ -7544,7 +7733,7 @@ cmd_reap() {
 # exists to preserve. `reap` is what ages them out, same as any other
 # on-disk debris this script owns, after 14 days.
 reap_prove_logs() {  # -> stdout "prove-logs-reaped=N"
-  local dir="$STATE_DIR/logs" n=0 f
+  local dir="$BOX_STATE_DIR/logs" n=0 f
   [ -d "$dir" ] || { echo "prove-logs-reaped=0"; return 0; }
   while IFS= read -r f; do
     [ -n "$f" ] || continue

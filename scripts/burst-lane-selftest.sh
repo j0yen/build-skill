@@ -283,7 +283,7 @@ block_start "pullback"
 # and isn't itself testing that re-proof path (see the dedicated
 # `paritycad AC2` case for that). Call only after `up` — needs an active
 # session.
-pc_active_session_id() { grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2; }
+pc_active_session_id() { grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/current/session.json" | cut -d: -f2; }
 pc_active_toolchain_fp() { "$BL" _debug-toolchain-fp; }
 
 # PRD-build-burst-pull-on-demand: rc0 iff `status --json`'s "dirty" array
@@ -312,6 +312,16 @@ fresh_env() {
   # itself, not of this function staying exhaustive forever.
   export BURST_LANE_TEST=1
   export BURST_LANE_STATE_DIR="$T/state"; mkdir -p "$BURST_LANE_STATE_DIR"
+  # PRD-build-burst-state-keyed-by-server-v2: pre-create $BURST_LANE_STATE_DIR/current
+  # so every existing fixture in this file that writes a per-box path
+  # directly (e.g. "$BURST_LANE_STATE_DIR/current/up.pid") before the
+  # first real burst-lane.sh invocation of this fresh_env block keeps
+  # working unchanged, exactly as it did against the old flat
+  # "$BURST_LANE_STATE_DIR/<name>" layout. burst-lane.sh's own
+  # box_point_current_at() folds this plain directory's content into the
+  # real box the moment one is known (box_activate/migrate_state_layout),
+  # so this placeholder never leaks into two different box ids.
+  mkdir -p "$BURST_LANE_STATE_DIR/current"
   export BURST_LANE_JOURNAL="$T/journal.log"
   # PRD-build-burst-prove-evidence-preservation requirement 6: the real
   # BURST_PROVE_TMP default is /mnt/data/jsy/tmp — scope it under $T like
@@ -459,7 +469,7 @@ create_calls2="$(grep -c 'server create' "$FAKE_HCLOUD_CALLLOG")"
 expect "second up made no additional create call" "[ \"$create_calls2\" -eq 1 ]"
 
 # adoption path: drop local session.json but leave the fake server alive
-rm -f "$BURST_LANE_STATE_DIR/session.json"
+rm -f "$BURST_LANE_STATE_DIR/current/session.json"
 out3="$("$BL" up)"; rc3=$?
 expect "up with lost state adopts existing server (exit 0)" "[ $rc3 -eq 0 ]"
 expect "adoption reported explicitly" "grep -q 'adopted' <<<\"$out3\""
@@ -541,9 +551,9 @@ expect "second explicit pull's bytes are fewer than the first's (AC11, increment
 run_out3="$(BURST_LANE_PRD_SLUG=fake-prd-slug-1 "$BL" run "$WT" -- bash build.sh 2>&1)"; run_rc3=$?
 expect "third run (explicit slug) also propagates the remote exit code" "[ $run_rc3 -eq 7 ]"
 expect "prds_served recorded the explicit BURST_LANE_PRD_SLUG" \
-  "grep -qxF fake-prd-slug-1 \"$BURST_LANE_STATE_DIR/prds_served\""
+  "grep -qxF fake-prd-slug-1 \"$BURST_LANE_STATE_DIR/current/prds_served\""
 expect "prds_served also recorded the worktree-basename fallback from the earlier unset-slug runs" \
-  "grep -qxF worktree \"$BURST_LANE_STATE_DIR/prds_served\""
+  "grep -qxF worktree \"$BURST_LANE_STATE_DIR/current/prds_served\""
 
 # ---- requirement 12: a uv-routed run pulls .pybuilder/ back, not target/ ----
 # (pull_target_incremental hardcodes target/ or its Cargo override — a
@@ -633,14 +643,14 @@ EOF
 # (sandbox_ok, remote_user above) rather than dragging in a full gate-tools
 # fixture just to flip one bit. runs_served is already >=1 from AC1/AC2's
 # four `run` calls above.
-sed -i 's/"gate_ready":"false"/"gate_ready":"true"/' "$BURST_LANE_STATE_DIR/session.json"
+sed -i 's/"gate_ready":"false"/"gate_ready":"true"/' "$BURST_LANE_STATE_DIR/current/session.json"
 down_out="$("$BL" down)"
 expect "down keeps the session while rust work is queued (proven box)" "[ \"$down_out\" = 'decision=keep' ]"
 expect "down journaled decision=keep" "grep -q 'decision=keep' \"$BURST_LANE_JOURNAL\""
 
 # ---- AC8: down schedules, then deletes at the hour boundary -----------------
 rm -f "$BURST_LANE_PRD_DIR/build-queue/PRD-fake-rust.md"
-boot_epoch="$(grep -oE '"boot_epoch":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+boot_epoch="$(grep -oE '"boot_epoch":[0-9]+' "$BURST_LANE_STATE_DIR/current/session.json" | cut -d: -f2)"
 export BURST_LANE_NOW=$((boot_epoch + 600))   # 10 minutes in — not near the hour boundary
 down_out2="$("$BL" down)"
 expect "down schedules teardown when no rust work remains, early in the hour" "[ \"$down_out2\" = 'decision=scheduled' ]"
@@ -659,7 +669,7 @@ cost_today_out="$("$BL" cost --today)"
 expect "cost --today prints hours and euros" "grep -qE 'hours=[0-9.]+ eur=[0-9.]+' <<<\"$cost_today_out\""
 expect "cost --today prints the PRDs served this session (AC13)" \
   "grep -q 'prds=' <<<\"$cost_today_out\" && grep -q 'fake-prd-slug-1' <<<\"$cost_today_out\" && grep -q 'worktree' <<<\"$cost_today_out\""
-expect "state cleared prds_served after deletion" "[ ! -f \"$BURST_LANE_STATE_DIR/prds_served\" ]"
+expect "state cleared prds_served after deletion" "[ ! -f \"$BURST_LANE_STATE_DIR/current/prds_served\" ]"
 unset BURST_LANE_NOW
 
 # ---- burstpull AC2: a dirty worktree's local cargo consumer (the shim's
@@ -706,7 +716,7 @@ expect "burstpull AC2: exactly one pull attribution row, trigger=local-read, rea
 # stands in for a live run in flight — never call `run` itself here, since
 # it would just block on that same lock rather than race it.
 "$BL" run "$WT_LR" -- bash build.sh >/dev/null 2>&1   # re-dirty it for this test
-lockfile_lr="$BURST_LANE_STATE_DIR/locks/wt-$(python3 -c "import hashlib,sys; print(hashlib.sha1(sys.argv[1].encode()).hexdigest()[:16])" "$WT_LR").lock"
+lockfile_lr="$BURST_LANE_STATE_DIR/current/locks/wt-$(python3 -c "import hashlib,sys; print(hashlib.sha1(sys.argv[1].encode()).hexdigest()[:16])" "$WT_LR").lock"
 mkdir -p "$(dirname "$lockfile_lr")"
 (
   exec 209>"$lockfile_lr"
@@ -743,20 +753,20 @@ done
 # Simulate "the box already gone for this one worktree": delete its remote
 # dir out from under the (otherwise still-alive) session.
 cold_remote="$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('remote_path',''))" \
-  "$BURST_LANE_STATE_DIR/dirty/$(printf '%s' "$T/mcphost-sw-cold" | sha1sum | cut -c1-8).json")"
+  "$BURST_LANE_STATE_DIR/current/dirty/$(printf '%s' "$T/mcphost-sw-cold" | sha1sum | cut -c1-8).json")"
 rm -rf "$cold_remote"
 
 # Simulate "a live run is still in flight on this one worktree right as the
 # box is about to die": hold its wt-lock in the background — the sweep must
 # skip it (leave it dirty, journal a failure) rather than abort (requirement
 # 4: "per-worktree failure does not abort the sweep").
-busy_lockfile="$BURST_LANE_STATE_DIR/locks/wt-$(python3 -c "import hashlib,sys; print(hashlib.sha1(sys.argv[1].encode()).hexdigest()[:16])" "$T/mcphost-sw-busy").lock"
+busy_lockfile="$BURST_LANE_STATE_DIR/current/locks/wt-$(python3 -c "import hashlib,sys; print(hashlib.sha1(sys.argv[1].encode()).hexdigest()[:16])" "$T/mcphost-sw-busy").lock"
 mkdir -p "$(dirname "$busy_lockfile")"
 ( exec 208>"$busy_lockfile"; flock 208; sleep 3 ) &
 busy_holder_pid=$!
 sleep 0.3
 
-boot_epoch_sw="$(grep -oE '"boot_epoch":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+boot_epoch_sw="$(grep -oE '"boot_epoch":[0-9]+' "$BURST_LANE_STATE_DIR/current/session.json" | cut -d: -f2)"
 export BURST_LANE_NOW=$((boot_epoch_sw + 3600 - 60))
 down_sw_out="$("$BL" down)"
 wait "$busy_holder_pid" 2>/dev/null || true
@@ -771,7 +781,7 @@ expect "burstpull AC4: the busy worktree's target/ was never fetched either (swe
 # `down` just tore this one down, so from here on marker state must be
 # checked as raw files on disk instead (marker_file mirrors
 # dirty_marker_file()'s own sha1-prefix key scheme).
-marker_file() { printf '%s/dirty/%s.json\n' "$BURST_LANE_STATE_DIR" "$(printf '%s' "$1" | sha1sum | cut -c1-8)"; }
+marker_file() { printf '%s/current/dirty/%s.json\n' "$BURST_LANE_STATE_DIR" "$(printf '%s' "$1" | sha1sum | cut -c1-8)"; }
 expect "burstpull AC4: the pulled/cold markers are cleared after the sweep" \
   "[ ! -s \"$(marker_file "$T/mcphost-sw-one")\" ] && [ ! -s \"$(marker_file "$T/mcphost-sw-two")\" ] && [ ! -s \"$(marker_file "$T/mcphost-sw-cold")\" ]"
 expect "burstpull AC4: the busy worktree's marker is LEFT dirty for a later retry (sweep does not abort on it)" \
@@ -785,12 +795,12 @@ unset BURST_LANE_NOW
 # ---- AC6: watchdog TTL teardown ----------------------------------------------
 fresh_env
 "$BL" up >/dev/null
-boot_epoch2="$(grep -oE '"boot_epoch":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+boot_epoch2="$(grep -oE '"boot_epoch":[0-9]+' "$BURST_LANE_STATE_DIR/current/session.json" | cut -d: -f2)"
 export BURST_LANE_NOW=$((boot_epoch2 + 7 * 3600))   # past the default 6h ttl
 wd_out="$("$BL" watchdog)"
 expect "watchdog deletes a session past its TTL" "grep -q '^watchdog teardown: ' <<<\"$wd_out\""
 expect "watchdog journal line names uptime" "grep -q 'burst-lane  watchdog  teardown' \"$BURST_LANE_JOURNAL\""
-expect "state cleared after watchdog teardown" "[ ! -f \"$BURST_LANE_STATE_DIR/session.json\" ]"
+expect "state cleared after watchdog teardown" "[ ! -f \"$BURST_LANE_STATE_DIR/current/session.json\" ]"
 unset BURST_LANE_NOW
 
 # ---- AC3 (shim, local-fallback half): no session -> local cargo, journaled --
@@ -845,13 +855,13 @@ expect "sub-cap exits 3 (fallback, never blocks) when the probe fails" "[ $subca
 # whose `up` sandbox probe failed still has a session.json (state_active is
 # true), so without this check sub-cap would otherwise report the full
 # 8-wide box capacity computed above regardless of sandbox status.
-sed -i 's/"sandbox_ok":"true"/"sandbox_ok":"false"/' "$BURST_LANE_STATE_DIR/session.json"
+sed -i 's/"sandbox_ok":"true"/"sandbox_ok":"false"/' "$BURST_LANE_STATE_DIR/current/session.json"
 subcap_nosandbox="$(FAKE_SSH_MEMINFO_GB=120 FAKE_SSH_NPROC=32 "$BL" sub-cap --candidates 10)"
 expect "sub-cap falls back to local cap 2 when sandbox is unavailable (req 6 / AC5)" \
   "grep -q '^sub-cap=2 local=0' <<<\"$subcap_nosandbox\""
 expect "sub-cap journals the sandbox-unavailable reason" \
   "grep -q 'burst-lane  sub-cap  sandbox-unavailable' \"$BURST_LANE_JOURNAL\""
-sed -i 's/"sandbox_ok":"false"/"sandbox_ok":"true"/' "$BURST_LANE_STATE_DIR/session.json"
+sed -i 's/"sandbox_ok":"false"/"sandbox_ok":"true"/' "$BURST_LANE_STATE_DIR/current/session.json"
 
 # =============================================================================
 # PRD-build-cost-attribution: every burst euro/box-hour lands on a PRD slug.
@@ -895,13 +905,13 @@ expect "AC2: nothing dropped — both runs landed a row (2 total)" \
 fresh_env
 mkdir -p "$BURST_LANE_REPOS_DIR/mcphost"
 "$BL" up >/dev/null
-sid3="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+sid3="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/current/session.json" | cut -d: -f2)"
 for slug in alpha beta gamma; do
   wt="$T/mcphost-$slug"; mkdir -p "$wt"
   echo 'mkdir -p target && echo built > target/out.txt; exit 0' > "$wt/build.sh"
   "$BL" run "$wt" -- bash build.sh >/dev/null 2>&1
 done
-boot_epoch3="$(grep -oE '"boot_epoch":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+boot_epoch3="$(grep -oE '"boot_epoch":[0-9]+' "$BURST_LANE_STATE_DIR/current/session.json" | cut -d: -f2)"
 export BURST_LANE_NOW=$((boot_epoch3 + 3600 - 60))
 down_out3="$("$BL" down)"
 expect "AC3: teardown with 3 attributed slugs still deletes cleanly" "[ \"$down_out3\" = 'decision=deleted' ]"
@@ -949,7 +959,7 @@ unset BURST_LANE_NOW
 fresh_env
 mkdir -p "$BURST_LANE_REPOS_DIR/mcphost"
 "$BL" up >/dev/null
-sid5="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+sid5="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/current/session.json" | cut -d: -f2)"
 python3 <<PY
 import json
 row = {"date": "2026-09-01T00:00:00Z", "session_id": "crashed-999", "slug": "orphan-work",
@@ -960,7 +970,7 @@ PY
 wt5="$T/mcphost-live"; mkdir -p "$wt5"
 echo 'mkdir -p target && echo built > target/out.txt; exit 0' > "$wt5/build.sh"
 "$BL" run "$wt5" -- bash build.sh >/dev/null 2>&1
-boot_epoch5="$(grep -oE '"boot_epoch":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+boot_epoch5="$(grep -oE '"boot_epoch":[0-9]+' "$BURST_LANE_STATE_DIR/current/session.json" | cut -d: -f2)"
 export BURST_LANE_NOW=$((boot_epoch5 + 3600 - 60))
 down_out5="$("$BL" down)"
 expect "AC5: teardown with an orphaned prior-session row still deletes cleanly" "[ \"$down_out5\" = 'decision=deleted' ]"
@@ -977,7 +987,7 @@ mkdir -p "$BURST_LANE_REPOS_DIR/mcphost"
 wt6="$T/mcphost-rollupwork"; mkdir -p "$wt6"
 echo 'mkdir -p target && echo built > target/out.txt; exit 0' > "$wt6/build.sh"
 "$BL" run "$wt6" -- bash build.sh >/dev/null 2>&1
-boot_epoch6="$(grep -oE '"boot_epoch":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+boot_epoch6="$(grep -oE '"boot_epoch":[0-9]+' "$BURST_LANE_STATE_DIR/current/session.json" | cut -d: -f2)"
 export BURST_LANE_NOW=$((boot_epoch6 + 3600 - 60))
 "$BL" down >/dev/null   # tears the box down and writes today's slug rows
 "$BL" down >/dev/null   # today's slug rows now exist -> rollup fires on THIS call
@@ -1039,7 +1049,7 @@ expect "burstdisk AC3: run exits 3 on a named rsync-up failure" "[ $rsyncfail_rc
 expect "burstdisk AC3: journal carries rc and the log's last stderr line" \
   "grep -qF 'cause=rsync-up-failed rc=11 err=\"rsync: write failed: No space left on device (28)\"' \"$BURST_LANE_JOURNAL\""
 expect "burstdisk AC3: the captured log lives under state/logs, not /tmp" \
-  "ls \"$BURST_LANE_STATE_DIR/logs\"/rsync-up.*.log >/dev/null 2>&1"
+  "ls \"$BURST_LANE_STATE_DIR/current/logs\"/rsync-up.*.log >/dev/null 2>&1"
 
 # ---- burstdisk AC4: reap deletes an orphan, skips a dirty-marked dir and a
 # keep-listed dir, leaves a live worktree's dir untouched (requirement 5).
@@ -1066,7 +1076,7 @@ echo 'mkdir -p target && echo built > target/out.txt; exit 0' > "$WT_BAZ/build.s
 baz_hash="$(printf '%s' "$WT_BAZ" | sha1sum | cut -c1-8)"
 baz_dir="$BURST_LANE_REMOTE_ROOT/mcphost-baz-$baz_hash"
 rm -rf "$WT_BAZ"
-expect "burstdisk AC4 setup: baz is still dirty-marked" "[ -s \"$BURST_LANE_STATE_DIR/dirty/$baz_hash.json\" ]"
+expect "burstdisk AC4 setup: baz is still dirty-marked" "[ -s \"$BURST_LANE_STATE_DIR/current/dirty/$baz_hash.json\" ]"
 
 # foo: an orphaned remote dir whose hash suffix decodes to no known local
 # worktree at all.
@@ -1145,7 +1155,7 @@ bytes_b=$((65 * 1073741824))
   echo "$(date -u +%Y-%m-%dT%H:%M:%SZ)  burst-lane  reap  ok  (dir=fake-b bytes=$bytes_b)"
   echo "$(date -u +%Y-%m-%dT%H:%M:%SZ)  burst-lane  run  fallback  (cause=disk-low free_gb=10 floor_gb=40 worktree=$wt7)"
 } >> "$BURST_LANE_JOURNAL"
-boot_epoch7="$(grep -oE '"boot_epoch":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+boot_epoch7="$(grep -oE '"boot_epoch":[0-9]+' "$BURST_LANE_STATE_DIR/current/session.json" | cut -d: -f2)"
 export BURST_LANE_NOW=$((boot_epoch7 + 3600 - 60))
 "$BL" down >/dev/null   # tears the box down and writes today's slug rows
 "$BL" down >/dev/null   # today's slug rows now exist -> rollup fires on THIS call
@@ -1280,7 +1290,7 @@ BURST_LANE_PRD_SLUG="gate-gateroute-repo" "$BL" run "$WT_G7" -- bash build.sh >/
 expect "gateroute AC7: attribution row uses the explicit gate-<repo> slug, not the worktree-basename guess" \
   "python3 -c \"import json; d=json.loads(open('$BURST_LANE_ATTR_LEDGER').read().strip().splitlines()[-1]); import sys; sys.exit(0 if d.get('slug')=='gate-gateroute-repo' else 1)\""
 
-boot_epoch_g7="$(grep -oE '"boot_epoch":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+boot_epoch_g7="$(grep -oE '"boot_epoch":[0-9]+' "$BURST_LANE_STATE_DIR/current/session.json" | cut -d: -f2)"
 export BURST_LANE_NOW=$((boot_epoch_g7 + 3600 - 60))
 "$BL" down >/dev/null
 unset BURST_LANE_NOW
@@ -1308,13 +1318,13 @@ export FAKE_SSH_GATE_TOOLS_MISSING="autobuilder jq"
 gatebox1_out="$("$BL" up)"; gatebox1_rc=$?
 expect "gatebox AC1: up succeeds even though autobuilder+jq start missing" "[ $gatebox1_rc -eq 0 ]"
 expect "gatebox AC1: session state records gate_ready:true after provisioning" \
-  "grep -q '\"gate_ready\":\"true\"' \"$BURST_LANE_STATE_DIR/session.json\""
-gt_missing_field="$(grep -oE '"gate_tools_missing":"[^"]*"' "$BURST_LANE_STATE_DIR/session.json" | cut -d'"' -f4)"
+  "grep -q '\"gate_ready\":\"true\"' \"$BURST_LANE_STATE_DIR/current/session.json\""
+gt_missing_field="$(grep -oE '"gate_tools_missing":"[^"]*"' "$BURST_LANE_STATE_DIR/current/session.json" | cut -d'"' -f4)"
 expect "gatebox AC1: gate_tools_missing is empty once provisioning completed" "[ -z \"$gt_missing_field\" ]"
 gatebox1_tools_rc=0
 python3 -c "
 import json
-d = json.load(open('$BURST_LANE_STATE_DIR/gate-tools.json'))
+d = json.load(open('$BURST_LANE_STATE_DIR/current/gate-tools.json'))
 expected = {'autobuilder', 'jq', 'gh', 'mold', 'cargo-deny', 'cargo-nextest', 'uv', 'claude'}
 got = set(d.get('tools', {}).keys())
 assert got == expected, ('tool set mismatch', got)
@@ -1332,12 +1342,12 @@ expect "gatebox AC1: verify reports 'gate-tools ok'" "grep -q '^gate-tools ok$' 
 
 # A second `up` (adoption path — state cleared but the fake server survives)
 # re-provisions via the adoption branch too, not just the fresh-create one.
-rm -f "$BURST_LANE_STATE_DIR/session.json"
+rm -f "$BURST_LANE_STATE_DIR/current/session.json"
 unset FAKE_SSH_GATE_TOOLS_MISSING
 gatebox1b_out="$("$BL" up)"; gatebox1b_rc=$?
 expect "gatebox AC1: adoption path also succeeds and re-provisions" "[ $gatebox1b_rc -eq 0 ]"
 expect "gatebox AC1: adoption path also records gate_ready:true" \
-  "grep -q '\"gate_ready\":\"true\"' \"$BURST_LANE_STATE_DIR/session.json\""
+  "grep -q '\"gate_ready\":\"true\"' \"$BURST_LANE_STATE_DIR/current/session.json\""
 
 # ---- gatebox AC2: `parity` runs the workspace suite on the box and
 # compares it to RedBaron's own baseline, writing exactly the differing
@@ -1524,7 +1534,7 @@ cred_mode="$(stat -c '%a' "$BURST_LANE_GATE_CRED_REMOTE_PATH" 2>/dev/null)"
 expect "gatebox AC4: the placed credential is mode 0600" "[ \"$cred_mode\" = 600 ]"
 expect "gatebox AC4: journal has 'cred  placed'" "grep -q 'burst-lane  up  cred  placed' \"$BURST_LANE_JOURNAL\""
 
-boot_epoch4="$(grep -oE '"boot_epoch":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+boot_epoch4="$(grep -oE '"boot_epoch":[0-9]+' "$BURST_LANE_STATE_DIR/current/session.json" | cut -d: -f2)"
 export BURST_LANE_NOW=$((boot_epoch4 + 3600 - 60))
 gatebox4_down_out="$("$BL" down)"; gatebox4_down_rc=$?
 unset BURST_LANE_NOW
@@ -1582,8 +1592,8 @@ export BURST_GATE_REMOTE=1
 # though the wait loop's own polling still uses a real `sleep`.
 fresh_env
 "$BL" up >/dev/null
-ip7="$(grep -oE '"ip":"[^"]*"' "$BURST_LANE_STATE_DIR/session.json" | cut -d'"' -f4)"
-boot_epoch7="$(grep -oE '"boot_epoch":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+ip7="$(grep -oE '"ip":"[^"]*"' "$BURST_LANE_STATE_DIR/current/session.json" | cut -d'"' -f4)"
+boot_epoch7="$(grep -oE '"boot_epoch":[0-9]+' "$BURST_LANE_STATE_DIR/current/session.json" | cut -d: -f2)"
 export BURST_LANE_NOW=$((boot_epoch7 + 3600 - 60))
 export BURST_LANE_GATE_WAIT_POLL_S=0.1
 
@@ -1596,10 +1606,10 @@ mkdir -p "$remote_path_7a/target/autobuilder/receipts"
 echo '{"pass": 25, "block": 0}' > "$remote_path_7a/target/autobuilder/last-verdict.json"
 echo "receipt" > "$remote_path_7a/target/autobuilder/receipts/some.json"
 echo "$ip7" > "$remote_path_7a/.gate-burst-host"
-marker_7a="$BURST_LANE_STATE_DIR/gate-inflight/$(printf '%s' "$WT_GATE7A" | sha1sum | cut -c1-8).json"
+marker_7a="$BURST_LANE_STATE_DIR/current/gate-inflight/$(printf '%s' "$WT_GATE7A" | sha1sum | cut -c1-8).json"
 mkdir -p "$(dirname "$marker_7a")"
 python3 -c "import json; json.dump({'repo': '$WT_GATE7A', 'host': '$ip7', 'started_epoch': $BURST_LANE_NOW, 'budget_s': 30}, open('$marker_7a', 'w'))"
-lockfile_7a="$BURST_LANE_STATE_DIR/locks/wt-$(python3 -c "import hashlib,sys; print(hashlib.sha1(sys.argv[1].encode()).hexdigest()[:16])" "$WT_GATE7A").lock"
+lockfile_7a="$BURST_LANE_STATE_DIR/current/locks/wt-$(python3 -c "import hashlib,sys; print(hashlib.sha1(sys.argv[1].encode()).hexdigest()[:16])" "$WT_GATE7A").lock"
 mkdir -p "$(dirname "$lockfile_7a")"
 ( exec 220>"$lockfile_7a"; flock 220; sleep 1 ) &
 holder7a_pid=$!
@@ -1622,16 +1632,16 @@ unset BURST_LANE_NOW BURST_LANE_GATE_WAIT_POLL_S
 # session — scenario A's `down` already deleted its own box above.
 fresh_env
 "$BL" up >/dev/null
-ip7="$(grep -oE '"ip":"[^"]*"' "$BURST_LANE_STATE_DIR/session.json" | cut -d'"' -f4)"
-boot_epoch7="$(grep -oE '"boot_epoch":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+ip7="$(grep -oE '"ip":"[^"]*"' "$BURST_LANE_STATE_DIR/current/session.json" | cut -d'"' -f4)"
+boot_epoch7="$(grep -oE '"boot_epoch":[0-9]+' "$BURST_LANE_STATE_DIR/current/session.json" | cut -d: -f2)"
 export BURST_LANE_NOW=$((boot_epoch7 + 3600 - 60))
 export BURST_LANE_GATE_WAIT_POLL_S=0.1
 WT_GATE7B="$T/gate7b-repo"; mkdir -p "$WT_GATE7B/target/autobuilder"
 echo '{"pass": 25, "block": 0, "stale": true}' > "$WT_GATE7B/target/autobuilder/last-verdict.json"
-marker_7b="$BURST_LANE_STATE_DIR/gate-inflight/$(printf '%s' "$WT_GATE7B" | sha1sum | cut -c1-8).json"
+marker_7b="$BURST_LANE_STATE_DIR/current/gate-inflight/$(printf '%s' "$WT_GATE7B" | sha1sum | cut -c1-8).json"
 mkdir -p "$(dirname "$marker_7b")"
 python3 -c "import json; json.dump({'repo': '$WT_GATE7B', 'host': '$ip7', 'started_epoch': $((BURST_LANE_NOW - 999)), 'budget_s': 30}, open('$marker_7b', 'w'))"
-lockfile_7b="$BURST_LANE_STATE_DIR/locks/wt-$(python3 -c "import hashlib,sys; print(hashlib.sha1(sys.argv[1].encode()).hexdigest()[:16])" "$WT_GATE7B").lock"
+lockfile_7b="$BURST_LANE_STATE_DIR/current/locks/wt-$(python3 -c "import hashlib,sys; print(hashlib.sha1(sys.argv[1].encode()).hexdigest()[:16])" "$WT_GATE7B").lock"
 mkdir -p "$(dirname "$lockfile_7b")"
 ( exec 221>"$lockfile_7b"; flock 221; sleep 2 ) &
 holder7b_pid=$!
@@ -1749,8 +1759,8 @@ expect "gatebox AC6: a third call for the SAME repo waited for the first to fini
 # (fast, no need to drive a real multi-second gate for this part).
 fresh_env
 "$BL" up >/dev/null
-mkdir -p "$BURST_LANE_STATE_DIR/gate-inflight"
-python3 -c "import json; json.dump({'repo': '/fake/repo', 'host': '127.0.0.1', 'started_epoch': 0, 'budget_s': 1800}, open('$BURST_LANE_STATE_DIR/gate-inflight/fakegate.json', 'w'))"
+mkdir -p "$BURST_LANE_STATE_DIR/current/gate-inflight"
+python3 -c "import json; json.dump({'repo': '/fake/repo', 'host': '127.0.0.1', 'started_epoch': 0, 'budget_s': 1800}, open('$BURST_LANE_STATE_DIR/current/gate-inflight/fakegate.json', 'w'))"
 subcap_gates="$(FAKE_SSH_MEMINFO_GB=120 FAKE_SSH_NPROC=32 "$BL" sub-cap --candidates 10)"
 # 120GB/32cores -> floor(120/8)=15, floor(32/4)=8 -> unweighted sub-cap=8
 # (AC7's own baseline, default GB-per-run bumped 6->8; cpu term still binds);
@@ -1812,7 +1822,7 @@ printf '%s  gate  somecrate  pass  (head=abc123 base=v1.0.0 gate: head=abc123 pa
 # the FIRST down does the actual delete (and writes the slug rows) but
 # fires maybe_daily_rollup too early to see them; the SECOND (no-op,
 # no-active-session) down sees them and emits the real rollup line.
-boot_epoch_r9="$(grep -oE '"boot_epoch":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+boot_epoch_r9="$(grep -oE '"boot_epoch":[0-9]+' "$BURST_LANE_STATE_DIR/current/session.json" | cut -d: -f2)"
 export BURST_LANE_NOW=$((boot_epoch_r9 + 3600 - 60))
 "$BL" down >/dev/null
 "$BL" down >/dev/null
@@ -1830,8 +1840,8 @@ expect "gatebox AC9: the daily rollup line carries gates_remote=2 gates_local=1"
 # a real `gate` call in the AC6/AC9 blocks above.
 fresh_env
 "$BL" up >/dev/null
-mkdir -p "$BURST_LANE_STATE_DIR/gate-inflight"
-python3 -c "import json; json.dump({'repo': '/fake/status-repo', 'host': '127.0.0.1', 'started_epoch': $(date -u +%s) - 90, 'budget_s': 1800, 'head_sha': 'abcdef0123456789', 'slot': '2'}, open('$BURST_LANE_STATE_DIR/gate-inflight/statusgate.json', 'w'))"
+mkdir -p "$BURST_LANE_STATE_DIR/current/gate-inflight"
+python3 -c "import json; json.dump({'repo': '/fake/status-repo', 'host': '127.0.0.1', 'started_epoch': $(date -u +%s) - 90, 'budget_s': 1800, 'head_sha': 'abcdef0123456789', 'slot': '2'}, open('$BURST_LANE_STATE_DIR/current/gate-inflight/statusgate.json', 'w'))"
 status_text_r8="$("$BL" status 2>&1)"
 expect "gatebox req8: status (text) lists the gate with repo/head/age/slot" \
   "grep -qE 'gate: /fake/status-repo head=abcdef012345 age=[0-9]+s slot=2' <<<\"$status_text_r8\""
@@ -1886,7 +1896,7 @@ expect "gatetools AC1: up succeeds with autobuilder initially missing" "[ $gt1_r
 expect "gatetools AC1: the autobuilder binary was copied (rsync) to the remote cargo bin dir" \
   "[ -f \"$BURST_LANE_GATE_TOOLS_REMOTE_BIN_DIR/autobuilder\" ]"
 expect "gatetools AC1: session state records autobuilder's version once provisioned" \
-  "python3 -c \"import json,sys; d=json.load(open('$BURST_LANE_STATE_DIR/gate-tools.json')); sys.exit(0 if d.get('tools',{}).get('autobuilder') not in (None,'','MISSING') else 1)\""
+  "python3 -c \"import json,sys; d=json.load(open('$BURST_LANE_STATE_DIR/current/gate-tools.json')); sys.exit(0 if d.get('tools',{}).get('autobuilder') not in (None,'','MISSING') else 1)\""
 unset FAKE_SSH_GATE_TOOLS_MISSING
 
 # ---- gatetools AC2: given a fake box where the autobuilder copy fails
@@ -1900,8 +1910,8 @@ export FAKE_SSH_GATE_TOOLS_INSTALL_FAIL=1
 "$BL" up >/dev/null
 gt2_verify_out="$("$BL" verify 2>&1)"; gt2_verify_rc=$?
 expect "gatetools AC2: verify exits 0 (lane checks alone decide verified) even though gate-tools failed" "[ $gt2_verify_rc -eq 0 ]"
-expect "gatetools AC2: session state is verified:true" "grep -q '\"verified\":\"true\"' \"$BURST_LANE_STATE_DIR/session.json\""
-expect "gatetools AC2: session state is gate_ready:false" "grep -q '\"gate_ready\":\"false\"' \"$BURST_LANE_STATE_DIR/session.json\""
+expect "gatetools AC2: session state is verified:true" "grep -q '\"verified\":\"true\"' \"$BURST_LANE_STATE_DIR/current/session.json\""
+expect "gatetools AC2: session state is gate_ready:false" "grep -q '\"gate_ready\":\"false\"' \"$BURST_LANE_STATE_DIR/current/session.json\""
 expect "gatetools AC2: verify journals gate-tools-missing naming autobuilder" \
   "grep -q 'burst-lane  verify  gate-tools-missing.*missing=autobuilder' \"$BURST_LANE_JOURNAL\""
 
@@ -1940,13 +1950,13 @@ export FAKE_SSH_GATE_TOOLS_MISSING="autobuilder"
 export FAKE_SSH_GATE_TOOLS_INSTALL_FAIL=1
 "$BL" up >/dev/null
 gt4_creates_before="$(grep -c 'server create' "$FAKE_HCLOUD_CALLLOG")"
-expect "gatetools AC4 setup: gate_ready:false after up (copy failed)" "grep -q '\"gate_ready\":\"false\"' \"$BURST_LANE_STATE_DIR/session.json\""
+expect "gatetools AC4 setup: gate_ready:false after up (copy failed)" "grep -q '\"gate_ready\":\"false\"' \"$BURST_LANE_STATE_DIR/current/session.json\""
 
 unset FAKE_SSH_GATE_TOOLS_INSTALL_FAIL
 gt4_out="$("$BL" provision 2>&1)"; gt4_rc=$?
 expect "gatetools AC4: provision exits 0 once the retried install succeeds" "[ $gt4_rc -eq 0 ]"
 expect "gatetools AC4: gate_ready becomes true without a reboot" \
-  "grep -q '\"gate_ready\":\"true\"' \"$BURST_LANE_STATE_DIR/session.json\""
+  "grep -q '\"gate_ready\":\"true\"' \"$BURST_LANE_STATE_DIR/current/session.json\""
 gt4_creates_after="$(grep -c 'server create' "$FAKE_HCLOUD_CALLLOG")"
 expect "gatetools AC4: no additional hcloud server create call happened" "[ \"$gt4_creates_after\" -eq \"$gt4_creates_before\" ]"
 gt4_status_out="$("$BL" status)"
@@ -1960,7 +1970,7 @@ fresh_env
 export FAKE_SSH_AUTOBUILDER_VERSION="autobuilder 1.0.0"
 gt5_out="$("$BL" up)"; gt5_rc=$?
 expect "gatetools AC5: up succeeds even though autobuilder's version drifted" "[ $gt5_rc -eq 0 ]"
-expect "gatetools AC5: gate_ready is false due to version drift" "grep -q '\"gate_ready\":\"false\"' \"$BURST_LANE_STATE_DIR/session.json\""
+expect "gatetools AC5: gate_ready is false due to version drift" "grep -q '\"gate_ready\":\"false\"' \"$BURST_LANE_STATE_DIR/current/session.json\""
 expect "gatetools AC5: journal names gate-tools version-drift" \
   "grep -q 'burst-lane  gate-tools  version-drift' \"$BURST_LANE_JOURNAL\""
 unset FAKE_SSH_AUTOBUILDER_VERSION
@@ -1988,7 +1998,7 @@ export FAKE_CARGO_REQUIRE_TOOLCHAIN="1.88.0"
 gtc1_out="$("$BL" up)"; gtc1_rc=$?
 expect "gatetc AC1: up succeeds (exit 0)" "[ $gtc1_rc -eq 0 ]"
 expect "gatetc AC1: gate_ready is true once cargo-deny/cargo-nextest install under +1.88.0" \
-  "grep -q '\"gate_ready\":\"true\"' \"$BURST_LANE_STATE_DIR/session.json\""
+  "grep -q '\"gate_ready\":\"true\"' \"$BURST_LANE_STATE_DIR/current/session.json\""
 expect "gatetc AC1: journal records cargo-deny install rc=0" \
   "grep -q 'gate-tools  install  (tool=cargo-deny rc=0' \"$BURST_LANE_JOURNAL\""
 expect "gatetc AC1: journal records cargo-nextest install rc=0" \
@@ -2157,7 +2167,7 @@ expect "burstuser AC1: root ssh received the user-creation call" \
 expect "burstuser AC1: the same root call installs the ssh key (authorized_keys)" \
   "grep -P '^root@\\S+\\t.*authorized_keys' \"$FAKE_SSH_CALL_LOG\" >/dev/null"
 expect "burstuser AC1: session.json records remote_user=build" \
-  "grep -q '\"remote_user\":\"build\"' \"$BURST_LANE_STATE_DIR/session.json\""
+  "grep -q '\"remote_user\":\"build\"' \"$BURST_LANE_STATE_DIR/current/session.json\""
 expect "burstuser AC1: booted journal line names remote_user=build" \
   "grep -q 'burst-lane  up  booted.*remote_user=build' \"$BURST_LANE_JOURNAL\""
 # Every OTHER call this `up` made — sandbox probe, gate-tools probe, the
@@ -2256,7 +2266,7 @@ expect "burstuser AC5: journal names the placement (no token bytes)" \
 # Force an immediate teardown (1 minute before the hour boundary, same
 # convention every other down/watchdog case in this file uses) so
 # shred_gate_credential actually runs instead of merely scheduling.
-bu5_boot_epoch="$(python3 -c "import json; print(json.load(open('$BURST_LANE_STATE_DIR/session.json'))['boot_epoch'])")"
+bu5_boot_epoch="$(python3 -c "import json; print(json.load(open('$BURST_LANE_STATE_DIR/current/session.json'))['boot_epoch'])")"
 export BURST_LANE_NOW=$((bu5_boot_epoch + 3600 - 60))
 "$BL" down >/dev/null 2>&1 || true
 unset BURST_LANE_NOW
@@ -2274,25 +2284,25 @@ unset BURST_GATE_REVIEWER BURST_CLAUDE_CRED_SRC
 fresh_env
 export FAKE_SSH_CALL_LOG="$T/ssh.calls"; : > "$FAKE_SSH_CALL_LOG"
 "$BL" up >/dev/null 2>&1
-bu6_sid="$(python3 -c "import json; print(json.load(open('$BURST_LANE_STATE_DIR/session.json'))['server_id'])")"
+bu6_sid="$(python3 -c "import json; print(json.load(open('$BURST_LANE_STATE_DIR/current/session.json'))['server_id'])")"
 # Simulate a pre-ship (or rolled-back) root-only session: hand-edit
 # remote_user back to root, and fabricate a dirty marker + remote artifact
 # shaped like one a root-routed `run` would have left behind.
-sed -i 's/"remote_user":"build"/"remote_user":"root"/' "$BURST_LANE_STATE_DIR/session.json"
+sed -i 's/"remote_user":"build"/"remote_user":"root"/' "$BURST_LANE_STATE_DIR/current/session.json"
 WT_MIG="$T/wt-migrate"; mkdir -p "$WT_MIG"
 OLD_REMOTE_MIG="$T/old-root-remote-tree"; mkdir -p "$OLD_REMOTE_MIG"
 echo "pre-existing build artifact" > "$OLD_REMOTE_MIG/artifact.txt"
-mkdir -p "$BURST_LANE_STATE_DIR/dirty"
+mkdir -p "$BURST_LANE_STATE_DIR/current/dirty"
 bu6_wkey="$(printf '%s' "$WT_MIG" | sha1sum | cut -c1-8)"
 python3 -c "
 import json
 json.dump({'worktree': '$WT_MIG', 'session_id': '$bu6_sid', 'remote_path': '$OLD_REMOTE_MIG', 'kind': 'target', 'marked_ts': '2026-01-01T00:00:00Z'},
-           open('$BURST_LANE_STATE_DIR/dirty/$bu6_wkey.json', 'w'))
+           open('$BURST_LANE_STATE_DIR/current/dirty/$bu6_wkey.json', 'w'))
 "
 : > "$FAKE_SSH_CALL_LOG"
 bu6_prov_out="$("$BL" provision 2>&1)"
 expect "burstuser AC6: session.json now records remote_user=build" \
-  "grep -q '\"remote_user\":\"build\"' \"$BURST_LANE_STATE_DIR/session.json\""
+  "grep -q '\"remote_user\":\"build\"' \"$BURST_LANE_STATE_DIR/current/session.json\""
 expect "burstuser AC6: journal records the user migration (root -> build)" \
   "grep -q 'burst-lane  provision  user-migrated.*from=root to=build' \"$BURST_LANE_JOURNAL\""
 expect "burstuser AC6: journal records the worktree's tree migrated, not gone cold" \
@@ -2327,17 +2337,17 @@ expect "burstuser AC6: that run made no root@ call" \
 fresh_env
 export FAKE_SSH_CALL_LOG="$T/ssh.calls"; : > "$FAKE_SSH_CALL_LOG"
 "$BL" up >/dev/null 2>&1
-pr4_sid="$(python3 -c "import json; print(json.load(open('$BURST_LANE_STATE_DIR/session.json'))['server_id'])")"
-sed -i 's/"remote_user":"build"/"remote_user":"root"/' "$BURST_LANE_STATE_DIR/session.json"
+pr4_sid="$(python3 -c "import json; print(json.load(open('$BURST_LANE_STATE_DIR/current/session.json'))['server_id'])")"
+sed -i 's/"remote_user":"build"/"remote_user":"root"/' "$BURST_LANE_STATE_DIR/current/session.json"
 WT_PR4="$T/wt-migrate-mismatch"; mkdir -p "$WT_PR4"
 OLD_REMOTE_PR4="$T/old-root-remote-tree-mismatch"; mkdir -p "$OLD_REMOTE_PR4"
 echo "pre-existing build artifact" > "$OLD_REMOTE_PR4/artifact.txt"
-mkdir -p "$BURST_LANE_STATE_DIR/dirty"
+mkdir -p "$BURST_LANE_STATE_DIR/current/dirty"
 pr4_wkey="$(printf '%s' "$WT_PR4" | sha1sum | cut -c1-8)"
 python3 -c "
 import json
 json.dump({'worktree': '$WT_PR4', 'session_id': '$pr4_sid', 'remote_path': '$OLD_REMOTE_PR4', 'kind': 'target', 'marked_ts': '2026-01-01T00:00:00Z'},
-           open('$BURST_LANE_STATE_DIR/dirty/$pr4_wkey.json', 'w'))
+           open('$BURST_LANE_STATE_DIR/current/dirty/$pr4_wkey.json', 'w'))
 "
 pr4_new_remote="$BURST_LANE_REMOTE_ROOT/$(basename "$WT_PR4")-$pr4_wkey"
 mkdir -p "$pr4_new_remote"
@@ -2863,9 +2873,13 @@ expect "isolate AC4: the refusal is journaled (isolation  refused)" "grep -q 'is
 # line just written above.
 today="$(date -u +%Y-%m-%d)"
 # The refused call above has NO side effect by design (that's AC1's own
-# point), so $iso_ac4_state was never created — make it now.
-mkdir -p "$iso_ac4_state"
-printf '{"date":"%sT00:00:00Z","kind":"slug","slug":"isolate-ac4","eur":0.01}\n' "$today" > "$iso_ac4_state/cost.jsonl"
+# point), so $iso_ac4_state was never created — make it now. cost.jsonl
+# is a per-box path (PRD-build-burst-state-keyed-by-server-v2 requirement
+# 1) reached via $BOX_STATE_DIR == $BURST_LANE_STATE_DIR/current, so the
+# fixture row must land there or maybe_daily_rollup's `[ -f "$COST_LEDGER" ]`
+# guard sees no file and returns before ever computing the rollup line.
+mkdir -p "$iso_ac4_state/current"
+printf '{"date":"%sT00:00:00Z","kind":"slug","slug":"isolate-ac4","eur":0.01}\n' "$today" > "$iso_ac4_state/current/cost.jsonl"
 env -i HOME="$iso_ac4_fakehome" PATH="/usr/bin:/bin" \
   BURST_LANE_STATE_DIR="$iso_ac4_state" BURST_LANE_TICK_JOURNAL_DIR="$iso_ac4_fakehome/tick-journal" \
   "$iso_ac4_bl" down >/dev/null 2>&1
@@ -2934,7 +2948,7 @@ paritycad_cargo_budget_env "$T"
 export FAKE_SSH_NEXTEST_PRESENT=1
 export BURST_LANE_FORCE_NEXTEST_LOCAL=1
 "$BL" up >/dev/null
-sid_pc1="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+sid_pc1="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/current/session.json" | cut -d: -f2)"
 WT_PC1="$T/paritycad-repo1"; mkdir -p "$WT_PC1"
 ( cd "$WT_PC1" && git init -q && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init )
 FAKEBIN_PC1="$T/fakebin-paritycad1"; mkdir -p "$FAKEBIN_PC1"
@@ -3006,7 +3020,7 @@ paritycad_cargo_budget_env "$T"
 export FAKE_SSH_NEXTEST_PRESENT=1
 export BURST_LANE_FORCE_NEXTEST_LOCAL=1
 "$BL" up >/dev/null
-sid_pc2="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+sid_pc2="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/current/session.json" | cut -d: -f2)"
 WT_PC2="$T/paritycad-repo2"; mkdir -p "$WT_PC2"
 ( cd "$WT_PC2" && git init -q && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init )
 FAKEBIN_PC2="$T/fakebin-paritycad2"; mkdir -p "$FAKEBIN_PC2"
@@ -3094,7 +3108,7 @@ expect "paritycad AC3: parity exits 3 when RedBaron's load exceeds the cap" "[ $
 expect "paritycad AC3: parity prints fallback: load" "grep -q '^fallback: load$' <<<\"$pc3_out\""
 expect "paritycad AC3: journal records the deferral with cause=load" \
   "grep -q 'burst-lane  parity  deferred  (cause=load' \"$BURST_LANE_JOURNAL\""
-expect "paritycad AC3: no session was ever brought up (neither side ran)" "[ ! -f \"$BURST_LANE_STATE_DIR/session.json\" ]"
+expect "paritycad AC3: no session was ever brought up (neither side ran)" "[ ! -f \"$BURST_LANE_STATE_DIR/current/session.json\" ]"
 expect "paritycad AC3: no local test baseline was written" "[ ! -e \"$WT_PC3/target/autobuilder/test-output.txt\" ]"
 expect "paritycad AC3: no parity receipt was written" "[ ! -e \"$WT_PC3/target/autobuilder/receipts/box-parity.json\" ]"
 unset CARGO_BUDGET_HOSTNAME CARGO_BUDGET_LOADAVG PARITY_LOAD_WAIT_S
@@ -3279,7 +3293,7 @@ unset FAKE_SSH_VOLUME_LABEL_PRESENT
 fresh_env
 export BURST_VOLUME_NAME="wm-burst-build"
 "$BL" up >/dev/null
-bv3_boot_epoch="$(grep -oE '"boot_epoch":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+bv3_boot_epoch="$(grep -oE '"boot_epoch":[0-9]+' "$BURST_LANE_STATE_DIR/current/session.json" | cut -d: -f2)"
 export BURST_LANE_NOW=$((bv3_boot_epoch + 3600 - 60))
 bv3_down_out="$("$BL" down)"
 unset BURST_LANE_NOW
@@ -3299,14 +3313,14 @@ fresh_env
 export BURST_VOLUME_NAME="wm-burst-build"
 "$BL" up >/dev/null
 export FAKE_HCLOUD_VOLUME_DETACH_FAIL=1
-bv4_boot_epoch="$(grep -oE '"boot_epoch":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+bv4_boot_epoch="$(grep -oE '"boot_epoch":[0-9]+' "$BURST_LANE_STATE_DIR/current/session.json" | cut -d: -f2)"
 export BURST_LANE_NOW=$((bv4_boot_epoch + 3600 - 60))
 bv4_down_out="$("$BL" down)"
 unset BURST_LANE_NOW FAKE_HCLOUD_VOLUME_DETACH_FAIL
 expect "burstvol AC4: server still deletes even though detach failed" "[ \"$bv4_down_out\" = 'decision=deleted' ]"
 expect "burstvol AC4: journal records volume detach-failed" "grep -q 'burst-lane  down  volume  detach-failed' \"$BURST_LANE_JOURNAL\""
 expect "burstvol AC4: volume state file marks volume_dirty=true" \
-  "python3 -c \"import json,sys; d=json.load(open('$BURST_LANE_STATE_DIR/volume.json')); sys.exit(0 if d.get('volume_dirty')=='true' else 1)\""
+  "python3 -c \"import json,sys; d=json.load(open('$BURST_LANE_STATE_DIR/current/volume.json')); sys.exit(0 if d.get('volume_dirty')=='true' else 1)\""
 export FAKE_SSH_VOLUME_FSCK_CALLLOG="$T/fsck.calls"; : > "$FAKE_SSH_VOLUME_FSCK_CALLLOG"
 bv4b_up_out="$("$BL" up)"; bv4b_up_rc=$?
 expect "burstvol AC4: the next up exits 0" "[ $bv4b_up_rc -eq 0 ]"
@@ -3325,7 +3339,7 @@ expect "burstvol AC5: no volume attach call was attempted" "! grep -q 'volume at
 expect "burstvol AC5: journal names the server the volume is attached to" \
   "grep -q 'burst-lane  up  volume  busy  (attached_to=999999' \"$BURST_LANE_JOURNAL\""
 expect "burstvol AC5: volume state recorded volume_mounted=false" \
-  "python3 -c \"import json,sys; d=json.load(open('$BURST_LANE_STATE_DIR/volume.json')); sys.exit(0 if d.get('volume_mounted')=='false' else 1)\""
+  "python3 -c \"import json,sys; d=json.load(open('$BURST_LANE_STATE_DIR/current/volume.json')); sys.exit(0 if d.get('volume_mounted')=='false' else 1)\""
 
 # ---- burstvol AC6: disk fields (status --json) reflect the volume, not ----
 # the root disk — a fake df reporting 41% used comes back as volume.used_pct.
@@ -3375,7 +3389,7 @@ export BURST_VOLUME_GB=500
 WT_BV8="$T/rollup-wt"; mkdir -p "$WT_BV8"
 echo 'mkdir -p target; exit 0' > "$WT_BV8/build.sh"
 "$BL" run "$WT_BV8" -- bash build.sh >/dev/null 2>&1
-bv8_boot_epoch="$(grep -oE '"boot_epoch":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+bv8_boot_epoch="$(grep -oE '"boot_epoch":[0-9]+' "$BURST_LANE_STATE_DIR/current/session.json" | cut -d: -f2)"
 export BURST_LANE_NOW=$((bv8_boot_epoch + 3600 - 60))
 "$BL" down >/dev/null
 "$BL" down >/dev/null
@@ -3397,10 +3411,10 @@ WT_BV9="$T/localdisk-wt"; mkdir -p "$WT_BV9"
 echo 'mkdir -p target && echo built > target/out.txt' > "$WT_BV9/build.sh"
 "$BL" run "$WT_BV9" -- bash build.sh >/dev/null 2>&1
 bv9_wkey="$(printf '%s' "$WT_BV9" | sha1sum | cut -c1-8)"
-mkdir -p "$BURST_LANE_STATE_DIR/pull-sizes"
+mkdir -p "$BURST_LANE_STATE_DIR/current/pull-sizes"
 # 87 GB, exactly matching the PRD's own AC9 scenario and the real
 # 2026-09-11 incident evidence (an 87 GB single gate pull).
-printf '%s\n' "$((87 * 1073741824))" > "$BURST_LANE_STATE_DIR/pull-sizes/$bv9_wkey"
+printf '%s\n' "$((87 * 1073741824))" > "$BURST_LANE_STATE_DIR/current/pull-sizes/$bv9_wkey"
 export BURST_LANE_LOCAL_FREE_GB=20
 # PRD-build-burst-pull-back-restore AC12: this fixture is deliberately
 # testing the STATIC floor/last-observed-size rule in isolation (an
@@ -3508,13 +3522,13 @@ fresh_env
 "$BL" up >/dev/null
 WT_BV10="$T/rootmove-wt"; mkdir -p "$WT_BV10"
 bv10_wkey="$(printf '%s' "$WT_BV10" | sha1sum | cut -c1-8)"
-mkdir -p "$BURST_LANE_STATE_DIR/dirty"
+mkdir -p "$BURST_LANE_STATE_DIR/current/dirty"
 python3 -c "
 import json
 json.dump(
     {'worktree': '$WT_BV10', 'session_id': 'stale-session', 'kind': 'target',
      'remote_path': '/root/build/rootmove-wt-$bv10_wkey', 'marked_ts': '2026-01-01T00:00:00Z'},
-    open('$BURST_LANE_STATE_DIR/dirty/$bv10_wkey.json', 'w'))
+    open('$BURST_LANE_STATE_DIR/current/dirty/$bv10_wkey.json', 'w'))
 "
 bv10_pull_out="$("$BL" pull "$WT_BV10" 2>&1)"; bv10_pull_rc=$?
 expect "burstvol AC10: pull against a marker under a moved root exits 0 (cold, not an error)" "[ $bv10_pull_rc -eq 0 ]"
@@ -3522,7 +3536,7 @@ expect "burstvol AC10: journal records pull cold cause=remote-path-missing" \
   "grep -q 'burst-lane  pull  cold  (worktree=$WT_BV10 .*cause=remote-path-missing' \"$BURST_LANE_JOURNAL\""
 expect "burstvol AC10: never journaled as rsync-failed for this worktree" \
   "! grep -q \"burst-lane  pull  fallback  (cause=rsync-failed worktree=$WT_BV10\" \"$BURST_LANE_JOURNAL\""
-expect "burstvol AC10: the stale marker was cleared" "[ ! -e \"$BURST_LANE_STATE_DIR/dirty/$bv10_wkey.json\" ]"
+expect "burstvol AC10: the stale marker was cleared" "[ ! -e \"$BURST_LANE_STATE_DIR/current/dirty/$bv10_wkey.json\" ]"
 # PRD-build-burst-pull-back-restore requirement 2 / AC2: same distinction as
 # AC3c above — a cold outcome clears the marker and stays exit-0 (pinned
 # just above), but must never echo "pulled" alongside it.
@@ -3537,20 +3551,20 @@ expect "burstpull AC2: cold pull's stdout never claims 'pulled'" "[ \"$bv10_pull
 fresh_env
 WT_BV3B="$T/no-session-wt"; mkdir -p "$WT_BV3B/target"
 bv3b_wkey="$(printf '%s' "$WT_BV3B" | sha1sum | cut -c1-8)"
-mkdir -p "$BURST_LANE_STATE_DIR/dirty"
+mkdir -p "$BURST_LANE_STATE_DIR/current/dirty"
 python3 -c "
 import json
 json.dump(
     {'worktree': '$WT_BV3B', 'session_id': 'dead-session', 'kind': 'target',
      'remote_path': '/root/build/no-session-wt-$bv3b_wkey', 'marked_ts': '2026-01-01T00:00:00Z'},
-    open('$BURST_LANE_STATE_DIR/dirty/$bv3b_wkey.json', 'w'))
+    open('$BURST_LANE_STATE_DIR/current/dirty/$bv3b_wkey.json', 'w'))
 "
 bv3b_pull_out="$("$BL" pull "$WT_BV3B" 2>&1)"; bv3b_pull_rc=$?
 expect "burstpull AC3b: pull with no active session exits 0 (cold, not an error)" "[ $bv3b_pull_rc -eq 0 ]"
 expect "burstpull AC3b: pull's stdout never claims 'pulled' when nothing transferred" "[ \"$bv3b_pull_out\" != pulled ]"
 expect "burstpull AC3b: journal records pull cold cause=no-active-session" \
   "grep -q 'burst-lane  pull  cold  (worktree=$WT_BV3B .*cause=no-active-session' \"$BURST_LANE_JOURNAL\""
-expect "burstpull AC3b: the stale marker was cleared" "[ ! -e \"$BURST_LANE_STATE_DIR/dirty/$bv3b_wkey.json\" ]"
+expect "burstpull AC3b: the stale marker was cleared" "[ ! -e \"$BURST_LANE_STATE_DIR/current/dirty/$bv3b_wkey.json\" ]"
 
 # ---- burstvol AC11: this fixture set exits 0 and names the burstvol cases -
 # (an explicit, in-band assertion, matching every sibling AC's own
@@ -3816,7 +3830,7 @@ ws2_manifest_rc=1
 python3 -c "
 import json
 try:
-    d = json.load(open('$BURST_LANE_STATE_DIR/remote-dirs.json'))
+    d = json.load(open('$BURST_LANE_STATE_DIR/current/remote-dirs.json'))
 except Exception:
     d = {}
 ok = any(k.startswith('deps/c-') and v.get('owner') == '$WT_WS2A' for k, v in d.items())
@@ -3961,8 +3975,8 @@ echo "STALE-HOST-KEY" > "$HYG_STALE_GLOBAL_KH"
 hyg1_out="$("$BL" up)"; hyg1_rc=$?
 block_start "bursthyg"
 expect "bursthyg AC2: up succeeds despite a stale GLOBAL known_hosts-shaped file existing on disk" "[ $hyg1_rc -eq 0 ]"
-hyg1_sid="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
-hyg1_khfile="$BURST_LANE_STATE_DIR/known_hosts.$hyg1_sid"
+hyg1_sid="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/current/session.json" | cut -d: -f2)"
+hyg1_khfile="$BURST_LANE_STATE_DIR/current/known_hosts.$hyg1_sid"
 expect "bursthyg AC1: a session known_hosts file was created, keyed by session_id" "[ -f \"$hyg1_khfile\" ]"
 # Round-trip a run+pull too, so the rsync log is exercised, not just ssh.
 HYG_WT="$T/hyg-wt"; mkdir -p "$HYG_WT"
@@ -3996,14 +4010,23 @@ expect "bursthyg AC2 (negative case): failure names the real ssh wording" "grep 
 # ---- bursthyg AC3: up reconciles session.json against hcloud reality ------
 fresh_env
 "$BL" up >/dev/null 2>&1
-hyg3_sid="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+hyg3_sid="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/current/session.json" | cut -d: -f2)"
+# PRD-build-burst-state-keyed-by-server-v2: capture the OLD box's real
+# directory before the reconciling `up` below — session_reconcile()
+# archives session.json.stale-* INSIDE the box it found stale (box A),
+# then this same `up` call creates a NEW box and box_activate() repoints
+# `current` at it (box B). Checking via `current` AFTER that call looks
+# in box B's directory, where the stale file never was — it has to be
+# checked in box A's own directory, resolved now while `current` still
+# points there.
+hyg3_old_box_dir="$(readlink -f "$BURST_LANE_STATE_DIR/current")"
 hcloud server delete "$hyg3_sid" >/dev/null 2>&1   # out-of-band delete, the 2026-09-13 incident
 hyg3_out="$("$BL" up)"; hyg3_rc=$?
 expect "bursthyg AC3: up succeeds after reconciling an absent server" "[ $hyg3_rc -eq 0 ]"
 expect "bursthyg AC3: up reports a genuinely NEW box, not an adoption" "grep -q '^up: ' <<<\"$hyg3_out\""
 expect "bursthyg AC3: the stale session.json was archived (not silently deleted)" \
-  "ls \"$BURST_LANE_STATE_DIR\"/session.json.stale-* >/dev/null 2>&1"
-hyg3_new_sid="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+  "ls \"$hyg3_old_box_dir\"/session.json.stale-* >/dev/null 2>&1"
+hyg3_new_sid="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/current/session.json" | cut -d: -f2)"
 expect "bursthyg AC3: the new session has a different server_id than the absent one" "[ \"$hyg3_new_sid\" != \"$hyg3_sid\" ]"
 expect "bursthyg AC3: journal recorded the stale-session reconcile" "grep -q 'burst-lane  session  stale' \"$BURST_LANE_JOURNAL\""
 
@@ -4015,7 +4038,7 @@ expect "bursthyg AC3: journal recorded the stale-session reconcile" "grep -q 'bu
 # served a `run` — this session is "unproven" by construction.
 fresh_env
 "$BL" up >/dev/null 2>&1
-hyg4_sid="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+hyg4_sid="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/current/session.json" | cut -d: -f2)"
 cat > "$BURST_LANE_PRD_DIR/build-queue/PRD-fake-rust-hyg.md" <<'EOF'
 # PRD — fake-rust-hyg
 
@@ -4026,33 +4049,33 @@ hyg4_out="$("$BL" down)"
 expect "bursthyg AC4: down deletes an unproven box despite rust-work-remains" "[ \"$hyg4_out\" = 'decision=deleted' ]"
 expect "bursthyg AC4: journal names the cause as unproven-box" \
   "grep -q 'burst-lane  down  decision=deleted.*cause=unproven-box' \"$BURST_LANE_JOURNAL\""
-expect "bursthyg AC4: session.json is gone" "[ ! -f \"$BURST_LANE_STATE_DIR/session.json\" ]"
+expect "bursthyg AC4: session.json is gone" "[ ! -f \"$BURST_LANE_STATE_DIR/current/session.json\" ]"
 expect "bursthyg AC4: the fake hcloud confirms the server is actually gone" "! hcloud server describe \"$hyg4_sid\" -o json >/dev/null 2>&1"
 rm -f "$BURST_LANE_PRD_DIR/build-queue/PRD-fake-rust-hyg.md"
 
 # ---- bursthyg AC5: down --force --------------------------------------------
 fresh_env
 "$BL" up >/dev/null 2>&1
-hyg5a_sid="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
-hyg5a_kh="$BURST_LANE_STATE_DIR/known_hosts.$hyg5a_sid"
+hyg5a_sid="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/current/session.json" | cut -d: -f2)"
+hyg5a_kh="$BURST_LANE_STATE_DIR/current/known_hosts.$hyg5a_sid"
 expect "bursthyg AC5 setup: session known_hosts file exists before force" "[ -f \"$hyg5a_kh\" ]"
 hyg5a_out="$("$BL" down --force)"; hyg5a_rc=$?
 expect "bursthyg AC5: down --force exits 0 against a live box" "[ $hyg5a_rc -eq 0 ]"
 expect "bursthyg AC5: down --force reports force-deleted" "[ \"$hyg5a_out\" = 'decision=force-deleted' ]"
 expect "bursthyg AC5: down --force actually deleted the fake server" "! hcloud server describe \"$hyg5a_sid\" -o json >/dev/null 2>&1"
-expect "bursthyg AC5: session.json is removed" "[ ! -f \"$BURST_LANE_STATE_DIR/session.json\" ]"
+expect "bursthyg AC5: session.json is removed" "[ ! -f \"$BURST_LANE_STATE_DIR/current/session.json\" ]"
 expect "bursthyg AC5: the session known_hosts file is removed" "[ ! -f \"$hyg5a_kh\" ]"
 
 # AC5's own literal scenario: session state naming a server that's ALREADY
 # gone (an operator's raw hcloud delete, or a crashed prior force call).
 "$BL" up >/dev/null 2>&1
-hyg5b_sid="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
-hyg5b_kh="$BURST_LANE_STATE_DIR/known_hosts.$hyg5b_sid"
+hyg5b_sid="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/current/session.json" | cut -d: -f2)"
+hyg5b_kh="$BURST_LANE_STATE_DIR/current/known_hosts.$hyg5b_sid"
 hcloud server delete "$hyg5b_sid" >/dev/null 2>&1
 hyg5b_out="$("$BL" down --force)"; hyg5b_rc=$?
 expect "bursthyg AC5: down --force exits 0 even when the server is already gone" "[ $hyg5b_rc -eq 0 ]"
 expect "bursthyg AC5: down --force still reports force-deleted for an already-gone server" "[ \"$hyg5b_out\" = 'decision=force-deleted' ]"
-expect "bursthyg AC5: session.json is still removed" "[ ! -f \"$BURST_LANE_STATE_DIR/session.json\" ]"
+expect "bursthyg AC5: session.json is still removed" "[ ! -f \"$BURST_LANE_STATE_DIR/current/session.json\" ]"
 expect "bursthyg AC5: the session known_hosts file is still removed" "[ ! -f \"$hyg5b_kh\" ]"
 
 # down --force with NO session at all must also stay rc=0 (nothing to do).
@@ -4070,7 +4093,7 @@ hyg6_pos_json="$("$BL" status --json)"
 hyg6_pos_rc=1
 grep -q '"active":true' <<<"$hyg6_pos_json" && grep -q '"server_verified":true' <<<"$hyg6_pos_json" && hyg6_pos_rc=0
 expect "bursthyg AC6: a live, hcloud-confirmed session reports active:true + server_verified:true" "[ $hyg6_pos_rc -eq 0 ]"
-hyg6_sid="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+hyg6_sid="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/current/session.json" | cut -d: -f2)"
 hcloud server delete "$hyg6_sid" >/dev/null 2>&1
 hyg6_json="$("$BL" status --json)"; hyg6_rc=$?
 expect "bursthyg AC6: status --json exits 0 even when the tracked server is gone" "[ $hyg6_rc -eq 0 ]"
@@ -4078,13 +4101,13 @@ hyg6_active_rc=1; grep -q '"active":false' <<<"$hyg6_json" && hyg6_active_rc=0
 hyg6_verified_rc=1; grep -q '"server_verified":false' <<<"$hyg6_json" && hyg6_verified_rc=0
 expect "bursthyg AC6: status reports active:false" "[ $hyg6_active_rc -eq 0 ]"
 expect "bursthyg AC6: status reports server_verified:false" "[ $hyg6_verified_rc -eq 0 ]"
-expect "bursthyg AC6: session.json was archived" "ls \"$BURST_LANE_STATE_DIR\"/session.json.stale-* >/dev/null 2>&1"
+expect "bursthyg AC6: session.json was archived" "ls \"$BURST_LANE_STATE_DIR/current\"/session.json.stale-* >/dev/null 2>&1"
 
 # ---- bursthyg AC7: volume.json gets the same reconcile treatment ----------
 fresh_env
 export BURST_VOLUME_NAME="wm-burst-build-hyg"
 "$BL" up >/dev/null 2>&1
-hyg7_vid="$(grep -oE '"volume_id":"?[0-9]+"?' "$BURST_LANE_STATE_DIR/volume.json" | grep -oE '[0-9]+')"
+hyg7_vid="$(grep -oE '"volume_id":"?[0-9]+"?' "$BURST_LANE_STATE_DIR/current/volume.json" | grep -oE '[0-9]+')"
 expect "bursthyg AC7 setup: volume.json recorded a volume_id after up" "[ -n \"$hyg7_vid\" ]"
 # Out-of-band volume delete (2026-09-13: volume 106857883) — the fake hcloud
 # has no `volume delete` verb of its own, so drop the line directly; same
@@ -4094,7 +4117,7 @@ hyg7_json="$("$BL" status --json)"; hyg7_rc=$?
 expect "bursthyg AC7: status --json exits 0 even when the tracked volume is gone" "[ $hyg7_rc -eq 0 ]"
 hyg7_verified_rc=1; grep -q '"volume_verified":false' <<<"$hyg7_json" && hyg7_verified_rc=0
 expect "bursthyg AC7: status reports volume_verified:false" "[ $hyg7_verified_rc -eq 0 ]"
-expect "bursthyg AC7: volume.json was archived" "ls \"$BURST_LANE_STATE_DIR\"/volume.json.stale-* >/dev/null 2>&1"
+expect "bursthyg AC7: volume.json was archived" "ls \"$BURST_LANE_STATE_DIR/current\"/volume.json.stale-* >/dev/null 2>&1"
 
 # `up` reconciles the volume too — even down the already-up fast path, which
 # returns before volume_ensure ever runs, so this is the only way an
@@ -4104,12 +4127,12 @@ expect "bursthyg AC7: volume.json was archived" "ls \"$BURST_LANE_STATE_DIR\"/vo
 fresh_env
 export BURST_VOLUME_NAME="wm-burst-build-hyg3"
 "$BL" up >/dev/null 2>&1
-hyg7b_vid="$(grep -oE '"volume_id":"?[0-9]+"?' "$BURST_LANE_STATE_DIR/volume.json" | grep -oE '[0-9]+')"
+hyg7b_vid="$(grep -oE '"volume_id":"?[0-9]+"?' "$BURST_LANE_STATE_DIR/current/volume.json" | grep -oE '[0-9]+')"
 expect "bursthyg AC7b setup: volume.json recorded a volume_id after up" "[ -n \"$hyg7b_vid\" ]"
 sed -i "/^$hyg7b_vid|/d" "$FAKE_HCLOUD_VOLUME_STATE"
 "$BL" up >/dev/null 2>&1   # session still alive -> already-up fast path
 expect "bursthyg AC7: up (already-up fast path) also archives a volume.json whose volume hcloud reports absent" \
-  "ls \"$BURST_LANE_STATE_DIR\"/volume.json.stale-* >/dev/null 2>&1"
+  "ls \"$BURST_LANE_STATE_DIR/current\"/volume.json.stale-* >/dev/null 2>&1"
 
 # ---- bursthyg AC9 (P1 style closer): this fixture set exits 0 and names
 # its own bursthyg cases — same in-band closing assertion every sibling
@@ -4138,17 +4161,17 @@ expect_block_green "bursthyg" "bursthyg: every bursthyg case above ran green"
 # ---- bursttdl AC1: setup-grace blocks watchdog + idle-guard ----------------
 fresh_env
 "$BL" up >/dev/null 2>&1
-btdl1_sid="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
-btdl1_boot="$(grep -oE '"boot_epoch":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+btdl1_sid="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/current/session.json" | cut -d: -f2)"
+btdl1_boot="$(grep -oE '"boot_epoch":[0-9]+' "$BURST_LANE_STATE_DIR/current/session.json" | cut -d: -f2)"
 block_start "bursttdl"
 expect "bursttdl AC1 setup: a fresh session starts phase=setup" \
-  "grep -q '\"phase\":\"setup\"' \"$BURST_LANE_STATE_DIR/session.json\""
+  "grep -q '\"phase\":\"setup\"' \"$BURST_LANE_STATE_DIR/current/session.json\""
 
 # Force watchdog's OWN due-check to fire immediately (ttl_hours=0) while
 # staying well inside the default 30-minute setup-grace window (5 minutes
 # in) — isolates "would watchdog otherwise delete this" from "does grace
 # block it".
-sed -i 's/"ttl_hours":[0-9]*/"ttl_hours":0/' "$BURST_LANE_STATE_DIR/session.json"
+sed -i 's/"ttl_hours":[0-9]*/"ttl_hours":0/' "$BURST_LANE_STATE_DIR/current/session.json"
 export BURST_LANE_NOW=$((btdl1_boot + 300))
 btdl1_wd_rc=0; "$BL" watchdog >/dev/null 2>&1 || btdl1_wd_rc=$?
 expect "bursttdl AC1: watchdog exits 0 on a deferred (not deleted, not leaked) teardown" "[ $btdl1_wd_rc -eq 0 ]"
@@ -4179,9 +4202,9 @@ d = json.load(open(path))
 d.pop("phase", None)
 d.pop("phase_epoch", None)
 json.dump(d, open(path, "w"))
-' "$BURST_LANE_STATE_DIR/session.json"
+' "$BURST_LANE_STATE_DIR/current/session.json"
 expect "bursttdl AC1 migration setup: the session file now has no phase field at all" \
-  "! grep -q '\"phase\"' \"$BURST_LANE_STATE_DIR/session.json\""
+  "! grep -q '\"phase\"' \"$BURST_LANE_STATE_DIR/current/session.json\""
 export BURST_LANE_NOW=$((btdl1_boot + 60))   # 1 minute in — deep inside any grace window
 btdl1_legacy_rc=0; "$BL" watchdog >/dev/null 2>&1 || btdl1_legacy_rc=$?
 expect "bursttdl AC1 migration: a legacy session with no phase field is NOT grace-protected (reads as already-provisioned)" \
@@ -4191,9 +4214,9 @@ unset BURST_LANE_NOW
 # ---- bursttdl AC2: an explicit `down` bypasses grace unconditionally ------
 fresh_env
 "$BL" up >/dev/null 2>&1
-btdl2_sid="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+btdl2_sid="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/current/session.json" | cut -d: -f2)"
 expect "bursttdl AC2 setup: the session is phase=setup, well inside the grace window" \
-  "grep -q '\"phase\":\"setup\"' \"$BURST_LANE_STATE_DIR/session.json\""
+  "grep -q '\"phase\":\"setup\"' \"$BURST_LANE_STATE_DIR/current/session.json\""
 # Route `down` through the SAME immediate-delete path bursthyg AC4 already
 # proves (a queued rust PRD -> rust-work-remains -> the unproven-box check,
 # gate_ready=false/runs_served=0 by construction on a box this fresh) —
@@ -4214,9 +4237,9 @@ rm -f "$BURST_LANE_PRD_DIR/build-queue/PRD-fake-rust-tdl.md"
 # ---- bursttdl AC3: grace expiry is not a leak ------------------------------
 fresh_env
 "$BL" up >/dev/null 2>&1
-btdl3_sid="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
-btdl3_boot="$(grep -oE '"boot_epoch":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
-sed -i 's/"ttl_hours":[0-9]*/"ttl_hours":0/' "$BURST_LANE_STATE_DIR/session.json"
+btdl3_sid="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/current/session.json" | cut -d: -f2)"
+btdl3_boot="$(grep -oE '"boot_epoch":[0-9]+' "$BURST_LANE_STATE_DIR/current/session.json" | cut -d: -f2)"
+sed -i 's/"ttl_hours":[0-9]*/"ttl_hours":0/' "$BURST_LANE_STATE_DIR/current/session.json"
 export BURST_LANE_NOW=$((btdl3_boot + 1801))   # one second past the default 30-minute grace
 "$BL" watchdog >/dev/null 2>&1
 expect "bursttdl AC3: an autonomous caller deletes once grace has expired" \
@@ -4228,10 +4251,10 @@ unset BURST_LANE_NOW
 # ---- bursttdl AC4: provision moves the session out of phase=setup ---------
 fresh_env
 "$BL" up >/dev/null 2>&1
-btdl4a_sid="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+btdl4a_sid="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/current/session.json" | cut -d: -f2)"
 "$BL" provision >/dev/null 2>&1   # default fixture: gate tools all present -> success
 expect "bursttdl AC4: a successful provision moves phase to provisioned" \
-  "grep -q '\"phase\":\"provisioned\"' \"$BURST_LANE_STATE_DIR/session.json\""
+  "grep -q '\"phase\":\"provisioned\"' \"$BURST_LANE_STATE_DIR/current/session.json\""
 
 fresh_env
 # Same deterministic gate_ready=false setup gatetools AC2/AC3 use: missing +
@@ -4242,14 +4265,14 @@ fresh_env
 export FAKE_SSH_GATE_TOOLS_MISSING="autobuilder"
 export FAKE_SSH_GATE_TOOLS_INSTALL_FAIL=1
 "$BL" up >/dev/null 2>&1
-btdl4b_sid="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
-btdl4b_boot="$(grep -oE '"boot_epoch":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+btdl4b_sid="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/current/session.json" | cut -d: -f2)"
+btdl4b_boot="$(grep -oE '"boot_epoch":[0-9]+' "$BURST_LANE_STATE_DIR/current/session.json" | cut -d: -f2)"
 btdl4b_prov_rc=0; "$BL" provision >/dev/null 2>&1 || btdl4b_prov_rc=$?
 unset FAKE_SSH_GATE_TOOLS_MISSING FAKE_SSH_GATE_TOOLS_INSTALL_FAIL
 expect "bursttdl AC4: a failed provision exits non-zero" "[ $btdl4b_prov_rc -ne 0 ]"
 expect "bursttdl AC4: a failed provision moves phase to failed" \
-  "grep -q '\"phase\":\"failed\"' \"$BURST_LANE_STATE_DIR/session.json\""
-sed -i 's/"ttl_hours":[0-9]*/"ttl_hours":0/' "$BURST_LANE_STATE_DIR/session.json"
+  "grep -q '\"phase\":\"failed\"' \"$BURST_LANE_STATE_DIR/current/session.json\""
+sed -i 's/"ttl_hours":[0-9]*/"ttl_hours":0/' "$BURST_LANE_STATE_DIR/current/session.json"
 export BURST_LANE_NOW=$((btdl4b_boot + 60))   # 1 minute in — deep inside any grace window
 "$BL" watchdog >/dev/null 2>&1
 expect "bursttdl AC4: a phase=failed box is deleted by the very next autonomous caller, without waiting out any grace" \
@@ -4267,7 +4290,7 @@ fresh_env
 mkdir -p "$BURST_LANE_REPOS_DIR/mcphost"
 ( cd "$BURST_LANE_REPOS_DIR/mcphost" && git init -q && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init )
 "$BL" up >/dev/null 2>&1
-btdl5_sid="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+btdl5_sid="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/current/session.json" | cut -d: -f2)"
 # The parity call was backgrounded (disowned) by `up` — poll its own journal
 # for a terminal line rather than assuming any fixed sleep is long enough.
 btdl5_seen=0
@@ -4299,8 +4322,8 @@ fresh_env
 export BURST_VOLUME_NAME="wm-burst-build-tdl6a"
 export FAKE_SSH_VOLUME_USED_PCT=1
 "$BL" up >/dev/null 2>&1
-btdl6a_boot="$(grep -oE '"boot_epoch":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
-btdl6a_vid="$(grep -oE '"volume_id":"?[0-9]+"?' "$BURST_LANE_STATE_DIR/volume.json" | grep -oE '[0-9]+')"
+btdl6a_boot="$(grep -oE '"boot_epoch":[0-9]+' "$BURST_LANE_STATE_DIR/current/session.json" | cut -d: -f2)"
+btdl6a_vid="$(grep -oE '"volume_id":"?[0-9]+"?' "$BURST_LANE_STATE_DIR/current/volume.json" | grep -oE '[0-9]+')"
 export BURST_LANE_NOW=$((btdl6a_boot + 3600 - 60))
 "$BL" down >/dev/null 2>&1
 unset BURST_LANE_NOW
@@ -4312,8 +4335,8 @@ expect "bursttdl AC6: the deletion is journaled with the volume's id and used_pc
 export BURST_VOLUME_NAME="wm-burst-build-tdl6b"
 export FAKE_SSH_VOLUME_USED_PCT=40
 "$BL" up >/dev/null 2>&1
-btdl6b_boot="$(grep -oE '"boot_epoch":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
-btdl6b_vid="$(grep -oE '"volume_id":"?[0-9]+"?' "$BURST_LANE_STATE_DIR/volume.json" | grep -oE '[0-9]+')"
+btdl6b_boot="$(grep -oE '"boot_epoch":[0-9]+' "$BURST_LANE_STATE_DIR/current/session.json" | cut -d: -f2)"
+btdl6b_vid="$(grep -oE '"volume_id":"?[0-9]+"?' "$BURST_LANE_STATE_DIR/current/volume.json" | grep -oE '[0-9]+')"
 BTDL6_WT="$T/tdl6-wt"; mkdir -p "$BTDL6_WT"; echo 'echo hi' > "$BTDL6_WT/build.sh"
 "$BL" run "$BTDL6_WT" -- bash build.sh >/dev/null 2>&1
 export BURST_LANE_NOW=$((btdl6b_boot + 3600 - 60))
@@ -4334,10 +4357,10 @@ fresh_env
 export BURST_VOLUME_NAME="wm-burst-build-tdl7"
 export FAKE_SSH_VOLUME_USED_PCT=1
 "$BL" up >/dev/null 2>&1
-btdl7_sid="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
-btdl7_vid="$(grep -oE '"volume_id":"?[0-9]+"?' "$BURST_LANE_STATE_DIR/volume.json" | grep -oE '[0-9]+')"
+btdl7_sid="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/current/session.json" | cut -d: -f2)"
+btdl7_vid="$(grep -oE '"volume_id":"?[0-9]+"?' "$BURST_LANE_STATE_DIR/current/volume.json" | grep -oE '[0-9]+')"
 hcloud server delete "$btdl7_sid" >/dev/null 2>&1
-rm -f "$BURST_LANE_STATE_DIR/session.json"
+rm -f "$BURST_LANE_STATE_DIR/current/session.json"
 expect "bursttdl AC7 setup: the volume is still real in hcloud after the out-of-band server delete" \
   "hcloud volume describe \"$btdl7_vid\" -o json >/dev/null 2>&1"
 btdl7_out="$("$BL" reap --volumes)"
@@ -4351,10 +4374,10 @@ expect "bursttdl AC7: the deletion is journaled with id and used_pct" \
 export BURST_VOLUME_NAME="wm-burst-build-tdl7b"
 export FAKE_SSH_VOLUME_USED_PCT=1
 "$BL" up >/dev/null 2>&1
-btdl7b_sid="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
-btdl7b_vid="$(grep -oE '"volume_id":"?[0-9]+"?' "$BURST_LANE_STATE_DIR/volume.json" | grep -oE '[0-9]+')"
+btdl7b_sid="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/current/session.json" | cut -d: -f2)"
+btdl7b_vid="$(grep -oE '"volume_id":"?[0-9]+"?' "$BURST_LANE_STATE_DIR/current/volume.json" | grep -oE '[0-9]+')"
 hcloud server delete "$btdl7b_sid" >/dev/null 2>&1
-rm -f "$BURST_LANE_STATE_DIR/session.json"
+rm -f "$BURST_LANE_STATE_DIR/current/session.json"
 "$BL" down --force >/dev/null 2>&1
 expect "bursttdl AC7: down --force also locates and deletes a stranded volume with no session pointer" \
   "! hcloud volume describe \"$btdl7b_vid\" -o json >/dev/null 2>&1"
@@ -4379,7 +4402,7 @@ expect_block_green "bursttdl" "bursttdl: every bursttdl case above ran green"
 fresh_env
 export BURST_VOLUME_NAME="wm-burst-volidfix1"
 vf1_out="$("$BL" up)"; vf1_rc=$?
-vf1_vid="$(grep -oE '"volume_id":"?[0-9]+"?' "$BURST_LANE_STATE_DIR/volume.json" 2>/dev/null | grep -oE '[0-9]+')"
+vf1_vid="$(grep -oE '"volume_id":"?[0-9]+"?' "$BURST_LANE_STATE_DIR/current/volume.json" 2>/dev/null | grep -oE '[0-9]+')"
 block_start "volidfix"
 expect "volidfix AC1: up exits 0 against a clean create" "[ $vf1_rc -eq 0 ]"
 expect "volidfix AC1: volume.json recorded the parsed id" "[ -n \"$vf1_vid\" ]"
@@ -4394,7 +4417,7 @@ fresh_env
 export BURST_VOLUME_NAME="wm-burst-volidfix2"
 export FAKE_HCLOUD_VOLUME_CREATE_STDERR_NOISE=1
 vf2_out="$("$BL" up)"; vf2_rc=$?
-vf2_vid="$(grep -oE '"volume_id":"?[0-9]+"?' "$BURST_LANE_STATE_DIR/volume.json" 2>/dev/null | grep -oE '[0-9]+')"
+vf2_vid="$(grep -oE '"volume_id":"?[0-9]+"?' "$BURST_LANE_STATE_DIR/current/volume.json" 2>/dev/null | grep -oE '[0-9]+')"
 expect "volidfix AC2: up exits 0 when create emits stderr progress noise" "[ $vf2_rc -eq 0 ]"
 expect "volidfix AC2: the id is parsed correctly from stdout alone" "[ -n \"$vf2_vid\" ]"
 expect "volidfix AC2: no volume-create-failed line was journaled despite stderr noise" \
@@ -4418,7 +4441,7 @@ expect "volidfix AC3: volume-create-failed is never journaled for this case" \
 expect "volidfix AC4: the fake hcloud holds zero volumes for this name afterward" \
   "! hcloud volume describe \"$BURST_VOLUME_NAME\" -o json >/dev/null 2>&1"
 expect "volidfix AC4: volume.json records volume_mounted=false (booted on root disk)" \
-  "python3 -c \"import json,sys; d=json.load(open('$BURST_LANE_STATE_DIR/volume.json')); sys.exit(0 if d.get('volume_mounted')=='false' else 1)\""
+  "python3 -c \"import json,sys; d=json.load(open('$BURST_LANE_STATE_DIR/current/volume.json')); sys.exit(0 if d.get('volume_mounted')=='false' else 1)\""
 unset FAKE_HCLOUD_VOLUME_CREATE_GARBLED
 
 # ---- volidfix AC5: create itself exits non-zero -> honest journal grammar
@@ -4443,10 +4466,10 @@ fresh_env
 export BURST_VOLUME_NAME="wm-burst-volidfix6"
 export FAKE_SSH_VOLUME_USED_PCT=7
 "$BL" up >/dev/null 2>&1
-vf6_sid="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
-vf6_vid="$(grep -oE '"volume_id":"?[0-9]+"?' "$BURST_LANE_STATE_DIR/volume.json" | grep -oE '[0-9]+')"
+vf6_sid="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/current/session.json" | cut -d: -f2)"
+vf6_vid="$(grep -oE '"volume_id":"?[0-9]+"?' "$BURST_LANE_STATE_DIR/current/volume.json" | grep -oE '[0-9]+')"
 hcloud server delete "$vf6_sid" >/dev/null 2>&1
-rm -f "$BURST_LANE_STATE_DIR/session.json"
+rm -f "$BURST_LANE_STATE_DIR/current/session.json"
 # Backdate the fixture's own "created" field 3 hours so age_h is provably
 # non-zero, without touching any other field.
 vf6_created3h="$(date -u -d "@$(( $(date -u +%s) - 10800 ))" +%Y-%m-%dT%H:%M:%SZ)"
@@ -4462,7 +4485,7 @@ unset FAKE_SSH_VOLUME_USED_PCT
 fresh_env
 export BURST_VOLUME_NAME="wm-burst-volidfix7"
 "$BL" up >/dev/null 2>&1
-vf7_vid="$(grep -oE '"volume_id":"?[0-9]+"?' "$BURST_LANE_STATE_DIR/volume.json" | grep -oE '[0-9]+')"
+vf7_vid="$(grep -oE '"volume_id":"?[0-9]+"?' "$BURST_LANE_STATE_DIR/current/volume.json" | grep -oE '[0-9]+')"
 vf7_out="$("$BL" reap --volumes)"
 expect "volidfix AC7: reap --volumes leaves an attached, live volume alone" "[ \"$vf7_out\" = 'volumes-reaped=0' ]"
 expect "volidfix AC7: no volume-deleted line was journaled for the attached volume" \
@@ -4477,7 +4500,7 @@ export BURST_VOLUME_NAME="wm-burst-volidfix8a"
 hcloud volume create --name "$BURST_VOLUME_NAME" --size 500 >/dev/null 2>&1
 vf8a_pre_vid="$(awk -F'|' -v n="$BURST_VOLUME_NAME" '$2==n{print $1}' "$FAKE_HCLOUD_VOLUME_STATE" | head -1)"
 vf8a_out="$("$BL" up)"; vf8a_rc=$?
-vf8a_vid="$(grep -oE '"volume_id":"?[0-9]+"?' "$BURST_LANE_STATE_DIR/volume.json" | grep -oE '[0-9]+')"
+vf8a_vid="$(grep -oE '"volume_id":"?[0-9]+"?' "$BURST_LANE_STATE_DIR/current/volume.json" | grep -oE '[0-9]+')"
 expect "volidfix AC8a: up exits 0 and adopts a pre-existing same-size volume" "[ $vf8a_rc -eq 0 ]"
 expect "volidfix AC8a: the adopted volume is the pre-existing one, not a new create" \
   "[ \"$vf8a_vid\" = \"$vf8a_pre_vid\" ]"
@@ -4494,7 +4517,7 @@ export BURST_VOLUME_NAME="wm-burst-volidfix8b"
 hcloud volume create --name "$BURST_VOLUME_NAME" --size 100 >/dev/null 2>&1
 vf8b_pre_vid="$(awk -F'|' -v n="$BURST_VOLUME_NAME" '$2==n{print $1}' "$FAKE_HCLOUD_VOLUME_STATE" | head -1)"
 vf8b_out="$("$BL" up)"; vf8b_rc=$?
-vf8b_vid="$(grep -oE '"volume_id":"?[0-9]+"?' "$BURST_LANE_STATE_DIR/volume.json" | grep -oE '[0-9]+')"
+vf8b_vid="$(grep -oE '"volume_id":"?[0-9]+"?' "$BURST_LANE_STATE_DIR/current/volume.json" | grep -oE '[0-9]+')"
 expect "volidfix AC8b: up exits 0 and replaces a size-mismatched pre-existing volume" "[ $vf8b_rc -eq 0 ]"
 expect "volidfix AC8b: the new volume is NOT the old mismatched one" \
   "[ \"$vf8b_vid\" != \"$vf8b_pre_vid\" ]"
@@ -4539,8 +4562,8 @@ export BURST_GATE_REVIEWER=1
 export BURST_CLAUDE_CRED_SRC="$T/fake-cred-src.json"
 echo '{"fake":"cred"}' > "$BURST_CLAUDE_CRED_SRC"
 "$BL" up >/dev/null 2>&1
-r1_gate_ready="$(grep -oE '"gate_ready":"[^"]*"' "$BURST_LANE_STATE_DIR/session.json" | cut -d'"' -f4)"
-r1_sandbox_ok="$(grep -oE '"sandbox_ok":"[^"]*"' "$BURST_LANE_STATE_DIR/session.json" | cut -d'"' -f4)"
+r1_gate_ready="$(grep -oE '"gate_ready":"[^"]*"' "$BURST_LANE_STATE_DIR/current/session.json" | cut -d'"' -f4)"
+r1_sandbox_ok="$(grep -oE '"sandbox_ok":"[^"]*"' "$BURST_LANE_STATE_DIR/current/session.json" | cut -d'"' -f4)"
 expect "reenable AC1 setup: session is gate_ready=true after up" "[ \"$r1_gate_ready\" = true ]"
 expect "reenable AC1 setup: session is sandbox_ok=true after up" "[ \"$r1_sandbox_ok\" = true ]"
 r1_cred_path="$BURST_LANE_GATE_CRED_REMOTE_PATH"
@@ -4592,7 +4615,7 @@ fresh_env
 export FAKE_SSH_GATE_TOOLS_MISSING="autobuilder"
 export FAKE_SSH_GATE_TOOLS_INSTALL_FAIL=1
 "$BL" up >/dev/null 2>&1
-r2b_gate_ready="$(grep -oE '"gate_ready":"[^"]*"' "$BURST_LANE_STATE_DIR/session.json" | cut -d'"' -f4)"
+r2b_gate_ready="$(grep -oE '"gate_ready":"[^"]*"' "$BURST_LANE_STATE_DIR/current/session.json" | cut -d'"' -f4)"
 expect "reenable AC2b setup: session is gate_ready=false after up" "[ \"$r2b_gate_ready\" = false ]"
 r2b_out="$("$BL" bake 2>&1)"; r2b_rc=$?
 expect "reenable AC2b: bake exits 3 when gate_ready=false" "[ $r2b_rc -eq 3 ]"
@@ -4647,7 +4670,7 @@ cat > "$BURST_LANE_STATE_DIR/snapshot.json" <<'JSON'
 {"image_id": "999889", "created": "2026-09-13T00:00:00Z", "base_image_id": "427125061", "build_skill_sha": "abc123", "gate_tool_versions": {}, "baked_history": ["999889"]}
 JSON
 "$BL" up >/dev/null 2>&1
-r4a_gate_ready="$(grep -oE '"gate_ready":"[^"]*"' "$BURST_LANE_STATE_DIR/session.json" | cut -d'"' -f4)"
+r4a_gate_ready="$(grep -oE '"gate_ready":"[^"]*"' "$BURST_LANE_STATE_DIR/current/session.json" | cut -d'"' -f4)"
 expect "reenable AC4a: a baked boot with every tool present reaches gate_ready=true" "[ \"$r4a_gate_ready\" = true ]"
 expect "reenable AC4a: zero install-start lines on an all-present baked boot" \
   "[ \"$(grep -c 'burst-lane  gate-tools  install-start' "$BURST_LANE_JOURNAL")\" -eq 0 ]"
@@ -4737,7 +4760,7 @@ WT_PROVE5="$T/prove-ac5-mcphost"; mkdir -p "$WT_PROVE5"
 r5_out="$(PATH="$REEN_PROVE_CARGO:$PATH" FAKE_SSH_HOSTNAME=wm-burst-lane-fake-box "$BL" prove --worktree "$WT_PROVE5" 2>&1)"; r5_rc=$?
 expect "reenable AC5: prove exits 0 when run+pull+freshness+host all check out" "[ $r5_rc -eq 0 ]"
 expect "reenable AC5: proof.json has routed=true and bytes>0" \
-  "python3 -c \"import json; d=json.load(open('$BURST_LANE_STATE_DIR/proof.json')); assert d['routed'] is True and d['bytes'] > 0, d\""
+  "python3 -c \"import json; d=json.load(open('$BURST_LANE_STATE_DIR/current/proof.json')); assert d['routed'] is True and d['bytes'] > 0, d\""
 expect "reenable AC5: journal has prove done" \
   "grep -q 'burst-lane  prove  done  (routed=true' \"$BURST_LANE_JOURNAL\""
 expect "reenable AC5: down ran at the end of prove (a decision line was journaled)" \
@@ -4753,7 +4776,7 @@ WT_PROVE6="$T/prove-ac6-mcphost"; mkdir -p "$WT_PROVE6"
 r6_out="$(PATH="$REEN_PROVE_CARGO:$PATH" "$BL" prove --worktree "$WT_PROVE6" 2>&1)"; r6_rc=$?
 expect "reenable AC6: prove exits 1 when the box's hostname matches the caller's" "[ $r6_rc -eq 1 ]"
 expect "reenable AC6: proof.json has routed=false with cause=host-mismatch" \
-  "python3 -c \"import json; d=json.load(open('$BURST_LANE_STATE_DIR/proof.json')); assert d['routed'] is False and d['cause'] == 'host-mismatch', d\""
+  "python3 -c \"import json; d=json.load(open('$BURST_LANE_STATE_DIR/current/proof.json')); assert d['routed'] is False and d['cause'] == 'host-mismatch', d\""
 expect "reenable AC6: journal has prove failed (cause=host-mismatch)" \
   "grep -q 'burst-lane  prove  failed  (cause=host-mismatch' \"$BURST_LANE_JOURNAL\""
 expect "reenable AC6: down still ran even though the proof failed" \
@@ -4871,9 +4894,9 @@ fresh_env
 WT_PFX1="$T/provefx-ac1"; mkdir -p "$WT_PFX1"
 pfx1_out="$(BURST_PROVE_TEST_ABORT=run-unbound "$BL" prove --worktree "$WT_PFX1" 2>&1)"; pfx1_rc=$?
 expect "provefx AC1: proof.json exists after an unbound-variable kill during run" \
-  "[ -f \"$BURST_LANE_STATE_DIR/proof.json\" ]"
+  "[ -f \"$BURST_LANE_STATE_DIR/current/proof.json\" ]"
 expect "provefx AC1: proof.json has routed=false cause=run-aborted and step=run" \
-  "python3 -c \"import json; d=json.load(open('$BURST_LANE_STATE_DIR/proof.json')); assert d['routed'] is False and d['cause'] == 'run-aborted' and d['step'] == 'run', d\""
+  "python3 -c \"import json; d=json.load(open('$BURST_LANE_STATE_DIR/current/proof.json')); assert d['routed'] is False and d['cause'] == 'run-aborted' and d['step'] == 'run', d\""
 expect "provefx AC1: exactly one prove-aborted journal line naming step=run" \
   "[ \"\$(grep -c 'burst-lane  prove  aborted  (step=run' \"$BURST_LANE_JOURNAL\")\" -eq 1 ]"
 expect "provefx AC1: down ran after the abort" \
@@ -4888,7 +4911,7 @@ WT_PFX2="$T/provefx-ac2"; mkdir -p "$WT_PFX2"
 pfx2_out="$(BURST_PROVE_TEST_ABORT=run-term "$BL" prove --worktree "$WT_PFX2" 2>&1)"; pfx2_rc=$?
 expect "provefx AC2: prove's exit code is 143 when killed with TERM during run" "[ $pfx2_rc -eq 143 ]"
 expect "provefx AC2: proof.json cause=run-aborted after the TERM abort" \
-  "python3 -c \"import json; d=json.load(open('$BURST_LANE_STATE_DIR/proof.json')); assert d['routed'] is False and d['cause'] == 'run-aborted' and d['exit_code'] == 143, d\""
+  "python3 -c \"import json; d=json.load(open('$BURST_LANE_STATE_DIR/current/proof.json')); assert d['routed'] is False and d['cause'] == 'run-aborted' and d['exit_code'] == 143, d\""
 expect "provefx AC2: down ran after the TERM abort" \
   "grep -q 'burst-lane  down  decision=' \"$BURST_LANE_JOURNAL\""
 
@@ -4901,9 +4924,9 @@ WT_PFX3="$T/provefx-ac3"; mkdir -p "$WT_PFX3"
 pfx3_out="$(FAKE_HCLOUD_CREATE_FAIL=1 "$BL" prove --worktree "$WT_PFX3" 2>&1)"; pfx3_rc=$?
 expect "provefx AC3: prove exits 1 when up itself fails" "[ $pfx3_rc -eq 1 ]"
 expect "provefx AC3: a prove.<epoch>.up.log was written under state/burst-lane/logs" \
-  "compgen -G \"$BURST_LANE_STATE_DIR/logs/prove.*.up.log\" >/dev/null"
+  "compgen -G \"$BURST_LANE_STATE_DIR/current/logs/prove.*.up.log\" >/dev/null"
 expect "provefx AC3: the up log holds cmd_up's own captured output" \
-  "grep -q 'hcloud server create failed' \"$BURST_LANE_STATE_DIR\"/logs/prove.*.up.log"
+  "grep -q 'hcloud server create failed' \"$BURST_LANE_STATE_DIR/current\"/logs/prove.*.up.log"
 expect "provefx AC3: the failure journal line carries the up log's tail" \
   "grep -q 'burst-lane  prove  failed  (cause=up-failed .*tail=\"fallback: hcloud server create failed' \"$BURST_LANE_JOURNAL\""
 
@@ -4924,7 +4947,7 @@ ln -sfn "$PFX4_REPO" "$BURST_LANE_REPOS_DIR/provefx-repo"
   source "$BL"
   cmd_parity() { sleep 30; }
   export BURST_PARITY_REPOS="provefx-repo"
-  exec 221>"$BURST_LANE_STATE_DIR/up.lock"
+  exec 221>"$BURST_LANE_STATE_DIR/current/up.lock"
   flock -n 221 || exit 1
   schedule_session_parity "provefx-ac4-session"
   sleep 0.3
@@ -4933,7 +4956,7 @@ ln -sfn "$PFX4_REPO" "$BURST_LANE_REPOS_DIR/provefx-repo"
 pfx4_setup_rc=$?
 expect "provefx AC4 setup: the fixture ran cleanly (lock was takeable, parity scheduled)" "[ $pfx4_setup_rc -eq 0 ]"
 pfx4_reacquire_rc=0
-( exec 224>"$BURST_LANE_STATE_DIR/up.lock"; flock -n 224 ) || pfx4_reacquire_rc=$?
+( exec 224>"$BURST_LANE_STATE_DIR/current/up.lock"; flock -n 224 ) || pfx4_reacquire_rc=$?
 expect "provefx AC4: a fresh flock succeeds immediately once the caller's own fd closes (background child did not inherit 221)" \
   "[ $pfx4_reacquire_rc -eq 0 ]"
 
@@ -4944,7 +4967,7 @@ fresh_env
 PFX5_DEAD_PID=999999
 while kill -0 "$PFX5_DEAD_PID" 2>/dev/null; do PFX5_DEAD_PID=$((PFX5_DEAD_PID - 1)); done
 mkdir -p "$BURST_LANE_STATE_DIR"
-echo "$PFX5_DEAD_PID" > "$BURST_LANE_STATE_DIR/up.pid"
+echo "$PFX5_DEAD_PID" > "$BURST_LANE_STATE_DIR/current/up.pid"
 pfx5_out="$("$BL" up 2>&1)"; pfx5_rc=$?
 expect "provefx AC5: up succeeds despite a stale up.pid (the lock itself was free)" "[ $pfx5_rc -eq 0 ]"
 expect "provefx AC5: journal has up lock-reclaimed naming the stale pid" \
@@ -4960,12 +4983,12 @@ fresh_env
 PFX6_DEAD_PID=999999
 while kill -0 "$PFX6_DEAD_PID" 2>/dev/null; do PFX6_DEAD_PID=$((PFX6_DEAD_PID - 1)); done
 mkdir -p "$BURST_LANE_STATE_DIR"
-echo "$PFX6_DEAD_PID" > "$BURST_LANE_STATE_DIR/up.pid"
-flock "$BURST_LANE_STATE_DIR/up.lock" -c 'sleep 10' &
+echo "$PFX6_DEAD_PID" > "$BURST_LANE_STATE_DIR/current/up.pid"
+flock "$BURST_LANE_STATE_DIR/current/up.lock" -c 'sleep 10' &
 PFX6_HOLDER_PID=$!
 pfx6_tries=0
 while [ "$pfx6_tries" -lt 50 ]; do
-  if ( exec 225>"$BURST_LANE_STATE_DIR/up.lock"; flock -n 225 ) 2>/dev/null; then
+  if ( exec 225>"$BURST_LANE_STATE_DIR/current/up.lock"; flock -n 225 ) 2>/dev/null; then
     pfx6_tries=$((pfx6_tries + 1)); sleep 0.05
   else
     break
@@ -5061,10 +5084,10 @@ expect "provefx AC8: status --json prove_last is null when prove has never run" 
 # each against a started billed hour.
 fresh_env
 "$BL" up >/dev/null 2>&1
-pfx11_create_epoch="$(grep -oE '"create_epoch":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+pfx11_create_epoch="$(grep -oE '"create_epoch":[0-9]+' "$BURST_LANE_STATE_DIR/current/session.json" | cut -d: -f2)"
 expect "provefx AC11 setup: up wrote a numeric create_epoch" "[ -n \"$pfx11_create_epoch\" ]"
 pfx11_boot_epoch=$((pfx11_create_epoch + 17 * 60))
-sed -i "s/\"boot_epoch\":[0-9]*/\"boot_epoch\":$pfx11_boot_epoch/" "$BURST_LANE_STATE_DIR/session.json"
+sed -i "s/\"boot_epoch\":[0-9]*/\"boot_epoch\":$pfx11_boot_epoch/" "$BURST_LANE_STATE_DIR/current/session.json"
 export BURST_LANE_NOW=$((pfx11_boot_epoch + 2 * 60))   # 19 minutes after create_epoch
 "$BL" status --json > "$T/pfx11-status.json"
 expect "provefx AC11: status --json minutes_alive reads 19 (from create_epoch, not boot_epoch's 2)" \
@@ -5103,7 +5126,7 @@ pfx13_out="$(PATH="$REEN_PROVE_CARGO:$PATH" TMPDIR="$PFX13_TMP" \
 expect "provefx AC13: prove routes true when the box's own artifacts land 15m behind wall-clock" \
   "[ $pfx13_rc -eq 0 ]"
 expect "provefx AC13: proof.json routed=true despite the clock skew" \
-  "python3 -c \"import json; d=json.load(open('$BURST_LANE_STATE_DIR/proof.json')); assert d['routed'] is True, d\""
+  "python3 -c \"import json; d=json.load(open('$BURST_LANE_STATE_DIR/current/proof.json')); assert d['routed'] is True, d\""
 expect "provefx AC13: no burst-prove-marker.* file remains in TMPDIR after prove" \
   "[ -z \"\$(find \"$PFX13_TMP\" -maxdepth 1 -name 'burst-prove-marker.*' 2>/dev/null)\" ]"
 
@@ -5145,7 +5168,7 @@ export BURST_PROVE_MCPHOST_REPO="$PFX14A_REPO"
 pfx14a_out="$(PATH="$REEN_PROVE_CARGO:$PATH" FAKE_SSH_HOSTNAME=wm-burst-lane-fake-box "$BL" prove 2>&1)"; pfx14a_rc=$?
 expect "provefx AC14: prove with no --worktree does its own git worktree add --detach and still routes true" \
   "[ $pfx14a_rc -eq 0 ]"
-pfx14a_wt="$(python3 -c "import json; print(json.load(open('$BURST_LANE_STATE_DIR/proof.json'))['worktree'])" 2>/dev/null)"
+pfx14a_wt="$(python3 -c "import json; print(json.load(open('$BURST_LANE_STATE_DIR/current/proof.json'))['worktree'])" 2>/dev/null)"
 expect "provefx AC14: prove's own disposable worktree is gone after prove finishes" \
   "[ -n \"$pfx14a_wt\" ] && [ ! -d \"$pfx14a_wt\" ]"
 expect "provefx AC14: the done journal line names local_target as <worktree>/target, not the repo's off-root override" \
@@ -5168,7 +5191,7 @@ printf '[build]\ntarget-dir = "%s"\n' "$PFX14_OFFROOT" > "$WT_PFX14/.cargo/confi
 pfx14_out="$(PATH="$REEN_PROVE_CARGO:$PATH" FAKE_SSH_HOSTNAME=wm-burst-lane-fake-box "$BL" prove --worktree "$WT_PFX14" 2>&1)"; pfx14_rc=$?
 expect "provefx AC14: prove routes true against an off-root target-dir override" "[ $pfx14_rc -eq 0 ]"
 expect "provefx AC14: proof.json routed=true" \
-  "python3 -c \"import json; d=json.load(open('$BURST_LANE_STATE_DIR/proof.json')); assert d['routed'] is True, d\""
+  "python3 -c \"import json; d=json.load(open('$BURST_LANE_STATE_DIR/current/proof.json')); assert d['routed'] is True, d\""
 expect "provefx AC14: the pull actually landed the artifact under the override, not \$worktree/target" \
   "[ -f '$PFX14_OFFROOT/out.txt' ]"
 expect "provefx AC14: the done journal line names local_target as the override path" \
@@ -5198,11 +5221,11 @@ WT_PFX15="$T/provefx-ac15"; mkdir -p "$WT_PFX15"
 pfx15_out="$(PATH="$PFX15_CARGO:$PATH" FAKE_SSH_HOSTNAME=wm-burst-lane-fake-box FAKE_SSH_REMOTE_DATE="2026-09-14T05:00:00Z" "$BL" prove --worktree "$WT_PFX15" 2>&1)"; pfx15_rc=$?
 expect "provefx AC15: prove exits 1 when the box compiled nothing newer than the marker" "[ $pfx15_rc -eq 1 ]"
 expect "provefx AC15: proof.json cause=no-fresh-artifact" \
-  "python3 -c \"import json; d=json.load(open('$BURST_LANE_STATE_DIR/proof.json')); assert d['routed'] is False and d['cause']=='no-fresh-artifact', d\""
+  "python3 -c \"import json; d=json.load(open('$BURST_LANE_STATE_DIR/current/proof.json')); assert d['routed'] is False and d['cause']=='no-fresh-artifact', d\""
 expect "provefx AC15: proof.json carries the full assert diagnosis" \
   "python3 -c \"
 import json
-d = json.load(open('$BURST_LANE_STATE_DIR/proof.json'))
+d = json.load(open('$BURST_LANE_STATE_DIR/current/proof.json'))
 assert d.get('files') == 0, d
 assert d.get('local_target'), d
 assert 'marker_mtime' in d and d['marker_mtime'], d
@@ -5238,7 +5261,7 @@ pfx16_out="$(PATH="$REEN_PROVE_CARGO:$PATH" FAKE_SSH_HOSTNAME=wm-burst-lane-fake
 expect "provefx AC16: artifacts 82s newer than the marker with skew_s=-330 assert routed=true" \
   "[ $pfx16_rc -eq 0 ]"
 expect "provefx AC16: proof.json routed=true, not no-fresh-artifact" \
-  "python3 -c \"import json; d=json.load(open('$BURST_LANE_STATE_DIR/proof.json')); assert d['routed'] is True, d\""
+  "python3 -c \"import json; d=json.load(open('$BURST_LANE_STATE_DIR/current/proof.json')); assert d['routed'] is True, d\""
 
 # ---- provefx AC17 (regression, commit ac319ac): the freshness check was
 # `find -L ... | grep -q .` under `set -uo pipefail` — on a real pulled
@@ -5283,7 +5306,7 @@ pfx17_out="$(PATH="$PFX17_CARGO:$PATH" FAKE_SSH_HOSTNAME=wm-burst-lane-fake-box 
 expect "provefx AC17: a pulled target with 8000 files newer than the marker asserts routed=true (find must not die of SIGPIPE under pipefail)" \
   "[ $pfx17_rc -eq 0 ]"
 expect "provefx AC17: proof.json routed=true, not no-fresh-artifact" \
-  "python3 -c \"import json; d=json.load(open('$BURST_LANE_STATE_DIR/proof.json')); assert d['routed'] is True, d\""
+  "python3 -c \"import json; d=json.load(open('$BURST_LANE_STATE_DIR/current/proof.json')); assert d['routed'] is True, d\""
 
 expect_block_green "provefx" "provefx: every provefx case above ran green"
 
@@ -5328,7 +5351,7 @@ git -C "$PK1_REPO" -c user.name=t -c user.email=t@t commit -q --allow-empty -m i
 export BURST_PROVE_MCPHOST_REPO="$PK1_REPO"
 pk1_out="$(PATH="$PK_CARGO:$PATH" FAKE_SSH_HOSTNAME=wm-burst-lane-fake-box FAKE_SSH_REMOTE_DATE="2026-09-15T06:00:00Z" "$BL" prove 2>&1)"; pk1_rc=$?
 expect "provekeep AC1: prove exits 1 on the no-fresh-artifact fixture" "[ $pk1_rc -eq 1 ]"
-pk1_dir="$(find -L "$BURST_LANE_STATE_DIR/evidence" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort | tail -1)"
+pk1_dir="$(find -L "$BURST_LANE_STATE_DIR/current/evidence" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort | tail -1)"
 expect "provekeep AC1: exactly one evidence dir was created" \
   "[ -n \"$pk1_dir\" ] && [ -d \"$pk1_dir\" ]"
 expect "provekeep AC1: evidence dir holds target/, proof.json, expression.sh, and a step log" \
@@ -5355,11 +5378,11 @@ for pk3_i in 1 2 3 4; do
   PATH="$PK_CARGO:$PATH" FAKE_SSH_HOSTNAME=wm-burst-lane-fake-box "$BL" prove --worktree "$WT_PK3" >/dev/null 2>&1
 done
 unset BURST_LANE_NOW
-pk3_before="$(find -L "$BURST_LANE_STATE_DIR/evidence" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)"
+pk3_before="$(find -L "$BURST_LANE_STATE_DIR/current/evidence" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)"
 expect "provekeep AC3 setup: four evidence dirs exist before reap" "[ \"$pk3_before\" -eq 4 ]"
-pk3_oldest="$(find -L "$BURST_LANE_STATE_DIR/evidence" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort | head -1)"
+pk3_oldest="$(find -L "$BURST_LANE_STATE_DIR/current/evidence" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort | head -1)"
 "$BL" reap >/dev/null 2>&1
-pk3_after="$(find -L "$BURST_LANE_STATE_DIR/evidence" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)"
+pk3_after="$(find -L "$BURST_LANE_STATE_DIR/current/evidence" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)"
 expect "provekeep AC3: exactly three evidence dirs remain after reap" "[ \"$pk3_after\" -eq 3 ]"
 expect "provekeep AC3: the oldest evidence dir was removed" "[ -n \"$pk3_oldest\" ] && [ ! -d \"$pk3_oldest\" ]"
 expect "provekeep AC3: the journal has exactly one reap evidence-deleted line" \
@@ -5369,7 +5392,7 @@ expect "provekeep AC3: the journal has exactly one reap evidence-deleted line" \
 pk4_json="$("$BL" status --json 2>/dev/null)"
 pk4_count="$(python3 -c "import json,sys; print(json.loads(sys.argv[1])['evidence']['count'])" "$pk4_json" 2>/dev/null)"
 pk4_bytes="$(python3 -c "import json,sys; print(json.loads(sys.argv[1])['evidence']['bytes'])" "$pk4_json" 2>/dev/null)"
-pk4_du="$(du -sbL "$BURST_LANE_STATE_DIR/evidence" 2>/dev/null | cut -f1)"
+pk4_du="$(du -sbL "$BURST_LANE_STATE_DIR/current/evidence" 2>/dev/null | cut -f1)"
 expect "provekeep AC4: status --json evidence.count=3" "[ \"$pk4_count\" = 3 ]"
 expect "provekeep AC4: status --json evidence.bytes matches du -sb within 1%" \
   "python3 -c \"a=int('$pk4_bytes'); b=int('${pk4_du:-0}'); assert b == 0 or abs(a-b)/max(b,1) <= 0.01, (a,b)\""
@@ -5383,7 +5406,7 @@ WT_PK5="$T/provekeep-ac5"; mkdir -p "$WT_PK5"
 pk5_out="$(PATH="$REEN_PROVE_CARGO:$PATH" FAKE_SSH_HOSTNAME=wm-burst-lane-fake-box "$BL" prove --worktree "$WT_PK5" 2>&1)"; pk5_rc=$?
 expect "provekeep AC5 setup: the fixture prove succeeded (routed=true)" "[ $pk5_rc -eq 0 ]"
 expect "provekeep AC5: no evidence directory is created for a successful prove without --keep-worktree" \
-  "[ ! -e \"$BURST_LANE_STATE_DIR/evidence\" ] || [ -z \"\$(find \"$BURST_LANE_STATE_DIR/evidence\" -mindepth 1 -maxdepth 1 2>/dev/null)\" ]"
+  "[ ! -e \"$BURST_LANE_STATE_DIR/current/evidence\" ] || [ -z \"\$(find \"$BURST_LANE_STATE_DIR/current/evidence\" -mindepth 1 -maxdepth 1 2>/dev/null)\" ]"
 
 # ---- provekeep AC6 (P1, requirement 5) -------------------------------------
 fresh_env
@@ -5391,7 +5414,7 @@ export BURST_LANE_AUTOBUILDER_BIN="$REEN_PROVE_AB_SRC/autobuilder"
 WT_PK6="$T/provekeep-ac6"; mkdir -p "$WT_PK6"
 pk6_out="$(PATH="$REEN_PROVE_CARGO:$PATH" FAKE_SSH_HOSTNAME=wm-burst-lane-fake-box "$BL" prove --worktree "$WT_PK6" --keep-worktree 2>&1)"; pk6_rc=$?
 expect "provekeep AC6 setup: the fixture prove succeeded (routed=true)" "[ $pk6_rc -eq 0 ]"
-pk6_dir="$(find -L "$BURST_LANE_STATE_DIR/evidence" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort | tail -1)"
+pk6_dir="$(find -L "$BURST_LANE_STATE_DIR/current/evidence" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort | tail -1)"
 expect "provekeep AC6: --keep-worktree preserves an evidence set on a successful prove" \
   "[ -n \"$pk6_dir\" ] && [ -d \"$pk6_dir/target\" ]"
 expect "provekeep AC6: journal has prove evidence-kept (reason=operator)" \
@@ -5409,7 +5432,7 @@ export BURST_LOCAL_DISK_FLOOR_GB=999999
 pk7_out="$(PATH="$PK_CARGO:$PATH" FAKE_SSH_HOSTNAME=wm-burst-lane-fake-box "$BL" prove --worktree "$WT_PK7" 2>&1)"; pk7_rc=$?
 unset FAKE_SSH_PULL_PROBE_BYTES BURST_LANE_LOCAL_FREE_GB BURST_LOCAL_DISK_FLOOR_GB
 expect "provekeep AC7: prove still fails at assert (no-fresh-artifact) under the inflated floor" "[ $pk7_rc -eq 1 ]"
-pk7_dir="$(find -L "$BURST_LANE_STATE_DIR/evidence" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort | tail -1)"
+pk7_dir="$(find -L "$BURST_LANE_STATE_DIR/current/evidence" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort | tail -1)"
 expect "provekeep AC7: the evidence set holds logs/proof.json/expression.sh but no target/" \
   "[ -n \"$pk7_dir\" ] && [ -f \"$pk7_dir/proof.json\" ] && [ -f \"$pk7_dir/expression.sh\" ] && [ -n \"\$(find \"$pk7_dir/logs\" -type f 2>/dev/null)\" ] && [ ! -d \"$pk7_dir/target\" ]"
 expect "provekeep AC7: journal has prove evidence-trimmed (reason=disk-floor)" \
@@ -5430,9 +5453,9 @@ block_start "proveguard"
 # ---- proveguard AC1: a live prove.inflight pid blocks down -----------------
 fresh_env
 "$BL" up >/dev/null 2>&1
-pg1_sid="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+pg1_sid="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/current/session.json" | cut -d: -f2)"
 sleep 300 & pg1_pid=$!
-printf 'pid=%s\nstart_epoch=%s\nserver_id=%s\n' "$pg1_pid" "$(date -u +%s)" "$pg1_sid" > "$BURST_LANE_STATE_DIR/prove.inflight"
+printf 'pid=%s\nstart_epoch=%s\nserver_id=%s\n' "$pg1_pid" "$(date -u +%s)" "$pg1_sid" > "$BURST_LANE_STATE_DIR/current/prove.inflight"
 pg1_out="$("$BL" down 2>&1)"; pg1_rc=$?
 expect "proveguard AC1: down exits 0 while a live prove.inflight pid is running" "[ $pg1_rc -eq 0 ]"
 expect "proveguard AC1: down prints decision=keep" "grep -q '^decision=keep$' <<<\"$pg1_out\""
@@ -5448,10 +5471,10 @@ kill "$pg1_pid" 2>/dev/null; wait "$pg1_pid" 2>/dev/null
 # not a special case).
 fresh_env
 "$BL" up >/dev/null 2>&1
-pg2_sid="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+pg2_sid="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/current/session.json" | cut -d: -f2)"
 ( : ) & pg2_pid=$!
 wait "$pg2_pid" 2>/dev/null
-printf 'pid=%s\nstart_epoch=%s\nserver_id=%s\n' "$pg2_pid" "$(date -u +%s)" "$pg2_sid" > "$BURST_LANE_STATE_DIR/prove.inflight"
+printf 'pid=%s\nstart_epoch=%s\nserver_id=%s\n' "$pg2_pid" "$(date -u +%s)" "$pg2_sid" > "$BURST_LANE_STATE_DIR/current/prove.inflight"
 cat > "$BURST_LANE_PRD_DIR/build-queue/PRD-fake-rust-proveguard.md" <<'EOF'
 # PRD — fake-rust-proveguard
 
@@ -5462,7 +5485,7 @@ pg2_out="$("$BL" down 2>&1)"
 expect "proveguard AC2: down deletes the unproven box once the stale marker is reclaimed" "[ \"$pg2_out\" = 'decision=deleted' ]"
 expect "proveguard AC2: journal has prove-inflight-stale naming the dead pid" \
   "grep -q \"burst-lane  down  prove-inflight-stale  (pid=$pg2_pid)\" \"$BURST_LANE_JOURNAL\""
-expect "proveguard AC2: the stale marker file is removed" "[ ! -f \"$BURST_LANE_STATE_DIR/prove.inflight\" ]"
+expect "proveguard AC2: the stale marker file is removed" "[ ! -f \"$BURST_LANE_STATE_DIR/current/prove.inflight\" ]"
 expect "proveguard AC2: journal still names the ordinary unproven-box cause" \
   "grep -q 'burst-lane  down  decision=deleted.*cause=unproven-box' \"$BURST_LANE_JOURNAL\""
 rm -f "$BURST_LANE_PRD_DIR/build-queue/PRD-fake-rust-proveguard.md"
@@ -5471,9 +5494,9 @@ rm -f "$BURST_LANE_PRD_DIR/build-queue/PRD-fake-rust-proveguard.md"
 # the override rather than silently ignoring it.
 fresh_env
 "$BL" up >/dev/null 2>&1
-pg3_sid="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+pg3_sid="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/current/session.json" | cut -d: -f2)"
 sleep 300 & pg3_pid=$!
-printf 'pid=%s\nstart_epoch=%s\nserver_id=%s\n' "$pg3_pid" "$(date -u +%s)" "$pg3_sid" > "$BURST_LANE_STATE_DIR/prove.inflight"
+printf 'pid=%s\nstart_epoch=%s\nserver_id=%s\n' "$pg3_pid" "$(date -u +%s)" "$pg3_sid" > "$BURST_LANE_STATE_DIR/current/prove.inflight"
 pg3_out="$("$BL" down --force 2>&1)"; pg3_rc=$?
 expect "proveguard AC3: down --force still exits 0 despite a live prove.inflight" "[ $pg3_rc -eq 0 ]"
 expect "proveguard AC3: down --force still deletes (decision=force-deleted)" "grep -q '^decision=force-deleted$' <<<\"$pg3_out\""
@@ -5485,10 +5508,10 @@ kill "$pg3_pid" 2>/dev/null; wait "$pg3_pid" 2>/dev/null
 # ---- proveguard AC4: idle-guard honors the same marker ---------------------
 fresh_env
 "$BL" up >/dev/null 2>&1
-pg4_sid="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
-pg4_create="$(grep -oE '"create_epoch":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+pg4_sid="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/current/session.json" | cut -d: -f2)"
+pg4_create="$(grep -oE '"create_epoch":[0-9]+' "$BURST_LANE_STATE_DIR/current/session.json" | cut -d: -f2)"
 sleep 300 & pg4_pid=$!
-printf 'pid=%s\nstart_epoch=%s\nserver_id=%s\n' "$pg4_pid" "$(date -u +%s)" "$pg4_sid" > "$BURST_LANE_STATE_DIR/prove.inflight"
+printf 'pid=%s\nstart_epoch=%s\nserver_id=%s\n' "$pg4_pid" "$(date -u +%s)" "$pg4_sid" > "$BURST_LANE_STATE_DIR/current/prove.inflight"
 export BURST_LANE_NOW=$((pg4_create + 1000))   # well past the 900s zero-runs idle threshold
 pg4_out="$("$BL" idle-guard 2>&1)"; pg4_rc=$?
 unset BURST_LANE_NOW
@@ -5506,7 +5529,7 @@ kill "$pg4_pid" 2>/dev/null; wait "$pg4_pid" 2>/dev/null
 fresh_env
 WT_PG5="$T/proveguard-ac5"; mkdir -p "$WT_PG5"
 BURST_PROVE_TEST_ABORT=run-unbound "$BL" prove --worktree "$WT_PG5" >/dev/null 2>&1
-expect "proveguard AC5: prove.inflight does not outlive an aborted fixture prove" "[ ! -f \"$BURST_LANE_STATE_DIR/prove.inflight\" ]"
+expect "proveguard AC5: prove.inflight does not outlive an aborted fixture prove" "[ ! -f \"$BURST_LANE_STATE_DIR/current/prove.inflight\" ]"
 
 # ---- proveguard AC6: prove's own FINISHING down is never blocked by its --
 # own inflight marker. Real run 2026-09-15T05:08:20Z: cmd_prove's own
@@ -5523,9 +5546,9 @@ export BURST_LANE_AUTOBUILDER_BIN="$REEN_PROVE_AB_SRC/autobuilder"
 WT_PG6="$T/proveguard-ac6"; mkdir -p "$WT_PG6"
 pg6_out="$(PATH="$REEN_PROVE_CARGO:$PATH" FAKE_SSH_HOSTNAME=wm-burst-lane-fake-box "$BL" prove --worktree "$WT_PG6" 2>&1)"; pg6_rc=$?
 expect "proveguard AC6: the fixture prove itself completes (routed)" "[ $pg6_rc -eq 0 ]"
-pg6_sid="$(python3 -c "import json; print(json.load(open('$BURST_LANE_STATE_DIR/proof.json')).get('server_id',''))" 2>/dev/null)"
+pg6_sid="$(python3 -c "import json; print(json.load(open('$BURST_LANE_STATE_DIR/current/proof.json')).get('server_id',''))" 2>/dev/null)"
 expect "proveguard AC6: proof.json names the server_id prove created" "[ -n \"$pg6_sid\" ]"
-expect "proveguard AC6: prove.inflight is gone" "[ ! -f \"$BURST_LANE_STATE_DIR/prove.inflight\" ]"
+expect "proveguard AC6: prove.inflight is gone" "[ ! -f \"$BURST_LANE_STATE_DIR/current/prove.inflight\" ]"
 expect "proveguard AC6: the journal has prove's own down decision, never decision=keep cause=prove-inflight" \
   "grep -qE \"burst-lane  down  decision=(deleted|scheduled)\" \"$BURST_LANE_JOURNAL\" && ! grep -q \"burst-lane  down  decision=keep  (server_id=$pg6_sid cause=prove-inflight\" \"$BURST_LANE_JOURNAL\""
 
@@ -5542,7 +5565,7 @@ cat > "$BURST_LANE_STATE_DIR/snapshot.json" <<'JSON'
 {"image_id": "555777", "created": "2026-09-13T00:00:00Z", "base_image_id": "427125061", "build_skill_sha": "abc123", "gate_tool_versions": {}, "baked_history": ["555777"]}
 JSON
 r7a_now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-cat > "$BURST_LANE_STATE_DIR/proof.json" <<JSON
+cat > "$BURST_LANE_STATE_DIR/current/proof.json" <<JSON
 {"ts": "$r7a_now", "image_id": "555777", "server_id": "1", "worktree": "/tmp/x", "sha": "deadbeef", "routed": true, "bytes": 100, "secs_remote": 5, "cause": ""}
 JSON
 r7a_out="$("$BL" enable)"; r7a_rc=$?
@@ -5567,7 +5590,7 @@ expect "reenable AC7b: journal names the refusal cause" \
 # SNAPSHOT_ID=427125061, no snapshot.json baked this case).
 fresh_env
 r7c_old="$(date -u -d '-30 days' +%Y-%m-%dT%H:%M:%SZ)"
-cat > "$BURST_LANE_STATE_DIR/proof.json" <<JSON
+cat > "$BURST_LANE_STATE_DIR/current/proof.json" <<JSON
 {"ts": "$r7c_old", "image_id": "427125061", "server_id": "1", "worktree": "/tmp/x", "sha": "deadbeef", "routed": true, "bytes": 100, "secs_remote": 5, "cause": ""}
 JSON
 r7c_out="$("$BL" enable 2>&1)"; r7c_rc=$?
@@ -5579,7 +5602,7 @@ expect "reenable AC7c: journal names the refusal cause" \
 # Case d: proof.json says routed=false -> refused (cause=not-routed).
 fresh_env
 r7d_now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-cat > "$BURST_LANE_STATE_DIR/proof.json" <<JSON
+cat > "$BURST_LANE_STATE_DIR/current/proof.json" <<JSON
 {"ts": "$r7d_now", "image_id": "427125061", "server_id": "1", "worktree": "/tmp/x", "sha": "deadbeef", "routed": false, "bytes": 0, "secs_remote": 5, "cause": "host-mismatch"}
 JSON
 r7d_out="$("$BL" enable 2>&1)"; r7d_rc=$?
@@ -5592,7 +5615,7 @@ expect "reenable AC7d: journal names the refusal cause" \
 # -> refused (cause=image-mismatch).
 fresh_env
 r7e_now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-cat > "$BURST_LANE_STATE_DIR/proof.json" <<JSON
+cat > "$BURST_LANE_STATE_DIR/current/proof.json" <<JSON
 {"ts": "$r7e_now", "image_id": "111222", "server_id": "1", "worktree": "/tmp/x", "sha": "deadbeef", "routed": true, "bytes": 100, "secs_remote": 5, "cause": ""}
 JSON
 r7e_out="$("$BL" enable 2>&1)"; r7e_rc=$?
@@ -5637,8 +5660,8 @@ expect "reenable AC8a: journal has run fallback (cause=up-failed worktree=$WT8A)
 # cause=verify-failed naming the server_id.
 fresh_env
 "$BL" up >/dev/null
-sed -i 's/"verified":"true"/"verified":"false"/' "$BURST_LANE_STATE_DIR/session.json"
-r8b_sid="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+sed -i 's/"verified":"true"/"verified":"false"/' "$BURST_LANE_STATE_DIR/current/session.json"
+r8b_sid="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/current/session.json" | cut -d: -f2)"
 WT8B="$T/worktree-ac8b"; mkdir -p "$WT8B"
 echo 'exit 0' > "$WT8B/build.sh"
 export FAKE_SSH_REMOTE_FAIL=1
@@ -5803,7 +5826,7 @@ expect "reenable AC12b: bake_age_h is a non-negative number" \
 # proof_age_h numeric.
 fresh_env
 mkdir -p "$BURST_LANE_STATE_DIR"
-cat > "$BURST_LANE_STATE_DIR/proof.json" <<'JSON'
+cat > "$BURST_LANE_STATE_DIR/current/proof.json" <<'JSON'
 {"ts": "2026-09-13T00:00:00Z", "image_id": "999891", "server_id": "1", "worktree": "/tmp/x", "sha": "deadbeef", "routed": true, "bytes": 100, "secs_remote": 5, "cause": ""}
 JSON
 r12c_json="$("$BL" status --json)"
@@ -5917,7 +5940,7 @@ chmod +x "$REEN_14A_SRC/autobuilder"
 export BURST_LANE_AUTOBUILDER_BIN="$REEN_14A_SRC/autobuilder"
 "$BL" up >/dev/null 2>&1
 expect "reenable AC14a: session reached gate_ready=true (default fixture)" \
-  "grep -q '\"gate_ready\":\"true\"' \"$BURST_LANE_STATE_DIR/session.json\""
+  "grep -q '\"gate_ready\":\"true\"' \"$BURST_LANE_STATE_DIR/current/session.json\""
 expect "reenable AC14a: up journals pending-reality-run (rc=0) with nothing pending" \
   "grep -q 'burst-lane  up  pending-reality-run  (rc=0)' \"$BURST_LANE_JOURNAL\""
 
@@ -5990,7 +6013,7 @@ export FAKE_SSH_GATE_TOOLS_MISSING="autobuilder"
 export FAKE_SSH_GATE_TOOLS_INSTALL_FAIL=1
 "$BL" up >/dev/null 2>&1
 expect "reenable AC14c setup: session is gate_ready=false" \
-  "grep -q '\"gate_ready\":\"false\"' \"$BURST_LANE_STATE_DIR/session.json\""
+  "grep -q '\"gate_ready\":\"false\"' \"$BURST_LANE_STATE_DIR/current/session.json\""
 expect "reenable AC14c: no pending-reality-run was journaled while gate_ready=false" \
   "! grep -q 'burst-lane  up  pending-reality-run' \"$BURST_LANE_JOURNAL\""
 expect "reenable AC14c: the pending registration is left untouched" \
@@ -6034,11 +6057,11 @@ fresh_env
 export BURST_LANE_AUTOBUILDER_BIN="$REEN15_AB_SRC/autobuilder"
 export FAKE_SSH_GATE_TOOLS_MISSING="jq"
 "$BL" up >/dev/null 2>&1
-r15a_gate_ready="$(grep -oE '"gate_ready":"[^"]*"' "$BURST_LANE_STATE_DIR/session.json" | cut -d'"' -f4)"
+r15a_gate_ready="$(grep -oE '"gate_ready":"[^"]*"' "$BURST_LANE_STATE_DIR/current/session.json" | cut -d'"' -f4)"
 expect "reenable AC15a setup: session is gate_ready=true" "[ \"$r15a_gate_ready\" = true ]"
 r15a_installs="$(grep -c 'burst-lane  gate-tools  install-start' "$BURST_LANE_JOURNAL")"
 expect "reenable AC15a setup: exactly one install-start line" "[ \"$r15a_installs\" -eq 1 ]"
-r15a_id="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+r15a_id="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/current/session.json" | cut -d: -f2)"
 ( source "$BL"; auto_bake_before_delete "$r15a_id" down ) >/dev/null 2>&1
 expect "reenable AC15a: journal has the auto-bake trigger naming the install count" \
   "grep -qE 'burst-lane  down  auto-bake  \\(cause=install-start-count=1 server_id=' \"$BURST_LANE_JOURNAL\""
@@ -6055,7 +6078,7 @@ export BURST_LANE_AUTOBUILDER_BIN="$REEN15_AB_SRC/autobuilder"
 "$BL" up >/dev/null 2>&1
 r15b_installs="$(grep -c 'burst-lane  gate-tools  install-start' "$BURST_LANE_JOURNAL")"
 expect "reenable AC15b setup: zero install-start lines" "[ \"$r15b_installs\" -eq 0 ]"
-r15b_id="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+r15b_id="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/current/session.json" | cut -d: -f2)"
 ( source "$BL"; auto_bake_before_delete "$r15b_id" down ) >/dev/null 2>&1
 expect "reenable AC15b: no auto-bake was journaled" \
   "! grep -q 'burst-lane  down  auto-bake' \"$BURST_LANE_JOURNAL\""
@@ -6129,7 +6152,7 @@ expect "opauth AC8: journal records the refusal" \
   "grep -q 'burst-lane  up  refused  (cause=no-operator-authorization)' \"\$BURST_LANE_JOURNAL\""
 expect "opauth AC8: no hcloud server create call was ever attempted" \
   "[ \"\$(grep -c 'server create' \"\$FAKE_HCLOUD_CALLLOG\")\" -eq 0 ]"
-expect "opauth AC8: no session.json was written" "[ ! -f \"\$BURST_LANE_STATE_DIR/session.json\" ]"
+expect "opauth AC8: no session.json was written" "[ ! -f \"\$BURST_LANE_STATE_DIR/current/session.json\" ]"
 
 # Same refusal for bake and prove, dispatched with no authorization.
 fresh_env
@@ -6152,7 +6175,7 @@ expect "opauth AC8: prove journal records the refusal" \
 expect "opauth AC8: prove attempted no hcloud call" \
   "[ \"\$(wc -l < \"\$FAKE_HCLOUD_CALLLOG\")\" -eq 0 ]"
 expect "opauth AC8: prove wrote no proof.json on the pre-hcloud refusal" \
-  "[ ! -f \"\$BURST_LANE_STATE_DIR/proof.json\" ]"
+  "[ ! -f \"\$BURST_LANE_STATE_DIR/current/proof.json\" ]"
 
 # ---- opauth AC9: no dispatch-context marker at all (a direct human-run
 # invocation) -> unaffected, proceeds exactly as before this PRD, even with
@@ -6214,10 +6237,10 @@ block_start "costrate"
 fresh_env
 export BURST_SERVER_TYPE=ccx43
 "$BL" up >/dev/null 2>&1
-cr1_sid="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
-cr1_create="$(grep -oE '"create_epoch":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+cr1_sid="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/current/session.json" | cut -d: -f2)"
+cr1_create="$(grep -oE '"create_epoch":[0-9]+' "$BURST_LANE_STATE_DIR/current/session.json" | cut -d: -f2)"
 expect "costrate AC1: the session records server_type=ccx43 at up time" \
-  "grep -q '\"server_type\":\"ccx43\"' \"$BURST_LANE_STATE_DIR/session.json\""
+  "grep -q '\"server_type\":\"ccx43\"' \"$BURST_LANE_STATE_DIR/current/session.json\""
 python3 -c '
 import json, sys
 path = sys.argv[1]
@@ -6225,7 +6248,7 @@ d = json.load(open(path))
 d.pop("phase", None)
 d.pop("phase_epoch", None)
 json.dump(d, open(path, "w"))
-' "$BURST_LANE_STATE_DIR/session.json"
+' "$BURST_LANE_STATE_DIR/current/session.json"
 export BURST_LANE_NOW=$((cr1_create + 3600))
 cr1_out="$("$BL" idle-guard 2>&1)"
 unset BURST_LANE_NOW
@@ -6241,8 +6264,8 @@ unset BURST_SERVER_TYPE
 fresh_env
 export BURST_COST_PER_HOUR_EUR=2.0
 "$BL" up >/dev/null 2>&1
-cr2_sid="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
-cr2_create="$(grep -oE '"create_epoch":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+cr2_sid="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/current/session.json" | cut -d: -f2)"
+cr2_create="$(grep -oE '"create_epoch":[0-9]+' "$BURST_LANE_STATE_DIR/current/session.json" | cut -d: -f2)"
 python3 -c '
 import json, sys
 path = sys.argv[1]
@@ -6250,7 +6273,7 @@ d = json.load(open(path))
 d.pop("phase", None)
 d.pop("phase_epoch", None)
 json.dump(d, open(path, "w"))
-' "$BURST_LANE_STATE_DIR/session.json"
+' "$BURST_LANE_STATE_DIR/current/session.json"
 export BURST_LANE_NOW=$((cr2_create + 3600))
 cr2_out="$("$BL" idle-guard 2>&1)"
 unset BURST_LANE_NOW
@@ -6267,8 +6290,8 @@ unset BURST_COST_PER_HOUR_EUR
 fresh_env
 export BURST_SERVER_TYPE=cpx31
 "$BL" up >/dev/null 2>&1
-cr3_sid="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
-cr3_create="$(grep -oE '"create_epoch":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+cr3_sid="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/current/session.json" | cut -d: -f2)"
+cr3_create="$(grep -oE '"create_epoch":[0-9]+' "$BURST_LANE_STATE_DIR/current/session.json" | cut -d: -f2)"
 python3 -c '
 import json, sys
 path = sys.argv[1]
@@ -6276,7 +6299,7 @@ d = json.load(open(path))
 d.pop("phase", None)
 d.pop("phase_epoch", None)
 json.dump(d, open(path, "w"))
-' "$BURST_LANE_STATE_DIR/session.json"
+' "$BURST_LANE_STATE_DIR/current/session.json"
 export BURST_LANE_NOW=$((cr3_create + 3600))
 cr3_out="$("$BL" idle-guard 2>&1)"
 unset BURST_LANE_NOW
@@ -6293,8 +6316,8 @@ unset BURST_SERVER_TYPE
 fresh_env
 export BURST_SERVER_TYPE=ccx43
 "$BL" up >/dev/null 2>&1
-cr4_sid="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
-cr4_create="$(grep -oE '"create_epoch":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+cr4_sid="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/current/session.json" | cut -d: -f2)"
+cr4_create="$(grep -oE '"create_epoch":[0-9]+' "$BURST_LANE_STATE_DIR/current/session.json" | cut -d: -f2)"
 python3 -c '
 import json, sys
 path = sys.argv[1]
@@ -6302,7 +6325,7 @@ d = json.load(open(path))
 d.pop("phase", None)
 d.pop("phase_epoch", None)
 json.dump(d, open(path, "w"))
-' "$BURST_LANE_STATE_DIR/session.json"
+' "$BURST_LANE_STATE_DIR/current/session.json"
 export BURST_SERVER_TYPE=ccx53
 export BURST_LANE_NOW=$((cr4_create + 3600))
 cr4_out="$("$BL" idle-guard 2>&1)"
@@ -6356,11 +6379,11 @@ expect "pullback AC11: the iteration ledger recorded this run" \
 fresh_env
 FAKE_BOX_CORES=32 FAKE_BOX_MEM_GB=128 FAKE_BOX_DISK_GB=600 "$BL" up >/dev/null
 expect "boxslots AC1: session.json carries box_cores=32" \
-  "grep -q '\"box_cores\":32' \"$BURST_LANE_STATE_DIR/session.json\""
+  "grep -q '\"box_cores\":32' \"$BURST_LANE_STATE_DIR/current/session.json\""
 expect "boxslots AC1: session.json carries box_mem_gb=128" \
-  "grep -q '\"box_mem_gb\":128' \"$BURST_LANE_STATE_DIR/session.json\""
+  "grep -q '\"box_mem_gb\":128' \"$BURST_LANE_STATE_DIR/current/session.json\""
 expect "boxslots AC1: session.json carries box_disk_gb=600" \
-  "grep -q '\"box_disk_gb\":600' \"$BURST_LANE_STATE_DIR/session.json\""
+  "grep -q '\"box_disk_gb\":600' \"$BURST_LANE_STATE_DIR/current/session.json\""
 expect "boxslots AC1: journal names cap=8 source=box bound=cpu" \
   "grep -q 'burst-lane  up  slots  (cap=8 source=box bound=cpu cores=32 mem_gb=128 disk_gb=600)' \"$BURST_LANE_JOURNAL\""
 
@@ -6479,8 +6502,8 @@ export BURST_LANE_LOOP_ACTIVE_OVERRIDE=false
 
 # ---- teardown AC2: hcloud unavailable is never a decision cause ------------
 "$BL" up >/dev/null 2>&1
-td2_sid="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
-td2_before="$(cat "$BURST_LANE_STATE_DIR/session.json")"
+td2_sid="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/current/session.json" | cut -d: -f2)"
+td2_before="$(cat "$BURST_LANE_STATE_DIR/current/session.json")"
 td2_fakebin="$T/no-hcloud-path"; mkdir -p "$td2_fakebin"
 for tool in bash env sh ssh rsync python3 systemctl awk grep sed date cut mkdir cat rm mv sleep tr head tail sort xargs sha1sum flock seq basename dirname find touch python wc stat ln readlink expr; do
   p="$(command -v "$tool" 2>/dev/null)"; [ -n "$p" ] && ln -sf "$p" "$td2_fakebin/$tool"
@@ -6495,8 +6518,8 @@ expect "teardown AC2: watchdog is a no-op decision=keep cause=probe-unavailable 
 expect "teardown AC2: idle-guard is a no-op decision=keep cause=probe-unavailable without hcloud" \
   "[ \"\$td2_ig_out\" = 'decision=keep cause=probe-unavailable' ]"
 expect "teardown AC2: session.json is byte-unchanged after all three" \
-  "[ \"\$(cat \"$BURST_LANE_STATE_DIR/session.json\")\" = \"\$td2_before\" ]"
-expect "teardown AC2: no .stale- file was created" "! ls \"$BURST_LANE_STATE_DIR\"/session.json.stale-* >/dev/null 2>&1"
+  "[ \"\$(cat \"$BURST_LANE_STATE_DIR/current/session.json\")\" = \"\$td2_before\" ]"
+expect "teardown AC2: no .stale- file was created" "! ls \"$BURST_LANE_STATE_DIR/current\"/session.json.stale-* >/dev/null 2>&1"
 td2_pu_lines="$(grep -c 'cause=probe-unavailable' "$BURST_LANE_JOURNAL")"
 expect "teardown AC2: probe-unavailable journaled at most once across down+watchdog+idle-guard (once-per-hour throttle)" \
   "[ \"$td2_pu_lines\" -le 1 ]"
@@ -6507,7 +6530,7 @@ export BURST_LANE_LOOP_ACTIVE_OVERRIDE=true
 td3_now="$(date -u +%s)"
 export BURST_LANE_NOW=$((td3_now - 700))
 "$BL" up >/dev/null 2>&1
-td3_sid="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+td3_sid="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/current/session.json" | cut -d: -f2)"
 unset BURST_LANE_NOW
 cat > "$BURST_LANE_PRD_DIR/build-queue/PRD-teardown-fake-rust.md" <<'EOF'
 # PRD — teardown-fake-rust
@@ -6530,7 +6553,7 @@ rm -f "$BURST_LANE_PRD_DIR/build-queue/PRD-teardown-fake-rust.md"
 fresh_env
 export BURST_LANE_LOOP_ACTIVE_OVERRIDE=false
 "$BL" up >/dev/null 2>&1
-td4_sid="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+td4_sid="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/current/session.json" | cut -d: -f2)"
 td4_now="$(date -u +%s)"
 printf '{"date":"%s","session_id":"%s","slug":"x"}\n' \
   "$(date -u -d "@$((td4_now - 3660))" +%Y-%m-%dT%H:%M:%SZ)" "$td4_sid" >> "$BURST_LANE_ATTR_LEDGER"
@@ -6546,7 +6569,7 @@ expect "teardown AC4: cause=idle-no-work" "[ \"$td4_cause\" = idle-no-work ]"
 fresh_env
 export BURST_LANE_LOOP_ACTIVE_OVERRIDE=true
 "$BL" up >/dev/null 2>&1
-td5_sid="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+td5_sid="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/current/session.json" | cut -d: -f2)"
 td5_now="$(date -u +%s)"
 printf '{"date":"%s","session_id":"%s","slug":"x"}\n' \
   "$(date -u -d "@$((td5_now - 3660))" +%Y-%m-%dT%H:%M:%SZ)" "$td5_sid" >> "$BURST_LANE_ATTR_LEDGER"
@@ -6570,13 +6593,13 @@ rm -f "$BURST_LANE_PRD_DIR/build-queue/PRD-teardown-fake-rust2.md"
 fresh_env
 export BURST_LANE_LOOP_ACTIVE_OVERRIDE=false
 "$BL" up >/dev/null 2>&1
-td6_sid="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+td6_sid="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/current/session.json" | cut -d: -f2)"
 ( source "$BL"
   _teardown_decision_record "$td6_sid" down keep work-queued '{"n":1}'
   _teardown_decision_record "$td6_sid" watchdog keep work-queued '{"n":2}'
   _teardown_decision_record "$td6_sid" idle-guard delete idle-no-work '{"n":3}'
 )
-mv "$BURST_LANE_STATE_DIR/session.json" "$BURST_LANE_STATE_DIR/session.json.deleted-20260915T120000Z"
+mv "$BURST_LANE_STATE_DIR/current/session.json" "$BURST_LANE_STATE_DIR/current/session.json.deleted-20260915T120000Z"
 td6_out="$("$BL" why-down "$td6_sid" 2>&1)"
 expect "teardown AC6: why-down prints all three rows in order" \
   "[ \"\$(grep -c 'decision=' <<<\"\$td6_out\")\" -ge 4 ]"
@@ -6603,7 +6626,7 @@ expect "teardown AC8: the refusal is journaled with cause=scheduled-teardown-dis
 # ---- teardown AC9: status --json's next_teardown matches a dry-run --------
 fresh_env
 "$BL" up >/dev/null 2>&1
-td9_sid="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/session.json" | cut -d: -f2)"
+td9_sid="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/current/session.json" | cut -d: -f2)"
 td9_status="$("$BL" status --json)"
 td9_nt_decision="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["next_teardown"]["decision"])' "$td9_status")"
 td9_nt_cause="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["next_teardown"]["cause"])' "$td9_status")"
@@ -6622,6 +6645,152 @@ expect "teardown AC9: polling status --json never appends to decisions.jsonl (dr
 
 unset BURST_LANE_LOOP_ACTIVE_OVERRIDE
 expect_block_green "teardown" "teardown: every teardown case above ran green"
+
+# =============================================================================
+# PRD-build-burst-state-keyed-by-server-v2: state layout migration
+# (requirement 1/10/11) — AC1, AC12, AC13, AC14, AC15, AC16. Requirements
+# 2-9 (actual N-box up/run/down/cost/reap orchestration) are NOT covered
+# here — see the PRD's own `next:` note; this block only proves the state
+# layout itself (the migration, the completeness tripwire, and the two
+# external readers) never regresses the single-box case.
+# =============================================================================
+block_start "multibox"
+
+# ---- multibox AC1: a pre-ship top-level session.json for box 111
+# migrates on the very next command; current points at it; status --json
+# still reads the same server_id.
+fresh_env
+# Seed the fake hcloud backend so server_alive(111) reports true — a bare
+# hand-written session.json with no matching fake-hcloud row describes an
+# UNTRACKED server, which session_reconcile() correctly archives as stale
+# (the fixture's own "not found" wiring, tightened alongside this PRD —
+# see the hcloud fixture's own header comment). AC1 is testing the
+# migration mechanism, not stale-reconcile, so the fixture must make 111
+# a genuinely alive fake server first, same as every other test here that
+# needs a real session gets one via "$BL" up.
+echo "111|wm-burst-lane|alive|$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$FAKE_HCLOUD_STATE"
+printf '{"server_id":111,"ip":"10.0.0.5","server_type":"ccx53"}' > "$BURST_LANE_STATE_DIR/session.json"
+mb1_out="$("$BL" status --json 2>&1)"
+expect "multibox AC1: boxes/111/session.json exists after migration" "[ -f \"$BURST_LANE_STATE_DIR/boxes/111/session.json\" ]"
+expect "multibox AC1: current points at boxes/111" "[ \"\$(readlink \"$BURST_LANE_STATE_DIR/current\")\" = boxes/111 ]"
+expect "multibox AC1: journal has 'state  migrated'" "grep -q 'burst-lane  state  migrated  (server_id=111' \"$BURST_LANE_JOURNAL\""
+mb1_sid="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("server_id",""))' "$mb1_out" 2>/dev/null)"
+expect "multibox AC1: status --json .server_id is 111" "[ \"$mb1_sid\" = 111 ]"
+
+# ---- multibox AC12: every per-box name for box 111 migrates, every
+# lane-wide name stays top-level, the journal names the exact moved
+# count, and no per-box name remains at the top level afterward.
+fresh_env
+# Same fake-hcloud seed as AC1 above — session_reconcile() must see 111
+# as alive or it archives session.json as stale before this block's own
+# per-box-name assertions ever get to run.
+echo "111|wm-burst-lane|alive|$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$FAKE_HCLOUD_STATE"
+mkdir -p "$BURST_LANE_STATE_DIR/pull-sizes" "$BURST_LANE_STATE_DIR/evidence" \
+         "$BURST_LANE_STATE_DIR/gate-inflight" "$BURST_LANE_STATE_DIR/logs"
+printf '{"server_id":111,"ip":"10.0.0.5"}' > "$BURST_LANE_STATE_DIR/session.json"
+echo '{}' > "$BURST_LANE_STATE_DIR/volume.json"
+echo '{}' > "$BURST_LANE_STATE_DIR/proof.json"
+: > "$BURST_LANE_STATE_DIR/run.lock"
+echo '{}' > "$BURST_LANE_STATE_DIR/remote-dirs.json"
+: > "$BURST_LANE_STATE_DIR/inflight.log"
+: > "$BURST_LANE_STATE_DIR/prove.inflight"
+: > "$BURST_LANE_STATE_DIR/known_hosts.111"
+: > "$BURST_LANE_STATE_DIR/.last-teardown-cause"
+: > "$BURST_LANE_STATE_DIR/logs/run-remote.1.log"
+echo '{}' > "$BURST_LANE_STATE_DIR/snapshot.json"
+: > "$BURST_LANE_STATE_DIR/parity-baseline-image"
+: > "$BURST_LANE_STATE_DIR/decisions.jsonl"
+: > "$BURST_LANE_STATE_DIR/provision.lock"
+"$BL" status --json > /dev/null 2>&1
+mb12_ok=1
+for f in session.json volume.json proof.json run.lock remote-dirs.json inflight.log \
+         prove.inflight known_hosts.111 .last-teardown-cause logs/run-remote.1.log; do
+  [ -f "$BURST_LANE_STATE_DIR/boxes/111/$f" ] || mb12_ok=0
+done
+[ -d "$BURST_LANE_STATE_DIR/boxes/111/pull-sizes" ] || mb12_ok=0
+[ -e "$BURST_LANE_STATE_DIR/boxes/111/evidence" ] || mb12_ok=0
+[ -d "$BURST_LANE_STATE_DIR/boxes/111/gate-inflight" ] || mb12_ok=0
+expect "multibox AC12: every per-box name for box 111 landed under boxes/111/" "[ \"$mb12_ok\" -eq 1 ]"
+expect "multibox AC12: snapshot.json (lane-wide) stayed top-level" "[ -f \"$BURST_LANE_STATE_DIR/snapshot.json\" ]"
+expect "multibox AC12: parity-baseline-image (lane-wide) stayed top-level" "[ -f \"$BURST_LANE_STATE_DIR/parity-baseline-image\" ]"
+expect "multibox AC12: decisions.jsonl (lane-wide) stayed top-level" "[ -f \"$BURST_LANE_STATE_DIR/decisions.jsonl\" ]"
+expect "multibox AC12: provision.lock (lane-wide) stayed top-level" "[ -f \"$BURST_LANE_STATE_DIR/provision.lock\" ]"
+mb12_moved="$(grep -oE 'state  migrated  \(server_id=111 moved=[0-9]+\)' "$BURST_LANE_JOURNAL" | grep -oE 'moved=[0-9]+' | cut -d= -f2 | head -n1)"
+expect "multibox AC12: journal names the exact moved count (13 per-box entries)" "[ \"${mb12_moved:-0}\" -eq 13 ]"
+# `probes/` is scripts/probe-result.sh's own ledger dir (a different
+# subsystem, keyed off $BUILD_STATE_DIR, not burst-lane.sh's $STATE_DIR at
+# all — in production they're siblings: state/burst-lane/ vs state/). It
+# only shows up as a CHILD of $BURST_LANE_STATE_DIR here because fresh_env
+# (this file's own fixture, see the route-check probe tests above) points
+# BUILD_STATE_DIR at the same sandboxed $T/state for convenience — a test-
+# harness coincidence, not a state-surface name this PRD's classification
+# ever owned, so it's excluded here rather than added to
+# scripts/burst-state-surface.txt (which classifies burst-lane.sh's own
+# $STATE_DIR/$BOX_STATE_DIR literals, and rightly has no opinion on it).
+mb12_leftover="$(find "$BURST_LANE_STATE_DIR" -maxdepth 1 -mindepth 1 \
+  ! -name current ! -name boxes ! -name snapshot.json ! -name parity-baseline-image \
+  ! -name decisions.jsonl ! -name provision.lock ! -name logs ! -name probes 2>/dev/null | wc -l)"
+expect "multibox AC12: find -maxdepth 1 shows no per-box name left at the top level" "[ \"$mb12_leftover\" -eq 0 ]"
+
+# ---- multibox AC16: an unattributable top-level residue (no
+# session.json, no known_hosts.<id> suffix) moves to boxes/_orphan-<ts>/,
+# nothing deleted, journaled migrated-orphan.
+fresh_env
+: > "$BURST_LANE_STATE_DIR/up.lock"
+: > "$BURST_LANE_STATE_DIR/inflight.log"
+"$BL" status --json > /dev/null 2>&1
+mb16_orphan_dir="$(find "$BURST_LANE_STATE_DIR/boxes" -maxdepth 1 -type d -name '_orphan-*' 2>/dev/null | head -n1)"
+expect "multibox AC16: an unattributable residue moved to boxes/_orphan-<ts>/" "[ -n \"$mb16_orphan_dir\" ]"
+expect "multibox AC16: up.lock landed in the orphan dir (not deleted)" "[ -f \"$mb16_orphan_dir/up.lock\" ]"
+expect "multibox AC16: inflight.log landed in the orphan dir (not deleted)" "[ -f \"$mb16_orphan_dir/inflight.log\" ]"
+expect "multibox AC16: journal has 'state  migrated-orphan'" "grep -q 'burst-lane  state  migrated-orphan' \"$BURST_LANE_JOURNAL\""
+expect "multibox AC16: the top-level copy is gone (moved, not copied)" "[ ! -e \"$BURST_LANE_STATE_DIR/up.lock\" ]"
+
+# ---- multibox AC13/AC14: the completeness tripwire fails, naming the
+# path/line, on an unclassified new $STATE_DIR/<name> and on a "boxes/"
+# literal outside box_path()/migrate_state_layout(); passes clean against
+# the real, unmodified script + surface file.
+mb_tw="$HERE/burst-state-tripwire.sh"
+mb_surface="$HERE/burst-state-surface.txt"
+expect "multibox AC13/14: tripwire passes clean against the real script + surface file" \
+  "bash \"$mb_tw\" \"$BL\" \"$mb_surface\" >/dev/null 2>&1"
+
+mb13_fixture="$T/bl-fixture-ac13.sh"
+cp "$BL" "$mb13_fixture"
+echo 'NEW_THING="$STATE_DIR/new-thing.json"' >> "$mb13_fixture"
+mb13_out="$(bash "$mb_tw" "$mb13_fixture" "$mb_surface" 2>&1)"; mb13_rc=$?
+expect "multibox AC13: tripwire fails on an unclassified new state path" "[ $mb13_rc -ne 0 ]"
+expect "multibox AC13: tripwire names the new path" "grep -q \"unclassified state path 'new-thing.json'\" <<<\"$mb13_out\""
+
+mb14_fixture="$T/bl-fixture-ac14.sh"
+cp "$BL" "$mb14_fixture"
+echo 'ROGUE_DIR="$STATE_DIR/boxes/rogue"' >> "$mb14_fixture"
+mb14_out="$(bash "$mb_tw" "$mb14_fixture" "$mb_surface" 2>&1)"; mb14_rc=$?
+expect "multibox AC14: tripwire fails on a boxes/ literal outside the allowed block" "[ $mb14_rc -ne 0 ]"
+expect "multibox AC14: tripwire names the offending line" 'grep -q "boxes/ literal outside" <<<"$mb14_out"'
+
+# ---- multibox AC15: gate-wedge.sh's default glob-expands to
+# boxes/*/{locks,slots} (a functional check, not just the tripwire's
+# static one above), and the tripwire finds no top-level
+# state/burst-lane/{locks,slots} literal in either external reader.
+mkdir -p "$T/state/burst-lane/boxes/111/locks" "$T/state/burst-lane/boxes/111/slots"
+: > "$T/state/burst-lane/boxes/111/locks/wt-smoke.lock"
+mb15_scan_dirs="$(BUILD_SKILL_DIR="$T" GATE_WEDGE_STATE_DIR="$T/gate-wedge-state" GATE_WEDGE_JOURNAL="$T/gw-journal.log" \
+  bash -x "$HERE/gate-wedge.sh" run --budget 1 --step mb15-smoke -- true 2>&1 | sed -n 's/^+ LOCK_SCAN_DIRS=//p' | head -n1)"
+expect "multibox AC15: gate-wedge.sh's default LOCK_SCAN_DIRS glob-expands to boxes/111/locks" \
+  "grep -qF \"boxes/111/locks\" <<<\"$mb15_scan_dirs\""
+expect "multibox AC15: gate-wedge.sh's default LOCK_SCAN_DIRS glob-expands to boxes/111/slots" \
+  "grep -qF \"boxes/111/slots\" <<<\"$mb15_scan_dirs\""
+expect "multibox AC15: tripwire finds no top-level {locks,slots} literal in gate-wedge.sh/isolation-guard.sh" \
+  "bash \"$mb_tw\" \"$BL\" \"$mb_surface\" \"$HERE/gate-wedge.sh\" \"$HERE/isolation-guard.sh\" >/dev/null 2>&1"
+
+mb15_fixture="$T/gw-fixture-ac15.sh"
+cp "$HERE/gate-wedge.sh" "$mb15_fixture"
+echo 'ROGUE="$SKILL_DIR/state/burst-lane/locks"' >> "$mb15_fixture"
+mb15_out="$(bash "$mb_tw" "$BL" "$mb_surface" "$mb15_fixture" 2>&1)"; mb15_rc=$?
+expect "multibox AC15: tripwire fails on a stray top-level locks/slots literal in an external reader" "[ $mb15_rc -ne 0 ]"
+
+expect_block_green "multibox" "multibox: every state-layout migration case above ran green"
 
 echo "=== $([ $fail -eq 0 ] && echo PASS || echo FAIL) ==="
 exit $fail

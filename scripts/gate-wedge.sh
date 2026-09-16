@@ -87,7 +87,15 @@
 #   GATE_WEDGE_PROBE_EVERY_S   (60)   seconds between probes thereafter
 #   GATE_WEDGE_SNAPSHOT_GAP_S  (30)   seconds between the two cpu snapshots
 #   GATE_WEDGE_STATE_DIR       (<skill-dir>/state/gate-wedge)
-#   GATE_WEDGE_LOCK_DIRS       (<skill-dir>/state/burst-lane/locks:<skill-dir>/state/burst-lane/slots)
+#   GATE_WEDGE_LOCK_DIRS       (glob-expanded <skill-dir>/state/burst-lane/boxes/*/locks:
+#                              <skill-dir>/state/burst-lane/boxes/*/slots —
+#                              PRD-build-burst-state-keyed-by-server-v2
+#                              requirement 11: the per-box state layout
+#                              moved locks/slots under boxes/<server_id>/,
+#                              so the default now expands that glob at
+#                              startup — a single active box (today) or
+#                              several (once multi-box `up --count` lands)
+#                              are both covered with no separate code path)
 #                              colon-separated dirs scanned for the
 #                              wt-*.lock / slot *.lock files a burst-lane.sh
 #                              run descendant can be blocked on.
@@ -118,7 +126,23 @@ PROBE_EVERY_S="${GATE_WEDGE_PROBE_EVERY_S:-60}"
 SNAPSHOT_GAP_S="${GATE_WEDGE_SNAPSHOT_GAP_S:-30}"
 SYSTEMCTL="${SCCACHE_ASSERT_SYSTEMCTL:-systemctl --user}"
 UNIT="${SCCACHE_ASSERT_UNIT:-sccache-server.service}"
-LOCK_SCAN_DIRS="${GATE_WEDGE_LOCK_DIRS:-$SKILL_DIR/state/burst-lane/locks:$SKILL_DIR/state/burst-lane/slots}"
+# PRD-build-burst-state-keyed-by-server-v2 requirement 11: default follows
+# the per-box layout. boxes/*/locks and boxes/*/slots are glob-expanded
+# HERE (never passed to tree_snapshot's python probe as a literal "*",
+# which os.listdir() would not expand) into whichever box dirs actually
+# exist right now — one today, several once multi-box `up --count` lands,
+# with no separate code path for either case.
+gate_wedge_lock_dirs_default() {
+  local base="$SKILL_DIR/state/burst-lane" d out=()
+  shopt -s nullglob
+  for d in "$base"/boxes/*/locks "$base"/boxes/*/slots; do
+    out+=("$d")
+  done
+  shopt -u nullglob
+  local IFS=:
+  printf '%s' "${out[*]}"
+}
+LOCK_SCAN_DIRS="${GATE_WEDGE_LOCK_DIRS:-$(gate_wedge_lock_dirs_default)}"
 REMOTE_PROBE_BIN="${GATE_WEDGE_REMOTE_PROBE:-$HERE/gate-wedge-remote-probe.sh}"
 JOURNAL="${GATE_WEDGE_JOURNAL:-$HOME/brain/journal/build/$(date -u +%F).md}"
 

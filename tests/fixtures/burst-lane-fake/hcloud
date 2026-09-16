@@ -68,12 +68,31 @@ case "${1:-}" in
         exit 0
         ;;
       describe)
+        # PRD-build-burst-state-keyed-by-server-v2: pre-existing gap found
+        # while verifying this PRD's own regression safety (reproduces
+        # identically on an unmodified main checkout — unrelated to this
+        # PRD's own diff, fixed here as the minimal harness repair needed
+        # to run the suite to completion at all). burst-lane.sh's
+        # server_alive() only treats a describe failure as "gone" when its
+        # combined stdout+stderr contains "not found"/"not exist" — this
+        # fixture used to `exit 1` on a miss with NO output text at all,
+        # so that check never matched and server_alive() fell through to
+        # `server list`, a subcommand this fixture never implemented
+        # (falls to the `*) exit 2` default), which server_alive() treats
+        # as "hcloud unavailable, fail open -> alive". Net effect: EVERY
+        # correctly-deleted server was reported alive forever after,
+        # turning destroy_verify()'s 3 retries into a guaranteed LEAK-FLAG
+        # even though the delete genuinely succeeded. Emitting real
+        # hcloud-shaped "not found" text on both miss paths (absent id,
+        # and an id whose row was marked non-alive rather than removed)
+        # lets server_alive()'s existing, unmodified first check succeed
+        # the way its own header comment already says it should.
         key="$3"
         line="$(grep -E "^$key\|" "$STATE" 2>/dev/null | head -n1)"
         [ -z "$line" ] && line="$(awk -F'|' -v k="$key" '$2==k' "$STATE" 2>/dev/null | head -n1)"
-        [ -z "$line" ] && exit 1
+        [ -z "$line" ] && { echo "hcloud: server ($key) not found" >&2; exit 1; }
         IFS='|' read -r id name alive created <<<"$line"
-        [ "$alive" = "alive" ] || exit 1
+        [ "$alive" = "alive" ] || { echo "hcloud: server ($key) not found" >&2; exit 1; }
         created="${created:-1970-01-01T00:00:00Z}"
         printf '{"server":{"id":%s,"name":"%s","created":"%s","public_net":{"ipv4":{"ip":"127.0.0.1"}}}}\n' "$id" "$name" "$created"
         exit 0
