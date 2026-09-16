@@ -352,5 +352,6 @@ case "${1:-all}" in
   *) echo "usage: repo-health-selftest.sh [ac1|ac2|ac3|ac4|ac5|ac6|ac7|ac8|ac9|all]" >&2; exit 2 ;;
 esac
 
-echo "repo-health-selftest: $pass passed, $fail failed" >&2
+total=$((pass + fail))
+echo "repo-health-selftest: $pass/$total ok, $fail FAIL" >&2
 [ "$fail" -eq 0 ]
