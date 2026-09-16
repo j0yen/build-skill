@@ -3155,6 +3155,29 @@ leak fails loud instead of polluting evidence silently.
 `scripts/lint-journal-fixtures.sh --code` fails a review that reintroduces
 a private `journal_line()`; `--corpus [date]` reports (never edits)
 fixture-shaped lines already sitting in a day's production journal.
+`--tests` fails a review that adds a `scripts/*selftest*.sh` or
+`tests/*.sh` file invoking anything under `scripts/` without declaring
+itself a test first (`scripts/lib/isolation.sh`'s `selftest_init` prelude,
+or an accepted per-script isolation override); `--quarantine YYYY-MM-DD`
+one-time-moves fixture-shaped lines already in a real day file to a
+`<date>.fixtures.md` sidecar (backup first, idempotent, never any date but
+the one given).
+
+**Dispatch nudge (P1, PRD-build-journal-single-writer requirement 6).**
+Prefer `scripts/run-selftests.sh <name...>` over invoking a selftest
+directly — the runner prints each test's journal-growth verdict inline.
+When this tick's testing activity shares one `BUILD_TEST_ROOT` across every
+selftest it runs this tick (direct invocations and `run-selftests.sh`
+alike — export `BUILD_TEST_ROOT` once before either), the tick summary
+gains a `selftests direct=<n> runner=<n>` field: run
+`scripts/tick-selftest-summary.sh "$BUILD_TEST_ROOT"` after testing is done
+and fold its one-line output into the summary. The counts come from the
+prelude's own `journal  test-run  (via=direct|runner name=<file>)` notice
+(landed under the test root, never production) — `direct` when
+`RUN_SELFTESTS_RUNNER` is unset at `selftest_init` time, `runner` when
+`run-selftests.sh` set it around that invocation. This is a nudge, not a
+gate (Non-goals): a tick that skips the shared root just gets `direct=0
+runner=0` back, never a refused receipt.
 
 ## Disable
 
