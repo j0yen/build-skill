@@ -13,6 +13,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SKILL_DIR="$(cd "$HERE/.." && pwd)"
 DECISIONS="$SKILL_DIR/scripts/decisions.sh"
 BANNER="$SKILL_DIR/scripts/decisions-banner.sh"
+SEED_PRD="$SKILL_DIR/scripts/repo-health-seed-prd.sh"
 
 pass=0
 fail=0
@@ -168,6 +169,37 @@ ac7() {
   rm -rf "$sbx"
 }
 
+ac8() {
+  local sbx; sbx="$(new_sandbox)"
+  eval "$(sbx_env "$sbx")"
+  "$DECISIONS" open "mcphost-only question" --owner joe --repo mcphost >/dev/null
+  "$DECISIONS" open "homeward-only question" --owner joe --repo homeward >/dev/null
+  local filtered; filtered="$("$DECISIONS" list --repo mcphost)"
+  local filter_ok=0
+  if printf '%s' "$filtered" | grep -qF "mcphost-only question" && ! printf '%s' "$filtered" | grep -qF "homeward-only question"; then
+    filter_ok=1
+  fi
+
+  # Fix-PRD template: repo-health-seed-prd.sh's Evidence section should
+  # fold in this repo's open decisions (requirement 8).
+  mkdir -p "$sbx/prds/build-queue" "$sbx/prds/visions"
+  : > "$sbx/prds/visions/buildloop-operations.md"
+  git -C "$sbx/prds" init -q
+  git -C "$sbx/prds" -c user.name=t -c user.email=t@t.local commit -q --allow-empty -m init
+  local evfile="$sbx/evidence.txt"; printf 'value=5\nfixture evidence line\n' > "$evfile"
+  PRD_DIR="$sbx/prds" "$SEED_PRD" main-ci-red mcphost "$evfile" --prd-dir "$sbx/prds" >/dev/null 2>&1
+  local seeded; seeded="$(cat "$sbx/prds/build-queue"/PRD-mcphost-health-main-ci-red-*.md 2>/dev/null)"
+  local seed_ok=0
+  printf '%s' "$seeded" | grep -qF "### Open decisions for mcphost" && printf '%s' "$seeded" | grep -qF "mcphost-only question" && seed_ok=1
+
+  if [ "$filter_ok" = "1" ] && [ "$seed_ok" = "1" ]; then
+    ok "AC8/req8: list --repo filters; seeded fix PRD's Evidence includes that repo's open decisions"
+  else
+    notok "AC8/req8: list --repo filters; seeded fix PRD's Evidence includes that repo's open decisions" "filter_ok=$filter_ok seed_ok=$seed_ok"
+  fi
+  rm -rf "$sbx"
+}
+
 case "${1:-all}" in
   ac1) ac1 ;;
   ac2) ac2 ;;
@@ -176,8 +208,9 @@ case "${1:-all}" in
   ac5) ac5 ;;
   ac6) ac6 ;;
   ac7) ac7 ;;
-  all) ac1; ac2; ac3; ac4; ac5; ac6; ac7 ;;
-  *) echo "usage: decisions-selftest.sh [ac1|ac2|ac3|ac4|ac5|ac6|ac7|all]" >&2; exit 2 ;;
+  ac8) ac8 ;;
+  all) ac1; ac2; ac3; ac4; ac5; ac6; ac7; ac8 ;;
+  *) echo "usage: decisions-selftest.sh [ac1|ac2|ac3|ac4|ac5|ac6|ac7|ac8|all]" >&2; exit 2 ;;
 esac
 
 total=$((pass + fail))

@@ -29,6 +29,7 @@ SKILL_DIR="$(cd "$HERE/.." && pwd)"
 export BUILD_STATE_DIR="${BUILD_STATE_DIR:-$SKILL_DIR/state}"
 PRD_DIR="${PRD_DIR:-$HOME/Documents/PRDs}"
 TEMPLATE="${REPO_HEALTH_TEMPLATE:-$SKILL_DIR/templates/repo-health-fix.md}"
+DECISIONS="${DECISIONS:-$HERE/decisions.sh}"
 PRD_LINT="${PRD_LINT:-$HERE/prd-lint.sh}"
 PRD_SLUG_CHECK="${PRD_SLUG_CHECK:-$HERE/prd-slug-check.sh}"
 
@@ -72,6 +73,21 @@ elif [ -f "$dest" ]; then
 fi
 
 evidence_body="$(cat "$evidence_file" 2>/dev/null || echo "(evidence file unreadable: $evidence_file)")"
+
+# PRD-build-open-decision-escalation requirement 8: fold this repo's open
+# decisions into the seeded fix PRD's own Evidence section — a fix PRD
+# blocked on an operator call should show the call right where the fix
+# PRD is read, not force a second lookup.
+if [ -x "$DECISIONS" ]; then
+  dec_list="$("$DECISIONS" list --repo "$repo" 2>/dev/null || true)"
+  if [ -n "$dec_list" ]; then
+    evidence_body="$evidence_body
+
+### Open decisions for $repo
+
+$dec_list"
+  fi
+fi
 grounding="repo-health rule=$rule repo=$repo fired $(date -u +%FT%TZ) — $(head -1 "$evidence_file" 2>/dev/null)"
 build_into="$HOME/wintermute/$repo"
 
