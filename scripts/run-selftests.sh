@@ -70,6 +70,7 @@ SELFTEST_REGISTRY=(
   scripts/manifest-reconcile-selftest.sh
   scripts/prd-lint-selftest.sh
   scripts/python-worktree-selftest.sh
+  scripts/worktree-extend-selftest.sh
   scripts/requeue-prd-selftest.sh
   scripts/sccache-assert-selftest.sh
   scripts/sccache-unit-selftest.sh
@@ -83,7 +84,19 @@ resolve_test() {
   if [ -f "$name" ]; then printf '%s\n' "$name"; return 0; fi
   if [ -f "$REPO_ROOT/$name" ]; then printf '%s\n' "$REPO_ROOT/$name"; return 0; fi
   local cand
-  for cand in "$REPO_ROOT/tests/$name" "$REPO_ROOT/tests/$name.sh" \
+  # PRD-build-shell-worktree-isolation AC10: `run-selftests.sh worktree-extend`
+  # must resolve to scripts/worktree-extend-selftest.sh, not the PRODUCTION
+  # script scripts/worktree-extend.sh that bare name would otherwise match
+  # via the `scripts/$name.sh` candidate below — this is the one name in
+  # this tree where the selftest's own basename ("worktree-extend") equals
+  # a real production script's basename. Tried FIRST (ahead of the plain
+  # scripts/$name(.sh) candidates) so a `<name>-selftest.sh` file always
+  # wins when one exists; every other name in this tree either has no
+  # `-selftest.sh` sibling at all (unaffected) or already used the
+  # selftest's own literal name (e.g. "gate-wedge-selftest") to resolve it,
+  # which still resolves identically either way.
+  for cand in "$REPO_ROOT/scripts/$name-selftest.sh" "$REPO_ROOT/tests/$name-selftest.sh" \
+              "$REPO_ROOT/tests/$name" "$REPO_ROOT/tests/$name.sh" \
               "$REPO_ROOT/scripts/$name" "$REPO_ROOT/scripts/$name.sh"; do
     [ -f "$cand" ] && { printf '%s\n' "$cand"; return 0; }
   done

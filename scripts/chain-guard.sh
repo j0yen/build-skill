@@ -82,6 +82,15 @@ GATE_LAUNCH="${CHAIN_GUARD_GATE_LAUNCH:-$HERE/gate-launch.sh}"
 SIDECAR="${CHAIN_GUARD_SIDECAR:-$HERE/manifest-sidecar.sh}"
 INFLIGHT_DIR="$STATE_DIR/gate-inflight"
 JQ="${JQ:-jq}"
+# shellcheck source=lib/gate-patience.sh
+# PRD-build-gate-patience-from-queue-depth requirement 1: this script's own
+# --integrate-lock probe journals the same derived `gate patience` line
+# extend-gate.sh does, for the same crate, so a tick summary or an operator
+# reading the journal sees one consistent number rather than two scripts'
+# independent guesses. The probe's own --lock-wait bound is unchanged by
+# this (it is a quick "is the lock free right now" precondition check, not
+# the gate itself, which is what actually pays the full patience wait).
+[ -r "$HERE/lib/gate-patience.sh" ] && source "$HERE/lib/gate-patience.sh"
 CHAIN_GUARD_JOURNAL="${CHAIN_GUARD_JOURNAL:-$HOME/brain/journal/build/$(date -u +%Y-%m-%d).md}"
 
 die() { echo "chain-guard: $*" >&2; exit "${2:-4}"; }
@@ -201,6 +210,23 @@ cmd_check() {
   local slug="${1:-}"; shift || true
   [ -n "$slug" ] || usage
 
+  # PRD-build-shell-worktree-isolation requirement 5: print this on every
+  # call, before any continue/stop verdict — a `continue` on a
+  # worktree-isolated branch is final (SKILL.md's "In-tick chaining"
+  # section instructs the coordinator not to additionally stop it for
+  # "shared-tree contention"; that class of stop only ever protected an
+  # unisolated shared checkout). `yes` iff the manifest's `work_tree` field
+  # for this slug is a path under the build-worktrees root.
+  local wt_field wt_root_chk isolated="no"
+  wt_field="$(manifest_field "$slug" work_tree)"
+  wt_root_chk="${BUILD_WT_ROOT:-$HOME/.cache/build-worktrees}"
+  if [ -n "$wt_field" ] && [ "$wt_field" != "__NO_ENTRY__" ]; then
+    case "$wt_field" in
+      "$wt_root_chk"/*) isolated="yes" ;;
+    esac
+  fi
+  echo "worktree-isolated: $isolated"
+
   local step_count=0 max_steps="${CHAIN_MAX_STEPS:-}" reflect_candidate=0
   local integrate_lock="" lock_wait=60 lane="$(hostname)" prd_dir="$HOME/Documents/PRDs"
   local skip_select_guard=0
@@ -285,6 +311,17 @@ cmd_check() {
   # the real integrate/gate step re-acquires it for its own actual work.
   if [ -n "$integrate_lock" ]; then
     mkdir -p "$(dirname "$integrate_lock")" 2>/dev/null || true
+    # PRD-build-gate-patience-from-queue-depth requirement 1: journal the
+    # derived patience for this crate once per acquisition attempt, same
+    # formula and same journal shape extend-gate.sh uses — visibility only,
+    # this probe's own wait bound ($lock_wait) is untouched.
+    if command -v gate_patience_compute >/dev/null 2>&1; then
+      _cg_crate="$(basename "$(dirname "$(dirname "$integrate_lock")")")"
+      _cg_repo="$(dirname "$(dirname "$integrate_lock")")"
+      gate_patience_compute "$_cg_repo" "$_cg_crate" "$lock_wait" "$CHAIN_GUARD_JOURNAL" \
+        "$prd_dir/build-queue/PRD-$slug.md" "$prd_dir"
+      printf '%s\n' "$(gate_patience_journal_line "$_cg_crate" "$GATE_PATIENCE_DEPTH" "$GATE_PATIENCE_WALL_EST" "$GATE_PATIENCE_S")" >> "$CHAIN_GUARD_JOURNAL"
+    fi
     if ! flock -w "$lock_wait" "$integrate_lock" -c true 2>/dev/null; then
       echo "stop: $slug: lock-contended"
       return 1

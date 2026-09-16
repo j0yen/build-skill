@@ -372,6 +372,7 @@ cmd_add() {
     print_cargo_budget_path_reminder "$repo" >&2
     print_burst_lane_path_reminder "$repo" >&2
     print_python_burst_lane_path_reminder "$repo" >&2
+    print_skill_repo_reminder "$repo" "$wt" >&2
     ensure_repo_hooks_installed "$repo"
     echo "$wt"; return 0
   fi
@@ -393,6 +394,7 @@ cmd_add() {
   print_cargo_budget_path_reminder "$repo" >&2
   print_burst_lane_path_reminder "$repo" >&2
   print_python_burst_lane_path_reminder "$repo" >&2
+  print_skill_repo_reminder "$repo" "$wt" >&2
   ensure_repo_hooks_installed "$repo"
   echo "$wt"
 }
@@ -469,6 +471,73 @@ print_burst_lane_path_reminder() {
   echo "PATH=\"burst-lane-bin:cargo-budget-bin:\$PATH\") this routes cargo build/test/clippy/" >&2
   echo "deny/nextest to the CCX53 burst lane when 'burst-lane.sh status' reports a session," >&2
   echo "and falls through to cargo-budget-bin's local routing otherwise (PRD-build-burst-lane-ccx53)." >&2
+}
+
+# PRD-build-shell-worktree-isolation requirement 3/4: a shell/hooks/config
+# PRD's `build_into` is commonly THIS VERY SKILL's own repo (SKILL.md +
+# scripts/ are what the running tick reads) — a selftest run from inside
+# that worktree must never write the running skill's own production
+# state/ or journal. Detected as "skill-shaped": SKILL.md + a
+# scripts/run-selftests.sh both present at the repo root, the same
+# structural signal `is_skill_shaped` names below, gated the same way the
+# cargo/python reminders above are gated on Cargo.toml/pyproject.toml.
+is_skill_shaped() {
+  local repo="${1:?is_skill_shaped: missing repo arg}"
+  [ -f "$repo/SKILL.md" ] && [ -e "$repo/scripts/run-selftests.sh" ]
+}
+
+# cmd_transition helper: a dirty file attributed to slug <s> is layered
+# ONTO that branch's own committed content, not blindly overwritten by the
+# dirty edit — the dirty content in <repo>'s working tree is relative to
+# <default>, which is NOT the same base as the branch's own HEAD once the
+# branch has its own commit(s). A 3-way merge (base=<default>'s pre-dirty
+# content, ours=<commit_dir>'s current HEAD content, theirs=the dirty
+# content pulled from the stash) reconciles the two; a text conflict falls
+# back to the dirty content verbatim (never silently dropped — a
+# merge-file conflict here means a human needs to look at this file once
+# it lands, same as any other merge conflict would).
+merge_dirty_file_from_stash() {
+  local repo="$1" commit_dir="$2" default="$3" f="$4"
+  local base_f ours_f theirs_f
+  base_f="$(mktemp)"; ours_f="$(mktemp)"; theirs_f="$(mktemp)"
+  git -C "$repo" show "$default:$f" >"$base_f" 2>/dev/null || : >"$base_f"
+  git -C "$commit_dir" show "HEAD:$f" >"$ours_f" 2>/dev/null || : >"$ours_f"
+  git -C "$repo" show "stash@{0}:$f" >"$theirs_f" 2>/dev/null \
+    || git -C "$repo" show "stash@{0}^3:$f" >"$theirs_f" 2>/dev/null || : >"$theirs_f"
+  mkdir -p "$(dirname "$commit_dir/$f")"
+  # Keep git's own conflict-marked output on a genuine textual conflict
+  # (both sides touched the same lines) instead of silently picking one
+  # side — the losing side's bytes stay right there between the markers
+  # for whoever picks the branch back up, exactly as a real `git merge`
+  # conflict would leave them. -p already wrote that output to $f above,
+  # win or lose; only the exit status differs.
+  if ! git merge-file -p "$ours_f" "$base_f" "$theirs_f" >"$commit_dir/$f" 2>/dev/null; then
+    echo "worktree-extend: transition: $f -- attribution merge conflict, left with markers for manual resolution" >&2
+  fi
+  rm -f "$base_f" "$ours_f" "$theirs_f"
+}
+
+# Prints the production-state rule (requirement 3) and the worktree-local
+# state-dir exports (requirement 4) to stderr — never stdout, which stays
+# the bare worktree path for `wt=$(worktree-extend.sh add ...)` callers,
+# same convention as the cargo/burst-lane reminders above. No-op for a
+# non-skill-shaped repo.
+print_skill_repo_reminder() {
+  local repo="${1:?print_skill_repo_reminder: missing repo arg}" wt="${2:?print_skill_repo_reminder: missing worktree arg}"
+  is_skill_shaped "$repo" || return 0
+  echo "worktree-extend: skill-shaped repo detected (SKILL.md + scripts/run-selftests.sh)." >&2
+  echo "worktree-extend: production-state rule — run THIS PRD's own scripts and selftests" >&2
+  echo "from this worktree, but call manifest-set.sh, lane-claim.sh, chain-guard.sh," >&2
+  echo "gate-*.sh, journal writers, and archive scripts via" >&2
+  echo "\$HOME/.claude/skills/build/scripts/... (the main checkout) — never via this" >&2
+  echo "worktree's own scripts/. Before any selftest run in this worktree, export:" >&2
+  echo "  export BUILD_STATE_DIR=\"$wt/state\" STATE_DIR=\"$wt/state\" BURST_LANE_STATE_DIR=\"$wt/state/burst-lane\"" >&2
+  echo "worktree-extend: BOTH BUILD_STATE_DIR and the bare STATE_DIR are needed — most" >&2
+  echo "scripts key off BUILD_STATE_DIR, but manifest-sidecar.sh's STATE_DIR does not fall" >&2
+  echo "back to it (the naming split this PRD's own Technical Considerations flags; not" >&2
+  echo "unified here, just covered so a worktree selftest can't miss it either way). This" >&2
+  echo "keeps a worktree selftest from writing the running skill's production state/ or" >&2
+  echo "journal (PRD-build-shell-worktree-isolation requirement 4)." >&2
 }
 
 # cmd_land — PRD-build-python-worktree-isolation's python `wm-buildtree land`
@@ -594,6 +663,65 @@ cmd_land() {
     die 4 "target tree dirty; refusing to land $slug (commit-or-revert the working tree first)"
   fi
   git -C "$repo" show-ref --verify --quiet "refs/heads/$branch" || die 2 "no branch $branch to land"
+
+  # PRD-build-shell-worktree-isolation requirement 2: rebase FIRST when
+  # <default> has genuinely advanced past the commit this branch was based
+  # on (a sibling landed in between this branch's `add` and this `land` —
+  # several shell branches on one repo now land in the same hour), then
+  # fast-forward instead of a --no-ff merge. When <default> has NOT moved
+  # since this branch's base (the common single-branch-per-tick case for
+  # rust/python today), branch_base == default_tip and this block is
+  # skipped entirely — the merge path below runs byte-identical to before
+  # this PRD (Non-goal: rust/python land behavior unchanged in that case).
+  if [ -d "$wt" ]; then
+    local branch_base default_tip
+    branch_base="$(git -C "$repo" merge-base "$branch" "$default" 2>/dev/null)"
+    default_tip="$(git -C "$repo" rev-parse "$default" 2>/dev/null)"
+    if [ -n "$branch_base" ] && [ -n "$default_tip" ] && [ "$branch_base" != "$default_tip" ]; then
+      local pre_commits; pre_commits="$(git -C "$repo" rev-list --count "$branch_base..$branch" 2>/dev/null || echo 0)"
+      if git -C "$wt" "${GIT_ID[@]}" rebase "$default_tip" >&2; then
+        checkout_or_die "$repo" "$default"
+        if git -C "$repo" merge --ff-only "$branch" >&2; then
+          local rj="${WORKTREE_EXTEND_JOURNAL:-$HOME/brain/journal/build/$(date -u +%Y-%m-%d).md}"
+          if [ -r "$(dirname "$0")/isolation-guard.sh" ]; then
+            # shellcheck source=isolation-guard.sh
+            source "$(dirname "$0")/isolation-guard.sh"
+            isolation_guard_path "$rj" "worktree-extend.sh"
+          fi
+          mkdir -p "$(dirname "$rj")"
+          printf '%s  land  rebased  (slug=%s onto=%s commits=%s)\n' \
+            "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$slug" "$default_tip" "${pre_commits:-0}" >>"$rj"
+          [ -x "$SERIAL_FALLBACK" ] && "$SERIAL_FALLBACK" streak-reset "$repo" >&2 || true
+          local rebased_sha; rebased_sha="$(git -C "$repo" rev-parse HEAD)"
+          local rcleanup; rcleanup="$(cmd_cleanup "$repo" "$slug")"
+          echo "worktree-extend: $slug: land: $rcleanup" >&2
+          printf '%s\n' "$rebased_sha"
+          return 0
+        fi
+        # Rebase landed cleanly but a fast-forward is somehow no longer
+        # possible (default moved again under us mid-flight) — fall through
+        # to the merge-based path below rather than silently failing; the
+        # rebased branch state is still intact in the worktree either way.
+      else
+        local rconflict; rconflict="$(git -C "$wt" diff --name-only --diff-filter=U 2>/dev/null | sort | tr '\n' ',' | sed 's/,$//')"
+        [ -z "$rconflict" ] && rconflict="unknown"
+        git -C "$wt" rebase --abort 2>/dev/null
+        local cj="${WORKTREE_EXTEND_JOURNAL:-$HOME/brain/journal/build/$(date -u +%Y-%m-%d).md}"
+        if [ -r "$(dirname "$0")/isolation-guard.sh" ]; then
+          # shellcheck source=isolation-guard.sh
+          source "$(dirname "$0")/isolation-guard.sh"
+          isolation_guard_path "$cj" "worktree-extend.sh"
+        fi
+        mkdir -p "$(dirname "$cj")"
+        printf '%s  land  conflict  (slug=%s files=%s)\n' \
+          "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$slug" "$rconflict" >>"$cj"
+        [ -x "$SIDECAR" ] && "$SIDECAR" write "$slug" "last_error=land-conflict:${rconflict}" >&2 || true
+        [ -x "$SERIAL_FALLBACK" ] && "$SERIAL_FALLBACK" streak-record "$repo" "$rconflict" >&2 || true
+        die 5 "rebase conflict landing $slug onto advanced $default; branch autobuilder/$slug intact, retry next tick (files=$rconflict)"
+      fi
+    fi
+  fi
+
   checkout_or_die "$repo" "$default"
   if ! git -C "$repo" "${GIT_ID[@]}" merge --no-ff --no-edit "$branch" >&2; then
     git -C "$repo" merge --abort 2>/dev/null
@@ -964,7 +1092,177 @@ cmd_prune_landed() {
   done < <(git -C "$repo" worktree list --porcelain; echo)
 }
 
-cmd_list() { local repo="${1:-}"; need "$repo" "usage: list <repo>"; git -C "$repo" worktree list | grep -F "$WT_ROOT/$(basename "$repo")-" || echo "(no autobuilder worktrees)"; }
+# PRD-build-shell-worktree-isolation requirement 7 (P1): each row also
+# names lang= (rust|python|shell — probed the same way the write_target_config/
+# burst-lane reminders detect it: Cargo.toml -> rust, pyproject.toml ->
+# python, else shell), behind= (commits <default> is ahead of this branch's
+# merge-base with it — 0 when the branch is fully caught up), and dirty=
+# (uncommitted changes inside the worktree itself) — so an operator can see
+# which branches will hit the rebase-first path at `land` before running it.
+cmd_list() {
+  local repo="${1:-}"; need "$repo" "usage: list <repo>"
+  local prefix="$WT_ROOT/$(basename "$repo")-"
+  local found=0 wt branch line
+  local default; default="$(default_branch "$repo" 2>/dev/null || echo main)"
+  while IFS= read -r line; do
+    case "$line" in
+      worktree\ *) wt="${line#worktree }"; branch="" ;;
+      branch\ *)   branch="${line#branch }"; branch="${branch#refs/heads/}" ;;
+      '')
+        if [ -n "${wt:-}" ] && [ "${wt#"$prefix"}" != "$wt" ]; then
+          found=1
+          local lang="shell"
+          [ -f "$wt/Cargo.toml" ] && lang="rust"
+          [ -f "$wt/pyproject.toml" ] && lang="python"
+          local behind=0
+          if [ -n "$branch" ]; then
+            local base; base="$(git -C "$repo" merge-base "$branch" "$default" 2>/dev/null)"
+            local dtip; dtip="$(git -C "$repo" rev-parse "$default" 2>/dev/null)"
+            if [ -n "$base" ] && [ -n "$dtip" ] && [ "$base" != "$dtip" ]; then
+              behind="$(git -C "$repo" rev-list --count "$base..$dtip" 2>/dev/null || echo 0)"
+            fi
+          fi
+          local dirty="no"
+          [ -n "$(git -C "$wt" status --porcelain 2>/dev/null)" ] && dirty="yes"
+          printf '%s  branch=%s  lang=%s behind=%s dirty=%s\n' "$wt" "${branch:-?}" "$lang" "$behind" "$dirty"
+        fi
+        wt=""; branch=""
+        ;;
+    esac
+  done < <(git -C "$repo" worktree list --porcelain; echo)
+  [ "$found" -eq 1 ] || echo "(no autobuilder worktrees)"
+}
+
+# PRD-build-shell-worktree-isolation requirement 6: the first tick after
+# ship must not open a new worktree onto a main checkout some prior
+# unisolated shell/hooks/config PRD left dirty. Per-FILE attribution: a
+# dirty file is attributed to slug <s> when EXACTLY ONE local
+# autobuilder/<s> branch's diff against <default> already touches that
+# same path (that branch's own committed work shadows this uncommitted
+# edit); zero or more-than-one candidates is unattributable. Attributed
+# files are committed onto their own autobuilder/<slug> branch (created if
+# missing, based on <default>); every unattributable file is committed
+# together onto one new `transition/<ts>` branch. Neither branch is
+# merged into <default> here — landing them is a normal follow-up `land`
+# — so this step's only observable effect on <default> is that its
+# working tree goes from dirty to clean. Never discards a byte: every
+# dirty file (tracked-modified or untracked) ends up committed somewhere.
+cmd_transition() {
+  local repo="${1:-}"; need "$repo" "usage: transition <repo>"
+  [ -d "$repo/.git" ] || git -C "$repo" rev-parse --git-dir >/dev/null 2>&1 || die 2 "not a git repo: $repo"
+  local journal="${WORKTREE_EXTEND_JOURNAL:-$HOME/brain/journal/build/$(date -u +%Y-%m-%d).md}"
+  if [ -r "$(dirname "$0")/isolation-guard.sh" ]; then
+    # shellcheck source=isolation-guard.sh
+    source "$(dirname "$0")/isolation-guard.sh"
+    isolation_guard_path "$journal" "worktree-extend.sh"
+  fi
+  mkdir -p "$(dirname "$journal")"
+
+  local dirty; dirty="$(git -C "$repo" status --porcelain)"
+  if [ -z "$dirty" ]; then
+    echo "worktree-extend: transition: main checkout already clean, nothing to do" >&2
+    return 0
+  fi
+  local default; default="$(default_branch "$repo")"
+  checkout_or_die "$repo" "$default"
+
+  local -a files=()
+  local line
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    files+=("${line:3}")
+  done <<<"$dirty"
+  local n_files="${#files[@]}"
+
+  local -a branches=()
+  local b
+  while IFS= read -r b; do
+    [ -n "$b" ] && branches+=("$b")
+  done < <(git -C "$repo" for-each-ref --format='%(refname:short)' 'refs/heads/autobuilder/*' 2>/dev/null)
+
+  # Stash everything dirty up front (tracked + untracked) so the working
+  # tree is clean and branch-switching below is always safe; every file's
+  # content is then pulled back out of this one stash entry per group.
+  git -C "$repo" "${GIT_ID[@]}" stash push -u -m "shell-worktree-transition" >&2 \
+    || die 2 "transition: stash push failed (dirty files not touched)"
+
+  local f slugs_seen=""
+  declare -A group_files=()
+  local -a unattributed=()
+  for f in "${files[@]}"; do
+    local match="" count=0
+    for b in "${branches[@]}"; do
+      if git -C "$repo" diff --name-only "$default...$b" -- "$f" 2>/dev/null | grep -qxF "$f"; then
+        match="$b"; count=$((count + 1))
+      fi
+    done
+    if [ "$count" -eq 1 ]; then
+      local slug="${match#autobuilder/}"
+      group_files["$slug"]="${group_files[$slug]:-}$f
+"
+      case " $slugs_seen " in *" $slug "*) ;; *) slugs_seen="$slugs_seen $slug" ;; esac
+    else
+      unattributed+=("$f")
+    fi
+  done
+
+  local action="committed" ts; ts="$(date -u +%Y%m%dT%H%M%SZ)"
+  local slug
+  for slug in $slugs_seen; do
+    local branch="autobuilder/$slug"
+    # A branch already checked out in a live worktree can NEVER be checked
+    # out again in the main repo (git refuses it outright) — commit
+    # directly into that worktree instead. The repo-wide stash ref is
+    # visible from any linked worktree, same .git dir. Only fall back to
+    # checking the branch out in the MAIN repo when no live worktree holds
+    # it (branch exists standalone, or doesn't exist yet at all).
+    local target_wt; target_wt="$(wt_path "$repo" "$slug")"
+    local commit_dir="$repo"
+    if [ -d "$target_wt" ] && git -C "$repo" worktree list --porcelain | grep -qxF "worktree $target_wt"; then
+      commit_dir="$target_wt"
+    elif git -C "$repo" show-ref --verify --quiet "refs/heads/$branch"; then
+      git -C "$repo" checkout -q "$branch" >&2
+    else
+      git -C "$repo" "${GIT_ID[@]}" checkout -q -b "$branch" "$default" >&2
+    fi
+    local -a slug_paths=()
+    while IFS= read -r f; do
+      [ -n "$f" ] && slug_paths+=("$f")
+    done <<<"${group_files[$slug]}"
+    for f in "${slug_paths[@]}"; do
+      merge_dirty_file_from_stash "$repo" "$commit_dir" "$default" "$f"
+    done
+    git -C "$commit_dir" add -A -- "${slug_paths[@]}" >&2
+    git -C "$commit_dir" "${GIT_ID[@]}" commit -q -m "wip: pre-worktree-isolation transition ($slug)" >&2 \
+      || echo "worktree-extend: transition: nothing to commit for $slug (already matched)" >&2
+    [ "$commit_dir" = "$repo" ] && checkout_or_die "$repo" "$default"
+  done
+
+  if [ "${#unattributed[@]}" -gt 0 ]; then
+    action="committed"
+    local tbranch="transition/$ts"
+    git -C "$repo" "${GIT_ID[@]}" checkout -q -b "$tbranch" "$default" >&2
+    for f in "${unattributed[@]}"; do
+      merge_dirty_file_from_stash "$repo" "$repo" "$default" "$f"
+    done
+    git -C "$repo" add -A -- "${unattributed[@]}" >&2
+    git -C "$repo" "${GIT_ID[@]}" commit -q -m "wip: pre-worktree-isolation transition (unattributed)" >&2 \
+      || echo "worktree-extend: transition: nothing to commit on $tbranch" >&2
+    checkout_or_die "$repo" "$default"
+    echo "worktree-extend: transition: unattributed files committed on $tbranch: ${unattributed[*]}" >&2
+  fi
+
+  git -C "$repo" stash drop -q >&2 2>/dev/null || true
+
+  if [ -n "$(git -C "$repo" status --porcelain)" ]; then
+    action="refused"
+    echo "worktree-extend: transition: $default still dirty after attribution pass — manual attention needed" >&2
+  fi
+  printf '%s  worktree  transition  (dirty_files=%s action=%s)\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$n_files" "$action" >>"$journal"
+  [ "$action" = "refused" ] && return 1
+  return 0
+}
 
 case "${1:-}" in
   add)          shift; cmd_add "$@" ;;
@@ -973,5 +1271,6 @@ case "${1:-}" in
   cleanup)      shift; cmd_cleanup "$@" ;;
   prune-landed) shift; cmd_prune_landed "$@" ;;
   list)         shift; cmd_list "$@" ;;
-  *) echo "usage: worktree-extend.sh {add|land|integrate|cleanup|prune-landed|list} ..." >&2; exit 1 ;;
+  transition)   shift; cmd_transition "$@" ;;
+  *) echo "usage: worktree-extend.sh {add|land|integrate|cleanup|prune-landed|list|transition} ..." >&2; exit 1 ;;
 esac

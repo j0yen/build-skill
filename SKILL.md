@@ -569,16 +569,52 @@ Read the PRD. Determine its implementation shape:
 - **Shell scripts / hook scripts** → implement directly with Write/Edit.
   Run with `set -uo pipefail`; smoke-test before committing.
 
+  **Worktree isolation, unconditional when `build_into` is set
+  (PRD-build-shell-worktree-isolation, 2026-09-15) — the shell/hooks/config
+  equivalent of python's `worktree-extend.sh add`/`land` above.** Before ANY
+  Phase-4 write for a `shell`/`hooks`/`config` PRD that declares `build_into`,
+  run `scripts/worktree-extend.sh add <build_into> <slug>` and make every
+  subsequent edit with cwd = the printed worktree path, never `build_into`
+  directly — this is what lets several same-repo shell PRDs (e.g. several
+  build-skill self-mod PRDs dispatched in one tick) advance in parallel
+  instead of serializing on one dirty main checkout. When this PRD's
+  iteration is done, run `scripts/worktree-extend.sh land <build_into>
+  <slug>` to merge the branch back: it exits 4 (no mutation) if `build_into`'s
+  default-branch checkout is dirty at land time, and exits 5 (also no
+  mutation, branch kept intact) if the default branch has advanced since
+  `add` (a sibling landed first) AND the resulting rebase conflicts — either
+  way, retry `land` again next tick, same worktree, same branch. A PRD with
+  NO `build_into` (a new-repo scaffold) skips all of this — there is nothing
+  shared to isolate from. If the very first tick after this PRD shipped
+  finds `build_into`'s main checkout already dirty from an earlier,
+  unisolated shell PRD, run `scripts/worktree-extend.sh transition
+  <build_into>` once before any `add` — it attributes each dirty file to
+  whichever `autobuilder/<slug>` branch's own commits already touch that
+  path (committing it there) and sweeps anything unattributable onto one
+  `transition/<ts>` branch, leaving `build_into`'s working tree clean
+  without discarding a single byte.
+
   **Self-mod distribution (build-skill's own files).** When a shell/config
   PRD's `build_into` points INSIDE this repo (`~/.local/share/build-skill`,
   i.e. the `~/.claude/skills/build` symlink target — its `scripts/*.sh`,
-  `SKILL.md`, or `.gitignore`), the edit takes effect locally the moment it
-  lands (the symlink means the running skill reads it), but it does NOT
-  reach other clones until pushed. There is no `wm-push`/`wm-publish`
-  wrapper for this repo. So after committing such a self-mod with the Joe
-  Yen identity, run `scripts/self-push.sh` as the final step — it
-  fast-forwards `origin/main` under hard guards (correct repo/remote/branch,
-  no uncommitted tracked changes, strictly fast-forward, ≥1 ahead) and is a
+  `SKILL.md`, or `.gitignore`), the worktree-isolation paragraph above
+  applies (build-skill is exactly the shared-tree case it exists for): `add`
+  detects this repo as skill-shaped (SKILL.md + scripts/run-selftests.sh)
+  and prints, to stderr, the production-state rule — run THIS PRD's own
+  scripts/selftests from the worktree, but call manifest-set.sh,
+  lane-claim.sh, chain-guard.sh, gate-*.sh, journal writers, and archive
+  scripts via `$HOME/.claude/skills/build/scripts/...` (the main checkout),
+  never via the worktree's own `scripts/` — plus the exact
+  `BUILD_STATE_DIR`/`BURST_LANE_STATE_DIR` exports to set before running any
+  selftest in that worktree, so it never touches the running skill's own
+  production `state/`. `land`'s merge takes effect locally the instant it
+  lands (the symlink means the running skill reads the main checkout
+  immediately), but it does NOT reach other clones until pushed — there is
+  no `wm-push`/`wm-publish` wrapper for this repo. So after `land` succeeds,
+  from the MAIN checkout (not the worktree — `land` already cleaned that
+  up), run `scripts/self-push.sh` as the final step — it fast-forwards
+  `origin/main` under hard guards (correct repo/remote/branch, no
+  uncommitted tracked changes, strictly fast-forward, ≥1 ahead) and is a
   no-op when already in sync. If it exits 5 (diverged), `git fetch` +
   rebase onto `origin/main` first, then re-run; never force-push.
   # After self-push.sh: answerable-emit.sh self-edit <file> "<why>" false
@@ -921,6 +957,41 @@ read it before assuming a step is "the last one this tick".
   receipts) and runs `autobuilder gate --project .` as the single verdict.
   Counts as one tick action.
 
+  **Patience is derived, not a fixed 60s/90s (PRD-build-gate-patience-
+  from-queue-depth).** Neither `extend-gate.sh` nor `chain-guard.sh` waits
+  a flat constant for the producer lock any more: `patience_s = max(floor,
+  depth * wall_est)`, where `floor` is `EXTEND_GATE_PRODUCER_LOCK_WAIT`
+  (default 90, now a floor rather than the whole answer), `depth` is the
+  number of OTHER live claims on this `build_into` (`lane-claim.sh --json`,
+  own claim excluded), and `wall_est` is the median `wall=<s>` of the last
+  three `gate <crate> ...` journal lines for this crate (600s fallback with
+  fewer than one). Both scripts journal `gate  patience  (crate=<name>
+  depth=<n> wall_est=<s> patience=<s>)` once per acquisition attempt —
+  `scripts/lib/gate-patience.sh` is the one place this formula lives, so
+  the two callers can never disagree about what a crate's patience is. A
+  lock still not acquired within patience is **contention, not a verdict**:
+  `extend-gate.sh` exits 4 and journals `gate  <slug>  contended  (crate=
+  <name> holder_pid=<pid> holder_slug=<slug|main> holder_age_s=<s>
+  waited_s=<s>)`, reading the holder's identity from a `.holder` sidecar it
+  writes beside the lock the instant it acquires one (`pid slug scope
+  started_epoch`, removed on every exit path; `extend-gate.sh --explain-lock
+  <build_into> [--scope branch --slug <slug>]` prints it on demand, and a
+  leftover sidecar whose pid is dead is journaled `gate  lock-reclaimed
+  (stale_pid=<pid>)` and overwritten rather than trusted). **A branch agent
+  that receives exit 4 (directly, or as `gate-then-land.sh` exit 12) must
+  set its Phase 7 manifest patch `next: gate-retry` and leave `blockers`
+  untouched — never `gate-block`, `gate-red`, or `verdict=block`; those are
+  reserved for a real pass/delta-pass/block verdict.** The old "3 attempts
+  of 90s" shape is gone: one acquisition attempt already waits the crate's
+  full derived patience (inside `extend-gate.sh`'s own `flock -w`), so a
+  caller that retried on top of that would just pay the same wait twice —
+  `gate-then-land.sh` does not retry a contended exit, it reports it (exit
+  12) and stops, exactly once. `lane-status.sh tick-summary` appends one
+  `gate-queue: crate=<name> depth=<n> holder=<slug> hold_max_s=<s>
+  contended=<n> exhausted=<n>` line per crate gated this tick, built from
+  these same journal lines, so an operator reads queue depth instead of
+  guessing why ships-per-hour read zero.
+
   **Shared-target path (PRD-build-gate-before-land, 2026-09-14): gate BEFORE
   land, not after.** The old land-then-gate order held the crate's
   integration lock for the gate's entire wall time (332s-3864s observed
@@ -950,12 +1021,17 @@ read it before assuming a step is "the last one this tick".
   integration lock for the merge + bump + commit alone (target: under 30s).
   If a sibling landed first (exit 6, `land-stale-base`), this is not a
   failure: `gate-then-land.sh` rebases the worktree onto main's new HEAD,
-  re-gates, and retries (up to 3 attempts) — after 3 consecutive stale
+  re-gates, and retries (up to 3 attempts — this bound is about repeated
+  STALE BASES, a sibling merging ahead of you; it has nothing to do with
+  lock-contention patience, see above) — after 3 consecutive stale
   bases the PRD is `blocked: land-retries-exhausted` with all 3 main shas
   recorded, leave `status: in_progress` and retry next tick. If the
   branch's own gate verdict is `block` (exit 7, `land-ungated`), the
   branch is kept and main is untouched — do NOT retry, this is a real red
-  gate, not a race; record `next: gate-red` same as any other block. On
+  gate, not a race; record `next: gate-red` same as any other block. Exit
+  12 (`contended`) is neither of these — see "Patience is derived" above:
+  branch kept, main untouched, `next: gate-retry`, not retried within this
+  call. On
   success, `gate-then-land.sh` prints the landed sha on stdout — proceed
   straight to **intent card refresh** and **push + cleanup** below with it
   (the merge already happened; there is no separate `integrate` call left
@@ -2506,6 +2582,20 @@ run the next Phase 4 step now, in the same dispatch; exit 1 (`stop:
 after the first, not a one-time gate — a chain that has run 5 green steps
 still re-checks before a 6th.
 
+**`worktree-isolated: yes|no` (PRD-build-shell-worktree-isolation, req. 5).**
+Every call also prints this line — `yes` when the manifest's
+`work_tree` field for this slug is a path under the build-worktrees root
+(`$BUILD_WT_ROOT`, default `~/.cache/build-worktrees`), `no` otherwise
+(no `work_tree` recorded at all, e.g. a new-repo PRD with no `build_into`).
+A `continue` verdict on a `worktree-isolated: yes` branch is final — the
+coordinator must NOT additionally stop it for "shared-tree contention" or
+any other sibling-is-also-editing-this-repo narration; the whole point of
+the worktree is that siblings on the same `build_into` cannot observe or
+clobber each other before `land`, so there is nothing left for a
+concurrent-edit-safety stop to protect against. That stop only ever made
+sense for the old unisolated shell/hooks/config path (direct edits on one
+shared checkout), which this PRD retires for any `build_into`-set PRD.
+
 **Per-step atomicity, unchanged (requirement 2).** Every chained step
 commits its own manifest transition via `manifest-set.sh`, exactly as a
 standalone tick action would, BEFORE the next step starts and BEFORE the
@@ -2532,7 +2622,7 @@ enforces these, in this order, and prints the matching reason:
 | `blockers`                     | manifest `blockers` is non-empty — covers gate red and any step failure, since a failed step's own action already appends a `blockers` line (e.g. the `gate` action's `gate: <receipt> — <message>` on block) before returning here. |
 | `needs-user`                   | manifest `status: needs_classification` (or `needs_user`).               |
 | `cap`                          | `CHAIN_MAX_STEPS` is explicitly set (env var or `--max-steps`) and this step's count has reached it. |
-| `lock-contended`               | `--integrate-lock` given and not acquired within the wait bound (default 60s — requirements 1 and 3 both name this figure; a probe acquire-then-release, the real step re-acquires for its own work). |
+| `lock-contended`               | `--integrate-lock` given and not acquired within the wait bound (default 60s — requirements 1 and 3 both name this figure; a probe acquire-then-release, the real step re-acquires for its own work). This probe's own bound is unchanged by PRD-build-gate-patience-from-queue-depth; it also journals that PRD's derived `gate patience` line for the crate (visibility only — see the `gate` action's "Patience is derived" paragraph for the real step's own wait, which IS patience-derived). |
 | `target-busy: <detail>`        | `select-guard.sh` (sub-cap / cargo-budget / burst-route / cross-lane busy) refused — same call the tick parent's dispatch-boundary guard makes. |
 
 On any stop, the branch records the reason in that step's own outcome

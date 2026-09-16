@@ -86,7 +86,18 @@ one-time real-hardware ACs, not as a general escape from writing tests.
 
 - `rust-*` → `/rustbuild` (cargo runs on RedBaron: locally there, remotely from every other node via the skill's cargo shim).
 - `python-*` → `/pybuild` (`--target cli|lib|agent` from the suffix); with `build_into` set, extends in place via `scripts/worktree-extend.sh add`/`land` (unconditional worktree isolation, PRD-build-python-worktree-isolation).
-- `shell`/`hooks`/`config` → direct edits. `kernel-extend` → hand-written C.
+- `shell`/`hooks`/`config` WITH `build_into` set → worktree-isolated, same
+  unconditional guarantee as python (PRD-build-shell-worktree-isolation):
+  `scripts/worktree-extend.sh add <build_into> <slug>` before any write,
+  cwd = the printed worktree path for every edit, `scripts/worktree-extend.sh
+  land <build_into> <slug>` at the PRD's stopping point. `land` exits 4 on a
+  dirty `build_into` default-branch checkout (no mutation, retry next tick)
+  and exits 5 when the default branch advanced since `add` and the resulting
+  rebase conflicts (branch kept intact, retry next tick) — see
+  `scripts/worktree-extend.sh`'s own header for the full add/land contract.
+  `shell`/`hooks`/`config` WITHOUT `build_into` (a new-repo PRD, nothing
+  shared to isolate from) → direct edits, unchanged. `kernel-extend` →
+  hand-written C.
 
 ## Publish
 
