@@ -38,7 +38,7 @@
 #       bump if any, since `land` never touches manifest files). Prints the
 #       worktree path on stdout.
 #
-#   land <repo> <slug>
+#   land <repo> <slug> [--writer-build-into <path>]
 #       [rust-extend and python-cli/python-lib/python-agent, added
 #       PRD-build-python-worktree-isolation] SERIAL, same per-repo
 #       integration lock as `integrate` below (mutually exclusive with it —
@@ -58,6 +58,25 @@
 #       for EVERY python-extend PRD, solo or shared build_into — it is the
 #       python `wm-buildtree`-equivalent (SKILL.md Phase 3/4 python routing,
 #       "Worktree isolation" section).
+#
+#       `--writer-build-into <path>` (PRD-build-cross-repo-commit-gate
+#       requirement 2, optional/additive — omit it and this whole check is
+#       a no-op, byte-identical to pre-this-PRD behavior): when given AND
+#       <repo> is a registered gated target (`gated-targets.sh is-gated`
+#       — some OTHER rust-extend PRD's build_into) AND
+#       realpath(<path>) != realpath(<repo>) (a genuine cross-repo write —
+#       the calling PRD's own home repo differs from what it's committing
+#       into), `land` runs <repo>'s branch gate
+#       (`extend-gate.sh <worktree> --scope branch --slug <slug>`) on THIS
+#       worktree's HEAD before ever touching the default branch, and
+#       refuses (exit 8) on anything but pass/delta-pass, journaling
+#       `cross-repo-gate  refused  (writer=<slug> target=<repo>
+#       blocking=<producer>)` — or `cross-repo-gate  pass  (writer=<slug>
+#       target=<repo>)` when it clears. Runs BEFORE the integration lock
+#       is taken (the branch-scope gate holds its own per-branch lock, not
+#       the shared per-repo one, so this never contends with a same-repo
+#       `integrate`/`land`, and a slow gate never holds the shared lock
+#       for its wall time).
 #
 #   integrate [--project-root <rel>] <repo> <slug> <bump> <tldr-file>
 #       SERIAL. Takes the per-repo integration lock. Refuses if <repo>'s
@@ -464,24 +483,72 @@ print_burst_lane_path_reminder() {
 # mechanics, "does not redesign them"; touching cmd_integrate's internals
 # risks the rust-extend shared-target path this PRD must not regress.
 cmd_land() {
-  local no_rebase="" gated_at="" verdict_path=""
+  local no_rebase="" gated_at="" verdict_path="" writer_build_into=""
   local -a pos=()
   while [ $# -gt 0 ]; do
     case "${1:-}" in
       --no-rebase) no_rebase=1; shift ;;
       --gated-at)  gated_at="${2:?worktree-extend: --gated-at needs a value}"; shift 2 ;;
       --verdict)   verdict_path="${2:?worktree-extend: --verdict needs a value}"; shift 2 ;;
+      --writer-build-into) writer_build_into="${2:?worktree-extend: --writer-build-into needs a value}"; shift 2 ;;
       *) pos+=("${1:-}"); shift ;;
     esac
   done
   local repo="${pos[0]:-}" slug="${pos[1]:-}"
-  need "$repo" "usage: land [--no-rebase] [--gated-at <main sha> --verdict <path>] <repo> <slug>"; need "$slug" "missing slug"
+  need "$repo" "usage: land [--no-rebase] [--gated-at <main sha> --verdict <path>] [--writer-build-into <path>] <repo> <slug>"; need "$slug" "missing slug"
   local branch="autobuilder/$slug"
   local wt; wt="$(wt_path "$repo" "$slug")"
   # PRD-build-worktree-default-branch AC2: resolve the repo's REAL default
   # branch instead of hardcoding "main" — a stale local `main` left by an
   # earlier session must never be silently checked out and merged onto.
   local default; default="$(default_branch "$repo")"
+
+  # PRD-build-cross-repo-commit-gate requirement 2 (P0), AC2/AC3/AC5: a
+  # cross-repo write — this land's calling PRD has a DIFFERENT home repo
+  # (--writer-build-into) than <repo>, and <repo> is some OTHER rust-extend
+  # PRD's gated build_into — must pass <repo>'s own branch gate before it
+  # ever reaches the default branch. Omitting --writer-build-into (every
+  # pre-this-PRD caller, and every same-repo land) reproduces prior
+  # behavior exactly: no gate call, no journal line (AC5). Run BEFORE the
+  # integration lock below — see this subcommand's own doc comment.
+  if [ -n "$writer_build_into" ]; then
+    local gt_sh; gt_sh="$(dirname "$0")/gated-targets.sh"
+    if [ -x "$gt_sh" ] && "$gt_sh" is-gated "$repo" >/dev/null 2>&1; then
+      local writer_rp repo_rp
+      writer_rp="$(realpath -q "$writer_build_into" 2>/dev/null || printf '%s' "$writer_build_into")"
+      repo_rp="$(realpath -q "$repo" 2>/dev/null || printf '%s' "$repo")"
+      if [ "$writer_rp" != "$repo_rp" ]; then
+        [ -d "$wt" ] || die 2 "cross-repo-gate: no worktree $wt to gate (run 'add' first)"
+        local eg_sh; eg_sh="$(dirname "$0")/extend-gate.sh"
+        local eg_out eg_rc
+        eg_out="$("$eg_sh" "$wt" --scope branch --slug "$slug" 2>&1)"; eg_rc=$?
+        local vpath="$wt/target/autobuilder/last-verdict.json"
+        local blocking=""
+        if [ "$eg_rc" -ne 0 ]; then
+          if [ -f "$vpath" ] && command -v jq >/dev/null 2>&1; then
+            blocking="$(jq -r '((.new_blocks // []) + (.inherited_blocks // [])) | map(select(. != "")) | join(",")' "$vpath" 2>/dev/null)"
+          fi
+          [ -n "$blocking" ] || blocking="unknown"
+        fi
+        local xjournal="${WORKTREE_EXTEND_JOURNAL:-$HOME/brain/journal/build/$(date -u +%Y-%m-%d).md}"
+        if [ -r "$(dirname "$0")/isolation-guard.sh" ]; then
+          # shellcheck source=isolation-guard.sh
+          source "$(dirname "$0")/isolation-guard.sh"
+          isolation_guard_path "$xjournal" "worktree-extend.sh"
+        fi
+        mkdir -p "$(dirname "$xjournal")"
+        if [ "$eg_rc" -ne 0 ]; then
+          printf '%s  cross-repo-gate  refused  (writer=%s target=%s blocking=%s)\n' \
+            "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$slug" "$(basename "$repo")" "$blocking" >>"$xjournal"
+          echo "worktree-extend: cross-repo-gate refused for $slug -> $(basename "$repo"): $eg_out" >&2
+          die 8 "cross-repo-gate refused: $slug -> $(basename "$repo") (blocking=$blocking)"
+        fi
+        printf '%s  cross-repo-gate  pass  (writer=%s target=%s)\n' \
+          "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$slug" "$(basename "$repo")" >>"$xjournal"
+      fi
+    fi
+  fi
+
   # Same per-repo integration lock file as cmd_integrate: land and integrate
   # against the same repo are mutually exclusive, language-agnostic.
   # PRD-extend-gate-lock-cloexec convention: no cargo is invoked in this

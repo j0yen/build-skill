@@ -33,6 +33,23 @@
 #               files not necessarily visible to git in a worktree-relative
 #               sense can pass its own `changed: <paths>` stdout line
 #               through here instead).
+#   --writer-slug   The PRD slug making this push (for the cross-repo-gate
+#               journal line's `writer=` field only, PRD-build-cross-repo-
+#               commit-gate). Purely cosmetic — omitting it just leaves
+#               that field `writer=unknown`; the gated-repo check itself
+#               (below) runs regardless.
+#
+# Gated-repo branch-verdict check (PRD-build-cross-repo-commit-gate
+# requirement 3): when <repo> is registered as some OTHER rust-extend
+# PRD's build_into (`gated-targets.sh is-gated`), a green CI-equivalent
+# delta alone is not enough — this push also requires a FRESH branch-gate
+# verdict (pass/delta-pass, from <repo>/target/autobuilder/last-verdict.json)
+# for the EXACT head being pushed. Missing, stale (different head), or
+# `block` all refuse (exit 1) with a `cross-repo-gate  refused  (writer=…
+# target=… blocking=…)` journal line, BEFORE the CI-equivalent machinery
+# below ever runs — never treated as green by omission. A repo that isn't
+# a registered gated target is entirely unaffected (this whole check is a
+# no-op for it, same as today).
 #
 # Delta -> check resolution: reads <repo>/.buildloop/ci-equivalent.toml,
 # a two-table TOML file:
@@ -73,7 +90,7 @@ source "$HERE/lib/journal.sh"
 CHECK_TIMEOUT_SECS="${MAIN_PUSH_GATE_TIMEOUT:-900}"   # 15 minutes (AC9)
 
 usage() {
-  echo "usage: main-push-gate.sh <repo> [--gated <sha>] [--head <sha>] [--changed <paths>]" >&2
+  echo "usage: main-push-gate.sh <repo> [--gated <sha>] [--head <sha>] [--changed <paths>] [--writer-slug <slug>]" >&2
 }
 
 die() {
@@ -86,12 +103,14 @@ repo_arg=""
 gated_want=""
 head_want=""
 changed_override=""
+writer_slug=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --gated)   gated_want="${2:?main-push-gate: --gated needs a value}"; shift 2 ;;
-    --head)    head_want="${2:?main-push-gate: --head needs a value}"; shift 2 ;;
-    --changed) changed_override="${2:?main-push-gate: --changed needs a value}"; shift 2 ;;
+    --gated)       gated_want="${2:?main-push-gate: --gated needs a value}"; shift 2 ;;
+    --head)        head_want="${2:?main-push-gate: --head needs a value}"; shift 2 ;;
+    --changed)     changed_override="${2:?main-push-gate: --changed needs a value}"; shift 2 ;;
+    --writer-slug) writer_slug="${2:?main-push-gate: --writer-slug needs a value}"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     --) shift ;;
     -*) echo "main-push-gate: unknown flag $1" >&2; usage; exit 2 ;;
@@ -133,6 +152,46 @@ if [ -n "$head_want" ]; then
   head_resolved="$(git -C "$repo" rev-parse --verify "${head_want}^{commit}" 2>/dev/null || true)"
   [ -n "$head_resolved" ] || die 2 "--head $head_want does not resolve to a commit in $repo"
   head_now="$head_resolved"
+fi
+
+# --- gated-repo branch-verdict check (PRD-build-cross-repo-commit-gate ---
+# requirement 3, P0): when <repo> is itself registered as some OTHER
+# rust-extend PRD's build_into (gated-targets.sh is-gated), "CI green" on
+# the delta below is not enough — this push also needs a FRESH branch-gate
+# verdict (pass/delta-pass) for the EXACT head about to be pushed, read
+# from <repo>/target/autobuilder/last-verdict.json (the same cache file
+# worktree-extend.sh's cmd_land's gate_cache_transfer writes onto main
+# after a gated land — a routed, gated land already leaves this file
+# fresh; an unrouted commit, or any push whose last gate ran at a
+# different head, leaves it stale or absent). Missing file, mismatched
+# head, or a `block` verdict all refuse — never treated as green by
+# omission, same principle as the missing-ci-equivalent.toml case below.
+# Checked BEFORE the ci-equivalent delta machinery so a gated repo with no
+# fresh verdict is refused before spending any wall time on a cargo run.
+gated_targets_sh="$SKILL_DIR/scripts/gated-targets.sh"
+if [ -x "$gated_targets_sh" ] && "$gated_targets_sh" is-gated "$repo" >/dev/null 2>&1; then
+  branch_verdict_file="$repo/target/autobuilder/last-verdict.json"
+  branch_head="" branch_verdict=""
+  if [ -f "$branch_verdict_file" ] && command -v jq >/dev/null 2>&1; then
+    branch_head="$(jq -r '.head // .head_sha // empty' "$branch_verdict_file" 2>/dev/null)"
+    branch_verdict="$(jq -r '.verdict // empty' "$branch_verdict_file" 2>/dev/null)"
+  fi
+  writer="${writer_slug:-unknown}"
+  case "$branch_verdict" in
+    pass|delta-pass) branch_ok=true ;;
+    *) branch_ok=false ;;
+  esac
+  if [ "$branch_head" != "$head_now" ] || ! $branch_ok; then
+    blocking="unknown"
+    if [ -f "$branch_verdict_file" ] && command -v jq >/dev/null 2>&1; then
+      blocking="$(jq -r '((.new_blocks // []) + (.inherited_blocks // [])) | map(select(. != "")) | join(",")' "$branch_verdict_file" 2>/dev/null)"
+    fi
+    [ -n "$blocking" ] || blocking="unknown"
+    [ -z "$branch_head" ] && blocking="no-verdict"
+    journal_line "$(date -u +%Y-%m-%dT%H:%M:%SZ)  cross-repo-gate  refused  (writer=$writer target=$slug blocking=$blocking)"
+    die 1 "cross-repo-gate refused: $slug has no fresh pass/delta-pass branch-gate verdict for head ${head_now:0:7} (branch_head=${branch_head:-none} verdict=${branch_verdict:-none})"
+  fi
+  journal_line "$(date -u +%Y-%m-%dT%H:%M:%SZ)  cross-repo-gate  pass  (writer=$writer target=$slug)"
 fi
 
 # --- resolve gated sha ---------------------------------------------------
