@@ -75,6 +75,7 @@ SELFTEST_REGISTRY=(
   scripts/sccache-assert-selftest.sh
   scripts/sccache-unit-selftest.sh
   scripts/secret-store-selftest.sh
+  scripts/routepar-selftest.sh
 )
 
 usage() { echo "usage: run-selftests.sh <name-or-path>... | --all" >&2; exit 2; }
