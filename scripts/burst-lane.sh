@@ -3836,6 +3836,323 @@ run_pending_reality_check_if_gate_ready() {
   return 0
 }
 
+# ---- canary (PRD-build-burst-gate-canary-invariant, R1-R3/R5) -------------
+# `burst-lane.sh canary` proves the box passes the gate, in three variants,
+# against a fixed HEAD — see the PRD's TL;DR. THIS PASS implements the
+# canary command itself (head resolution, baseline, the three variants,
+# canary.json + journal) as a purely additive new subcommand: nothing here
+# is called from cmd_up/cmd_bake/cmd_enable/cmd_status yet (R6/R8 wiring and
+# the daily-cadence/divergence-confirmation state machine of R7 are later
+# chained steps — see the manifest's outcome text for what remains).
+#
+# Variant "delta" is NOT a fourth gate invocation. extend-gate.sh already
+# runs `gate-delta.sh verdict` against the repo's committed
+# agent/gate-baseline.json as part of EVERY --scope main gate (see its own
+# "delta verdict against the committed baseline" section) and caches the
+# result at <repo>/target/autobuilder/last-verdict.json. Re-running a full
+# gate a third time would blow the "<=1 gate wall + 2 min/variant" budget
+# (Non-functional); the delta variant instead reads that cache, which the
+# "main" variant's own run just wrote — this is exactly what Technical
+# considerations means by "the delta variant reuses it."
+CANARY_REPO="${BURST_LANE_CANARY_REPO:-${BURST_PROVE_MCPHOST_REPO:-$HOME/wintermute/mcphost}}"
+CANARY_GATE_LAUNCH="${BURST_LANE_CANARY_GATE_LAUNCH:-$HERE/gate-launch.sh}"
+CANARY_RECEIPT_DIFF="${BURST_LANE_CANARY_RECEIPT_DIFF:-$HERE/gate-receipt-diff.sh}"
+CANARY_GH="${BURST_LANE_GH:-gh}"
+CANARY_BASELINE_ROOT="$STATE_DIR/canary-baseline"
+CANARY_RUNS_ROOT="$STATE_DIR/canary-runs"
+
+# canary_repo_slug <repo> -> stdout "owner/name" from origin's URL, or empty.
+canary_repo_slug() {
+  local repo="$1" url
+  url="$(git -C "$repo" remote get-url origin 2>/dev/null)" || { printf ''; return 0; }
+  sed -E 's#^(git@github\.com:|https://github\.com/)##; s#\.git$##' <<<"$url"
+}
+
+# canary_gh_run <repo> <ref> -> stdout "<conclusion> <sha>" for the newest
+# COMPLETED run at <ref> ("none " when there is none, or gh/network fails —
+# fails closed to "not green" per R1, never treats a lookup failure as
+# green). Wraps `gh run list` behind $CANARY_GH so a selftest can point it
+# at a fixture script instead of the real gh CLI / network (same pattern
+# as gate-launch.sh's own overridable tool vars).
+canary_gh_run() {
+  local repo="$1" ref="$2" slug out
+  slug="$(canary_repo_slug "$repo")"
+  if [ -z "$slug" ]; then printf 'none \n'; return 0; fi
+  out="$("$CANARY_GH" run list --repo "$slug" --branch "$ref" --limit 1 \
+        --json conclusion,status,headSha 2>/dev/null)" || out=""
+  [ -n "$out" ] || out='[]'
+  python3 -c '
+import json, sys
+try:
+    rows = json.loads(sys.argv[1])
+except Exception:
+    rows = []
+if rows and rows[0].get("status") == "completed":
+    print(rows[0].get("conclusion") or "none", rows[0].get("headSha") or "")
+else:
+    print("none", "")
+' "$out"
+}
+
+# canary_resolve_head <repo> <operator_head> -> stdout "<sha> <source>" on
+# success (source is operator|green-main|last-green-tag); returns 1 with
+# nothing on stdout when neither main nor any tag is green (R1, AC9/AC11).
+# An explicit operator_head short-circuits with no CI lookup at all — the
+# operator is trusted to have named a real, known-good sha.
+canary_resolve_head() {
+  local repo="$1" operator_head="$2" concl sha
+  if [ -n "$operator_head" ]; then
+    printf '%s operator\n' "$operator_head"
+    return 0
+  fi
+  read -r concl sha < <(canary_gh_run "$repo" main)
+  if [ "$concl" = "success" ] && [ -n "$sha" ]; then
+    printf '%s green-main\n' "$sha"
+    return 0
+  fi
+  local tag
+  while IFS= read -r tag; do
+    [ -n "$tag" ] || continue
+    read -r concl sha < <(canary_gh_run "$repo" "$tag")
+    if [ "$concl" = "success" ] && [ -n "$sha" ]; then
+      printf '%s last-green-tag\n' "$sha"
+      return 0
+    fi
+  done < <(git -C "$repo" tag --sort=-creatordate 2>/dev/null)
+  return 1
+}
+
+# canary_diverged_lines <baseline_dir> <run_dir> -> stdout, one
+# "<producer> <local> <box> <route> DIVERGED" line per divergence (empty,
+# rc irrelevant, when there is no baseline or no receipts to compare — R2's
+# --no-baseline / missing-baseline cases must never report a divergence
+# against nothing).
+canary_diverged_lines() {
+  local baseline_dir="$1" run_dir="$2"
+  [ -n "$baseline_dir" ] && [ -d "$baseline_dir" ] || return 0
+  [ -n "$(ls -A "$run_dir" 2>/dev/null)" ] || return 0
+  "$CANARY_RECEIPT_DIFF" "$baseline_dir" "$run_dir" 2>/dev/null | awk '$NF=="DIVERGED"'
+  return 0
+}
+
+# canary_build_baseline <head_sha> <baseline_dir> — R2: a local --scope
+# main gate at that HEAD, nice -n 10, CARGO_BUDGET_TEST_THREADS=2 (never
+# BURST_LANE=1 — this IS the local baseline the box is compared against).
+canary_build_baseline() {
+  local head_sha="$1" baseline_dir="$2" ts rc=0
+  ts="$(now_epoch)"
+  journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  canary  baseline  building  (head=$head_sha)"
+  nice -n 10 env CARGO_BUDGET_TEST_THREADS=2 "$CANARY_GATE_LAUNCH" "$CANARY_REPO" \
+    --head "$head_sha" --scope main --slug "canary-baseline-$ts" --wait \
+    >/dev/null 2>&1 || rc=$?
+  mkdir -p "$baseline_dir"
+  cp -f "$CANARY_REPO"/target/autobuilder/receipts/*.json "$baseline_dir"/ 2>/dev/null || true
+  if [ -n "$(ls -A "$baseline_dir" 2>/dev/null)" ]; then
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  canary  baseline  built  (head=$head_sha rc=$rc)"
+  else
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  canary  baseline  failed  (head=$head_sha rc=$rc)"
+  fi
+}
+
+# canary_run_variant_main <head_sha> <baseline_dir> <baseline_state> <server_id>
+# -> stdout verdict (pass|block|diverged); sets CANARY_LAST_DIVERGED_LINES.
+canary_run_variant_main() {
+  local head_sha="$1" baseline_dir="$2" baseline_state="$3" server_id="$4"
+  local ts rc=0 verdict="pass" n_diverged=0
+  ts="$(now_epoch)"
+  BURST_LANE=1 "$CANARY_GATE_LAUNCH" "$CANARY_REPO" --head "$head_sha" --scope main \
+    --slug "canary-main-$ts" --wait >/dev/null 2>&1 || rc=$?
+  local run_dir="$CANARY_RUNS_ROOT/$ts-main/receipts"
+  mkdir -p "$run_dir"
+  cp -f "$CANARY_REPO"/target/autobuilder/receipts/*.json "$run_dir"/ 2>/dev/null || true
+  [ "$rc" -eq 0 ] || verdict="block"
+  local diverged_lines=""
+  if [ "$baseline_state" = "present" ]; then
+    diverged_lines="$(canary_diverged_lines "$baseline_dir" "$run_dir")"
+    [ -n "$diverged_lines" ] && verdict="diverged" && n_diverged="$(printf '%s\n' "$diverged_lines" | grep -c .)"
+  fi
+  CANARY_LAST_DIVERGED_LINES="$diverged_lines"
+  CANARY_LAST_RUN_DIR="$run_dir"
+  local receipts_n; receipts_n="$(find "$run_dir" -maxdepth 1 -name '*.json' 2>/dev/null | grep -c .)"
+  journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  canary  main  $verdict  (head=$head_sha receipts=$receipts_n diverged=$n_diverged route=burst:${server_id:-unknown})"
+  printf '%s\n' "$verdict"
+}
+
+# canary_run_variant_branch <head_sha> <baseline_dir> <baseline_state> <server_id>
+# -> stdout verdict (pass|block|diverged); sets CANARY_LAST_DIVERGED_LINES.
+# The throwaway branch/worktree is never pushed and is deleted after (R3,
+# Technical considerations).
+canary_run_variant_branch() {
+  local head_sha="$1" baseline_dir="$2" baseline_state="$3" server_id="$4"
+  local ts branch wt rc=0 verdict="pass" n_diverged=0 branch_head
+  ts="$(now_epoch)"
+  branch="canary/$ts"
+  wt="$(mktemp -u "${TMPDIR:-/tmp}/burst-canary-branch.XXXXXX")"
+  if ! git -C "$CANARY_REPO" worktree add -b "$branch" "$wt" "$head_sha" >/dev/null 2>&1; then
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  canary  branch  block  (head=$head_sha cause=worktree-add-failed)"
+    CANARY_LAST_DIVERGED_LINES=""
+    printf 'block\n'
+    return 0
+  fi
+  git -C "$wt" commit --allow-empty -m "canary: throwaway commit for --scope branch" >/dev/null 2>&1
+  branch_head="$(git -C "$wt" rev-parse HEAD 2>/dev/null || echo "$head_sha")"
+  BURST_LANE=1 "$CANARY_GATE_LAUNCH" "$wt" --head "$branch_head" --scope branch \
+    --slug "canary-branch-$ts" --wait >/dev/null 2>&1 || rc=$?
+  local run_dir="$CANARY_RUNS_ROOT/$ts-branch/receipts"
+  mkdir -p "$run_dir"
+  cp -f "$wt"/target/autobuilder/receipts/*.json "$run_dir"/ 2>/dev/null || true
+  [ "$rc" -eq 0 ] || verdict="block"
+  local diverged_lines=""
+  if [ "$baseline_state" = "present" ]; then
+    diverged_lines="$(canary_diverged_lines "$baseline_dir" "$run_dir")"
+    [ -n "$diverged_lines" ] && verdict="diverged" && n_diverged="$(printf '%s\n' "$diverged_lines" | grep -c .)"
+  fi
+  CANARY_LAST_DIVERGED_LINES="$diverged_lines"
+  CANARY_LAST_RUN_DIR="$run_dir"
+  local receipts_n; receipts_n="$(find "$run_dir" -maxdepth 1 -name '*.json' 2>/dev/null | grep -c .)"
+  journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  canary  branch  $verdict  (head=$branch_head receipts=$receipts_n diverged=$n_diverged route=burst:${server_id:-unknown})"
+  git -C "$CANARY_REPO" worktree remove --force "$wt" >/dev/null 2>&1 || rm -rf "$wt"
+  git -C "$CANARY_REPO" branch -D "$branch" >/dev/null 2>&1 || true
+  printf '%s\n' "$verdict"
+}
+
+# canary_run_variant_delta <head_sha> <server_id> -> stdout verdict
+# (pass|delta-pass|block|unknown), reading the "main" variant's own
+# last-verdict.json cache — see the header comment above for why this is
+# not a fourth gate invocation.
+canary_run_variant_delta() {
+  local head_sha="$1" server_id="$2"
+  local verdict_file="$CANARY_REPO/target/autobuilder/last-verdict.json"
+  local baseline_state="absent" verdict="unknown"
+  if git -C "$CANARY_REPO" show HEAD:agent/gate-baseline.json >/dev/null 2>&1; then
+    baseline_state="present"
+  fi
+  if [ -n "$JQ" ] && [ -f "$verdict_file" ]; then
+    verdict="$("$JQ" -r '.verdict // "unknown"' "$verdict_file" 2>/dev/null)"
+    [ -n "$verdict" ] || verdict="unknown"
+  fi
+  journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  canary  delta  $verdict  (head=$head_sha baseline=$baseline_state route=burst:${server_id:-unknown})"
+  printf '%s\n' "$verdict"
+}
+
+# canary_write_state_json <out_file> <head> <head_source> <ts> <image_id>
+# <baseline_dir> <verdict_main> <verdict_branch> <verdict_delta>
+# <diverged_ndjson> — R5's canary.json, written atomically (tmp + mv).
+canary_write_state_json() {
+  local out_file="$1" head="$2" head_source="$3" ts="$4" image_id="$5" \
+        baseline_dir="$6" v_main="$7" v_branch="$8" v_delta="$9" diverged_ndjson="${10}"
+  mkdir -p "$(dirname "$out_file")"
+  local tmp; tmp="$(mktemp "$(dirname "$out_file")/.canary.XXXXXX")"
+  python3 -c '
+import json, sys
+(head, head_source, ts, image_id, baseline_dir, v_main, v_branch, v_delta,
+ diverged_ndjson, out_path) = sys.argv[1:11]
+diverged = []
+for line in diverged_ndjson.splitlines():
+    parts = line.split()
+    if len(parts) < 5:
+        continue
+    diverged.append({"producer": parts[0], "local": parts[1], "box": parts[2], "route": parts[3]})
+d = {
+    "head": head,
+    "head_source": head_source,
+    "image_id": image_id,
+    "ts": ts,
+    "variants": {"main": v_main, "branch": v_branch, "delta": v_delta},
+    "diverged": diverged,
+    "baseline_dir": baseline_dir,
+}
+json.dump(d, open(out_path, "w"), indent=2, sort_keys=True)
+' "$head" "$head_source" "$ts" "$image_id" "$baseline_dir" "$v_main" "$v_branch" "$v_delta" \
+  "$diverged_ndjson" "$tmp"
+  mv -f "$tmp" "$out_file"
+}
+
+cmd_canary() {
+  local head="" variants="main,branch,delta" no_baseline=false
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --head) head="${2:?canary: --head needs a value}"; shift 2 ;;
+      --variants) variants="${2:?canary: --variants needs a value}"; shift 2 ;;
+      --no-baseline) no_baseline=true; shift ;;
+      *) echo "usage: burst-lane.sh canary [--head <sha>] [--variants main,branch,delta] [--no-baseline]" >&2; exit 2 ;;
+    esac
+  done
+
+  mkdir -p "$BOX_STATE_DIR" "$CANARY_BASELINE_ROOT" "$CANARY_RUNS_ROOT"
+
+  # Non-functional: never more than one canary in flight per box.
+  local canary_lock="$BOX_STATE_DIR/canary.inflight.lock"
+  exec {_canary_lock_fd}>"$canary_lock"
+  if ! flock -n "$_canary_lock_fd"; then
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  canary  refused  (cause=inflight)"
+    echo "canary refused (cause=inflight)" >&2
+    exit 3
+  fi
+  printf 'pid=%s\nstart_epoch=%s\n' "$$" "$(now_epoch)" > "$BOX_STATE_DIR/canary.inflight"
+  trap 'rm -f "$BOX_STATE_DIR/canary.inflight"' EXIT
+
+  local resolved head_sha head_source
+  if ! resolved="$(canary_resolve_head "$CANARY_REPO" "$head")"; then
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  canary  refused  (cause=no-green-head)"
+    echo "canary refused (cause=no-green-head)" >&2
+    exit 4
+  fi
+  read -r head_sha head_source <<<"$resolved"
+
+  local server_id; server_id="$(state_read server_id)"
+  local image_id; image_id="$(state_read image_id)"
+  local box_dir="$STATE_DIR/boxes/${server_id:-unknown}"
+  mkdir -p "$box_dir"
+
+  local baseline_dir="" baseline_state="absent"
+  if [ "$no_baseline" = true ]; then
+    baseline_state="skipped"
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  canary  baseline=skipped  (head=$head_sha)"
+  else
+    baseline_dir="$CANARY_BASELINE_ROOT/$head_sha/receipts"
+    if [ ! -d "$baseline_dir" ] || [ -z "$(ls -A "$baseline_dir" 2>/dev/null)" ]; then
+      canary_build_baseline "$head_sha" "$baseline_dir"
+    fi
+    [ -d "$baseline_dir" ] && [ -n "$(ls -A "$baseline_dir" 2>/dev/null)" ] && baseline_state="present"
+  fi
+
+  local -a want=()
+  IFS=',' read -r -a want <<<"$variants"
+
+  local v_main="skipped" v_branch="skipped" v_delta="skipped"
+  local diverged_ndjson="" w
+  for w in "${want[@]}"; do
+    case "$w" in
+      main)
+        v_main="$(canary_run_variant_main "$head_sha" "$baseline_dir" "$baseline_state" "$server_id")"
+        [ -n "$CANARY_LAST_DIVERGED_LINES" ] && diverged_ndjson="$diverged_ndjson$CANARY_LAST_DIVERGED_LINES"$'\n'
+        ;;
+      branch)
+        v_branch="$(canary_run_variant_branch "$head_sha" "$baseline_dir" "$baseline_state" "$server_id")"
+        [ -n "$CANARY_LAST_DIVERGED_LINES" ] && diverged_ndjson="$diverged_ndjson$CANARY_LAST_DIVERGED_LINES"$'\n'
+        ;;
+      delta)
+        v_delta="$(canary_run_variant_delta "$head_sha" "$server_id")"
+        ;;
+      *) echo "canary: unknown variant '$w' (ignored)" >&2 ;;
+    esac
+  done
+
+  canary_write_state_json "$box_dir/canary.json" "$head_sha" "$head_source" "$(now_iso)" \
+    "${image_id:-unknown}" "$baseline_dir" "$v_main" "$v_branch" "$v_delta" "$diverged_ndjson"
+  cp -f "$box_dir/canary.json" "$STATE_DIR/canary.json" 2>/dev/null || true
+
+  rm -f "$BOX_STATE_DIR/canary.inflight"
+  trap - EXIT
+  flock -u "$_canary_lock_fd" 2>/dev/null || true
+
+  case " $v_main $v_branch $v_delta " in
+    *" block "*|*" diverged "*) exit 1 ;;
+    *) exit 0 ;;
+  esac
+}
+
 cmd_up() {
   if ! burst_configured; then
     echo "burst: refused — not configured (RedBaron-local policy); set BUILD_BURST_ENABLED=1 to allow" >&2
@@ -9970,6 +10287,7 @@ main() {
     evidence)  cmd_evidence "$@" ;;
     enable)    cmd_enable "$@" ;;
     disable)   cmd_disable "$@" ;;
+    canary)    cmd_canary "$@" ;;
     # Undocumented/hidden — PRD-build-burst-unprivileged-user requirement 1:
     # a pure read-only print of the resolved remote identity/paths, no ssh,
     # no filesystem writes outside $STATE_DIR's own mkdir at file top. Exists
@@ -9992,6 +10310,20 @@ main() {
     _debug-toolchain-fp)
       toolchain_fingerprint
       exit 0
+      ;;
+    # Undocumented/hidden — PRD-build-burst-gate-canary-invariant R1: a
+    # direct call into canary_resolve_head() so a selftest can exercise
+    # the green-main/last-green-tag/no-green-head logic against a fixture
+    # repo + fixture $BURST_LANE_GH without running the rest of `canary`
+    # (baseline build, real gate launches) at all. Same rationale as
+    # _debug-remote-config/_debug-toolchain-fp above.
+    _debug-canary-resolve-head)
+      _dcrh_repo="${1:?usage: _debug-canary-resolve-head <repo> [--head <sha>]}"
+      shift
+      _dcrh_head=""
+      if [ "${1:-}" = "--head" ]; then _dcrh_head="${2:-}"; fi
+      canary_resolve_head "$_dcrh_repo" "$_dcrh_head"
+      exit $?
       ;;
     *) usage ;;
   esac
