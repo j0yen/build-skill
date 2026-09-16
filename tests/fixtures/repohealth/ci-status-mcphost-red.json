@@ -1,0 +1,9 @@
+{
+  "generated_at": "2026-09-15T07:50:00Z",
+  "owner": "j0yen",
+  "rows": {
+    "mcphost": {"conclusion": "failure", "red_since": "2026-09-15T06:59:59Z", "head_sha": "deadbeef1", "run_id": 998877, "created_at": "2026-09-15T06:55:00Z", "failing_job": "ci-checks"},
+    "agorabus": {"conclusion": "success", "red_since": null, "head_sha": "aaa111", "run_id": 111222, "created_at": "2026-09-15T05:00:00Z", "failing_job": null},
+    "summa": {"conclusion": "success", "red_since": null, "head_sha": "bbb222", "run_id": 111223, "created_at": "2026-09-15T05:10:00Z", "failing_job": null}
+  }
+}

@@ -1,0 +1,9 @@
+[Unit]
+Description=Refresh state/ci-status.json for repo-health.sh (PRD-build-repo-health-invariants)
+
+[Service]
+Type=oneshot
+Environment=HOME=/home/jsy
+Environment=PATH=/home/jsy/.local/bin:/home/jsy/.cargo/bin:/home/jsy/.npm-global/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/home/jsy/.claude/skills/build/scripts/ci-status.sh --json
+TimeoutStartSec=120

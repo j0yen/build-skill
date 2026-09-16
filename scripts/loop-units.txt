@@ -23,3 +23,8 @@ RedBaron prd-sync.timer
 RedBaron claude-vibeloop-measure.timer
 RedBaron burst-idle-guard.timer
 RedBaron agorabus-reap.timer
+# PRD-build-repo-health-invariants requirement 6/11: refreshes
+# state/ci-status.json every 10 minutes so repo-health.sh's main-ci-red
+# rule reads a file, never `gh` directly. Unit source:
+# systemd/ci-status.{service,timer} in this repo.
+RedBaron ci-status.timer
