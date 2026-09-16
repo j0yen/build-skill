@@ -21,7 +21,14 @@ selslot_guard depwait 0 "" >/dev/null 2>&1 || true
 # hide behind a loose containment check.
 grep -qxF 'select: depwait gated (depends-on) slot-not-consumed' "$SELECT_GUARD_JOURNAL" \
   || { echo "FAIL AC8: journal line is not a literal match" >&2; cat "$SELECT_GUARD_JOURNAL" >&2 2>/dev/null; exit 1; }
-lines=$(wc -l < "$SELECT_GUARD_JOURNAL")
-[ "$lines" -eq 1 ] || { echo "FAIL AC8: expected exactly one journal line, got $lines" >&2; exit 1; }
+# Counts only `select: ` lines, not the file's total line count —
+# PRD-build-journal-single-writer requirement 1 routed select-guard.sh
+# through the shared journal_line, which appends its own one-time
+# `journal  legacy-env  (name=SELECT_GUARD_JOURNAL)` notice the first
+# time this process sees that override active (scripts/lib/journal.sh);
+# that notice is a legitimate, separate line, not a near-miss duplicate
+# of the gated verdict this AC actually guards against.
+lines=$(grep -c '^select: ' "$SELECT_GUARD_JOURNAL")
+[ "$lines" -eq 1 ] || { echo "FAIL AC8: expected exactly one select: journal line, got $lines" >&2; cat "$SELECT_GUARD_JOURNAL" >&2 2>/dev/null; exit 1; }
 
 echo "ok  AC8: journal line matches the exact contract format, literally"

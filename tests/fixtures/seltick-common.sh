@@ -19,8 +19,17 @@ set -uo pipefail
 SELTICK_HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 ST="$SELTICK_HERE/../scripts/select-tick.sh"
 SELTICK_JQ="${JQ:-$(command -v jq 2>/dev/null || echo /usr/bin/jq)}"
+# shellcheck source=../../scripts/lib/isolation.sh
+source "$SELTICK_HERE/../scripts/lib/isolation.sh"
 
 seltick_setup() {
+  # PRD-build-journal-single-writer requirement 3: structural isolation
+  # BEFORE select-tick.sh (or select-guard.sh, which it shells out to
+  # internally and which every seltick_ac*.sh file here never isolated on
+  # its own — SELECT_TICK_JOURNAL below only covers select-tick.sh's OWN
+  # journal, a distinct env var) ever runs. This is the exact gap the
+  # 2026-09-15 leak's five-whys named these files for.
+  selftest_init || { echo "seltick-common: selftest_init failed" >&2; exit 1; }
   ROOT=$(mktemp -d "${TMPDIR:-/tmp}/seltick-ac.XXXXXX")
   trap 'rm -rf "$ROOT"' EXIT
   mkdir -p "$ROOT/build-queue" "$ROOT/built-prds" "$ROOT/visions" "$ROOT/state"

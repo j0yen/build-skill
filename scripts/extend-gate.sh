@@ -181,6 +181,8 @@ set -uo pipefail
 BUILD_SCRIPTS="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=lib/probe.sh
 source "$BUILD_SCRIPTS/lib/probe.sh"
+# shellcheck source=lib/journal.sh
+source "$BUILD_SCRIPTS/lib/journal.sh"
 
 # --- PATH order guard (P0 requirement 1, PRD-build-gate-cargo-route-attest;
 #     rewritten under PRD-build-cargo-route-precedence) -------------------
@@ -682,7 +684,13 @@ base_ref="$(resolve_base)"
 # silently exiting — can use the exact same journal file and default-deny
 # isolation guard a full run uses. Nothing between the old and new location
 # reads $journal, so this is a pure reorder.
-journal="${EXTEND_GATE_JOURNAL:-$HOME/brain/journal/build/$(date -u +%Y-%m-%d).md}"
+# PRD-build-journal-single-writer requirement 1: this stays the one place
+# extend-gate.sh resolves its journal path (every append below routes
+# through journal_line --file "$journal" instead of a private printf >>);
+# the default now composes off journal_root() instead of a literal
+# brain/journal path so BUILD_JOURNAL_ROOT redirects it too.
+# EXTEND_GATE_JOURNAL remains a legacy alias (scripts/lib/journal.sh).
+journal="${EXTEND_GATE_JOURNAL:-$(journal_root)/$(date -u +%Y-%m-%d).md}"
 if [ -r "$BUILD_SCRIPTS/isolation-guard.sh" ]; then
   # shellcheck source=isolation-guard.sh
   source "$BUILD_SCRIPTS/isolation-guard.sh"
@@ -837,8 +845,8 @@ if ! $record_baseline && ! $force && [ -f "$cache_file" ] && ! jq -e . "$cache_f
   # through the tree/hash checks below as an ordinary, silent miss — the
   # gate below still runs fresh either way, but now with a named cause
   # instead of an empty-verdict path nobody can explain afterward.
-  printf '%s  gate  %s  verdict-cache  corrupt  (path=%s)\n' \
-    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(basename "$repo")" "$cache_file" >>"$journal"
+  journal_line --file "$journal" "$(printf '%s  gate  %s  verdict-cache  corrupt  (path=%s)' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(basename "$repo")" "$cache_file")"
   rm -f "$cache_file" 2>/dev/null || true
 fi
 if ! $record_baseline && ! $force && [ -f "$cache_file" ]; then
@@ -886,11 +894,11 @@ if ! $record_baseline && ! $force && [ -f "$cache_file" ]; then
       cached_from_slug="$(jq -r '.slug // empty' "$cache_file" 2>/dev/null || true)"
       _cache_crate_name="$(basename "$repo")"
       if [ -n "$cached_from_slug" ]; then
-        printf '%s  gate  %s  %s  (cached tree=%s from=%s slug=%s)\n' \
-          "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$_cache_crate_name" "$cached_verdict" "$tree_now" "$cached_from_scope" "$cached_from_slug" >>"$journal"
+        journal_line --file "$journal" "$(printf '%s  gate  %s  %s  (cached tree=%s from=%s slug=%s)' \
+          "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$_cache_crate_name" "$cached_verdict" "$tree_now" "$cached_from_scope" "$cached_from_slug")"
       else
-        printf '%s  gate  %s  %s  (cached tree=%s from=%s)\n' \
-          "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$_cache_crate_name" "$cached_verdict" "$tree_now" "$cached_from_scope" >>"$journal"
+        journal_line --file "$journal" "$(printf '%s  gate  %s  %s  (cached tree=%s from=%s)' \
+          "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$_cache_crate_name" "$cached_verdict" "$tree_now" "$cached_from_scope")"
       fi
       exit "$cached_rc"
     fi
@@ -938,8 +946,8 @@ if [ -x "$BURST_LANE_SH" ]; then
   else
     route_intended="unknown"
     route_host="unknown"
-    printf '%s  gate  %s  route  unknown  (cause=probe-failed)\n' \
-      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$crate_name" >>"$journal"
+    journal_line --file "$journal" "$(printf '%s  gate  %s  route  unknown  (cause=probe-failed)' \
+      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$crate_name")"
   fi
   # Structural check (ties requirement 1's PATH guard to requirement 4's
   # postcondition): does a `cargo` call under THIS process's own $PATH
@@ -1325,7 +1333,7 @@ else
   # (and did) leak selftest fixture lines into the real shared journal.
   # Fixed in passing (PRD-build-gate-before-land requirement 7 found it via
   # the same isolation gap it was closing for select-guard.sh).
-  echo "$(date -u +%FT%TZ)  gate  ${repo##*/}  reviewer-skipped  (blocks=${#blocking_notes[@]} head=${head_now:0:7})" >> "$journal"
+  journal_line --file "$journal" "$(date -u +%FT%TZ)  gate  ${repo##*/}  reviewer-skipped  (blocks=${#blocking_notes[@]} head=${head_now:0:7})"
   record_phase reviewer 0 skip
 fi
 _phase_t0=$(date +%s)
@@ -1346,8 +1354,8 @@ if [ -z "$summary" ]; then
   # own rc and the last non-blank line of its output, before that
   # placeholder is ever substituted in.
   _gs_err_line="$(printf '%s\n' "$gate_out" | grep -v '^[[:space:]]*$' | tail -n1 | cut -c1-160)"
-  printf '%s  gate  %s  gate-summary  missing  (rc=%s err="%s")\n' \
-    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(basename "$repo")" "$gate_rc" "$_gs_err_line" >>"$journal"
+  journal_line --file "$journal" "$(printf '%s  gate  %s  gate-summary  missing  (rc=%s err="%s")' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(basename "$repo")" "$gate_rc" "$_gs_err_line")"
 fi
 
 # --- cargo-route postcondition (P0 requirement 4, AC4) --------------------
@@ -1489,12 +1497,12 @@ if $record_baseline; then
   # (requirement 1, AC1).
   scope_prefix=""
   [ "$scope" = branch ] && scope_prefix="scope=branch slug=$slug "
-  printf '%s  gate  %s  record-baseline  (%shead=%s base=%s %s wall=%ss %s lock_wait=%ss cargo=burst:%s/local:%s)\n' \
+  journal_line --file "$journal" "$(printf '%s  gate  %s  record-baseline  (%shead=%s base=%s %s wall=%ss %s lock_wait=%ss cargo=burst:%s/local:%s)' \
     "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$crate_name" "$scope_prefix" "$head_now" "$journal_base_field" \
-    "${summary:-gate: no-summary-line}" "$wall" "$phases_field" "$lock_wait" "$route_burst_n" "$route_local_n" >>"$journal"
+    "${summary:-gate: no-summary-line}" "$wall" "$phases_field" "$lock_wait" "$route_burst_n" "$route_local_n")"
   if $route_mismatch; then
-    printf '%s  gate  route-mismatch  (intended=%s burst=%s local=%s cause=%s)\n' \
-      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$route_intended" "$route_burst_n" "$route_local_n" "${route_first_local_cause:-unknown}" >>"$journal"
+    journal_line --file "$journal" "$(printf '%s  gate  route-mismatch  (intended=%s burst=%s local=%s cause=%s)' \
+      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$route_intended" "$route_burst_n" "$route_local_n" "${route_first_local_cause:-unknown}")"
   fi
   exit 0
 fi
@@ -1545,16 +1553,16 @@ fi
 # stayed local.
 scope_prefix=""
 [ "$scope" = branch ] && scope_prefix="scope=branch slug=$slug "
-printf '%s  gate  %s  %s  (%shead=%s base=%s %s blocking=%s wall=%ss %s lock_wait=%ss cargo=burst:%s/local:%s)%s\n' \
+journal_line --file "$journal" "$(printf '%s  gate  %s  %s  (%shead=%s base=%s %s blocking=%s wall=%ss %s lock_wait=%ss cargo=burst:%s/local:%s)%s' \
   "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$crate_name" "$outcome" "$scope_prefix" "$head_now" "$journal_base_field" \
   "${summary:-gate: no-summary-line}" "${blockers_csv:-none}" "$wall" "$phases_field" "$lock_wait" \
-  "$route_burst_n" "$route_local_n" "$journal_suffix" >>"$journal"
+  "$route_burst_n" "$route_local_n" "$journal_suffix")"
 
 # A route mismatch is a journaled guard event, never a block (Non-goals) —
 # the verdict computed above is unaffected either way (requirement 4, AC4).
 if $route_mismatch; then
-  printf '%s  gate  route-mismatch  (intended=%s burst=%s local=%s cause=%s)\n' \
-    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$route_intended" "$route_burst_n" "$route_local_n" "${route_first_local_cause:-unknown}" >>"$journal"
+  journal_line --file "$journal" "$(printf '%s  gate  route-mismatch  (intended=%s burst=%s local=%s cause=%s)' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$route_intended" "$route_burst_n" "$route_local_n" "${route_first_local_cause:-unknown}")"
 fi
 
 # --- write the verdict cache (P1) — every full run, pass/delta-pass/block

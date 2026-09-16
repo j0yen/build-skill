@@ -14,6 +14,15 @@ LC="$HERE/../scripts/lane-claim.sh"
 MANIFEST_SET="$HERE/../scripts/manifest-set.sh"
 [ -x "$LC" ] || { echo "ac8: lane-claim.sh not executable" >&2; exit 2; }
 
+# PRD-build-journal-single-writer requirement 3: structural isolation
+# before lane-claim.sh (sourced below) or manifest-set.sh (invoked via
+# lane-claim.sh's own reclaim, at the bottom of this file) run — this
+# file already scoped lane-claim.sh's own JOURNAL_DIR per-call below, but
+# never covered manifest-set.sh's separate JOURNAL default at all.
+# shellcheck source=../scripts/lib/isolation.sh
+source "$HERE/../scripts/lib/isolation.sh"
+selftest_init || { echo "ac8: selftest_init failed" >&2; exit 2; }
+
 fail=0
 expect() {
   local label="$1" cond="$2"

@@ -20,8 +20,25 @@ set -uo pipefail
 SELSLOT_HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 SG="$SELSLOT_HERE/../scripts/select-guard.sh"
 DG="$SELSLOT_HERE/../scripts/lib/depends-gate.sh"
+# shellcheck source=../../scripts/lib/isolation.sh
+source "$SELSLOT_HERE/../scripts/lib/isolation.sh"
 
 selslot_setup() {
+  # PRD-build-journal-single-writer requirement 3: structural isolation
+  # (BUILD_TEST=1, HOME/STATE_DIR rerouted, isolation-guard.sh armed)
+  # alongside the explicit SELECT_GUARD_JOURNAL override below —
+  # belt-and-suspenders so any OTHER script select-guard.sh's call graph
+  # reaches is covered too, not just the one override name this file
+  # already knew about. BUILD_JOURNAL_ROOT is deliberately unset right
+  # back off again: scripts/lib/journal.sh gives it unconditional
+  # priority over every legacy alias (including SELECT_GUARD_JOURNAL,
+  # "never consulted when BUILD_JOURNAL_ROOT itself is set"), and this
+  # fixture family's own ACs (selslot_ac4/ac8) assert against the exact
+  # $SELECT_GUARD_JOURNAL file content byte-for-byte — leaving
+  # BUILD_JOURNAL_ROOT set would silently redirect select-guard.sh's
+  # writes to journal_root() instead and break those assertions.
+  selftest_init || { echo "selslot-common: selftest_init failed" >&2; exit 1; }
+  unset BUILD_JOURNAL_ROOT
   ROOT=$(mktemp -d "${TMPDIR:-/tmp}/selslot-ac.XXXXXX")
   trap 'rm -rf "$ROOT"' EXIT
   git init -q --bare "$ROOT/origin.git"

@@ -65,7 +65,9 @@ SKILL_DIR="${BUILD_SKILL_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 STATE_DIR="${BUILD_STATE_DIR:-$SKILL_DIR/state}"
 LOCKFILE="${TICK_LOCK_FILE:-$STATE_DIR/tick.lock}"
 HOLDERFILE="${TICK_LOCK_HOLDER_FILE:-$LOCKFILE.holder}"
-JOURNAL="${TICK_RUN_JOURNAL:-$HOME/brain/journal/build/$(date -u +%F).md}"
+# shellcheck source=lib/journal.sh
+source "$SKILL_DIR/scripts/lib/journal.sh"
+JOURNAL="${TICK_RUN_JOURNAL:-$(journal_root)/$(date -u +%F).md}"
 CLAUDE_BIN="${CLAUDE_BIN:-$HOME/.local/bin/claude}"
 BOOT_ID_FILE="${TICK_RUN_BOOT_ID_FILE:-/proc/sys/kernel/random/boot_id}"
 
@@ -73,9 +75,13 @@ now_iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 now_epoch() { date -u +%s; }
 boot_id() { cat "$BOOT_ID_FILE" 2>/dev/null || echo unknown; }
 
+# PRD-build-journal-single-writer requirement 1: routed through the one
+# journal_line instead of a private printf >>. TICK_RUN_JOURNAL is now a
+# legacy alias journal_line itself understands (scripts/lib/journal.sh),
+# so this still honors the same override every existing ticklock_* /
+# pin_ac* selftest sets.
 journal() {
-  mkdir -p "$(dirname "$JOURNAL")" 2>/dev/null || true
-  printf '%s  %s\n' "$(now_iso)" "$1" >> "$JOURNAL"
+  journal_line --file "$JOURNAL" "$(printf '%s  %s' "$(now_iso)" "$1")"
 }
 
 usage() { echo "usage: tick-run.sh [--status|--check-held] [-- <cmd...>]" >&2; exit 2; }

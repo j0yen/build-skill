@@ -12,6 +12,13 @@
 # leak reproduction (select-guard.sh same-target-admit against a
 # /tmp/does-not-matter-ac2 fixture target).
 
+# lint-journal-fixtures:tests-exempt PRD-build-journal-single-writer — this
+# file's whole job is to read the REAL, un-isolated $HOME/brain journal
+# line count before/after running two tests through run-selftests.sh (the
+# runner isolates ITSELF internally); sourcing the selftest_init prelude
+# here would override $HOME before that count is ever taken, defeating
+# the one assertion this file exists to make (production journal line
+# count unchanged). See scripts/run-selftests.sh for the real prelude use.
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 SKILL_DIR="$(cd "$HERE/.." && pwd)"
