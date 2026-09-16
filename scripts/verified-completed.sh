@@ -154,6 +154,32 @@
 #           `ac<N>_` or `ac0<N>_`, or a `def test_ac<N>_...` / `def
 #           test_ac_<N>_...` (both separator styles observed in the
 #           fleet), anywhere under tests/. Last resort, whole-tree scan.
+#        f. `real-box`    — ONLY for an AC whose own PRD text carries the
+#           `(Real-box` marker (this repo's authoring convention for an AC
+#           that can only be proven on real hardware — see build-
+#           contract.md's Acceptance-criteria section and PRD-build-burst-
+#           dispatch-reenable's own AC10/AC11 for the worked example).
+#           Tried FIRST and EXCLUSIVELY for a tagged AC — before (a)-(e),
+#           before ANY collision detection. A real-box AC is by definition
+#           never meant to own a tests/ file, so tests/ content (including
+#           an unrelated sibling PRD's same-numbered file) is never a real
+#           pairing OR a real collision candidate for it (bug found live:
+#           checking this rule LAST let a sibling PRD's mid-tick
+#           `tests/lintdr_ac10_*.sh` land make AC10 misreport as
+#           `ac-number-collision` instead of PAIRED). A fixture test would
+#           misrepresent a one-time real-hardware run as automated
+#           coverage anyway, so this rule instead re-checks the SAME
+#           durable, git-ignored receipts `burst-lane.sh enable` itself
+#           trusts as proof a real box did the work: `state/burst-lane/
+#           proof.json` (`routed=true`, `bytes>0`, younger than 7 days —
+#           the identical freshness window `enable` enforces) naming the
+#           image `status --json` reports as what `up` would boot RIGHT
+#           NOW. This is a live re-check, not a memo of a past run: once
+#           the proof goes stale or a new bake supersedes the image
+#           without a fresh `prove`, the AC reverts to MISSING on the next
+#           run — same "testable claim, not prose to trust" posture as
+#           --check-receipt-claim/--check-deferral-premises below, applied
+#           to check #5's own classification instead of a standalone gate.
 #   4. `deferred_acs` is read only in the contract's list form (scan-
 #      prds.sh). A prose value is reported as `deferred_acs: unparsed —
 #      use [N, N]` (once, on stdout) and treated as none — the ACs that
@@ -464,6 +490,24 @@ if [ "$num_acs" -le 0 ]; then
   echo "verified-completed: no ACs found in $prd" >&2; exit 2
 fi
 
+# real-box tagging: which written AC numbers carry the "(Real-box" marker
+# (see rule f above) — keyed by the literal number on the line, not its
+# position in the file (a PRD can list its ACs out of numeric order, e.g.
+# this repo's own AC15 sitting between AC9 and AC10).
+declare -A ac_is_realbox=()
+while IFS=$'\t' read -r acn flag; do
+  [ -n "$acn" ] || continue
+  [ "$flag" = 1 ] && ac_is_realbox[$acn]=1
+done < <(awk '
+  /^##[[:space:]]+([[:digit:]]+\.[[:space:]]+)?Acceptance/ { in_block=1; next }
+  /^##[[:space:]]/ && in_block { in_block=0 }
+  in_block && match($0, /^[[:digit:]]+\./) {
+    n = substr($0, RSTART, RLENGTH-1) + 0
+    rb = ($0 ~ /\(Real-box/) ? 1 : 0
+    print n "\t" rb
+  }
+' "$prd")
+
 declare -A is_paired is_deferred reason_for paired_evidence
 declare -A derived_rule derived_path is_failing
 declare -A fnscan_path
@@ -584,9 +628,73 @@ find_collision() {
   return 1
 }
 
+# check_real_box_evidence <repo> — stdout: one evidence line, rc 0, when a
+# CURRENT real-box proof exists for $repo; rc 1 (no stdout) otherwise. Reads
+# the exact files/fields `burst-lane.sh enable` itself gates on, so a "PAIRED"
+# real-box AC and a passing `enable` always agree: proof.json routed=true,
+# bytes>0, timestamp within the same 168h (7-day) freshness window `enable`
+# enforces, AND naming the image `status --json` reports as what `up` would
+# boot right now (a proof against a superseded/un-baked image never pairs).
+check_real_box_evidence() {
+  local repo="$1" bl status_json boot_image proof_path
+  bl="$repo/scripts/burst-lane.sh"
+  proof_path="$repo/state/burst-lane/proof.json"
+  [ -x "$bl" ] || return 1
+  [ -f "$proof_path" ] || return 1
+  status_json="$("$bl" status --json 2>/dev/null)" || return 1
+  boot_image="$("$JQ" -r '.image_id // empty' <<<"$status_json" 2>/dev/null)"
+  [ -n "$boot_image" ] || return 1
+  python3 -c '
+import calendar, json, sys, time
+
+proof_path, boot_image = sys.argv[1:3]
+
+try:
+    proof = json.load(open(proof_path))
+except Exception:
+    sys.exit(1)
+
+if proof.get("routed") is not True:
+    sys.exit(1)
+if not (proof.get("bytes") or 0) > 0:
+    sys.exit(1)
+if proof.get("image_id") != boot_image:
+    sys.exit(1)
+
+ts = proof.get("ts", "")
+try:
+    t = time.strptime(ts, "%Y-%m-%dT%H:%M:%SZ")
+    age_h = (time.time() - calendar.timegm(t)) / 3600.0
+except Exception:
+    sys.exit(1)
+if age_h > 168:
+    sys.exit(1)
+
+print("state/burst-lane/proof.json (routed=true image=%s bytes=%s ts=%s)" % (
+    proof.get("image_id"), proof.get("bytes"), ts))
+' "$proof_path" "$boot_image"
+}
+
 classify_ac() {
   local n="$1" padded="" repo_tests="$repo/tests" f p numform matches ext other
   [ "$n" -lt 10 ] && padded="0$n"
+  # f. real-box — checked FIRST, exclusively, for an AC tagged via
+  # ac_is_realbox: this AC is provable ONLY on real hardware (see header),
+  # so tests/ content is never relevant to it either way — a same-numbered
+  # bare/fn-scan file belonging to some unrelated sibling PRD is not a real
+  # collision candidate for it and must never be treated as one. Tried
+  # before rules a-e and before any collision detection (bug found live:
+  # a sibling PRD landing tests/lintdr_ac10_*.sh mid-tick made AC10 read
+  # `ac-number-collision` instead of PAIRED, because the declared-prefix
+  # branch's find_collision ran before this rule did).
+  if [ -n "${ac_is_realbox[$n]:-}" ]; then
+    if evidence="$(check_real_box_evidence "$repo")"; then
+      printf 'PAIRED|real-box|%s|\n' "$evidence"
+    else
+      printf 'MISSING|||\n'
+    fi
+    return
+  fi
   if [ ! -d "$repo_tests" ]; then printf 'MISSING|||\n'; return; fi
 
   shopt -s nullglob

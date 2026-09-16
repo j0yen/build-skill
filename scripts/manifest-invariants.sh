@@ -69,11 +69,64 @@ STALE_ACTIVITY_HOURS="${STALE_ACTIVITY_HOURS:-24}"
 LOCK_WAIT_SECS="${LOCK_WAIT_SECS:-60}"
 JOURNAL="${JOURNAL:-$HOME/brain/journal/build/$(date -u +%F).md}"
 DOCKET_RUN="${DOCKET_RUN:-manifest-invariants.$(date -u +%Y%m%dT%H%M%SZ)}"
+# Every repo-health subscript (alert-deliver.sh, notify-gh-issue.sh,
+# repo-health-seed-prd.sh) journals via scripts/lib/journal.sh's
+# journal_line(), which keys off BUILD_JOURNAL_ROOT (a directory) — this
+# script's own JOURNAL var is a full file path. Exporting BUILD_JOURNAL_ROOT
+# as JOURNAL's own directory keeps both conventions pointed at the SAME
+# tree: a sandboxed JOURNAL (a selftest's `$SBX/journal/day.md`) means a
+# sandboxed BUILD_JOURNAL_ROOT (`$SBX/journal`), and production's default
+# resolves to the same $HOME/brain/journal/build lib/journal.sh already
+# defaults to on its own. Without this, a test overriding only JOURNAL (this
+# script's own knob) leaks every repo-health subscript's lines straight into
+# the real production journal — caught and fixed during this PRD's own
+# build (see journal `notify`/`seed-prd`/`notify-send` lines dated
+# 2026-09-15T23:43-52Z, removed from the real journal the same session).
+export BUILD_JOURNAL_ROOT="${BUILD_JOURNAL_ROOT:-$(dirname "$JOURNAL")}"
+
+# ---- repo-health (PRD-build-repo-health-invariants) -----------------------
+# Same env-tunable thresholds repo-health.sh compute reads — defaulted and
+# EXPORTED here so an operator override on manifest-invariants.sh's own
+# invocation (or a selftest) reaches repo-health.sh unchanged, and this
+# script's own would-fire/alarm printf lines always name the threshold that
+# was actually evaluated, never a hardcoded literal that could drift from
+# the real one.
+export REPO_CI_RED_MIN="${REPO_CI_RED_MIN:-30}"
+export REPO_NO_SHIP_H="${REPO_NO_SHIP_H:-24}"
+export REPO_MIN_ATTEMPTS="${REPO_MIN_ATTEMPTS:-3}"
+export REPO_LOCK_WAIT_MAX="${REPO_LOCK_WAIT_MAX:-100}"
+export BUILD_STATE_DIR="${BUILD_STATE_DIR:-$STATE_DIR}"
+REPO_HEALTH="${REPO_HEALTH:-$HERE/repo-health.sh}"
+ALERT_DELIVER="${ALERT_DELIVER:-$HERE/alert-deliver.sh}"
+REPO_HEALTH_EVIDENCE="${REPO_HEALTH_EVIDENCE:-$HERE/repo-health-evidence.sh}"
+REPO_HEALTH_SEED_PRD="${REPO_HEALTH_SEED_PRD:-$HERE/repo-health-seed-prd.sh}"
+REPO_HEALTH_CI="${REPO_HEALTH_CI:-$STATE_DIR/ci-status.json}"
+REPO_HEALTH_OUT="${REPO_HEALTH_OUT:-$STATE_DIR/repo-health.json}"
+# Test seam (AC1-3/6/9): REPO_HEALTH_AS_OF pins "now"; REPO_HEALTH_JOURNALS
+# is a ':'-separated list of journal fixture files, standing in for the
+# production today+yesterday default repo-health.sh would otherwise
+# resolve on its own. Unset in production — every real tick gets the real
+# journal and the real clock.
+REPO_HEALTH_AS_OF="${REPO_HEALTH_AS_OF:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
+rh_journal_args=()
+if [ -n "${REPO_HEALTH_JOURNALS:-}" ]; then
+  IFS=':' read -r -a _rh_j <<< "$REPO_HEALTH_JOURNALS"
+  for _f in "${_rh_j[@]}"; do rh_journal_args+=(--journal "$_f"); done
+else
+  _rh_date="${REPO_HEALTH_AS_OF%%T*}"
+  _rh_yday="$(date -u -d "$_rh_date -1 day" +%F 2>/dev/null || echo "$_rh_date")"
+  for _f in "$HOME/brain/journal/build/$_rh_date.md" "$HOME/brain/journal/build/$_rh_yday.md"; do
+    [ -f "$_f" ] && rh_journal_args+=(--journal "$_f")
+  done
+fi
 
 log() { printf 'manifest-invariants: %s\n' "$*" >&2; }
 die() { log "$*"; exit "${2:-1}"; }
 
 command -v python3 >/dev/null 2>&1 || die "python3 not on PATH"
+
+# shellcheck source=lib/alert-marker.sh
+source "$HERE/lib/alert-marker.sh"
 
 report_mode=false
 format=table
@@ -380,12 +433,49 @@ print(json.dumps(alarms))' "$alarms_json" "$collisions_json")"
 heals_count="$(python3 -c 'import json,sys; print(len(json.loads(sys.argv[1])))' "$final_heals")"
 alarms_count="$(python3 -c 'import json,sys; print(len(json.loads(sys.argv[1])))' "$alarms_json")"
 
+# ---- repo-health (PRD-build-repo-health-invariants requirement 3) --------
+# Computed unconditionally in both --report and live mode — the compute
+# itself only refreshes the state/repo-health.json CACHE (a read model,
+# recomputed every run, same posture as any other state/*.json this skill
+# maintains) and never touches the manifest, the journal, or
+# state/alerts.banner; those three are the gated side effects (AC2: manifest
+# mtime unchanged, alerts.banner not created under --report), applied only
+# below, only in live mode, only for alarms not already delivered today.
+if [ -x "$REPO_HEALTH" ]; then
+  "$REPO_HEALTH" compute "${rh_journal_args[@]}" --ci "$REPO_HEALTH_CI" \
+    --as-of "$REPO_HEALTH_AS_OF" --out "$REPO_HEALTH_OUT" 2>>"$JOURNAL.repo-health.stderr" || \
+    log "repo-health.sh compute failed (non-fatal, repo-health alarms skipped this run)"
+fi
+
+rh_active_json='{"active":[],"ci_stale":false,"ci_stale_age_s":null,"rules_disabled":[]}'
+if [ -f "$REPO_HEALTH_OUT" ]; then
+  rh_active_json="$(python3 -c 'import json,sys
+d=json.load(open(sys.argv[1]))
+red_min=sys.argv[2]; min_att=sys.argv[3]; lock_max=sys.argv[4]
+active=[]
+for repo, row in d.get("repos", {}).items():
+    for rule in row.get("alarms", []):
+        if rule == "main-ci-red":
+            value = row["ci"]["red_minutes"]; threshold = red_min; since = row["ci"]["red_since"]
+        elif rule == "no-ship-with-attempts":
+            value = row["gate_attempts_24h"]; threshold = min_att; since = d.get("as_of")
+        else:
+            value = row["lock_wait_lines_24h"]; threshold = lock_max; since = d.get("as_of")
+        active.append({"repo": repo, "rule": rule, "value": value,
+                        "threshold": threshold, "since": since or d.get("as_of")})
+print(json.dumps({"active": active, "ci_stale": d.get("ci_stale", False),
+                   "ci_stale_age_s": d.get("ci_stale_age_s"),
+                   "rules_disabled": d.get("rules_disabled", [])}))' \
+    "$REPO_HEALTH_OUT" "$REPO_CI_RED_MIN" "$REPO_MIN_ATTEMPTS" "$REPO_LOCK_WAIT_MAX")"
+fi
+
 # ---- --report: print and exit, no writes at all ---------------------------
 if [ "$report_mode" = true ]; then
   if [ "$format" = json ]; then
     python3 -c 'import json,sys
-print(json.dumps({"mode":"report","heals":json.loads(sys.argv[1]),"alarms":json.loads(sys.argv[2])}, indent=2))' \
-      "$final_heals" "$alarms_json"
+print(json.dumps({"mode":"report","heals":json.loads(sys.argv[1]),"alarms":json.loads(sys.argv[2]),
+                   "repo_health":json.loads(sys.argv[3])}, indent=2))' \
+      "$final_heals" "$alarms_json" "$rh_active_json"
   else
     echo "manifest-invariants --report: $heals_count heal(s) would fire, $alarms_count alarm(s)"
     python3 -c 'import json,sys
@@ -394,6 +484,26 @@ for h in json.loads(sys.argv[1]):
 for a in json.loads(sys.argv[2]):
     print("  ALARM " + a["slug"] + " [" + a["class"] + "]: " + a["message"])' \
       "$final_heals" "$alarms_json"
+  fi
+  # Table format only — --format json already embeds the identical data as
+  # the "repo_health" object above; printing these as loose text lines
+  # unconditionally corrupted every --format json caller's stdout (a real
+  # regression caught by this PRD's own build: durheal_ac8_real_corpus_
+  # lint_pass_sweep.sh, which parses --report --format json, started
+  # failing with "Extra data" until this guard was added).
+  if [ "$format" != json ]; then
+    while IFS= read -r rh_alarm; do
+      [ -n "$rh_alarm" ] || continue
+      repo="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["repo"])' "$rh_alarm")"
+      rule="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["rule"])' "$rh_alarm")"
+      value="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["value"])' "$rh_alarm")"
+      threshold="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["threshold"])' "$rh_alarm")"
+      since="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["since"])' "$rh_alarm")"
+      printf '%s  %s  would-fire  %s  (class=repo-health lane=%s since=%s value=%s threshold=%s)\n' \
+        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$repo" "$rule" "$(hostname)" "$since" "$value" "$threshold"
+    done < <(python3 -c 'import json,sys
+for a in json.loads(sys.argv[1])["active"]:
+    print(json.dumps(a))' "$rh_active_json")
   fi
   exit 0
 fi
@@ -547,6 +657,67 @@ while IFS= read -r alarm_json; do
 done < <(python3 -c 'import json,sys
 for a in json.loads(sys.argv[1]):
     print(json.dumps(a))' "$alarms_json")
+
+# ---- repo-health: live delivery (requirements 3/4/5/6, AC1-3/6/9) ---------
+# Everything above this point (the repo-health.json compute) runs in BOTH
+# modes; everything from here down is the live-only side effect set
+# --report never reaches (it already returned above). Each of the three
+# gated writes — the alarm journal line, alert-deliver.sh's banner+notify,
+# and the seeded fix PRD — is applied once per (rule, repo, UTC day),
+# governed by the SAME marker file (scripts/lib/alert-marker.sh) so two
+# manifest-invariants.sh runs in one day produce exactly one of each
+# (AC3), not one per run.
+rh_ci_stale="$(python3 -c 'import json,sys; print("1" if json.loads(sys.argv[1])["ci_stale"] else "0")' "$rh_active_json")"
+rh_ci_stale_age="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["ci_stale_age_s"])' "$rh_active_json")"
+if [ "$rh_ci_stale" = 1 ] && [ "$rh_ci_stale_age" != "None" ]; then
+  printf '%s  ci-status  ci-status-stale  (age_s=%s file=%s lane=%s)\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$rh_ci_stale_age" "$REPO_HEALTH_CI" "$(hostname)" >> "$JOURNAL"
+fi
+
+while IFS= read -r rh_rule; do
+  [ -n "$rh_rule" ] || continue
+  printf '%s  repo-health  rule-disabled  (rule=%s lane=%s)\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$rh_rule" "$(hostname)" >> "$JOURNAL"
+done < <(python3 -c 'import json,sys
+for r in json.loads(sys.argv[1])["rules_disabled"]:
+    print(r)' "$rh_active_json")
+
+while IFS= read -r rh_alarm; do
+  [ -n "$rh_alarm" ] || continue
+  repo="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["repo"])' "$rh_alarm")"
+  rule="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["rule"])' "$rh_alarm")"
+  value="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["value"])' "$rh_alarm")"
+  threshold="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["threshold"])' "$rh_alarm")"
+  since="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["since"])' "$rh_alarm")"
+
+  if alert_marker_exists "$rule" "$repo"; then
+    continue  # already delivered today — AC3 idempotency
+  fi
+
+  printf '%s  %s  alarm  %s  (class=repo-health lane=%s since=%s value=%s threshold=%s)\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$repo" "$rule" "$(hostname)" "$since" "$value" "$threshold" >> "$JOURNAL"
+  alarms_count=$((alarms_count + 1))
+
+  rh_evidence_file="$(mktemp)"
+  if [ -x "$REPO_HEALTH_EVIDENCE" ]; then
+    "$REPO_HEALTH_EVIDENCE" "$repo" "$REPO_HEALTH_OUT" "${rh_journal_args[@]}" \
+      --rule "$rule" --value "$value" --threshold "$threshold" > "$rh_evidence_file" 2>/dev/null
+  fi
+
+  if [ -x "$ALERT_DELIVER" ]; then
+    "$ALERT_DELIVER" "$rule" "$repo" "$rh_evidence_file" --value "$value" \
+      || log "alert-deliver.sh failed for $rule/$repo (non-fatal)"
+  fi
+
+  if [ -x "$REPO_HEALTH_SEED_PRD" ]; then
+    PRD_DIR="$PRD_DIR" "$REPO_HEALTH_SEED_PRD" "$rule" "$repo" "$rh_evidence_file" --prd-dir "$PRD_DIR" \
+      || log "repo-health-seed-prd.sh failed for $rule/$repo (non-fatal)"
+  fi
+
+  rm -f "$rh_evidence_file"
+done < <(python3 -c 'import json,sys
+for a in json.loads(sys.argv[1])["active"]:
+    print(json.dumps(a))' "$rh_active_json")
 
 if [ "$format" = json ]; then
   python3 -c 'import json,sys

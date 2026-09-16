@@ -239,7 +239,7 @@ reconcile, post-lint), the hard pre-filter, Depends-on resolution,
 own-claim continuations first, the priority sort, and `select-guard.sh`
 (cap + same-target + lane-predicate, branch-count/admitted-targets
 threaded internally) into one call, and emits `{"admitted":[...],
-"skipped":[...],"counts":{...}}`.
+"skipped":[...],"pinned":[...],"counts":{...}}`.
 The coordinator must dispatch every entry of admitted[] in one message — do not re-derive the pool, do not call any of the
 composed guards a second time, and do not stop selecting partway through;
 `select-tick.sh` already finished selecting before you saw its output. A
@@ -248,6 +248,26 @@ coordinator that dispatches fewer than `counts.admitted` PRDs must journal
 cause=<text>)` — the line exists so the deviation is countable, not so it
 is allowed. `select-tick.sh --explain <slug>` answers "why wasn't my PRD
 picked" without reading the coordinator's own narration.
+
+**`run <slugs>` is a pin, resolved inside this one call (2026-09-15,
+PRD-build-select-tick-run-pin) — the coordinator never sees the slug
+list and never calls a guard itself.** `tick-run.sh` derives `--pin` from
+`BUILD_TICK_ARGS="run <slugs>"` before exec'ing the coordinator and
+exports it as `SELECT_TICK_PIN`, which this same `select-tick.sh` call
+reads as its `--pin` default — the coordinator's own `/build` prompt
+carries no slugs at all by the time it runs. A pinned slug that survives
+the hard pre-filter and Depends-on gate above is ordered first, in pin
+order, ahead of continuations and the priority sort, and still passes
+through `select-guard.sh` like any other candidate — a pin skips the
+queue, never the safety checks. Every pin's fate is journaled
+(`pin-over-cap`, `pin-refused cause=...`, `pin-unknown`) and each
+`admitted[]`/`skipped[]` entry carries its own `pinned` boolean, so a
+status sweep or `--explain <slug>` never has to recompute it from the
+run list by hand. This closes the exact gap the 2026-09-15 21:24Z (pinned
+slugs silently ignored) and 22:23:55Z (coordinator re-ran `select-guard.sh`
+per pinned slug — a second selection wave) incidents both trace to: the
+`run <slugs>` text used to reach only the coordinator's prompt, and what
+happened next depended on how an LLM read it.
 
 #### How select-tick decides
 
@@ -1284,7 +1304,13 @@ read it before assuming a step is "the last one this tick".
      - the AC is in BOTH `deferred_acs:` AND `mock_unjustified_for:`
        with a companion `mock_justifications:` entry (one sentence per
        listed AC; an entry with no companion justification is a parser
-       error per `scan-prds.sh`).
+       error per `scan-prds.sh`), OR the same shape under
+       `deferred_ac_reasons:` (an inline JSON object keyed by AC number,
+       e.g. `{"10": "...", "11": "..."}` — equivalent to
+       `mock_justifications:` for this checklist, and to `prd-lint.sh`'s
+       `deferred-acs-missing-justification` check; either key alone
+       satisfies both, see build-contract.md's key table,
+       PRD-build-prd-lint-deferred-reasons-key).
 
      Any AC with none of the three remains a hard fail: the PRD is NOT
      verified-completed — leave `status: in_progress` and surface the
@@ -1326,6 +1352,26 @@ read it before assuming a step is "the last one this tick".
   4. **mocks** — `tests/mocks/ac<N>.rs` (and `.py`, `.sh`).
   5. **fn-scan** — a `#[test] fn ac<N>_...` or `def test_ac<N>_...` /
      `def test_ac_<N>_...` anywhere under `tests/`. Last resort.
+  6. **real-box** (PRD-build-burst-dispatch-reenable) — checked FIRST and
+     EXCLUSIVELY (ahead of rules 1-5 and all collision detection) for an AC
+     whose own PRD text carries the `(Real-box` marker (build-contract.md's
+     Acceptance-criteria section; e.g. "(Real-box; deferrable only with a
+     justification naming why no box was reachable.)"). A real-box AC is by
+     definition never meant to own a `tests/` file, so `tests/` content —
+     including an unrelated sibling PRD's same-numbered file — is never a
+     real pairing OR a real collision candidate for it; checking this rule
+     LAST once let a sibling PRD's own `tests/lintdr_ac10_*.sh` misreport
+     this PRD's AC10 as `ac-number-collision` instead of PAIRED. A fixture
+     test would misrepresent a one-time real-hardware run as automated
+     coverage anyway, so these ACs instead pair against burst-lane's own
+     durable, git-ignored
+     receipts — `state/burst-lane/proof.json` (`routed=true`, `bytes>0`,
+     younger than 7 days) naming the image `burst-lane.sh status --json`
+     reports as what `up` would boot right now — the exact same fields
+     `burst-lane.sh enable` itself gates on. This is a LIVE re-check, not a
+     memo of a past run: once the proof goes stale or a bake supersedes the
+     image without a fresh `prove`, the AC reverts to MISSING on the next
+     `verified-completed.sh` run.
 
   A guessed slug-derived prefix that doesn't match the crate's real
   convention (e.g. `mcphost-rest-tools`'s tests are actually `http_ac*`,
@@ -2949,8 +2995,27 @@ vellum amend PRD-<slug>.md --append-iter-log "v0.1 — all ACs green"
 - `/build` → run one tick (same as the timer), inside an already-running
   interactive Claude session.
 - `/build status` → dump manifest as a human-readable table; exit.
-- `/build run <slug>` → advance that specific PRD this tick regardless
-  of the priority rules.
+- `/build run <slug...>` → **a pin, not an instruction to the coordinator**
+  (PRD-build-select-tick-run-pin, grounded in a 2026-09-15 21:24Z tick that
+  admitted 5 by priority and ignored all 5 pinned slugs in the run list
+  with no journal line, and a 22:23:55Z tick where the coordinator called
+  `select-guard.sh` itself for each pinned slug — a forbidden second
+  selection wave). `tick-run.sh` derives `--pin <slug,...>` from this text
+  before it ever execs the coordinator (space- or comma-separated slugs,
+  both spellings resolve identically) and forwards bare `/build` — no slug
+  list — to the coordinator's own prompt. `select-tick.sh`'s one Phase 2
+  call picks the pin up as its default (`SELECT_TICK_PIN` env, exported by
+  `tick-run.sh`) and admits any pinned slug that survives the hard
+  pre-filter and Depends-on gate FIRST, in pin order, ahead of
+  continuations and the priority sort — `admitted[]` already reflects the
+  pins by the time the coordinator sees it. **The coordinator must never
+  call `select-guard.sh` or any composed guard itself, and must never
+  re-derive or re-apply the run list** — a pin skips the queue, not the
+  safety checks (cap, same-target, lane-predicate still apply, and a
+  refused pin is journaled `pin-refused`/`pin-over-cap`/`pin-unknown`,
+  never silently dropped). This is the same "one script decides" rule
+  Phase 2 already states, made true for `run` by construction rather than
+  by an LLM's reading of this paragraph.
 - `/build pause` → write `state/paused` sentinel; subsequent timer
   fires exit immediately. `/build resume` clears it.
 

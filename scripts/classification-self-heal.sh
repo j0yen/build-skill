@@ -32,6 +32,17 @@
 #       PRDs are already outside Phase 2's candidate pool by construction;
 #       this call's value is the dedup + alarm, not new exclusion logic).
 #
+#       PRD-build-prd-lint-deferred-reasons-key requirement 7: before any
+#       of the above, if this PRD already carries a recorded bounce and a
+#       FRESH prd-lint.sh run over the same file no longer names lint_id
+#       among its failures, the diagnosis stopped reproducing because the
+#       LINT ITSELF changed (the caller's lint_id/lint_msg can be stale --
+#       e.g. cached from earlier in the same tick), not because the PRD's
+#       frontmatter did. Clear the bounce record, journal
+#       `bounce-cleared lint-changed`, and return -- without requiring a
+#       frontmatter edit, which the one-way-trap fix in scan-prds.sh's own
+#       lint pass already covers for its own whole-file-OK case.
+#
 #   classification-self-heal.sh resolve <prd-file>
 #       Requirement 3. Only touches a PRD whose Status is already
 #       needs_classification. Probes build_into's substrate
@@ -62,6 +73,7 @@ STATE_DIR="${BUILD_STATE_DIR:-$SKILL_DIR/state}"
 MANIFEST="${BUILD_MANIFEST:-$STATE_DIR/manifest.json}"
 MANIFEST_SET="${MANIFEST_SET:-$HERE/manifest-set.sh}"
 SUBSTRATE_PROBE="${SUBSTRATE_PROBE:-$HERE/substrate-probe.sh}"
+LINT_SH="${LINT_SH:-$HERE/prd-lint.sh}"
 JOURNAL="${JOURNAL:-$HOME/brain/journal/build/$(date -u +%F).md}"
 DOCKET_RUN="${DOCKET_RUN:-classification-self-heal.$(date -u +%Y%m%dT%H%M%SZ)}"
 GIT_ID=(-c user.email=jyen.tech@gmail.com -c user.name="Joe Yen")
@@ -142,15 +154,55 @@ cmd_bounce_check() {
   build_target="$(read_field "$prd_file" build_target)"
   build_into="$(read_field "$prd_file" build_into)"
   local hash; hash="$(sha_of "${build_target}|${build_into}|${lint_id}|${lint_msg}")"
+  local lint_sha_now=""
+  [ -r "$LINT_SH" ] && lint_sha_now="$(sha256sum "$LINT_SH" 2>/dev/null | cut -d' ' -f1)"
 
-  local entry status stored_hash bounces
+  local entry status stored_hash bounces stored_lint_sha
   entry="$(manifest_entry_json "$slug")"
   status="$(entry_field "$entry" status)"
   stored_hash="$(entry_field "$entry" needs_classification_hash)"
+  stored_lint_sha="$(entry_field "$entry" needs_classification_lint_sha)"
   bounces="$(entry_field "$entry" needs_classification_bounces)"
   case "$bounces" in ''|*[!0-9]*) bounces=0 ;; esac
 
   mkdir -p "$(dirname "$JOURNAL")" 2>/dev/null || true
+
+  # Requirement 7: "unchanged frontmatter hash (lint itself changed)" is
+  # keyed on the LINT SCRIPT's own sha, recorded alongside every bounce
+  # below (`needs_classification_lint_sha`) -- not on re-deriving ground
+  # truth from an unconditional fresh lint run, which would also fire on
+  # every ordinary repeat bounce (the frontmatter/diagnosis genuinely
+  # UNCHANGED case AC3/AC7 below cover) whenever a caller's lint_id happens
+  # not to be mechanically reproducible from a synthetic/partial fixture --
+  # only a PRD already parked, with a DIFFERENT (or no, i.e. pre-upgrade)
+  # recorded lint sha, triggers the re-check; if the script hasn't changed
+  # since the bounce was recorded, this is a no-op and the unchanged-
+  # diagnosis bounce-counting logic below runs exactly as before.
+  if [ "$status" = "needs_classification" ] && [ -n "$stored_hash" ] \
+     && [ -n "$lint_sha_now" ] && [ "$stored_lint_sha" != "$lint_sha_now" ] \
+     && [ -x "$LINT_SH" ]; then
+    local relint relint_ids
+    relint="$("$LINT_SH" "$prd_file" --format json 2>/dev/null)"
+    relint_ids="$(printf '%s' "$relint" | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)[0]
+except Exception:
+    sys.exit(0)
+for f in d.get("failures") or []:
+    print(f["id"])
+' 2>/dev/null)"
+    if ! printf '%s\n' "$relint_ids" | grep -qxF "$lint_id"; then
+      local tmp; tmp="$(mktemp)" || { log "mktemp failed"; exit 0; }
+      printf '{"status":"queued","needs_classification_reason":"","needs_classification_hash":"","needs_classification_bounces":0,"needs_classification_lint_sha":""}' >"$tmp"
+      "$MANIFEST_SET" "$slug" "$tmp" 1>&2 || log "manifest write failed for $slug (bounce-cleared)"
+      rm -f "$tmp"
+      printf '%s  %s  bounce-cleared  lint-changed  (id=%s lane=%s)\n' \
+        "$(utc_now)" "$slug" "$lint_id" "$(hostname)" >> "$JOURNAL"
+      echo "bounce-cleared: $slug lint-changed (id=$lint_id)"
+      exit 0
+    fi
+  fi
 
   if [ "$status" != "needs_classification" ] || [ -z "$stored_hash" ]; then
     # Fresh bounce: first time this PRD is being parked, or the manifest
@@ -160,8 +212,9 @@ cmd_bounce_check() {
       "status":"needs_classification",
       "needs_classification_reason": sys.argv[1] + ": " + sys.argv[2],
       "needs_classification_hash": sys.argv[3],
-      "needs_classification_bounces": 1}))' \
-      "$lint_id" "$lint_msg" "$hash" >"$tmp"
+      "needs_classification_bounces": 1,
+      "needs_classification_lint_sha": sys.argv[4]}))' \
+      "$lint_id" "$lint_msg" "$hash" "$lint_sha_now" >"$tmp"
     "$MANIFEST_SET" "$slug" "$tmp" 1>&2 || log "manifest write failed for $slug (fresh bounce)"
     rm -f "$tmp"
     printf '%s  %s  bounce  parked  (id=%s bounces=1 lane=%s)\n' \
@@ -202,8 +255,9 @@ cmd_bounce_check() {
     "status":"needs_classification",
     "needs_classification_reason": sys.argv[1] + ": " + sys.argv[2],
     "needs_classification_hash": sys.argv[3],
-    "needs_classification_bounces": 1}))' \
-    "$lint_id" "$lint_msg" "$hash" >"$tmp"
+    "needs_classification_bounces": 1,
+    "needs_classification_lint_sha": sys.argv[4]}))' \
+    "$lint_id" "$lint_msg" "$hash" "$lint_sha_now" >"$tmp"
   "$MANIFEST_SET" "$slug" "$tmp" 1>&2 || log "manifest write failed for $slug (changed diagnosis)"
   rm -f "$tmp"
   printf '%s  %s  bounce  parked-diagnosis-changed  (id=%s bounces=1 lane=%s)\n' \

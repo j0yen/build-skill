@@ -11,6 +11,14 @@
 #
 # Usage:
 #   prd-lint.sh <file|dir>... [--format text|json|pass-fail] [--quiet] [--contract <path>]
+#   prd-lint.sh --explain <check-id>
+#
+# `--explain <check-id>` (PRD-build-prd-lint-deferred-reasons-key P2) prints
+# a short human explainer for one check id -- today just
+# `deferred-acs-missing-justification`, showing both accepted justification
+# shapes with a one-line example each -- and exits 0 (2 for an unknown id).
+# It never touches a file argument and is not part of the lint-a-corpus
+# contract above.
 #
 # `--format text` (the default) and `--format json` are the original,
 # stable machine/human contracts -- scan-prds.sh's Phase-1 gate shells out
@@ -45,11 +53,13 @@ export LINT_STATE_DIR="${BUILD_STATE_DIR:-$HERE/../state}"
 
 usage() {
   echo "usage: prd-lint.sh <file|dir>... [--format text|json|pass-fail] [--quiet] [--contract <path>]" >&2
+  echo "       prd-lint.sh --explain <check-id>" >&2
 }
 
 format="text"
 quiet=0
 contract=""
+explain_id=""
 files=()
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -77,6 +87,16 @@ while [ "$#" -gt 0 ]; do
       contract="${1#--contract=}"
       shift
       ;;
+    --explain)
+      shift
+      explain_id="${1:-}"
+      [ -n "$explain_id" ] || { usage; exit 2; }
+      shift
+      ;;
+    --explain=*)
+      explain_id="${1#--explain=}"
+      shift
+      ;;
     -h|--help)
       usage; exit 0
       ;;
@@ -95,6 +115,26 @@ while [ "$#" -gt 0 ]; do
       ;;
   esac
 done
+
+if [ -n "$explain_id" ]; then
+  case "$explain_id" in
+    deferred-acs-missing-justification)
+      cat <<'EXPLAIN'
+deferred-acs-missing-justification: a non-empty `deferred_acs:` list needs a
+justification under ONE of these two keys (either one satisfies the rule):
+
+  mock_justifications: AC15 is a P1 perf target with no warm pool shipped; AC16 is a deferred debug RPC.
+
+  deferred_ac_reasons: {"15": "P1 perf target, no warm pool shipped.", "16": "deferred debug RPC."}
+EXPLAIN
+      exit 0
+      ;;
+    *)
+      echo "prd-lint: no --explain text for check id: $explain_id" >&2
+      exit 2
+      ;;
+  esac
+fi
 
 if [ "${#files[@]}" -eq 0 ]; then
   usage
@@ -584,18 +624,54 @@ def lint_file(path):
             )
 
     # -- deferred_acs ------------------------------------------------------------
+    # PRD-build-prd-lint-deferred-reasons-key: the justification for a
+    # deferred AC may be documented under EITHER `mock_justifications:`
+    # (prose) or `deferred_ac_reasons:` (an inline JSON object keyed by AC
+    # number, one sentence per AC) -- scan-prds.sh, verified-completed.sh,
+    # and archive-trailer.sh all already read the second key; this lint
+    # only knew the first, which parked a finished PRD
+    # (PRD-mcphost-tenant-tables) on a name mismatch between the lint and
+    # the parsers it exists to front-run (2026-09-15 22:21:41Z).
     deferred_raw = fm.get("deferred_acs")
     if deferred_raw:
         if re.match(r"^\[\s*\d+(\s*,\s*\d+)*\s*\]$", deferred_raw) or re.match(r"^\[\s*\]$", deferred_raw):
             is_list = True
             has_items = bool(re.match(r"^\[\s*\d+", deferred_raw))
+            deferred_nums = [int(n) for n in re.findall(r"\d+", deferred_raw)] if has_items else []
         else:
             is_list = False
             has_items = False
+            deferred_nums = []
         if not is_list:
             fail("deferred-acs-prose", "deferred_acs must be a list, e.g. [15, 16]")
-        elif has_items and "mock_justifications" not in fm:
-            fail("deferred-acs-missing-justification", "deferred_acs is a non-empty list but no `mock_justifications:` line was found")
+        elif has_items:
+            reasons_raw = fm.get("deferred_ac_reasons")
+            if "mock_justifications" not in fm and reasons_raw is None:
+                fail(
+                    "deferred-acs-missing-justification",
+                    "deferred_acs is a non-empty list but no `mock_justifications:` "
+                    "or `deferred_ac_reasons:` line was found",
+                )
+            if reasons_raw is not None:
+                try:
+                    reasons_map = json.loads(reasons_raw)
+                    if not isinstance(reasons_map, dict):
+                        raise ValueError("deferred_ac_reasons is not a JSON object")
+                except (ValueError, TypeError):
+                    fail(
+                        "deferred-acs-reasons-prose",
+                        f"deferred_ac_reasons must be an inline JSON object keyed by AC "
+                        f'number, e.g. {{"15": "...", "16": "..."}}: got {reasons_raw!r}',
+                    )
+                else:
+                    missing = [n for n in deferred_nums if not str(reasons_map.get(str(n), "")).strip()]
+                    if missing:
+                        plural = "s" if len(missing) > 1 else ""
+                        named = ", ".join(str(n) for n in missing)
+                        fail(
+                            "deferred-acs-reason-missing",
+                            f"deferred_ac_reasons is missing a non-empty reason for AC{plural} {named}",
+                        )
 
     # -- Depends-on: existence + cycle -------------------------------------------
     depends_raw = fm.get("depends-on")
