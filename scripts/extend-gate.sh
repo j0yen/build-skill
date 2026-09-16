@@ -1167,12 +1167,104 @@ json.dump(obj, open('$out', 'w'))
 }
 
 # 7. ci-checks — needs `gh` authenticated against the pushed HEAD.
+ci_checks_receipt="$project_abs/target/autobuilder/receipts/ci-checks.json"
 if ! command -v gh >/dev/null 2>&1; then
   note_block "ci-checks — gh CLI not on \$PATH (install: https://cli.github.com)"
   record_phase ci-checks 0 skip
 elif ! gh auth status >/dev/null 2>&1; then
   note_block "ci-checks — gh not authenticated: run 'gh auth login'"
   record_phase ci-checks 0 skip
+elif [ "$scope" = branch ]; then
+  # PRD-build-branch-gate-scope-artifacts requirement 2 (P0, AC2/AC3): a
+  # branch gate runs BEFORE land — main scope's assumption (CI has already
+  # run by the time a gate checks it) never holds here, so `run_count==0`
+  # is a scope artifact, not a real defect (Problem statement: `ci-checks`
+  # blocked with `run_count: 0` on every one of 14 branch gates because the
+  # branch was never pushed). `BRANCH_GATE_PUSH` (default 1) controls
+  # whether THIS gate pushes the branch itself under its own name (the
+  # worktree's branch, created by worktree-extend.sh add, is already named
+  # `autobuilder/<slug>` — falls back to that literal name if HEAD is
+  # somehow detached) before asking `ci-checks` to look for runs, polling
+  # up to `CI_CHECKS_BRANCH_WAIT` seconds (default 900) for one to appear.
+  # `autobuilder gate` below reads every receipt straight off disk and
+  # counts a MISSING file as a hard fail (unlike a present receipt whose
+  # verdict this script can rewrite) — a deferral that never invokes
+  # `autobuilder ci-checks` at all (push-disabled, push-failed), or whose
+  # one call errors before it ever gets to write a receipt (e.g. `origin`
+  # resolves but isn't a github.com URL — the exact shape of the fixture
+  # requirement 6 adds: a bare local `origin`, per ci_checks.rs's
+  # `try_detect_repo`, which errors rather than skips on an unparseable
+  # remote), must synthesize a minimal digest-bound receipt itself so the
+  # gate has something to read as passing. write_ci_defer_receipt does
+  # that; the in-place jq rewrite below stays for the one case where a
+  # real receipt WAS written (run_count==0, clean block).
+  write_ci_defer_receipt() {  # $1=skip_reason
+    jq -n --arg head "$head_now" --arg reason "$1" '{
+      schema: "autobuilder.ci_checks_receipt.v1",
+      head_sha: $head, repo: "", run_count: 0, success_count: 0,
+      failure_count: 0, pending_count: 0, runs: [],
+      verdict: "pass", scope_deferred: true, skip_reason: $reason,
+      captured_at: (now | todateiso8601), receipt_digest: ""
+    }' > "$ci_checks_receipt" 2>/dev/null
+  }
+  _phase_t0=$(date +%s)
+  if [ "${BRANCH_GATE_PUSH:-1}" = "0" ]; then
+    write_ci_defer_receipt "push-disabled: BRANCH_GATE_PUSH=0, branch was never pushed"
+    note_defer "ci-checks — scope-deferred (push-disabled) — BRANCH_GATE_PUSH=0, branch was never pushed; land re-runs this at main scope"
+    record_phase ci-checks 0 defer
+  else
+    _push_ref="$(git -C "$repo" symbolic-ref --short HEAD 2>/dev/null || echo "autobuilder/$slug")"
+    if ! ( cd "$repo" && git push origin "HEAD:refs/heads/$_push_ref" ) >&2; then
+      write_ci_defer_receipt "push-failed: could not push $_push_ref to origin"
+      note_defer "ci-checks — scope-deferred (push-failed) — could not push $_push_ref to origin; land re-runs this at main scope"
+      record_phase ci-checks 0 defer
+    else
+      _ci_wait_s="${CI_CHECKS_BRANCH_WAIT:-900}"
+      _ci_poll_s="${CI_CHECKS_BRANCH_POLL:-15}"
+      _ci_deadline=$(( $(date +%s) + _ci_wait_s ))
+      _ci_ok=false
+      while :; do
+        if ( cd "$repo" && autobuilder ci-checks --project "$project_rel" ) 9>&-; then
+          _ci_ok=true
+          break
+        fi
+        # A receipt with runs already on it (pending/failed, not just
+        # absent) is real CI signal, not a scope artifact — stop polling
+        # and let it fall through to the normal block below instead of
+        # waiting out the full deadline for nothing. A receipt that was
+        # never written at all (ci-checks errored before writing one —
+        # e.g. an unparseable origin URL) reads as 0 the same way, via the
+        # `|| echo 0` fallback below, and keeps polling/deferring exactly
+        # like a written run_count==0 receipt would.
+        _ci_run_count="$(jq -r '.run_count // 0' "$ci_checks_receipt" 2>/dev/null || echo 0)"
+        [ "$_ci_run_count" != "0" ] && break
+        [ "$(date +%s)" -ge "$_ci_deadline" ] && break
+        sleep "$_ci_poll_s"
+      done
+      if $_ci_ok; then
+        record_phase ci-checks $(( $(date +%s) - _phase_t0 )) ok
+      else
+        _ci_run_count="$(jq -r '.run_count // 0' "$ci_checks_receipt" 2>/dev/null || echo 0)"
+        if [ "$_ci_run_count" = "0" ]; then
+          if [ -f "$ci_checks_receipt" ] && jq -e . "$ci_checks_receipt" >/dev/null 2>&1; then
+            _tmp_ci="$(mktemp "${TMPDIR:-/tmp}/extend-gate-ci-defer.XXXXXX")"
+            if jq '.verdict = "pass" | .scope_deferred = true' "$ci_checks_receipt" > "$_tmp_ci" 2>/dev/null; then
+              mv "$_tmp_ci" "$ci_checks_receipt"
+            else
+              rm -f "$_tmp_ci" 2>/dev/null || true
+            fi
+          else
+            write_ci_defer_receipt "no-runs-on-ref: ci-checks never wrote a receipt within ${_ci_wait_s}s (see gate output above)"
+          fi
+          note_defer "ci-checks — scope-deferred (no-runs-on-ref) — no workflow runs observed for $head_now within ${_ci_wait_s}s; land re-runs this at main scope"
+          record_phase ci-checks $(( $(date +%s) - _phase_t0 )) defer
+        else
+          note_block "ci-checks — workflow(s) on HEAD are not green, or still pending (the next tick retries)"
+          record_phase ci-checks $(( $(date +%s) - _phase_t0 )) fail
+        fi
+      fi
+    fi
+  fi
 else
   _phase_t0=$(date +%s)
   if ( cd "$repo" && autobuilder ci-checks --project "$project_rel" ) 9>&-; then
