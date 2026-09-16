@@ -220,7 +220,19 @@ else
 fi
 export PATH="$PATH:$HOME/.cargo/bin:$HOME/.local/bin"
 _extend_gate_resolved_cargo="$(command -v cargo 2>/dev/null || true)"
-echo "extend-gate: cargo=${_extend_gate_resolved_cargo:-not-found}"
+# PRD-build-branch-gate-scope-artifacts requirement 5/AC7 (found live):
+# stderr, not stdout — this is a human-facing diagnostic ("logged once,
+# right here", not part of any mode's return value), but it ran BEFORE
+# --print-verdict-path's/--phases-json's early exits, which promise a
+# single clean stdout value for a caller to consume programmatically.
+# On stdout it silently became a SECOND line gate-then-land.sh's own
+# `verdict_path="$(... --print-verdict-path)"` capture never expected,
+# so `[ -f "$verdict_path" ]` always failed and every real land hit
+# `land-ungated (verdict=missing)` even on a genuine pass — caught by
+# bgscope_ac7_land_reruns_deferred_at_main_scope.sh running gate-then-
+# land.sh for real (a prior hand-rolled fake-extend-gate harness never
+# exercised this real interaction).
+echo "extend-gate: cargo=${_extend_gate_resolved_cargo:-not-found}" >&2
 
 # Overridable so tests/ can point at a fixture dir of fake binaries
 # without touching production behavior (default unchanged).
