@@ -1,0 +1,71 @@
+{
+  "_comment": "Recorded real `burst-lane.sh status --json` output (PRD-build-burst-gate-canary-invariant R16/AC18-19), captured against a fake-but-real session.json (BURST_LANE_HCLOUD_BIN pointed off-PATH so server_alive fails open) -- not hand-typed. Secrets/ids/live-host values redacted to placeholders below; every KEY and value TYPE is exactly what the real script emitted. Regenerate with the recipe in scripts/canary_ac18_fixture_parity.sh's header comment whenever burst-lane.sh's status --json shape changes; the parity test (tests/canary_ac18_fixture_parity.sh) fails naming the drifted keys when this file falls behind.",
+  "active": true,
+  "server_verified": true,
+  "server_id": "<server_id>",
+  "ip": "<ip>",
+  "minutes_alive": 0,
+  "ttl_hours": "6",
+  "sandbox_ok": "true",
+  "concurrent": "0/6",
+  "run_slots": {
+    "cap": 6,
+    "held": 0,
+    "source": "env",
+    "bound": "",
+    "box_cores": null,
+    "box_mem_gb": null,
+    "box_disk_gb": null
+  },
+  "free_disk_gb": null,
+  "disk_state": "ok",
+  "dirty": [],
+  "gates": [],
+  "gate_ready": "true",
+  "gate_tools_missing": "none",
+  "volume": null,
+  "volume_verified": true,
+  "redbaron_free_gb": 0,
+  "parity": [],
+  "next_teardown": {
+    "decision": "keep",
+    "cause": "probe-unavailable",
+    "eta_s": null
+  },
+  "boxes": [
+    {
+      "server_id": "<server_id>",
+      "server_type": "ccx43",
+      "ready": true,
+      "runs_served": 0,
+      "held": 0,
+      "cap": 6,
+      "age_min": 0,
+      "eur": 0.0
+    }
+  ],
+  "totals": {
+    "boxes": 1,
+    "held": 0,
+    "cap": 6,
+    "eur": 0.0
+  },
+  "image_id": "<image_id>",
+  "image_source": "env",
+  "bake_age_h": null,
+  "proof_age_h": null,
+  "proof_routed": null,
+  "enabled": true,
+  "prove_last": null,
+  "evidence": {
+    "count": 0,
+    "bytes": 0,
+    "newest_ts": null
+  },
+  "canary": {
+    "verdict": "missing",
+    "age_h": 0.0,
+    "head": "-------",
+    "ts": null
+  }
+}
