@@ -40,6 +40,18 @@
 #   After --max-retries consecutive stale-base attempts: blocked, exit 6,
 #   with all the main shas seen recorded in the sidecar/journal (AC5).
 #
+# Post-land intent-card check (PRD-build-intent-card-pregate-refresh R5,
+# P1, AC6): once `integrate` above lands (exit 0), this script compares
+# the landed head's agent/intent-card.json against $slug's own PRD path
+# (same manifest/build-queue resolution extend-gate.sh's pre-gate refresh
+# uses). Normally this is a no-op CHECK — the branch's own pre-gate
+# refresh already committed a correct card before this land's gate ran —
+# journaled `intent-card  check  ok`. On a genuine mismatch (the pre-gate
+# refresh never ran, e.g. an older branch that landed via a different
+# path), it is journaled `intent-card-drift` and fixed in place with a
+# commit `agent: refresh intent card for <slug>` directly on main (the
+# same commit subject SKILL.md's ship-sequence step already uses).
+#
 # Post-land deferred re-verification (PRD-build-branch-gate-scope-
 # artifacts requirement 5, P0, AC7): a branch-scope verdict can carry
 # `deferred_receipts` (rollback-plan's head-untagged, ci-checks'
@@ -199,6 +211,69 @@ while [ "$attempt" -le "$max_retries" ]; do
   case "$land_rc" in
     0)
       landed_sha="$(git -C "$repo" rev-parse HEAD)"
+      # R5 (P1, PRD-build-intent-card-pregate-refresh, AC6): post-land is
+      # a CHECK now, not a write — R1/R2's pre-gate refresh (extend-
+      # gate.sh, --scope branch) already committed a correct card ON THE
+      # BRANCH before this land's own gate ran, so the landed head should
+      # already carry it. Compare the landed card's prd_source against
+      # this slug's own PRD path — same resolution extend-gate.sh's
+      # pre-gate step uses (manifest path, falling back to the
+      # build-queue/ convention on slug) — never intent-card-refresh.sh
+      # --check's own "newest BUILT PRD" inference, which is stale here:
+      # $slug's manifest status is still in_progress at this exact
+      # moment, well before Phase 7 marks it built. Only on a real
+      # mismatch is the card fixed in place and committed on main — the
+      # "fixed as today" ship-sequence convention (SKILL.md Phase 4's
+      # "intent card refresh" step's own commit subject).
+      _icr_check_prd_dir="${GATE_PATIENCE_PRD_DIR:-$HOME/Documents/PRDs}"
+      _icr_check_prd_path="$_icr_check_prd_dir/build-queue/PRD-$slug.md"
+      _icr_check_manifest="${INTENT_CARD_REFRESH_MANIFEST:-$HERE/../state/manifest.json}"
+      if [ -r "$_icr_check_manifest" ] && command -v jq >/dev/null 2>&1; then
+        _icr_check_manifest_path="$(jq -r --arg s "$slug" '.prds[$s].path // empty' "$_icr_check_manifest" 2>/dev/null)"
+        if [ -n "$_icr_check_manifest_path" ] && [ "$_icr_check_manifest_path" != null ] && [ -r "$_icr_check_manifest_path" ]; then
+          _icr_check_prd_path="$_icr_check_manifest_path"
+        fi
+      fi
+      if [ -r "$_icr_check_prd_path" ]; then
+        _icr_landed_prd_source="$(jq -r '.prd_source // empty' "$repo/agent/intent-card.json" 2>/dev/null || true)"
+        _icr_same=false
+        if [ -n "$_icr_landed_prd_source" ]; then
+          _icr_landed_abs="$_icr_landed_prd_source"
+          [ -r "$_icr_landed_prd_source" ] && _icr_landed_abs="$(cd "$(dirname "$_icr_landed_prd_source")" && pwd)/$(basename "$_icr_landed_prd_source")"
+          _icr_expect_abs="$(cd "$(dirname "$_icr_check_prd_path")" && pwd)/$(basename "$_icr_check_prd_path")"
+          [ "$_icr_landed_abs" = "$_icr_expect_abs" ] && _icr_same=true
+        fi
+        if $_icr_same; then
+          jlog "intent-card  check  ok"
+        else
+          jlog "intent-card-drift landed_prd_source=${_icr_landed_prd_source:-none} expected=$_icr_check_prd_path"
+          _icr_fix_args=("$repo" --prd "$_icr_check_prd_path")
+          [ -n "$project_root" ] && _icr_fix_args+=(--project-root "$project_root")
+          if "$HERE/intent-card-refresh.sh" "${_icr_fix_args[@]}" >&2; then
+            # Same atomicity gotcha as extend-gate.sh's pre-gate commit: a
+            # pathspec that never existed (no extended-gates.toml, no
+            # amendment file) fails `git add`/`git commit -- <pathspec>`
+            # for every path in one invocation, not just the missing one.
+            _icr_candidate_paths=(agent/intent-card.json agent/intent-card.carried.json agent/intent_card_amendment_request.json extended-gates.toml)
+            _icr_existing_paths=()
+            for _icr_p in "${_icr_candidate_paths[@]}"; do
+              if [ -e "$repo/$_icr_p" ] || git -C "$repo" ls-files --error-unmatch -- "$_icr_p" >/dev/null 2>&1; then
+                _icr_existing_paths+=("$_icr_p")
+              fi
+            done
+            if [ "${#_icr_existing_paths[@]}" -gt 0 ] && \
+               [ -n "$(git -C "$repo" status --porcelain -- "${_icr_existing_paths[@]}" 2>/dev/null)" ]; then
+              ( cd "$repo" && git add -- "${_icr_existing_paths[@]}"
+                git "${GIT_ID[@]}" commit -q -m "agent: refresh intent card for $slug" \
+                  -- "${_icr_existing_paths[@]}" )
+              landed_sha="$(git -C "$repo" rev-parse HEAD)"
+              jlog "intent-card-drift fixed sha=$landed_sha"
+            fi
+          else
+            jlog "intent-card-drift fix-failed"
+          fi
+        fi
+      fi
       # requirement 5 / AC7 — see file header and $deferred_list's own
       # comment above (captured before `integrate` deleted the worktree
       # this verdict lived in). Only when THIS land's own gate verdict

@@ -9,7 +9,18 @@
 #
 # Usage:
 #   intent-card-refresh.sh <repo> <prd-path> [--dry-run] [--project-root <rel>]
+#   intent-card-refresh.sh <repo> --prd <prd-path> [--dry-run] [--project-root <rel>]
 #   intent-card-refresh.sh --check <repo>
+#
+# --prd <path>: same effect as the positional <prd-path> above (this
+#   script has never inferred a PRD in its default mode -- only --check's
+#   "newest built PRD" lookup infers anything, see that mode's own doc
+#   below) but fails with the distinct stderr token `prd-not-found` (not
+#   the shared "PRD not readable" text) when <path> isn't readable, so a
+#   caller that resolved this path itself (e.g. extend-gate.sh's pre-gate
+#   refresh, PRD-build-intent-card-pregate-refresh R1/R3) can key a named
+#   block on that exact word. Mutually exclusive with a positional
+#   <prd-path>.
 #
 # --project-root <rel>: relative path (from <repo>) to the Cargo project
 #   root, for a repo whose crate lives below the repo root (e.g.
@@ -98,6 +109,7 @@ MANIFEST="${MANIFEST:-$SKILL_DIR/state/manifest.json}"
 
 usage() {
   echo "usage: intent-card-refresh.sh <repo> <prd-path> [--dry-run] [--project-root <rel>]" >&2
+  echo "       intent-card-refresh.sh <repo> --prd <prd-path> [--dry-run] [--project-root <rel>]" >&2
   echo "       intent-card-refresh.sh --check <repo>" >&2
 }
 
@@ -108,6 +120,16 @@ dry_run=false
 repo=""
 prd=""
 project_root_rel=""
+# PRD-build-intent-card-pregate-refresh requirement R3: an explicit --prd
+# flag, distinct from the pre-existing positional <prd-path> form, so a
+# caller (extend-gate.sh's pre-gate refresh) can state in its own
+# invocation that the PRD came from a resolved claim/manifest lookup, not
+# inference. Both forms behave identically here (the positional form has
+# never inferred anything — see file header's Exit-code list, mode
+# `default`), but --prd additionally fails with the distinct message
+# `prd-not-found` (not the shared "PRD not readable" text below) so a
+# caller can grep for that exact token when deciding a block cause.
+prd_flag_given=false
 
 if [ "${1:-}" = "--check" ]; then
   mode=check
@@ -119,6 +141,9 @@ else
     case "$1" in
       --dry-run) dry_run=true; shift ;;
       --project-root) project_root_rel="${2:?intent-card-refresh: --project-root needs a value}"; shift 2 ;;
+      --prd)
+        [ -z "$prd" ] || { echo "intent-card-refresh: --prd given more than once (or combined with a positional prd-path)" >&2; usage; exit 2; }
+        prd="${2:?intent-card-refresh: --prd needs a value}"; prd_flag_given=true; shift 2 ;;
       -h|--help) usage; exit 0 ;;
       --) shift ;;
       -*) echo "intent-card-refresh: unknown flag $1" >&2; usage; exit 2 ;;
@@ -201,7 +226,14 @@ PY
   exit $?
 fi
 
-[ -r "$prd" ] || { echo "intent-card-refresh: PRD not readable: $prd" >&2; exit 4; }
+if [ ! -r "$prd" ]; then
+  if $prd_flag_given; then
+    echo "intent-card-refresh: prd-not-found: $prd" >&2
+  else
+    echo "intent-card-refresh: PRD not readable: $prd" >&2
+  fi
+  exit 4
+fi
 
 stage1_out="$(python3 - "$repo" "$prd" "$dry_run" <<'PY'
 import json, os, re, sys
