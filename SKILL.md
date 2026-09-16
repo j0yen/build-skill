@@ -768,13 +768,23 @@ read it before assuming a step is "the last one this tick".
   commit, never the head the gate above actually tested; this closes that
   gap (see the grounding incident in this PRD's own header). Exit 0: fall
   through to `push` below. Exit 4 (`refused` — the resolved check went red)
-  or 5 (`unknown` — no `.buildloop/ci-equivalent.toml`, or the check timed
-  out) defers the branch exactly like `target-dirty`: run `cleanup`
-  WITHOUT `--drop-branch` (branch and refresh commit survive), leave the
-  PRD `in_progress`, set `last_error=main-push-refused` (exit 4) or
-  `last_error=main-push-unknown` (exit 5), and do NOT call `wm-push`. Counts
-  as one tick action when it stops the chain here; otherwise folds into the
-  same step as `push`.
+  defers the branch exactly like `target-dirty`: run `cleanup` WITHOUT
+  `--drop-branch` (branch and refresh commit survive), leave the PRD
+  `in_progress`, set `last_error=main-push-refused`, and do NOT push.
+  **Exit 5 (`unknown` — no `.buildloop/ci-equivalent.toml`, or the check
+  timed out) is NOT a blanket defer** (Migration / compatibility section):
+  check `<build_into>`'s basename against `scripts/lib/fleet-repos.sh`'s
+  `FLEET_REPOS` array (the same list `ci-status.sh`/`repo-health.sh` use).
+  A repo IN that list is expected to declare a CI-equivalent — treat
+  exactly like exit 4 (`last_error=main-push-unknown`, defer, no push). A
+  repo NOT in that list (this skill's own `build-skill` included — it has
+  no GitHub Actions CI at all) is `ok-unmapped`: journal
+  `main-push  ok-unmapped  (... reason=not-in-fleet-repos-list)` and fall
+  through to `push` below same as exit 0 — without this exemption a
+  shell-target self-mod PRD (or any non-fleet `build_into`) could never
+  push again once the pre-push hook is installed on it (caught live,
+  2026-09-15, on this PRD's own self-push). Counts as one tick action when
+  it stops the chain here; otherwise folds into the same step as `push`.
 - **push** [rust-extend only]: **check `scripts/branch-protection.sh
   status <repo>`'s `push_via_branch` field (or read
   `state/branch-protection.json` directly) before choosing how to push —
@@ -2639,11 +2649,16 @@ python-specific contract.
    the non-shared push step — a protected `main`, e.g. mcphost since this
    PRD's live AC6/AC7 landing, refuses a direct push outright), then
    `worktree-extend.sh cleanup <repo> <slug>
-   --drop-branch`. Exit 4/5, same as any other deferred branch (dirty
+   --drop-branch`. Exit 4, same as any other deferred branch (dirty
    target / conflict / red gate): run `cleanup` WITHOUT `--drop-branch` so
    the next tick resumes the same branch via `add`, leave the PRD
-   `in_progress`, and set `last_error=main-push-refused` (4) or
-   `last_error=main-push-unknown` (5) — no `wm-push` call is made.
+   `in_progress`, and set `last_error=main-push-refused` — no push is
+   made. Exit 5: same non-fleet-repo exemption as the non-shared push step
+   above (check `<repo>`'s basename against `scripts/lib/fleet-repos.sh`'s
+   `FLEET_REPOS`) — a fleet repo defers exactly like exit 4
+   (`last_error=main-push-unknown`); a non-fleet repo is `ok-unmapped`
+   (journaled) and falls through to `branch-protection.sh push` same as
+   exit 0.
 6. **gate** — the real gate already ran, INSIDE `gate-then-land.sh`, BEFORE
    step 3 above (`extend-gate.sh <worktree> --head <worktree HEAD> --scope
    branch --slug <slug>`, no crate-wide lock — see the **gate** action's

@@ -18,9 +18,21 @@
 # MAIN_PUSH_GATE_BYPASS=1 skips the check entirely (never silently — a
 # `bypassed` journal line is always written, per requirement 4).
 #
-# Exit: 0 lets the push proceed (every checked ref was ok, or bypassed);
-#       nonzero refuses the WHOLE push (git's pre-push contract has no
-#       per-ref exit — refusing one ref refuses the batch).
+# ok-unmapped for non-fleet repos (Migration / compatibility section):
+# main-push-gate.sh exits 5 mechanically for ANY repo missing
+# .buildloop/ci-equivalent.toml (AC8) -- it has no way to know whether
+# that repo is even meant to declare one. This hook is one of the
+# CALLERS the Migration section names: "rc 5 ... ok-unmapped (journaled)
+# for repos not in ci-status.sh's list". build-skill itself is exactly
+# this case (a shell-target skill repo with no GitHub Actions CI at all,
+# not in scripts/lib/fleet-repos.sh's FLEET_REPOS) -- without this
+# exemption, this PRD's own self-push.sh would refuse to land its own
+# changes forever (caught live, 2026-09-15, the moment this hook's own
+# author tried to self-push).
+#
+# Exit: 0 lets the push proceed (every checked ref was ok, bypassed, or
+#       ok-unmapped); nonzero refuses the WHOLE push (git's pre-push
+#       contract has no per-ref exit — refusing one ref refuses the batch).
 set -uo pipefail
 
 repo_root="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
@@ -30,6 +42,20 @@ main_push_gate="$skill_dir/main-push-gate.sh"
 
 # shellcheck source=../lib/journal.sh
 source "$skill_dir/lib/journal.sh"
+
+FLEET_REPOS=()
+if [ -r "$skill_dir/lib/fleet-repos.sh" ]; then
+  # shellcheck source=../lib/fleet-repos.sh
+  source "$skill_dir/lib/fleet-repos.sh"
+fi
+
+is_fleet_repo() {
+  local slug="$1" r
+  for r in "${FLEET_REPOS[@]}"; do
+    [ "$r" = "$slug" ] && return 0
+  done
+  return 1
+}
 
 zero_sha="0000000000000000000000000000000000000000"
 refused=0
@@ -52,6 +78,10 @@ while read -r local_ref local_sha remote_ref remote_sha; do
     "$main_push_gate" "$repo_root" --head "$local_sha"
   fi
   rc=$?
+  if [ "$rc" -eq 5 ] && ! is_fleet_repo "$(basename "$repo_root")"; then
+    journal_line "$(date -u +%Y-%m-%dT%H:%M:%SZ)  $(basename "$repo_root")  main-push  ok-unmapped  (repo=$(basename "$repo_root") local=${local_sha:0:7} remote=${remote_sha:0:7} via=pre-push-hook reason=not-in-fleet-repos-list)"
+    continue
+  fi
   if [ "$rc" -ne 0 ]; then
     echo "pre-push: main-push-gate refused $local_ref -> $remote_ref (rc=$rc) — see $(journal_root)/$(date -u +%F).md" >&2
     refused=1
