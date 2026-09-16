@@ -78,6 +78,11 @@
 #      this land's own deferred receipts blocked. Main is left gated-red at
 #      the landed head, not reverted — the next tick's ordinary main-scope
 #      gate/ship path fixes it forward like any other main-scope block.
+#  12  contended (PRD-build-gate-patience-from-queue-depth) — extend-gate.sh
+#      exited 4: it already waited this crate's full derived patience for
+#      the producer lock and never got it. Not a red gate, not retried here
+#      (extend-gate.sh's own flock already paid the wait once) — branch
+#      kept, main untouched, `next: gate-retry` for the next tick/step.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
@@ -156,6 +161,27 @@ while [ "$attempt" -le "$max_retries" ]; do
 
   case "$gate_rc" in
     0|1) : ;;   # pass or block — a real verdict, let land's own precondition decide
+    4)
+      # PRD-build-gate-patience-from-queue-depth requirement 2/6 (P0/P1):
+      # exit 4 means extend-gate.sh already waited this crate's full
+      # derived patience for the producer lock and never got it — it is
+      # CONTENTION, not a red gate and not an infra failure, and it is
+      # never retried again here: a second call would just wait out the
+      # same patience a second time (AC8's "no fixed 90s retry boundary" —
+      # the wait already happened exactly once, inside extend-gate.sh's
+      # own flock). Never journals `gate-block`/`gate-red`/`verdict=block`.
+      # manifest-sidecar.sh has no dedicated `next` key (its schema is
+      # status/last_error/action/outcome/output_repo_*) — the actual
+      # `next: gate-retry` manifest field this requirement names is written
+      # by the calling branch agent's own Phase 7 manifest-set.sh patch
+      # (see SKILL.md's gate action, "derived patience" paragraph);
+      # `outcome` here is this script's own best-effort record of the same
+      # fact for anyone reading the sidecar directly. `blockers` is never
+      # touched by this exit path (nothing here calls into blocker state).
+      [ -x "$SIDECAR" ] && "$SIDECAR" write "$slug" "outcome=contended, next=gate-retry" >&2 || true
+      jlog "contended attempt=$attempt (see extend-gate.sh's own gate/contended journal line for holder identity)"
+      die 12 "producer-lock-contended — extend-gate.sh exhausted this crate's derived patience; branch kept, main untouched, next=gate-retry"
+      ;;
     *)
       [ -x "$SIDECAR" ] && "$SIDECAR" write "$slug" "last_error=gate-infra-failure:$gate_rc" >&2 || true
       jlog "gate-infra-failure rc=$gate_rc attempt=$attempt"

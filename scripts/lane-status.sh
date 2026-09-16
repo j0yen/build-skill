@@ -195,6 +195,77 @@ branch_gates_stats() {
   printf '%s %s %s\n' "${pass:-0}" "${block:-0}" "${deferred_only:-0}"
 }
 
+# PRD-build-gate-patience-from-queue-depth requirement 5 (P1, AC7): one
+# `gate-queue: crate=<name> depth=<n> holder=<slug> hold_max_s=<s>
+# contended=<n> exhausted=<n>` line per crate that had a gate THIS tick
+# (scans only the journal file this tick already wrote to — never a
+# cross-day scan). `depth` here is the count of gate ATTEMPTS this journal
+# shows for the crate this tick (contended lines + real pass/delta-pass/
+# block verdict lines) — the queue length an operator reads a tick summary
+# to see, built from the same `gate patience`/`gate ... contended` lines
+# requirement 1/2 write, never re-derived by a separate formula.
+# `exhausted` counts `gate-then-land ... land-retries-exhausted` lines
+# (stale-base retries exhausted — a different failure mode than
+# contention) attributed to a crate via that same line's slug, resolved
+# against this tick's own contended lines (best-effort; a slug never seen
+# contended this tick is simply not attributed to a crate here).
+gate_queue_stats() {
+  local journal="$1"
+  [ -f "$journal" ] || return 0
+  python3 - "$journal" <<'PY'
+import re, sys
+
+path = sys.argv[1]
+crates = {}
+
+def get(name):
+    return crates.setdefault(name, {"depth": 0, "holder": "", "hold_max_s": 0, "contended": 0, "exhausted": 0})
+
+contended_re = re.compile(r'gate\s+(\S+)\s+contended\s+\(crate=(\S+)\s+holder_pid=(\S+)\s+holder_slug=(\S+)\s+holder_age_s=(\S+)\s+waited_s=(\S+)\)')
+verdict_re = re.compile(r'gate\s+(\S+)\s+(pass|delta-pass|block)\s+\(')
+exhausted_re = re.compile(r'gate-then-land\s+(\S+)\s+land-retries-exhausted')
+
+slug_to_crate = {}
+
+with open(path) as f:
+    lines = f.readlines()
+
+for line in lines:
+    m = contended_re.search(line)
+    if m:
+        slug, crate = m.group(1), m.group(2)
+        slug_to_crate[slug] = crate
+        entry = get(crate)
+        entry["depth"] += 1
+        entry["contended"] += 1
+        entry["holder"] = m.group(4)
+        try:
+            entry["hold_max_s"] = max(entry["hold_max_s"], int(m.group(5)))
+        except ValueError:
+            pass
+        continue
+    m = verdict_re.search(line)
+    if m:
+        crate = m.group(1)
+        entry = get(crate)
+        entry["depth"] += 1
+        wm = re.search(r'wall=(\d+)s', line)
+        if wm:
+            entry["hold_max_s"] = max(entry["hold_max_s"], int(wm.group(1)))
+
+for line in lines:
+    m = exhausted_re.search(line)
+    if m:
+        crate = slug_to_crate.get(m.group(1))
+        if crate:
+            get(crate)["exhausted"] += 1
+
+for crate, e in crates.items():
+    holder = e["holder"] or "-"
+    print(f'gate-queue: crate={crate} depth={e["depth"]} holder={holder} hold_max_s={e["hold_max_s"]} contended={e["contended"]} exhausted={e["exhausted"]}')
+PY
+}
+
 cmd_tick_summary() {
   local lane="$1" claimed="$2" skipped="$3"
   local journal="${4:-$HOME/brain/journal/build/$(date -u +%F).md}"
@@ -243,6 +314,8 @@ cmd_tick_summary() {
   read -r bg_pass bg_block bg_deferred_only < <(branch_gates_stats "$journal")
   printf '%s  lane-health  BRANCH-GATES: branch_gates pass=%s block=%s deferred_only=%s\n' \
     "$(now_iso)" "$bg_pass" "$bg_block" "$bg_deferred_only" >> "$journal"
+  # PRD-build-gate-patience-from-queue-depth requirement 5 (P1, AC7).
+  gate_queue_stats "$journal" >> "$journal"
   echo "appended: $journal"
 }
 

@@ -183,6 +183,13 @@ BUILD_SCRIPTS="$(cd "$(dirname "$0")" && pwd)"
 source "$BUILD_SCRIPTS/lib/probe.sh"
 # shellcheck source=lib/journal.sh
 source "$BUILD_SCRIPTS/lib/journal.sh"
+# shellcheck source=lib/gate-patience.sh
+# PRD-build-gate-patience-from-queue-depth requirement 1: derives how long
+# the producer-lock wait below should be from the ACTUAL queue in front of
+# this gate, instead of the fixed EXTEND_GATE_PRODUCER_LOCK_WAIT constant
+# alone (that constant becomes the FLOOR, not the whole answer — see the
+# lib's own header).
+source "$BUILD_SCRIPTS/lib/gate-patience.sh"
 
 # --- PATH order guard (P0 requirement 1, PRD-build-gate-cargo-route-attest;
 #     rewritten under PRD-build-cargo-route-precedence) -------------------
@@ -396,6 +403,44 @@ EOF
 if [ "${1:-}" = "--explain-scope" ]; then
   explain_scope
   exit 0
+fi
+
+# PRD-build-gate-patience-from-queue-depth requirement 3 (P0, AC5): prints
+# the live holder's identity (pid, slug, scope, age) from the `.holder`
+# sidecar file written beside whichever lock this <build_into>/--scope
+# would take — the exact thing a `contended` journal line already names,
+# available on demand without grepping the journal. Exit 1 + "no holder
+# (lock free)" when the sidecar is absent (lock free, or a pre-this-PRD
+# holder that predates the sidecar).
+if [ "${1:-}" = "--explain-lock" ]; then
+  shift
+  explain_repo="${1:?extend-gate: --explain-lock needs <build_into>}"; shift
+  explain_scope_arg="main"; explain_slug=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --scope) explain_scope_arg="${2:?extend-gate: --scope needs a value}"; shift 2 ;;
+      --slug)  explain_slug="${2:?extend-gate: --slug needs a value}"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  explain_repo_real="$(cd "$explain_repo" 2>/dev/null && pwd)" || { echo "extend-gate: no such directory: $explain_repo" >&2; exit 1; }
+  explain_common_dir="$(git -C "$explain_repo_real" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || echo "$explain_repo_real/.git")"
+  if [ "$explain_scope_arg" = branch ] && [ -n "$explain_slug" ]; then
+    explain_lockfile="$explain_common_dir/autobuilder-gate-$explain_slug.lock"
+  else
+    explain_lockfile="$explain_common_dir/autobuilder-integrate.lock"
+  fi
+  explain_holder="$explain_lockfile.holder"
+  if [ -f "$explain_holder" ]; then
+    explain_h_pid="" explain_h_slug="" explain_h_scope="" explain_h_started=""
+    read -r explain_h_pid explain_h_slug explain_h_scope explain_h_started < "$explain_holder" 2>/dev/null || true
+    explain_h_age=$(( $(date +%s) - ${explain_h_started:-0} ))
+    printf 'pid=%s slug=%s scope=%s age_s=%s\n' \
+      "${explain_h_pid:-unknown}" "${explain_h_slug:-unknown}" "${explain_h_scope:-unknown}" "$explain_h_age"
+    exit 0
+  fi
+  echo "no holder (lock free)"
+  exit 1
 fi
 
 producers_desc() {
@@ -827,24 +872,82 @@ else
   lockfile="$git_common_dir/autobuilder-integrate.lock"
 fi
 exec 9>"$lockfile"
+holder_file="$lockfile.holder"
+crate_name="${repo##*/}"
+
+# PRD-build-gate-patience-from-queue-depth requirement 1 (P0, AC1/AC2):
+# patience_s = max(floor, depth * wall_est) — replaces the bare
+# EXTEND_GATE_PRODUCER_LOCK_WAIT constant as the flock wait bound below.
+# `depth` excludes THIS run's own claim (identified by --slug, when given);
+# GATE_PATIENCE_EXCLUDE_PRD/GATE_PATIENCE_PRD_DIR let selftests point this
+# at a fixture PRD clone. EXTEND_GATE_PATIENCE_OVERRIDE (selftest-only)
+# skips the derivation entirely and pins patience to an exact number —
+# AC1/AC8-style fixtures need a fixed clock, not a live claims scan.
+gate_patience_exclude_prd="${GATE_PATIENCE_EXCLUDE_PRD:-}"
+gate_patience_prd_dir="${GATE_PATIENCE_PRD_DIR:-$HOME/Documents/PRDs}"
+if [ -z "$gate_patience_exclude_prd" ] && [ -n "$slug" ]; then
+  gate_patience_exclude_prd="$gate_patience_prd_dir/build-queue/PRD-$slug.md"
+fi
+if [ -n "${EXTEND_GATE_PATIENCE_OVERRIDE:-}" ]; then
+  GATE_PATIENCE_DEPTH="${EXTEND_GATE_PATIENCE_DEPTH_OVERRIDE:-0}"
+  GATE_PATIENCE_WALL_EST="${EXTEND_GATE_PATIENCE_WALL_EST_OVERRIDE:-600}"
+  GATE_PATIENCE_S="$EXTEND_GATE_PATIENCE_OVERRIDE"
+else
+  gate_patience_compute "$repo" "$crate_name" "$EXTEND_GATE_PRODUCER_LOCK_WAIT" "$journal" \
+    "$gate_patience_exclude_prd" "$gate_patience_prd_dir"
+fi
+journal_line --file "$journal" "$(gate_patience_journal_line "$crate_name" "$GATE_PATIENCE_DEPTH" "$GATE_PATIENCE_WALL_EST" "$GATE_PATIENCE_S")"
+
 # PRD-build-extend-gate-concurrent-isolation requirement 8 (P2, journal
 # visibility): every run records how long it waited for producer access —
 # 0 when uncontended — so a future lane-status-style summary can tell
 # whether the ≤5 same-target sub-cap is actually causing gate contention
 # in practice.
 lock_wait_t0=$(date +%s)
-if ! flock -w "$EXTEND_GATE_PRODUCER_LOCK_WAIT" 9; then
-  # PRD-build-extend-gate-concurrent-isolation requirement 2: fail closed
-  # with an unambiguous, actionable message naming the contending PID —
-  # never proceed to read (or start writing into) a receipts dir another
-  # invocation may be mid-write on. `fuser` names every PID holding an
-  # open fd on the lock file; the holder that actually has it flock'd is
-  # normally the sole result, but a race (holder just exited) can leave
-  # none — "unknown" rather than a misleading blank in that case.
-  holder_pid="$(fuser "$lockfile" 2>/dev/null | tr -s ' \t' '\n' | grep -E '^[0-9]+$' | paste -sd, -)"
-  die 4 "producer-lock-contended, pid=${holder_pid:-unknown} (could not acquire integration lock for $repo within ${EXTEND_GATE_PRODUCER_LOCK_WAIT}s — another integrate/gate is running)"
+if ! flock -w "$GATE_PATIENCE_S" 9; then
+  # PRD-build-gate-patience-from-queue-depth requirement 2 (P0, AC3/AC4):
+  # a lock not acquired within patience is CONTENTION, never a verdict —
+  # it journals `gate <slug> contended (...)`, never a `block`/`gate-block`/
+  # `verdict=block` line, and the caller (gate-then-land.sh / SKILL.md's
+  # gate action) sets `next: gate-retry` on this exit code, not gate-red.
+  waited_s=$(( $(date +%s) - lock_wait_t0 ))
+  holder_pid="" holder_slug_v="" holder_scope_v="" holder_started=""
+  if [ -f "$holder_file" ]; then
+    read -r holder_pid holder_slug_v holder_scope_v holder_started < "$holder_file" 2>/dev/null || true
+  fi
+  # PRD-build-extend-gate-concurrent-isolation requirement 2 (retained):
+  # `fuser` names every PID holding an open fd on the lock file when the
+  # sidecar above is missing/stale (a holder that predates this PRD) —
+  # "unknown" rather than a misleading blank in that case.
+  if [ -z "$holder_pid" ]; then
+    holder_pid="$(fuser "$lockfile" 2>/dev/null | tr -s ' \t' '\n' | grep -E '^[0-9]+$' | paste -sd, -)"
+  fi
+  holder_age_s="unknown"
+  [ -n "${holder_started:-}" ] && holder_age_s=$(( $(date +%s) - holder_started ))
+  journal_line --file "$journal" "$(gate_patience_contended_line "${slug:-main}" "$crate_name" \
+    "${holder_pid:-unknown}" "${holder_slug_v:-unknown}" "$holder_age_s" "$waited_s")"
+  die 4 "producer-lock-contended, pid=${holder_pid:-unknown} holder_slug=${holder_slug_v:-unknown} waited=${waited_s}s patience=${GATE_PATIENCE_S}s (could not acquire integration lock for $repo within patience — another integrate/gate is running)"
 fi
 lock_wait=$(( $(date +%s) - lock_wait_t0 ))
+
+# PRD-build-gate-patience-from-queue-depth requirement 3 (P0, AC5/AC10):
+# record this run's own identity beside the lock the instant it's held, and
+# remove it on every exit path (trap) — the only new persistent state this
+# PRD adds. A leftover sidecar whose pid is no longer alive means a prior
+# holder crashed without releasing (the OS flock itself was already freed
+# by the kernel on that process's exit, which is why THIS flock just
+# succeeded) — journal the reclaim so an operator sees it happened rather
+# than silently overwriting stale identity.
+if [ -f "$holder_file" ]; then
+  stale_holder_pid=""
+  read -r stale_holder_pid _ _ _ < "$holder_file" 2>/dev/null || true
+  if [ -n "$stale_holder_pid" ] && ! kill -0 "$stale_holder_pid" 2>/dev/null; then
+    journal_line --file "$journal" "$(printf '%s  gate  lock-reclaimed  (stale_pid=%s)' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$stale_holder_pid")"
+  fi
+fi
+printf '%s %s %s %s\n' "$$" "${slug:-main}" "$scope" "$(date +%s)" > "$holder_file"
+_gate_patience_release_holder() { rm -f "$holder_file" 2>/dev/null || true; }
+trap _gate_patience_release_holder EXIT
 
 # --- prune landed worktrees before producing receipts (PRD-build-worktree-targets-off-root) --
 # A gate must never start on a disk full of worktrees whose branches already
