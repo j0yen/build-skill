@@ -3633,16 +3633,23 @@ cmd_prove() {
 }
 
 # ---- enable / disable (PRD-build-burst-dispatch-reenable requirement 4) --
-# The tick's ONLY opt-in surface. `enable` never edits
-# ~/.config/wm-burst/.env (that file also carries HCLOUD_TOKEN and
-# burst-configured.sh deliberately sources it only in a subshell — see that
-# file's header); instead it writes a diffable, single-purpose, one-`rm`-
-# reversible systemd user-service drop-in that sets BUILD_BURST_ENABLED=1
-# for claude-build.service specifically. It reads ONLY `resolve_boot_image`
-# (requirement 2, the same precedence `status`/`up` use) and `proof.json`
-# (requirement 3's own receipt) — never re-derives its own notion of "what
-# would `up` boot" or "is the proof fresh", so `enable` and `status --json`
-# can never disagree about either question.
+# The tick's ONLY opt-in surface. `enable` writes a diffable, single-purpose,
+# one-`rm`-reversible systemd user-service drop-in that sets
+# BUILD_BURST_ENABLED=1 for claude-build.service specifically. It reads ONLY
+# `resolve_boot_image` (requirement 2, the same precedence `status`/`up`
+# use) and `proof.json` (requirement 3's own receipt) — never re-derives its
+# own notion of "what would `up` boot" or "is the proof fresh", so `enable`
+# and `status --json` can never disagree about either question.
+#
+# PRD-build-burst-gate-canary-invariant R17 (2026-09-16): the drop-in alone
+# is not enough — gate-launch units source ~/.config/wm-burst/.env directly
+# and never see a systemd Environment= override (the 2026-09-15 23:38 EDT
+# incident: the knob was hand-set in BOTH files, with no canary verdict
+# backing either, and every mcphost gate went red at 02:20 EDT). `enable`
+# now writes BUILD_BURST_ENABLED into both knob files together via
+# write_burst_knob_env() below — never touching any OTHER line in
+# $ENV_FILE (HCLOUD_TOKEN included; write_burst_knob_env() upserts exactly
+# one `BUILD_BURST_ENABLED=` line and leaves the rest of the file alone).
 cmd_enable() {
   local boot_image_id boot_image_source
   read -r boot_image_id boot_image_source <<<"$(resolve_boot_image)"
@@ -3722,6 +3729,7 @@ print("allow", ts, proof.get("image_id", ""))
   mkdir -p "$(dirname "$SYSTEMD_DROPIN")"
   printf '[Service]\nEnvironment=BUILD_BURST_ENABLED=1\n' > "$SYSTEMD_DROPIN"
   systemctl --user daemon-reload >/dev/null 2>&1 || true
+  write_burst_knob_env 1
 
   # R17: enable.json is the sole sanctioned record pairing this
   # BUILD_BURST_ENABLED=1 write with the canary verdict that authorized it.
@@ -3743,6 +3751,27 @@ json.dump({"ts": ts, "canary_verdict": canary_verdict, "canary_ts": canary_ts, "
   exit 0
 }
 
+# R17: upserts exactly one `BUILD_BURST_ENABLED=<val>` line in $ENV_FILE,
+# creating the file (and its parent dir) if absent, and never touching any
+# other line — HCLOUD_TOKEN and every other key in that file survive
+# untouched. Shared by cmd_enable (val=1) and remove_burst_dropin (val=0)
+# so the two knob files (systemd drop-in, wm-burst/.env) can never disagree
+# about which value burst-lane.sh itself last set — a THIRD party hand-
+# editing either file out of band is exactly what select-tick.sh's
+# knob-ownership check (R17, same PRD) alarms on.
+write_burst_knob_env() {  # $1 = 0|1
+  local val="$1"
+  if [ ! -f "$ENV_FILE" ]; then
+    mkdir -p "$(dirname "$ENV_FILE")"
+    : > "$ENV_FILE"
+  fi
+  if grep -q '^BUILD_BURST_ENABLED=' "$ENV_FILE" 2>/dev/null; then
+    sed -i "s/^BUILD_BURST_ENABLED=.*/BUILD_BURST_ENABLED=$val/" "$ENV_FILE"
+  else
+    printf '\nBUILD_BURST_ENABLED=%s\n' "$val" >> "$ENV_FILE"
+  fi
+}
+
 # Shared by cmd_disable (operator-invoked, journals "disable done") and
 # check_auto_disable (autonomous, journals "auto-disabled" — a distinct
 # event name because AC9's journal text differs from AC7's and, unlike
@@ -3751,6 +3780,7 @@ json.dump({"ts": ts, "canary_verdict": canary_verdict, "canary_ts": canary_ts, "
 remove_burst_dropin() {
   rm -f "$SYSTEMD_DROPIN"
   systemctl --user daemon-reload >/dev/null 2>&1 || true
+  write_burst_knob_env 0
 }
 
 cmd_disable() {

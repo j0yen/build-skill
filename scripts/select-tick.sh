@@ -387,6 +387,72 @@ if [ -x "$BURST_LANE_SH" ]; then
   [ "$gr" = "true" ] && burst_session=1
 fi
 
+# PRD-build-burst-gate-canary-invariant R17: BUILD_BURST_ENABLED may only be
+# 1 because burst-lane.sh's own `enable` wrote it, paired with a passing
+# canary recorded in enable.json (R6, same PRD — enable now writes both
+# knob files, see write_burst_knob_env() in burst-lane.sh). Every tick
+# checks the live knob against that record: a knob read as 1 with no
+# record at all, or a record whose canary is stale (>=24h) or not `pass`,
+# means the knob was set by hand — exactly the 2026-09-15 23:38 EDT
+# incident (both knob files hand-edited, no canary verdict, every mcphost
+# gate red at 02:20 EDT). ALARM through the SAME gate-red channel
+# PRD-build-gate-red-alarm-invariant already wires (never a second,
+# competing notifier) and force routing off for THIS tick only: both
+# burst_session and BUILD_BURST_ENABLED are reset to 0 here, before
+# select-guard.sh's own per-candidate loop below runs, so every admitted
+# gate this tick inherits BUILD_BURST_ENABLED=0 (AC21).
+BURST_LANE_SYSTEMD_DROPIN="${BURST_LANE_SYSTEMD_DROPIN:-$HOME/.config/systemd/user/claude-build.service.d/burst.conf}"
+BURST_LANE_ENV_FILE="${BURST_LANE_ENV_FILE:-$HOME/.config/wm-burst/.env}"
+ALERT_DELIVER="${ALERT_DELIVER:-$HERE/alert-deliver.sh}"
+
+knob_source=""
+for knob_file in "$BURST_LANE_SYSTEMD_DROPIN" "$BURST_LANE_ENV_FILE"; do
+  [ -r "$knob_file" ] || continue
+  knob_val="$(grep -oE 'BUILD_BURST_ENABLED=[01]' "$knob_file" 2>/dev/null | tail -1 | cut -d= -f2 || true)"
+  if [ "$knob_val" = "1" ]; then
+    knob_source="$(basename "$knob_file")"
+    break
+  fi
+done
+
+if [ -n "$knob_source" ]; then
+  knob_enable_json="${BURST_LANE_STATE_DIR:-$SKILL_DIR/state/burst-lane}/enable.json"
+  knob_cause=""
+  knob_alarm=false
+  if [ ! -f "$knob_enable_json" ]; then
+    knob_alarm=true   # AC21: no record at all -- cause left blank
+  else
+    knob_canary_verdict="$("$JQ" -r '.canary_verdict // empty' "$knob_enable_json" 2>/dev/null || true)"
+    knob_canary_ts="$("$JQ" -r '.canary_ts // empty' "$knob_enable_json" 2>/dev/null || true)"
+    if [ "$knob_canary_verdict" != "pass" ]; then
+      knob_cause="canary-not-pass"; knob_alarm=true
+    else
+      knob_ts_epoch="$(date -u -d "$knob_canary_ts" +%s 2>/dev/null || echo 0)"
+      knob_now_epoch="$(date -u +%s)"
+      if [ "$knob_ts_epoch" -le 0 ]; then
+        knob_cause="canary-not-pass"; knob_alarm=true
+      elif [ $(( (knob_now_epoch - knob_ts_epoch) / 3600 )) -ge 24 ]; then
+        knob_cause="canary-stale"; knob_alarm=true   # AC23
+      fi
+    fi
+  fi
+
+  if [ "$knob_alarm" = true ]; then
+    knob_alarm_text="ALARM burst-knob-unsanctioned (source=$knob_source${knob_cause:+ cause=$knob_cause})"
+    if [ "$DRY_RUN" = false ]; then
+      journal_line --file "$JOURNAL" "$(date -u +%Y-%m-%dT%H:%M:%SZ)  select-tick  $knob_alarm_text  lane=$LANE_ARG"
+      knob_evidence="$(mktemp "${TMPDIR:-/tmp}/select-tick-knob-alarm.XXXXXX")"
+      printf 'value=1 -- %s\n' "$knob_alarm_text" > "$knob_evidence"
+      if [ -x "$ALERT_DELIVER" ]; then
+        "$ALERT_DELIVER" gate-red build-loop "$knob_evidence" >/dev/null 2>&1 || true
+      fi
+      rm -f "$knob_evidence"
+    fi
+    burst_session=0
+    export BUILD_BURST_ENABLED=0
+  fi
+fi
+
 # --- Step 3: select-guard.sh per surviving candidate, threading
 # branch-count/admitted-targets exactly as select-guard-selftest.sh already
 # demonstrates by hand. Continuations are exempted from the running

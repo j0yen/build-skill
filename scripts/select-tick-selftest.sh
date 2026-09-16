@@ -80,9 +80,21 @@ EOF
 chmod +x "$FAKE_BURST"
 
 run_select_tick() {
+  # R17 knob-ownership check (PRD-build-burst-gate-canary-invariant): reads
+  # the systemd drop-in / wm-burst.env / enable.json directly, not just via
+  # BURST_LANE_SH -- point all three at nonexistent fixture paths under
+  # $ROOT so this selftest never reads (or, via a concurrently-running
+  # production lane, races against) the real host's knob files or the
+  # running skill's own state/burst-lane/enable.json (PRD-build-shell-
+  # worktree-isolation requirement 4, same isolation discipline as
+  # SELECT_TICK_JOURNAL above). Neither fixture file exists, so the
+  # knob-ownership check reads knob=absent and never fires.
   BUILD_STATE_DIR="$ROOT/state" BUILD_MANIFEST="$ROOT/state/manifest.json" \
     SELECT_TICK_JOURNAL="$JOURNAL" \
     BURST_LANE_SH="$FAKE_BURST" \
+    BURST_LANE_SYSTEMD_DROPIN="$ROOT/fixture-burst.conf" \
+    BURST_LANE_ENV_FILE="$ROOT/fixture-wm-burst.env" \
+    BURST_LANE_STATE_DIR="$ROOT/state/burst-lane" \
     FAKE_BURST_READY="$FAKE_BURST_READY" FAKE_BURST_WIDTH="$FAKE_BURST_WIDTH" \
     "$ST" --prd-dir "$ROOT" "$@"
 }
