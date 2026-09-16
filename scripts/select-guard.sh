@@ -237,7 +237,7 @@ main() {
           select_guard_journal_line "$slug" cap-local "cause=probe-failed"
         fi
         if [ "$gate_ready" = "true" ]; then
-          width="$(printf '%s' "$bstatus" | jq -r '.width // empty' 2>/dev/null || true)"
+          width="$(printf '%s' "$bstatus" | jq -r '.width // .run_slots.cap // empty' 2>/dev/null || true)"
           case "$width" in ''|*[!0-9]*) width="" ;; esac
           if [ -n "$width" ]; then
             cap_burst="${BUILD_SAME_TARGET_CAP_BURST:-4}"
