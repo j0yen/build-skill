@@ -844,6 +844,21 @@ fi
 if ! $record_baseline && ! $force && [ -f "$cache_file" ]; then
   cached_tree="$(jq -r '.tree_sha // empty' "$cache_file" 2>/dev/null || true)"
   cached_hash="$(jq -r '.script_sha256 // empty' "$cache_file" 2>/dev/null || true)"
+  # NOTE (PRD-build-branch-gate-scope-artifacts, Technical considerations):
+  # "a deferred verdict must not be reused at main scope — include scope in
+  # the cache key" sounds like it belongs here, but a blanket scope check
+  # on this general hit condition regresses PRD-build-gate-before-land
+  # requirement 4 / AC7b's already-shipped contract — `land` deliberately
+  # transfers a branch-scope cache entry (scope=branch, same tree) so a
+  # post-land `--scope main` gate call CAN replay it as a cache hit instead
+  # of re-running all 25 producers on an unchanged tree
+  # (extend-gate-scope-selftest.sh / gate-verdict-tree-cache-selftest.sh
+  # AC7b assert exactly this: 0 producer output after land). The actual
+  # fix belongs to requirement 5 (land re-runs deferred producers at main
+  # scope before tagging): that re-run is what must clear/refresh
+  # `deferred_receipts` on the transferred cache entry so a later hit is
+  # known-safe — not a scope match here, which would just make every
+  # post-land gate re-run everything. Left as plain tree+hash, unchanged.
   if [ -n "$cached_tree" ] && [ "$cached_tree" = "$tree_now" ] && [ -n "$cached_hash" ] && [ "$cached_hash" = "$self_hash" ]; then
     cached_verdict="$(jq -r '.verdict // empty' "$cache_file" 2>/dev/null || true)"
     cached_rc="$(jq -r '.exit_code // empty' "$cache_file" 2>/dev/null || true)"
@@ -939,6 +954,15 @@ fi
 t0=$(date +%s)
 blocking_notes=()
 note_block() { blocking_notes+=("$1"); echo "extend-gate: $1" >&2; }
+# PRD-build-branch-gate-scope-artifacts requirement 1/3/4: a scope-deferred
+# receipt (branch-scope artifact, not a real defect) is tracked separately
+# from a real block — it never suppresses reviewer-agent (requirement 3's
+# skip check below only ever looks at blocking_notes) and never turns the
+# verdict block (the underlying receipt is rewritten to pass on disk before
+# `autobuilder gate` runs, below), but IS named in the journal's `deferred=`
+# field and `last-verdict.json.deferred_receipts` (requirement 4).
+deferred_notes=()
+note_defer() { deferred_notes+=("$1"); echo "extend-gate: DEFERRED: $1" >&2; }
 
 # --- per-step phase timing (PRD-build-gate-phase-timing) -----------------
 # Every invoked producer below is wrapped in a `date +%s` pair and recorded
@@ -954,12 +978,13 @@ note_block() { blocking_notes+=("$1"); echo "extend-gate: $1" >&2; }
 # array needed) so invocation order is preserved for free.
 phase_names=()
 phase_vals=()
-record_phase() {  # $1=name $2=seconds $3=ok|skip|fail
+record_phase() {  # $1=name $2=seconds $3=ok|skip|fail|defer
   phase_names+=("$1")
   case "$3" in
-    skip) phase_vals+=("skip") ;;
-    fail) phase_vals+=("${2}!") ;;
-    *)    phase_vals+=("$2") ;;
+    skip)  phase_vals+=("skip") ;;
+    defer) phase_vals+=("defer") ;;
+    fail)  phase_vals+=("${2}!") ;;
+    *)     phase_vals+=("$2") ;;
   esac
 }
 
@@ -1048,12 +1073,51 @@ else
 fi
 
 # 5. rollback-plan over <base>..HEAD.
+# PRD-build-branch-gate-scope-artifacts requirement 1 (P0, AC1): at
+# `--scope branch`, a `head-untagged` block is a scope artifact — no
+# branch HEAD ever carries a release tag, only main does, after a ship
+# (Problem statement: 14/14 branch gates on 2026-09-15 blocked here alone).
+# autobuilder's rollback.rs itself is untouched (Non-goals: the policy
+# lives in the caller); this script post-classifies the receipt IT wrote:
+# when `block_reason == head-untagged` and the receipt's own `head_sha`
+# matches this run's actual HEAD (i.e. it is a fresh receipt for exactly
+# this commit, not a stale leftover — the freshness guard the PRD's
+# fallback text names as "commit_count == <branch commit count>"; a raw
+# git commit count does not correspond to rollback.rs's own commit_count
+# field, which counts version-bump commits, not all commits, so head_sha
+# freshness is the meaningful, robust form of that same check), the block
+# is rewritten to a pass ON DISK — `autobuilder gate` below reads receipts
+# fresh off disk and has no other notion of "deferred", so this is what
+# keeps its aggregate from blocking on a scope artifact — and recorded
+# `scope-deferred` here. `land` re-runs this producer at `--scope main`
+# before tagging (requirement 5), where a real tag is expected and this
+# deferral path is never reached (scope != branch).
 _phase_t0=$(date +%s)
+rollback_receipt="$project_abs/target/autobuilder/receipts/rollback-plan.json"
 if ( cd "$repo" && autobuilder rollback-plan --project "$project_rel" --base "$base_ref" ) 9>&-; then
   record_phase rollback-plan $(( $(date +%s) - _phase_t0 )) ok
 else
-  note_block "rollback-plan — commits since $base_ref are not all revert-clean (see target/autobuilder/rollback.md); fix forward, or a human rewrites history and says so — this script never edits history to force a pass"
-  record_phase rollback-plan $(( $(date +%s) - _phase_t0 )) fail
+  rollback_deferred=false
+  if [ "$scope" = branch ] && [ -f "$rollback_receipt" ]; then
+    _rb_reason="$(jq -r '.block_reason // empty' "$rollback_receipt" 2>/dev/null)"
+    _rb_head="$(jq -r '.head_sha // empty' "$rollback_receipt" 2>/dev/null)"
+    if [ "$_rb_reason" = "head-untagged" ] && [ -n "$_rb_head" ] && [ "$_rb_head" = "$head_now" ]; then
+      rollback_deferred=true
+    fi
+  fi
+  if $rollback_deferred; then
+    _tmp_rb="$(mktemp "${TMPDIR:-/tmp}/extend-gate-rollback-defer.XXXXXX")"
+    if jq '.verdict = "pass" | .scope_deferred = true' "$rollback_receipt" > "$_tmp_rb" 2>/dev/null; then
+      mv "$_tmp_rb" "$rollback_receipt"
+    else
+      rm -f "$_tmp_rb" 2>/dev/null || true
+    fi
+    note_defer "rollback-plan — scope-deferred (head-untagged) — branch HEAD carries no release tag; land re-runs this at main scope"
+    record_phase rollback-plan $(( $(date +%s) - _phase_t0 )) defer
+  else
+    note_block "rollback-plan — commits since $base_ref are not all revert-clean (see target/autobuilder/rollback.md); fix forward, or a human rewrites history and says so — this script never edits history to force a pass"
+    record_phase rollback-plan $(( $(date +%s) - _phase_t0 )) fail
+  fi
 fi
 
 # 6. reviewer-agent: prepare, spawn the independent review headlessly via
@@ -1211,6 +1275,22 @@ if [ "${#blocking_notes[@]}" -gt 0 ]; then
   blockers_csv="$(IFS='|'; echo "${blocking_notes[*]}")"
 fi
 
+# PRD-build-branch-gate-scope-artifacts requirement 4 (AC5): names of the
+# scope-deferred producers, comma-joined (matches the AC's own example:
+# `deferred=rollback-plan,ci-checks`) for the journal line, and as a JSON
+# array for last-verdict.json.deferred_receipts. note_defer strings share
+# note_block's "<receipt-name> — <detail>" shape, so the name is everything
+# before the first em dash, same split gate-attribution's notes-file uses.
+deferred_csv=""
+deferred_json='[]'
+if [ "${#deferred_notes[@]}" -gt 0 ]; then
+  for n in "${deferred_notes[@]}"; do
+    _dname="$(printf '%s' "$n" | sed -E 's/^([^ ]+) — .*$/\1/')"
+    if [ -n "$deferred_csv" ]; then deferred_csv="$deferred_csv,$_dname"; else deferred_csv="$_dname"; fi
+    deferred_json="$(jq -c --arg n "$_dname" '. + [$n]' <<<"$deferred_json")"
+  done
+fi
+
 # --- phase timing summary (PRD-build-gate-phase-timing) -------------------
 # Builds `phases=<name>:<val>,...` in invocation order from the
 # record_phase calls above, and checks the sum of every non-skipped phase's
@@ -1226,9 +1306,10 @@ for _pi in "${!phase_names[@]}"; do
   _pname="${phase_names[$_pi]}"
   _pval="${phase_vals[$_pi]}"
   case "$_pval" in
-    skip) : ;;
-    *!)   phase_sum=$(( phase_sum + ${_pval%!} )) ;;
-    *)    phase_sum=$(( phase_sum + _pval )) ;;
+    skip)  : ;;
+    defer) : ;;
+    *!)    phase_sum=$(( phase_sum + ${_pval%!} )) ;;
+    *)     phase_sum=$(( phase_sum + _pval )) ;;
   esac
   if [ -n "$phases_str" ]; then phases_str="$phases_str,$_pname:$_pval"; else phases_str="$_pname:$_pval"; fi
 done
@@ -1344,6 +1425,11 @@ fi
 if [ "${#blocking_notes[@]}" -gt 0 ]; then
   journal_suffix="$journal_suffix inherited=$attribution_inherited in-scope=$attribution_in_scope"
 fi
+# requirement 4 (AC5): `deferred=<names>` — appended whenever this run
+# scope-deferred at least one receipt, independent of both suffixes above.
+if [ -n "$deferred_csv" ]; then
+  journal_suffix="$journal_suffix deferred=$deferred_csv"
+fi
 
 # One journal line per gate run (requirement 8 / AC13): crate, HEAD, base
 # tag, pass/block counts, blocking receipt names, wall seconds, (PRD-
@@ -1395,6 +1481,7 @@ jq -n --arg head "$head_now" --arg tree "$tree_now" --arg hash "$self_hash" --ar
      --arg host "$route_host" --argjson attribution "$attribution_for_cache" \
      --argjson phases "$phases_json" --argjson wall_s "$wall" \
      --arg scope "$scope" --arg slug "$slug" \
+     --argjson deferred "$deferred_json" \
      --argjson over "$phase_over_tolerance" --argjson unattr "$phase_unattributed" '
   {
     head_sha: $head,
@@ -1411,7 +1498,8 @@ jq -n --arg head "$head_now" --arg tree "$tree_now" --arg hash "$self_hash" --ar
     phases: $phases,
     wall_s: $wall_s,
     scope: $scope,
-    slug: $slug
+    slug: $slug,
+    deferred_receipts: $deferred
   } + (if $over then {unattributed_s: $unattr} else {} end)
 ' > "$cache_file" 2>/dev/null || true
 
