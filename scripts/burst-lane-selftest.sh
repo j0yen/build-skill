@@ -6666,10 +6666,11 @@ expect_block_green "teardown" "teardown: every teardown case above ran green"
 # set instead of acting on `current` alone) is covered below for down and
 # idle-guard — AC4, AC5; watchdog's own iteration is exercised by AC4/AC5's
 # shared down_one_box/watchdog_one_box/idle_guard_one_box refactor pattern
-# but has no dedicated AC in the PRD beyond those two. Requirements 7-8
-# (`status --json` boxes/totals, `reap`'s orphan-box-deleted) remain open —
-# see the PRD's own tracking; this block does not yet cover AC9 or a
-# dedicated status-schema check.
+# but has no dedicated AC in the PRD beyond those two. Requirement 8
+# (`reap`'s orphan-box-deleted sweep, server side only — the volume side has
+# no dedicated AC and per-box volume naming is still open) is AC9.
+# Requirement 7 (`status --json` boxes/totals schema) remains open — no
+# dedicated AC names it, see the PRD's own tracking.
 # =============================================================================
 block_start "multibox"
 
@@ -6952,6 +6953,25 @@ expect "multibox AC5: down --force leaves no wm-burst-lane* server in hcloud" \
   "! grep -q 'wm-burst-lane' \"$FAKE_HCLOUD_STATE\""
 expect "multibox AC5: down --force leaves no wm-burst-* volume in hcloud" \
   "! grep -q 'wm-burst-' \"$FAKE_HCLOUD_VOLUME_STATE\""
+
+# ---- multibox AC9 (requirement 8): `reap` deletes any wm-burst-lane*
+# server hcloud still lists with no boxes/<id>/ directory here, journaling
+# `reap  orphan-box-deleted` — and leaves a LEGITIMATE box (one that DOES
+# have a boxes/<id>/ dir) alone in the same pass.
+fresh_env
+"$BL" up >/dev/null 2>&1
+mb9_legit_id="$(grep -oE '"server_id":[0-9]+' "$BURST_LANE_STATE_DIR/current/session.json" | cut -d: -f2)"
+hcloud server create --name wm-burst-lane-9 >/dev/null 2>&1
+mb9_orphan_id="$(awk -F'|' '$2=="wm-burst-lane-9"{print $1}' "$FAKE_HCLOUD_STATE" | head -n1)"
+expect "multibox AC9 setup: the orphan server has no boxes/<id>/ dir yet" \
+  "[ ! -d \"$BURST_LANE_STATE_DIR/boxes/$mb9_orphan_id\" ]"
+"$BL" reap >/dev/null 2>&1
+expect "multibox AC9: the orphan server is gone from hcloud" \
+  "! hcloud server describe \"$mb9_orphan_id\" -o json >/dev/null 2>&1"
+expect "multibox AC9: journal has 'reap  orphan-box-deleted' naming the orphan server" \
+  "grep -q \"burst-lane  reap  orphan-box-deleted  (server_id=$mb9_orphan_id name=wm-burst-lane-9\" \"$BURST_LANE_JOURNAL\""
+expect "multibox AC9: the legitimate box (has a boxes/<id>/ dir) is untouched" \
+  "hcloud server describe \"$mb9_legit_id\" -o json >/dev/null 2>&1"
 
 expect_block_green "multibox" "multibox: every state-layout migration case above ran green"
 

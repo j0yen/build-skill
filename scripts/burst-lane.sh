@@ -8113,7 +8113,13 @@ cmd_reap() {
   local prove_out; prove_out="$(reap_prove_logs)"
   local evidence_out; evidence_out="$(reap_evidence)"
   local stuck_out; stuck_out="$(reap_stuck_markers)"
-  printf '%s\n%s\n%s\n%s\n%s\n' "$proc_out" "$out" "$prove_out" "$evidence_out" "$stuck_out"
+  # PRD-build-burst-state-keyed-by-server-v2 requirement 8/AC9: a
+  # wm-burst-lane* server hcloud still knows about with no boxes/<id>/ dir
+  # here is unattributable to any of the other reap/cost/teardown paths
+  # above (every one of them is keyed by box_path()'s "boxes/<id>/") — sweep
+  # it every plain `reap` call, same cadence as the rest of this function.
+  local orphan_box_out; orphan_box_out="$(reap_orphan_boxes)"
+  printf '%s\n%s\n%s\n%s\n%s\n%s\n' "$proc_out" "$out" "$prove_out" "$evidence_out" "$stuck_out" "$orphan_box_out"
   exit 0
 }
 
@@ -8175,6 +8181,47 @@ reap_volumes() {  # -> stdout "volumes-reaped=N"
     journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  reap  volume-delete-failed  (id=$vid used_pct=$used_pct size=${vsize:-unknown}G age_h=$age_h)"
     echo "volumes-reaped=0"
   fi
+}
+
+# ---- orphan-box server sweep (PRD-build-burst-state-keyed-by-server-v2
+# requirement 8, AC9) --------------------------------------------------------
+# A wm-burst-lane* server hcloud still lists but this state dir has no
+# boxes/<id>/ directory for is unattributable: every other reap/cost/
+# teardown path above is keyed by box_path()'s "boxes/<id>/" (requirement
+# 1), so nothing left in this script can ever act on that server again — the
+# exact unattributed-billing failure class this PRD exists to close (the
+# 09-13 orphaned-volume incident's server-side twin). Unlike reap_volumes
+# above (one named lane-wide volume, no used_pct keep-check because it has
+# no session pointer to consult), this sweep iterates EVERY server the
+# find_by_prefix("$SERVER_NAME") set names, deletes any with no matching
+# boxes/ dir unconditionally, and journals `reap  orphan-box-deleted` per
+# PRD contract — a server with a boxes/<id>/ dir (active OR already torn
+# down, same distinction list_all_box_ids draws) is left alone even if its
+# own down/watchdog/idle-guard decision hasn't run yet; this sweep is a
+# backstop for a server this script's own bookkeeping never learned about
+# at all (created out of band, or whose boxes/<id>/ dir was itself deleted
+# by hand), not a substitute for the normal teardown decision path.
+reap_orphan_boxes() {  # -> stdout "orphan-boxes-reaped=N"
+  # Membership is checked via list_all_box_ids (a helper inside the
+  # tripwire's own box_path()/box_activate() license region) rather than a
+  # literal "$STATE_DIR/boxes/$id" test here — the tripwire (requirement 10)
+  # fails on any "boxes/" literal outside that block, and this function
+  # lives far below it alongside the rest of `reap`'s own helpers.
+  local n=0 line id ip name known
+  known="$(list_all_box_ids)"
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    read -r id ip name <<<"$line"
+    [ -n "$id" ] || continue
+    grep -qx "$id" <<<"$known" && continue
+    if destroy_verify "$id"; then
+      journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  reap  orphan-box-deleted  (server_id=$id name=$name cause=no-boxes-dir)"
+      n=$((n + 1))
+    else
+      journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  reap  orphan-box-delete-failed  (server_id=$id name=$name)"
+    fi
+  done < <(find_by_prefix "$SERVER_NAME" 2>/dev/null)
+  echo "orphan-boxes-reaped=$n"
 }
 
 # ---- box isolation check (PRD-build-burst-selftest-isolation req 3) --------
