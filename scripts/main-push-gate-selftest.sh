@@ -1,17 +1,23 @@
 #!/usr/bin/env bash
 # main-push-gate-selftest.sh — the one entrypoint for
 # PRD-build-main-push-gate's fixture coverage (test_prefix: mainpush).
-# Runs every tests/mainpush_ac*.sh (each builds its own throwaway git+cargo
-# fixture under $TMPDIR — see tests/fixtures/mainpush-common.sh — and
-# tears it down on exit; nothing here touches a real fleet repo).
+# Runs every tests/mainpush_ac*.sh: AC0-5/8-9 each build their own
+# throwaway git+cargo fixture under $TMPDIR (see
+# tests/fixtures/mainpush-common.sh) and tear it down on exit — nothing
+# there touches a real fleet repo.
 #
-# AC6 and AC7 are P1 requirements verified LIVE against the real j0yen/
-# mcphost repo (branch protection + a real branch/PR/auto-merge landing) —
-# they are not fixture-shaped (a fixture can't stand in for GitHub's own
-# branch-protection enforcement) and are not run by this script. Their
-# verdicts are journaled separately by branch-protection.sh's own run and
-# recorded in state/branch-protection.json; see that script and this PRD's
-# journal entries for the live evidence.
+# AC6 and AC7 are P1 requirements that were EXECUTED live against the real
+# j0yen/mcphost repo (branch protection enabled; a real branch/PR/
+# auto-merge landing, PR #1, merged 4f1112d) — a fixture can't stand in
+# for GitHub's own branch-protection enforcement, so those actions were
+# never going to be fixture-shaped. tests/mainpush_ac6_*.sh and
+# tests/mainpush_ac7_*.sh instead re-verify the DURABLE evidence those
+# live actions left behind (state/branch-protection.json's push_via_branch
+# record cross-checked against a live, READ-ONLY `gh api` call; PR #1's
+# actual merged state) every time this runs — real regression coverage
+# without re-mutating mcphost on every pass. Both skip cleanly (exit 0) if
+# `gh` isn't authenticated/reachable, since "can't reach GitHub" is an
+# environment gap, not a regression in this PRD's own code.
 #
 # Usage: main-push-gate-selftest.sh [--via-run-selftests]
 #   --via-run-selftests   delegate to scripts/run-selftests.sh mainpush
