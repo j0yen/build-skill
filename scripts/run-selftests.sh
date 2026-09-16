@@ -79,6 +79,8 @@ SELFTEST_REGISTRY=(
   scripts/sccache-unit-selftest.sh
   scripts/secret-store-selftest.sh
   scripts/routepar-selftest.sh
+  tests/canary_ac3_receipt_diff_diverged.sh
+  tests/canary_ac4_receipt_diff_same.sh
 )
 
 usage() { echo "usage: run-selftests.sh <name-or-path>... | --all" >&2; exit 2; }
