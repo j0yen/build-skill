@@ -38,6 +38,17 @@ SHIM="$HERE/burst-lane-bin/cargo"
 # fresh_env. Refuses to start rather than silently running unguarded if,
 # for any reason, the export below didn't take.
 export BURST_LANE_TEST=1
+# PRD-build-burst-gate-canary-invariant R6: cmd_up/cmd_bake/cmd_enable now
+# refuse (bake/enable) or journal-divergent (up) on a non-pass CACHED
+# canary verdict, and every fixture in THIS suite predates the canary
+# invariant -- none of them seed a boxes/<id>/canary.json, so bake/enable
+# would otherwise refuse `cause=canary` on every AC in here that reaches
+# that gate, even though what each AC is actually proving is unrelated
+# (image resolution, credential shredding, multi-box refusal, ...).
+# BURST_CANARY_SKIP=1 is R6's own documented escape hatch for exactly this
+# — canary's own behavior (missing/diverged/pass, the skip bypass itself)
+# is covered separately by tests/canary_ac*.sh, never by this file.
+export BURST_CANARY_SKIP=1
 [ "${BURST_LANE_TEST:-}" = "1" ] || {
   echo "burst-lane-selftest: BURST_LANE_TEST not set in own environment — refusing to start" >&2
   exit 2
@@ -5573,7 +5584,7 @@ expect "reenable AC7a: enable exits 0 on a fresh, routed, image-matching proof" 
 expect "reenable AC7a: the drop-in exists with Environment=BUILD_BURST_ENABLED=1" \
   "grep -q '^Environment=BUILD_BURST_ENABLED=1$' \"$BURST_LANE_SYSTEMD_DROPIN\""
 expect "reenable AC7a: journal has enable done (proof_ts=... image_id=555777)" \
-  "grep -q \"burst-lane  enable  done  (proof_ts=$r7a_now image_id=555777)\" \"$BURST_LANE_JOURNAL\""
+  "grep -q \"burst-lane  enable  done  (proof_ts=$r7a_now image_id=555777 canary=pass)\" \"$BURST_LANE_JOURNAL\""
 expect "reenable AC7a: burst_configured() reads true in a fresh shell sourcing the drop-in's Environment= line" \
   "bash -c 'set -a; source <(grep ^Environment= \"$BURST_LANE_SYSTEMD_DROPIN\"); set +a; source \"$HERE/lib/burst-configured.sh\"; burst_configured'"
 
