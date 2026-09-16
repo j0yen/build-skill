@@ -1,0 +1,31 @@
+# state/cargo-producers.txt — PRD-build-burst-gate-canary-invariant R15.
+#
+# Producers whose cargo call, under a burst-intended gate, must resolve
+# through the routed shims (cargo-budget-bin -> burst-lane-bin, PATH shim-
+# first per rustbuild's extended-receipts.sh) and therefore leave at least
+# one cargo-budget.sh ledger row with parent_step=<this name> within the
+# gate's own window. A producer whose cargo resolves outside the shims
+# (e.g. $HOME/.cargo/bin ahead of them, the 2026-09-16 04:56Z incident)
+# never reaches the ledger at all -- extend-gate.sh's R15 check blocks on
+# the first name below with no matching row.
+#
+# Deliberately a SUBSET of extended-receipts.sh's 17 producers: only the
+# ones that spawn a real cargo compile/test (flake-audit's 3x full test
+# suite, mutation-kill, cold-build-time, bench-delta, msrv-verify,
+# hermetic-build, determinism, semver-check) -- the remaining nine
+# (supply-audit, license-audit, secrets-scan, sbom, binary-size,
+# cli-surface, schema-compat, ac-traceability, experiment) are static/
+# metadata-only and never touch cargo-budget's ledger even when routed
+# correctly, so listing them here would false-block every burst gate.
+#
+# One producer name per line; blank lines and #-comments ignored. List
+# order is the order extend-gate.sh reports as the FIRST missing producer
+# on a block (cause=producer-cargo-unattested producer=<first-in-list>).
+flake-audit
+mutation-kill
+cold-build-time
+bench-delta
+msrv-verify
+hermetic-build
+determinism
+semver-check

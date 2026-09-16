@@ -1,9 +1,28 @@
-state/
-# Explicit even though state/ already covers it (PRD-build-tenant-secret-
+# state/* (not a plain "state/"), PRD-build-burst-gate-canary-invariant
+# R15: git cannot re-include a file whose PARENT DIRECTORY is itself
+# excluded ("state/" excludes the directory; "!state/cargo-producers.txt"
+# below would then be silently powerless — confirmed via `git check-ignore
+# -v` while landing R15). "state/*" excludes every top-level entry
+# individually instead, which is functionally identical for everything
+# else under state/ (each entry, file or directory, is still excluded,
+# and an excluded directory's own contents still never get traversed) but
+# leaves room for the one negation below.
+state/*
+# Explicit even though state/* already covers it (PRD-build-tenant-secret-
 # continuity): runtime secrets a branch dispatch mints (tenant keys,
 # tokens) must never be git-tracked, so this line stays true even if the
-# blanket state/ entry above is ever narrowed.
+# blanket state/* entry above is ever narrowed.
 state/secrets/
+# PRD-build-burst-gate-canary-invariant R15: the ONE exception to the
+# blanket state/* ignore above. Every other path under state/ is
+# runtime-derived (sessions, ledgers, manifests) and must never be
+# git-tracked; cargo-producers.txt is the opposite shape — an
+# operator-authored policy list (which producers' cargo calls a
+# burst-intended gate requires a ledger row for) that extend-gate.sh reads
+# at gate time, no different in kind from a config file that happens to
+# live under state/ by convention. Un-ignored so a fresh clone / a fresh
+# box has the real list on disk, not an empty gate-blocking void.
+!state/cargo-producers.txt
 *.lock
 *.bak.*
 repos/
