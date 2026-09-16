@@ -333,8 +333,58 @@ usage: extend-gate.sh <build_into> [--base <tag>] [--head <sha>] [--dry-run]
                        [--parallelism N] [--record-baseline] [--force]
                        [--phases-json] [--print-verdict-path]
                        [--scope main|branch --slug <slug>]
+       extend-gate.sh --explain-scope
 EOF
 }
+
+# PRD-build-branch-gate-scope-artifacts requirement 9 (P2, AC11): a
+# standalone, argument-free print of the branch-scope policy table below —
+# so "what does branch scope do to producer X" is one command, not a
+# read of this file's own comments (requirement 1/2/3/5's inline notes at
+# the rollback-plan, ci-checks, reviewer-agent, and land call sites).
+explain_scope() {
+  cat <<'EOF'
+producer          branch-scope policy
+----------------  -----------------------------------------------------
+risk-gate         unchanged (runs identically at any scope, if scripts/audit.sh exists)
+intake            unchanged
+proof-receipt     unchanged (autobuilder loop --iteration 0 --trace)
+vti-plan          unchanged
+rollback-plan     a head-untagged block on THIS run's own fresh HEAD is
+                  post-classified scope-deferred (never blocking) — a
+                  branch HEAD never carries a release tag; any other
+                  block_reason still blocks. land re-runs this producer
+                  at --scope main before tagging.
+reviewer-agent    always runs at branch scope (the quota-guard skip that
+                  suppresses a doomed main-scope gate does not apply
+                  here — a branch's reviewer finding is wanted whether
+                  the branch passes or blocks); at --scope main,
+                  unchanged (skipped when any in-scope block exists).
+ci-checks         BRANCH_GATE_PUSH=1 (default): pushes the branch to
+                  origin under its own ref, waits up to
+                  CI_CHECKS_BRANCH_WAIT (default 900s) for a run to
+                  appear; run_count==0 after the wait -> scope-deferred
+                  (no-runs-on-ref). BRANCH_GATE_PUSH=0: never invoked,
+                  scope-deferred (push-disabled). A push failure ->
+                  scope-deferred (push-failed). Any OTHER outcome
+                  (a real run that failed/is pending) still blocks.
+                  land re-runs this producer at --scope main.
+extended-receipts unchanged (17 producers, run in parallel)
+gate              unchanged (autobuilder gate reads all receipts fresh
+                  off disk; a scope-deferred receipt was already
+                  rewritten to pass before this runs, so it never sees
+                  the deferral as a block)
+land              (not a gate producer) re-runs every scope-deferred
+                  producer named above at --scope main on the landed
+                  head before cutting a tag; a block there is a normal
+                  main-scope block (branch stays merged, main untagged).
+EOF
+}
+
+if [ "${1:-}" = "--explain-scope" ]; then
+  explain_scope
+  exit 0
+fi
 
 producers_desc() {
   cat <<'EOF'
@@ -1318,8 +1368,19 @@ fi
 # Quota guard (Joe 2026-09-11): the reviewer is a Sonnet `claude -p` call. It runs LAST, and only
 # when every other producer passed — a red gate never pays for a review it cannot use. The next gate
 # on a fixed HEAD runs it. On 2026-09-11 five reviewer runs shipped nothing.
+#
+# PRD-build-branch-gate-scope-artifacts requirement 3 (P0, AC4/AC6): at
+# `--scope branch` the quota guard above does not apply — a branch gate is
+# a one-shot evaluation (not main's repeated-retry loop the guard was
+# built for), and the whole point of this PRD is that the reviewer's
+# finding is attached whether the branch passes OR blocks (user story:
+# "when my branch is wrong, I want ... the reviewer's finding, so the next
+# step fixes the cause"; AC6: a branch with a failing test still gets a
+# reviewer-agent receipt alongside its in-scope block). `--scope main`
+# keeps the pre-existing skip-on-any-block behavior unchanged (Non-goals:
+# main-scope semantics untouched).
 _phase_t0=$(date +%s)
-if [ "${#blocking_notes[@]}" -eq 0 ]; then
+if [ "$scope" = branch ] || [ "${#blocking_notes[@]}" -eq 0 ]; then
   if run_reviewer; then
     record_phase reviewer $(( $(date +%s) - _phase_t0 )) ok
   else
