@@ -81,7 +81,11 @@ run_pool() {
 # active session in this sandboxed environment) -> cap=1, source=local.
 # =========================================================================
 echo "=== AC8: no burst session ==="
-unset BUILD_SAME_TARGET_CAP BUILD_SAME_TARGET_CAP_BURST BUILD_DISTINCT_TARGETS BUILD_MAX_BRANCHES BURST_LANE_SH
+unset BUILD_SAME_TARGET_CAP BUILD_SAME_TARGET_CAP_BURST BUILD_DISTINCT_TARGETS BUILD_MAX_BRANCHES
+# Isolate from the host's REAL burst lane: with a live box, select-guard.sh's
+# default $HERE/burst-lane.sh reports gate_ready=true + run_slots.cap and this
+# "no session" case would widen to cap=4 source=burst (2026-09-16, box up).
+export BURST_LANE_SH="$T/no-such-burst-lane.sh"
 admitted="$(run_pool)"
 expect "AC8: exactly one of five admitted (default cap=1)" "[ \"$admitted\" -eq 1 ]"
 diag="$(BUILD_MAX_BRANCHES=30 "$SG" satcap-mcphost-1 redbaron "$T/clone" 0 "" 2>&1 >/dev/null)"
