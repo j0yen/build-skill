@@ -43,6 +43,10 @@ known_hosts           per-box   # today known_hosts.<server_id>
 canary.inflight.lock  per-box   # PRD-build-burst-gate-canary-invariant R1/R6: flock guarding "one canary at a time per box"
 canary.inflight       per-box   # PRD-build-burst-gate-canary-invariant: pid/start_epoch marker while a canary runs against this box
 canary.json           per-box   # PRD-build-burst-gate-canary-invariant R5: reached via box_path_for() (requirement 2/3's multi-box counterpart to box_path()), not $BOX_STATE_DIR -- the $STATE_DIR/canary.json convenience copy below is the lane-wide alias of the SAME name
+canary-last-routed-main-pass.json  per-box   # PRD-build-burst-gate-canary-invariant R7: "a routed --scope main gate at a green HEAD passed" marker the daily timer's recent-pass skip check reads, per box
+.routed-main-pass.XXXXXX  per-box   # PRD-build-burst-gate-canary-invariant R7: canary-last-routed-main-pass.json's own mktemp tmp-then-mv sibling
+canary-disabled-since.json  per-box   # PRD-build-burst-gate-canary-invariant R7: confirm=2/2 divergence marker; presence gates canary_maybe_reenable's AC14 re-enable path
+.canary-disabled.XXXXXX  per-box   # PRD-build-burst-gate-canary-invariant R7: canary-disabled-since.json's own mktemp tmp-then-mv sibling
 # logs/ is split: the per-run log prefixes below are per-box (reached via
 # $BOX_STATE_DIR/logs/<prefix>.*); logs/failed/ and logs/failed-sessions.log
 # (GATE_TOOLS_FAILED_LOG_DIR / GATE_TOOLS_FAILED_SESSIONS_LOG) are the one
@@ -65,6 +69,7 @@ decisions.jsonl       lane-wide   # append-only teardown-decision audit trail (s
 canary-baseline       lane-wide   # PRD-build-burst-gate-canary-invariant R2: local --scope main gate receipts at a given HEAD, keyed by sha (not server_id) -- shared across whichever box the canary next runs against
 canary-runs           lane-wide   # PRD-build-burst-gate-canary-invariant R3: per-run receipt copies, keyed by ts+variant, not server_id
 canary.json           lane-wide   # PRD-build-burst-gate-canary-invariant R5: convenience copy of the latest per-box canary.json (see the per-box entry above for the box_path_for()-reached original)
+.canary-last-diverged-lines  lane-wide   # PRD-build-burst-gate-canary-invariant: CANARY_DIVERGED_LINES_FILE, a cross-boundary handoff file for gate-receipt-diff.sh's own DIVERGED lines out of a subshell-run variant call
 enable.json           lane-wide   # PRD-build-burst-gate-canary-invariant R17: {ts, canary_verdict, canary_ts, head} record pairing the BUILD_BURST_ENABLED=1 write with the canary verdict that authorized it
 .enable.XXXXXX        lane-wide   # PRD-build-burst-gate-canary-invariant R17: enable.json's own mktemp tmp-then-mv sibling
 

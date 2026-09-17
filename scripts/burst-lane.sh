@@ -4270,35 +4270,103 @@ canary_run_variant_delta() {
 
 # canary_write_state_json <out_file> <head> <head_source> <ts> <image_id>
 # <baseline_dir> <verdict_main> <verdict_branch> <verdict_delta>
-# <diverged_ndjson> — R5's canary.json, written atomically (tmp + mv).
+# <diverged_ndjson> [<lane_id> <verdict_lane>] — R5's canary.json, written
+# atomically (tmp + mv). The lane args are optional (R12, P2): omitted or
+# empty means no named-lane variant ran this canary, and "lane" is left out
+# of variants{} entirely rather than written as a hollow key, so existing
+# consumers (canary_print_report, the R16 fixture parity test) see no new
+# required key on a canary that never used --variants <lane-id>.
 canary_write_state_json() {
   local out_file="$1" head="$2" head_source="$3" ts="$4" image_id="$5" \
-        baseline_dir="$6" v_main="$7" v_branch="$8" v_delta="$9" diverged_ndjson="${10}"
+        baseline_dir="$6" v_main="$7" v_branch="$8" v_delta="$9"
+  shift 9
+  local diverged_ndjson="$1" lane_id="${2:-}" v_lane="${3:-}"
   mkdir -p "$(dirname "$out_file")"
   local tmp; tmp="$(mktemp "$(dirname "$out_file")/.canary.XXXXXX")"
   python3 -c '
 import json, sys
 (head, head_source, ts, image_id, baseline_dir, v_main, v_branch, v_delta,
- diverged_ndjson, out_path) = sys.argv[1:11]
+ diverged_ndjson, lane_id, v_lane, out_path) = sys.argv[1:13]
 diverged = []
 for line in diverged_ndjson.splitlines():
     parts = line.split()
     if len(parts) < 5:
         continue
     diverged.append({"producer": parts[0], "local": parts[1], "box": parts[2], "route": parts[3]})
+variants = {"main": v_main, "branch": v_branch, "delta": v_delta}
+if lane_id:
+    variants["lane"] = {"id": lane_id, "verdict": v_lane}
 d = {
     "head": head,
     "head_source": head_source,
     "image_id": image_id,
     "ts": ts,
-    "variants": {"main": v_main, "branch": v_branch, "delta": v_delta},
+    "variants": variants,
     "diverged": diverged,
     "baseline_dir": baseline_dir,
 }
 json.dump(d, open(out_path, "w"), indent=2, sort_keys=True)
 ' "$head" "$head_source" "$ts" "$image_id" "$baseline_dir" "$v_main" "$v_branch" "$v_delta" \
-  "$diverged_ndjson" "$tmp"
+  "$diverged_ndjson" "$lane_id" "$v_lane" "$tmp"
   mv -f "$tmp" "$out_file"
+}
+
+# canary_lookup_lane <repo> <lane_id> -> stdout, one required_command per
+# line (empty + return 1 when the repo has no agent/proof-lanes.toml or no
+# [[lane]] with that id). R12 (P2): "`--variants` accepts a named proof
+# lane from `agent/proof-lanes.toml` to run only that lane's required
+# commands as a fourth variant" — this is the lookup half;
+# canary_run_variant_lane below is the run half.
+canary_lookup_lane() {
+  local repo="$1" lane_id="$2"
+  local toml="$repo/agent/proof-lanes.toml"
+  [ -f "$toml" ] || return 1
+  python3 -c '
+import sys
+try:
+    import tomllib
+except ModuleNotFoundError:
+    sys.exit(3)
+toml_path, lane_id = sys.argv[1], sys.argv[2]
+with open(toml_path, "rb") as fh:
+    doc = tomllib.load(fh)
+for lane in doc.get("lane", []):
+    if lane.get("id") == lane_id:
+        for cmd in lane.get("required_commands", []):
+            print(cmd)
+        sys.exit(0)
+sys.exit(1)
+' "$toml" "$lane_id"
+}
+
+# canary_run_variant_lane <repo> <lane_id> <head_sha> <server_id> -> stdout
+# verdict (pass|block|unknown-lane); journals one line. Runs each of the
+# lane's required_commands via `bash -c` from the repo root, in order,
+# stopping at the first non-zero exit (the failing command is named in the
+# journal, never fabricated). "unknown-lane" (lane id not found in
+# agent/proof-lanes.toml, or the repo has no such file) is distinct from
+# "block" -- it means the operator asked for a lane this repo doesn't
+# define, not that the lane's commands ran and failed.
+canary_run_variant_lane() {
+  local repo="$1" lane_id="$2" head_sha="$3" server_id="$4"
+  local -a cmds=()
+  local cmd_out
+  if ! cmd_out="$(canary_lookup_lane "$repo" "$lane_id")"; then
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  canary  lane=$lane_id  unknown-lane  (head=$head_sha route=burst:${server_id:-unknown})"
+    printf 'unknown-lane\n'
+    return 0
+  fi
+  mapfile -t cmds <<<"$cmd_out"
+  local verdict="pass" failed_cmd="none" c
+  for c in "${cmds[@]}"; do
+    [ -n "$c" ] || continue
+    if ! ( cd "$repo" && bash -c "$c" ) >/dev/null 2>&1; then
+      verdict="block"; failed_cmd="$c"
+      break
+    fi
+  done
+  journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  canary  lane=$lane_id  $verdict  (head=$head_sha cmd_failed=$failed_cmd route=burst:${server_id:-unknown})"
+  printf '%s\n' "$verdict"
 }
 
 # _canary_core <head> <variants> <no_baseline> -> return 0 (pass), 1
@@ -4350,6 +4418,7 @@ _canary_core() {
   IFS=',' read -r -a want <<<"$variants"
 
   local v_main="skipped" v_branch="skipped" v_delta="skipped"
+  local lane_id="" v_lane=""
   local diverged_ndjson="" w
   for w in "${want[@]}"; do
     case "$w" in
@@ -4367,19 +4436,29 @@ _canary_core() {
       delta)
         v_delta="$(canary_run_variant_delta "$head_sha" "$server_id")"
         ;;
-      *) echo "canary: unknown variant '$w' (ignored)" >&2 ;;
+      *)
+        # R12 (P2): anything else is tried as a named proof lane from
+        # $CANARY_REPO/agent/proof-lanes.toml before falling back to the
+        # old "unknown variant" warning -- canary_run_variant_lane itself
+        # journals unknown-lane vs block vs pass, so no duplicate warning
+        # is needed on the unknown-lane path either.
+        lane_id="$w"
+        v_lane="$(canary_run_variant_lane "$CANARY_REPO" "$lane_id" "$head_sha" "$server_id")"
+        ;;
     esac
   done
 
   canary_write_state_json "$box_dir/canary.json" "$head_sha" "$head_source" "$(now_iso)" \
-    "${image_id:-unknown}" "$baseline_dir" "$v_main" "$v_branch" "$v_delta" "$diverged_ndjson"
+    "${image_id:-unknown}" "$baseline_dir" "$v_main" "$v_branch" "$v_delta" "$diverged_ndjson" \
+    "$lane_id" "$v_lane"
   cp -f "$box_dir/canary.json" "$STATE_DIR/canary.json" 2>/dev/null || true
 
   CANARY_CORE_V_MAIN="$v_main"; CANARY_CORE_V_BRANCH="$v_branch"; CANARY_CORE_V_DELTA="$v_delta"
+  CANARY_CORE_V_LANE="$v_lane"; CANARY_CORE_LANE_ID="$lane_id"
   CANARY_CORE_DIVERGED_NDJSON="$diverged_ndjson"
   CANARY_CORE_FIRST_DIVERGED_PRODUCER="$(printf '%s\n' "$diverged_ndjson" | awk 'NF{print $1; exit}')"
 
-  case " $v_main $v_branch $v_delta " in
+  case " $v_main $v_branch $v_delta $v_lane " in
     *" block "*|*" diverged "*) return 1 ;;
     *) return 0 ;;
   esac
@@ -4431,6 +4510,9 @@ v = d.get("variants") or {}
 print("variant main   %s" % v.get("main", ""))
 print("variant branch %s" % v.get("branch", ""))
 print("variant delta  %s" % v.get("delta", ""))
+lane = v.get("lane")
+if lane:
+    print("variant lane   id=%s verdict=%s" % (lane.get("id", ""), lane.get("verdict", "")))
 print("baseline_dir   %s" % d.get("baseline_dir", ""))
 diverged = d.get("diverged") or []
 if diverged:
@@ -4451,7 +4533,7 @@ cmd_canary() {
       --variants) variants="${2:?canary: --variants needs a value}"; shift 2 ;;
       --no-baseline) no_baseline=true; shift ;;
       --report) report=true; shift ;;
-      *) echo "usage: burst-lane.sh canary [--head <sha>] [--variants main,branch,delta] [--no-baseline] [--report]" >&2; exit 2 ;;
+      *) echo "usage: burst-lane.sh canary [--head <sha>] [--variants main,branch,delta|<lane-id>] [--no-baseline] [--report]" >&2; exit 2 ;;
     esac
   done
 
