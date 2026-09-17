@@ -64,7 +64,22 @@ receipt_json() {
     "$head" "$decision" "$(json_reasons_array "$reasons_csv")" "$reviewed_at"
 }
 
-if [ "${FAKE_REVIEWER_WRITE_RECEIPT:-1}" = "1" ]; then
+if [ -n "${FAKE_REVIEWER_RECEIPT_FIXTURE:-}" ]; then
+  # AC9: write a STORED receipt fixture (e.g. the real 2026-09-17 incident
+  # receipt), patched with THIS run's own live head_sha/reviewed_at — the
+  # freshness check (R1) is about liveness, not a frozen historical
+  # timestamp, so a faithful replay has to look fresh the same way the
+  # original receipt did at the moment it was written.
+  mkdir -p target/autobuilder/receipts
+  python3 -c "
+import json, sys
+obj = json.load(open(sys.argv[1]))
+obj['head_sha'] = sys.argv[2]
+obj['reviewed_at'] = sys.argv[3]
+json.dump(obj, open(sys.argv[4], 'w'))
+" "$FAKE_REVIEWER_RECEIPT_FIXTURE" "$receipt_head" "$receipt_reviewed_at" \
+    target/autobuilder/receipts/reviewer-agent.json
+elif [ "${FAKE_REVIEWER_WRITE_RECEIPT:-1}" = "1" ]; then
   mkdir -p target/autobuilder/receipts
   receipt_json "$receipt_head" "$receipt_reviewed_at" "$receipt_decision" "$receipt_reasons" \
     > target/autobuilder/receipts/reviewer-agent.json
@@ -98,6 +113,12 @@ case "${FAKE_REVIEWER_STDOUT_MODE:-json}" in
     ;;
   empty)
     printf ''
+    ;;
+  fixture)
+    # AC9 (rvrcpt_ac9_incident_replay.sh): replay a STORED raw stdout
+    # fixture verbatim (FAKE_REVIEWER_STDOUT_FIXTURE=<path>) instead of
+    # generating one — the real 05:15:46Z 2026-09-17 incident text.
+    cat "${FAKE_REVIEWER_STDOUT_FIXTURE:?FAKE_REVIEWER_STDOUT_FIXTURE required for STDOUT_MODE=fixture}"
     ;;
 esac
 exit 0

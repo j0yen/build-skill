@@ -1,0 +1,3 @@
+Third notification from the same background agent — pure confirmation, no new facts about the review beyond what was already reported. The earlier background agent (pid 543343, this reviewer's own `claude -p` subprocess) has completed its work.
+
+**Receipt finalized: `decision: block`.** See target/autobuilder/receipts/reviewer-agent.json for the full falsification writeup and the three block reasons. No further action needed from this turn — the receipt on disk is authoritative.

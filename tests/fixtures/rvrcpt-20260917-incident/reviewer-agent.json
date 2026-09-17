@@ -1,0 +1,25 @@
+{
+  "schema": "autobuilder.reviewer_agent_receipt.v1",
+  "head_sha": "REPLACE_HEAD",
+  "intent_card_sha": "fake-incident-fixture",
+  "decision": "block",
+  "block_reasons": [
+    "must-ac-failing-at-head",
+    "ac-test-bindings-vacuous-for-must-acs",
+    "outside-src-file-changed-without-amendment"
+  ],
+  "concern_reasons": [],
+  "falsification": {
+    "test_audit": "MUST-AC test for the mcphost gate-debt fix passes on a trivially satisfiable input; the AC's English description requires the debt counter to persist across a restart, which the test never exercises.",
+    "panic_audit": "no new unwrap/expect/panic in src/ since baseline",
+    "unsafe_audit": "no unsafe present",
+    "public_api_audit": "no public API changes",
+    "deps_audit": "no dependency changes since baseline",
+    "drift_audit": "one file outside src/ (scripts/gate-debt.sh) changed without an intent-card amendment request",
+    "counter_attack": {
+      "description": "restart the debt daemon mid-run and assert the counter survived; the current implementation resets to zero",
+      "test_skeleton": "#[test]\nfn would_break_debt_counter_restart_persistence() {\n    // simulate a daemon restart and assert the counter survived\n    todo!()\n}"
+    }
+  },
+  "reviewed_at": "2026-09-17T05:14:01Z"
+}
