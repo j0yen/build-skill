@@ -23,6 +23,14 @@ state/secrets/
 # live under state/ by convention. Un-ignored so a fresh clone / a fresh
 # box has the real list on disk, not an empty gate-blocking void.
 !state/cargo-producers.txt
+# PRD-build-land-conflict-resolver R2: same exception shape as
+# cargo-producers.txt above — the negation must target state/land-policy
+# itself (the top-level entry state/* excludes), not state/land-policy/*,
+# per the R15 comment above (a file's parent directory being excluded
+# can't be undone by negating the file alone). state/land-policy/<repo>.json
+# is an operator-authored generated/append-only file list per target
+# repo, not runtime-derived state.
+!state/land-policy
 *.lock
 *.bak.*
 repos/

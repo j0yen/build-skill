@@ -1,0 +1,11 @@
+{
+  "generated": [
+    {"path": "agent/intent-card.json", "regen": "scripts/intent-card-refresh.sh {slug}"},
+    {"path": "tests/suite_*.rs", "regen": "scripts/gen-test-suites.sh"}
+  ],
+  "append_only": [
+    "CHANGELOG.md",
+    "www/llms.txt",
+    ".buildloop/extended-gates.toml"
+  ]
+}
