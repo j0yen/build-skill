@@ -17,6 +17,12 @@
 #   <ts>  <slug>  verify-gate-red-unchanged  blocked-not-retried  (...)
 #   <ts>  gate-then-land  <slug>  landed attempt=<n> ...
 #   <ts>  <slug>  archive  archived  (...)
+#   <ts>  gate  <crate>  <pass|block>  (scope=main slug=<S> head=<M> ...) pinned=landing
+#   <ts>  gate  <crate>  <pass|block>  (scope=main slug=main-health head=<N> ...) main-health
+# The last two (PRD-build-main-verdict-pinned-to-landing R9) are
+# extend-gate.sh's own journal_line, not gate-then-land's — tracked under
+# a slug@sha7 (or repo@sha7 main-health) composite key so a block at one
+# M is never conflated with a pass at a different M for the same slug.
 # Continuation lines with no leading timestamp (`  ACTION: ...`) are
 # skipped and counted in `parse_skipped` — never fatal (AC3).
 #
@@ -162,6 +168,34 @@ awk '
     if (is_green && gslug != "") {
       if (!(gslug in green_ts) || ts > green_ts[gslug]) green_ts[gslug] = ts
       seen[gslug] = 1
+    }
+    # PRD-build-main-verdict-pinned-to-landing R9/AC11: extend-gate.sh
+    # writes its OWN "gate <crate> <outcome> (...)" line (see extend-gate.sh
+    # journal_line call, scope_prefix + journal_suffix) — a third shape
+    # this classifier never recognized before (only gate-then-land/
+    # verify-gate-red/archive lines, above). A pinned main-scope run
+    # ($2=="gate", trailing " pinned=landing") or a bare-HEAD main-health
+    # run (trailing " main-health") is tracked under a composite key so a
+    # block at a *different* M is never attributed to this M (AC11 "never
+    # attributed to S"), and a main-health red is keyed by repo@sha7 per
+    # R6, not by the "main-health" sentinel slug alone.
+    if ($2 == "gate" && match($0, /slug=[^ ]+/)) {
+      pin_slug = substr($0, RSTART + 5, RLENGTH - 5)
+      pin_head7 = ""
+      if (match($0, /head=[^ ]+/)) pin_head7 = substr(substr($0, RSTART + 5, RLENGTH - 5), 1, 7)
+      pin_is_mainhealth = ($0 ~ / main-health$/)
+      pin_is_pinned = ($0 ~ / pinned=landing$/)
+      if ((pin_is_mainhealth || pin_is_pinned) && pin_head7 != "") {
+        pin_key = pin_is_mainhealth ? ($3 "@" pin_head7 " main-health") : (pin_slug "@" pin_head7)
+        if ($4 == "block") {
+          if (!(pin_key in red_ts) || ts > red_ts[pin_key]) red_ts[pin_key] = ts
+          if (oldest_red == "") oldest_red = ts
+          seen[pin_key] = 1
+        } else if ($4 == "pass") {
+          if (!(pin_key in green_ts) || ts > green_ts[pin_key]) green_ts[pin_key] = ts
+          seen[pin_key] = 1
+        }
+      }
     }
   }
   END {
