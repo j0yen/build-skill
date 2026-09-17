@@ -54,11 +54,31 @@ EOF
 chmod +x "$FAKE_ALERT"
 
 run_seltick() {
+  # GATE_RED_ALERT_DELIVER must be faked too, not just ALERT_DELIVER: this
+  # test's own knob-alarm path (select-tick.sh L447) reads ALERT_DELIVER,
+  # but select-tick.sh also runs gate-red-tick.sh internally on every call
+  # (L762-764), and gate-red-tick.sh resolves its OWN alert-deliver.sh path
+  # from GATE_RED_ALERT_DELIVER independently (gate-red-tick.sh L56) --
+  # ALERT_DELIVER alone left that second path pointed at the REAL
+  # scripts/alert-deliver.sh, which shells out to the REAL
+  # notify-gh-issue.sh (a live GitHub issue create/comment) and journals
+  # via its own bare `journal_line` call (no --file), which falls through
+  # journal.sh's generic default straight to the real production journal
+  # root since nothing in this chain set BUILD_JOURNAL_ROOT either --
+  # confirmed live: 12+ real "notify rc=0 (rule=gate-red ... cmd=.../
+  # notify-gh-issue.sh gate-red build-loop <this test's own $ROOT>/state/
+  # gate-red.evidence...)" lines landed in ~/brain/journal/build/*.md
+  # across today's reverification runs of this PRD, one real GitHub call
+  # per run. Faking both env vars closes the whole path: gate-red-tick.sh
+  # now calls $FAKE_ALERT the same as select-tick.sh's own call, so no real
+  # alert-deliver.sh / notify-gh-issue.sh / journal_line-to-production ever
+  # runs from this test again.
   BUILD_STATE_DIR="$ROOT/state" BUILD_MANIFEST="$ROOT/state/manifest.json" \
     SELECT_TICK_JOURNAL="$JOURNAL" \
     BURST_LANE_SH="$FAKE_BURST" \
     BURST_LANE_SYSTEMD_DROPIN="$DROPIN" BURST_LANE_ENV_FILE="$ENVFILE" \
     BURST_LANE_STATE_DIR="$BURST_STATE" ALERT_DELIVER="$FAKE_ALERT" \
+    GATE_RED_ALERT_DELIVER="$FAKE_ALERT" \
     "$ST" --prd-dir "$ROOT" --format json "$@"
 }
 
@@ -101,7 +121,19 @@ EOF
 out="$(run_seltick)"; rc=$?
 expect "quiet: exit 0" "[ $rc -eq 0 ]"
 expect "quiet: no ALARM line journaled" "! grep -q 'burst-knob-unsanctioned' '$JOURNAL'"
-expect "quiet: alert-deliver never invoked" "[ ! -s '$ALERT_CALLS' ]"
+# Scoped to R17's OWN alarm path, not "nothing called alert-deliver at
+# all": now that GATE_RED_ALERT_DELIVER is correctly faked (see
+# run_seltick's comment above), gate-red-tick.sh's own, unrelated
+# gate-red-count alarm (PRD-build-gate-red-alarm-invariant) legitimately
+# also calls $FAKE_ALERT every tick this fixture's build-queue computes
+# red>0, and correctly shows up in $ALERT_CALLS -- that was always true,
+# it just went to the real alert-deliver.sh unobserved before the fix
+# above. What this regression guard actually checks is R17's own
+# select-tick.sh L447 call, identifiable by its evidence file's mktemp
+# template (select-tick-knob-alarm.XXXXXX, select-tick.sh L444) — a
+# literal `grep -q` avoids false-negatives if the file was replaced.
+expect "quiet: no burst-knob alert-deliver call" \
+  "! grep -q 'select-tick-knob-alarm' '$ALERT_CALLS'"
 bs="$(printf '%s' "$out" | "$JQ" '.counts.burst_session')"
 expect "quiet: counts.burst_session reflects the real probe (1)" "[ '$bs' = '1' ]"
 
