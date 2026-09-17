@@ -35,6 +35,23 @@
 # SKILL.md's "gate" step and "Resuming a landing-pending PRD" section for
 # exactly which callers do.
 #
+# --main-health (PRD-build-main-verdict-pinned-to-landing R6): the tick's
+# "is main green right now" question, independent of any particular PRD's
+# landing — bare current HEAD, no PRD card, reviewer-agent and
+# intent-card-refresh scope-deferred inside extend-gate.sh, ci-checks read
+# straight from Actions runs at HEAD (never a PR's checks, even on a
+# push_via_branch=true repo — see extend-gate.sh's own R6 comments).
+# Caller resolves the repo's current main HEAD itself and passes it as
+# --head (unlike --pinned-landing, this flag does NOT reroute to a
+# different entrypoint — it is forwarded straight through to
+# extend-gate.sh, same as any other passthrough flag), and defaults
+# --slug to the "main-health" sentinel when omitted. Requires --scope
+# main; mutually exclusive with --pinned-landing. extend-gate.sh's own
+# tree-keyed verdict cache (R4, already generalized past pinned-landing)
+# makes a second call at the same tree a fast cache-hit replay rather
+# than a full producer run — "once per new sha" falls out of that for
+# free, no separate cache needed here.
+#
 # PATH the unit runs with: scripts/lib/cargo-route.sh's
 # cargo_route_path_prefix() prepended to $PATH when that file exists at
 # run time (another coder is adding it in a sibling worktree — this
@@ -105,7 +122,7 @@ repo_arg="$1"; shift
 [ -n "$repo_arg" ] || usage
 repo="$(cd "$repo_arg" 2>/dev/null && pwd)" || die 1 "no such directory: $repo_arg"
 
-head_sha="" scope="" slug="" wait_flag=0 pinned_landing=0
+head_sha="" scope="" slug="" wait_flag=0 pinned_landing=0 main_health=0
 extra=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -114,10 +131,20 @@ while [ $# -gt 0 ]; do
     --slug) slug="${2:-}"; shift 2 ;;
     --wait) wait_flag=1; shift ;;
     --pinned-landing) pinned_landing=1; shift ;;
+    --main-health) main_health=1; shift ;;
     --) shift; extra+=("$@"); break ;;
     *) extra+=("$1"); shift ;;
   esac
 done
+# PRD-build-main-verdict-pinned-to-landing R6: a main-health caller has no
+# slug of its own (bare-HEAD, "is main green now") — default it to the
+# same "main-health" sentinel extend-gate.sh itself defaults to, so the
+# inflight marker filename/unit name and journal calls below have
+# something non-empty to key on, same as every other caller of this
+# script already needs.
+if [ "$main_health" -eq 1 ] && [ -z "$slug" ]; then
+  slug="main-health"
+fi
 [ -n "$head_sha" ] && [ -n "$slug" ] || usage
 case "$scope" in
   main|branch) ;;
@@ -126,6 +153,10 @@ esac
 if [ "$pinned_landing" -eq 1 ]; then
   [ "$scope" = main ] || die 4 "--pinned-landing requires --scope main"
   [ -x "$MAIN_VERDICT_PIN_GATE" ] || die 2 "missing $MAIN_VERDICT_PIN_GATE"
+fi
+if [ "$main_health" -eq 1 ]; then
+  [ "$scope" = main ] || die 4 "--main-health requires --scope main"
+  [ "$pinned_landing" -eq 0 ] || die 4 "--main-health and --pinned-landing are mutually exclusive"
 fi
 
 mkdir -p "$INFLIGHT_DIR"
@@ -170,6 +201,13 @@ if [ "$pinned_landing" -eq 1 ]; then
   inner="exec $(printf '%q' "$MAIN_VERDICT_PIN_GATE") $(printf '%q' "$repo") $(printf '%q' "$slug")"
 else
   inner="exec $(printf '%q' "$EXTEND_GATE") $(printf '%q' "$repo") --head $(printf '%q' "$head_sha") --scope $(printf '%q' "$scope") --slug $(printf '%q' "$slug")"
+  # PRD-build-main-verdict-pinned-to-landing R6: unlike --pinned-landing
+  # (which routes to a whole different entrypoint that re-resolves its
+  # own head), --main-health is a plain extend-gate.sh flag — this
+  # caller already resolved $head_sha itself (the checkout's own current
+  # HEAD; R5 in extend-gate.sh refuses anything else), so it is passed
+  # straight through, same as any other extend-gate.sh passthrough flag.
+  [ "$main_health" -eq 1 ] && inner="$inner --main-health"
 fi
 for a in "${extra[@]}"; do
   inner+=" $(printf '%q' "$a")"

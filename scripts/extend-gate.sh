@@ -512,6 +512,15 @@ pinned_landing=false
 # alike) so the NEXT pinned call for this slug has something to seed
 # from. A no-op when unset — ordinary (non-pinned) callers never pass it.
 verdict_cache_mirror=""
+# PRD-build-main-verdict-pinned-to-landing R6/AC8: set by the tick's
+# bare-HEAD main-health caller — a slug-less (well, slug defaults to the
+# literal "main-health" sentinel below), reviewer/intent-card-refresh
+# scope-deferred main-scope gate at the checkout's OWN current HEAD
+# (never a landed PRD's merge sha — that is --pinned-landing's job, and
+# the two are mutually exclusive by construction: a caller passes one or
+# the other, never both). See the reviewer-agent and ci-checks sections
+# below for the two places this actually changes behavior.
+main_health=false
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -527,10 +536,20 @@ while [ $# -gt 0 ]; do
     --scope)            scope="${2:?extend-gate: --scope needs a value}"; shift 2 ;;
     --slug)             slug="${2:?extend-gate: --slug needs a value}"; shift 2 ;;
     --pinned-landing)   pinned_landing=true; shift ;;
+    --main-health)      main_health=true; shift ;;
     --verdict-cache-mirror) verdict_cache_mirror="${2:?extend-gate: --verdict-cache-mirror needs a value}"; shift 2 ;;
     *) die 1 "unknown argument: $1 (see --help)" ;;
   esac
 done
+
+# R6: a slug-less caller (the common case — "is main green right now")
+# gets the "main-health" sentinel slug so every downstream slug-keyed
+# mechanism (the journal line's scope_prefix below, the per-repo verdict
+# cache, a future gate-red-summary.sh attribution) has something non-empty
+# to key on, same as --pinned-landing already requires a real slug S.
+if $main_health && [ -z "$slug" ]; then
+  slug="main-health"
+fi
 
 case "$scope" in
   main|branch) : ;;
@@ -541,6 +560,12 @@ if [ "$scope" = branch ] && [ -z "$slug" ]; then
 fi
 if $pinned_landing && { [ "$scope" != main ] || [ -z "$slug" ] || [ -z "$head_want" ]; }; then
   die 1 "--pinned-landing requires --scope main, --slug <slug>, and --head <M>"
+fi
+if $main_health && { [ "$scope" != main ] || [ -z "$head_want" ]; }; then
+  die 1 "--main-health requires --scope main and --head <N>"
+fi
+if $main_health && $pinned_landing; then
+  die 1 "--main-health and --pinned-landing are mutually exclusive"
 fi
 
 repo="$(cd "$repo_arg" 2>/dev/null && pwd)" || die 1 "no such directory: $repo_arg"
@@ -1739,7 +1764,15 @@ elif [ "$scope" = branch ]; then
 else
   _phase_t0=$(date +%s)
   _repo_slug_for_ci="$(basename "$repo")"
-  if [ "$(push_via_branch_for "$_repo_slug_for_ci")" = "true" ]; then
+  # PRD-build-main-verdict-pinned-to-landing R6/AC8: main-health always
+  # takes the direct "runs at HEAD" branch below, even on a
+  # push_via_branch=true repo — there is no slug/PR to key a
+  # `branch-protection.sh pr-checks` lookup on (that call needs a real
+  # landed PRD slug), and R6's own wording is explicit: "ci-checks from
+  # Actions runs at HEAD". A pinned-landing call (which DOES have a real
+  # slug/PR) is unaffected — this only widens the condition below with an
+  # extra `! $main_health` guard, never removes the existing branch.
+  if ! $main_health && [ "$(push_via_branch_for "$_repo_slug_for_ci")" = "true" ]; then
     # PRD-build-main-push-gate-pr-path requirement 4 (P0, AC6): a
     # push_via_branch=true repo's main-scope `ci-checks` can never be
     # "runs at HEAD" — HEAD here is a local, unpushed commit on a repo
@@ -1844,7 +1877,33 @@ fi
 # `intent-card-stale` note from that step, so the second disjunct is also
 # false and reviewer-agent is skipped via the same "skipped" branch below.
 _phase_t0=$(date +%s)
-if { [ "$scope" = branch ] && [ "$intent_card_stale" != true ]; } || [ "${#blocking_notes[@]}" -eq 0 ]; then
+if $main_health; then
+  # PRD-build-main-verdict-pinned-to-landing R6/AC8: a bare-HEAD
+  # main-health gate never has a PRD/slug to review a range against (no
+  # landing, no card) — this is the "reviewer-agent ... scope-deferred
+  # (no card)" half of R6, distinct from --pinned-landing's R3 (which
+  # WIDENS the reviewer to run, never skips it). `autobuilder gate`'s own
+  # reviewer-agent spec (crates/gate/src/lib.rs) requires the file be
+  # PRESENT with `schema`/`head_sha`/`decision` — a missing file is read
+  # as a hard block, same trap ci-checks' write_ci_defer_receipt above
+  # already closes for its own producer — so this writes a synthetic
+  # receipt rather than leaving the phase merely "skipped" the way an
+  # ordinary main-scope run with a pre-existing block does a few lines
+  # down (that path is safe only because SOME OTHER note already forces
+  # the aggregate to block regardless; main-health has no such guarantee).
+  reviewer_receipt="$project_abs/target/autobuilder/receipts/reviewer-agent.json"
+  mkdir -p "$(dirname "$reviewer_receipt")" 2>/dev/null || true
+  jq -n --arg head "$head_now" --arg captured "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '{
+    schema: "autobuilder.reviewer_agent_receipt.v1",
+    head_sha: $head, intent_card_sha: "", decision: "pass",
+    block_reasons: [], concern_reasons: [],
+    scope_deferred: true, skip_reason: "main-health: no PRD/slug to review a range against",
+    captured_at: $captured, receipt_digest: ""
+  }' > "$reviewer_receipt" 2>/dev/null
+  echo "extend-gate: reviewer-agent scope-deferred (main-health — no card)" >&2
+  journal_line --file "$journal" "$(date -u +%FT%TZ)  gate  ${repo##*/}  reviewer-deferred  (main-health head=${head_now:0:7})"
+  record_phase reviewer 0 defer
+elif { [ "$scope" = branch ] && [ "$intent_card_stale" != true ]; } || [ "${#blocking_notes[@]}" -eq 0 ]; then
   run_reviewer || true
   # PRD-build-reviewer-receipt-primary R5: the note (and this phase's own
   # ok/fail) tracks run_reviewer()'s OWN $_reviewer_verdict — set from a
@@ -2285,6 +2344,12 @@ fi
 # suffix above, so a pinned run's journal line always ends with
 # `pinned=landing` regardless of what else this run's own suffixes named.
 $pinned_landing && journal_suffix="$journal_suffix pinned=landing"
+# PRD-build-main-verdict-pinned-to-landing R6: same convention, for a
+# bare-HEAD main-health run — `main-health` at the very end names what
+# this verdict is (GATES/gate-red-summary.sh read this to tell a
+# main-health red apart from a PRD's own pinned or ordinary main-scope
+# red; see those scripts' own R9/R10 handling).
+$main_health && journal_suffix="$journal_suffix main-health"
 
 # One journal line per gate run (requirement 8 / AC13): crate, HEAD, base
 # tag, pass/block counts, blocking receipt names, wall seconds, (PRD-
@@ -2303,6 +2368,9 @@ scope_prefix=""
 # after every other field this line already carries, including head=$head_now
 # right after this prefix.
 $pinned_landing && scope_prefix="scope=main slug=$slug "
+# R6: same widening for main-health (slug is the "main-health" sentinel
+# set at arg-parse time when the caller didn't pass its own --slug).
+$main_health && scope_prefix="scope=main slug=$slug "
 # PRD-build-gate-route-parity-ledger requirement 2 (R2/AC2): `routed=<n>/
 # <receipts>` and `route=<value>` are appended at the very end, after the
 # pre-existing cargo=burst:.../local:... field — existing fields keep
