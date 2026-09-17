@@ -10,16 +10,20 @@
 # only with its own named evidence, never a fixture; deferred ->
 # live-ac-deferred), R5 (archive-live-ac-refusal.sh: refuses + journals
 # live-ac-unproven:<N> for an unproven `(Live` AC, goes silent once its
-# evidence appears), R7/R8g (`(Real-box` wins over `(Live` when both are
-# present, in both the lint layer AND the derive layer), and R9
-# (live-ac-report.sh: the one-time deferred-live/real/box report, never
-# re-opening anything). That is PRD ACs 1, 2, 3, 4, 5, 8, 9.
-# AC6/AC7 (the reality check's built->shipped flip and its
-# LIVE_AC_MAX_TICKS decision-open) and AC10's full-suite claim remain
-# follow-on chained steps, blocked needs-user on this PRD's own open
-# question (LIVE_AC_MAX_TICKS default) -- NOT asserted here yet; the PRD
-# stays `in_progress`, not `built`, until they land and this file grows
-# their fixtures too. Never claim green on a rule that isn't wired.
+# evidence appears), R6 (live-ac-reality-check.sh: the built->shipped flip
+# once a `(Live` AC's own evidence appears, and the LIVE_AC_MAX_WALL
+# decision-open when it doesn't), R7/R8g (`(Real-box` wins over `(Live`
+# when both are present, in both the lint layer AND the derive layer), and
+# R9 (live-ac-report.sh: the one-time deferred-live/real/box report, never
+# re-opening anything). That is PRD ACs 1, 2, 3, 4, 5, 6, 7, 8, 9.
+#
+# AC6/AC7 were blocked needs-user on this PRD's own open question
+# (LIVE_AC_MAX_TICKS default 24 or a wall-clock bound?) until the Operator-
+# note 2026-09-17T19:25Z (Joe: "6h") resolved it: a wall-clock bound,
+# `LIVE_AC_MAX_WALL` (default 6h), replacing the tick count entirely. Both
+# fixtures below use `LIVE_AC_MAX_WALL=60s` per the PRD's own AC7 wording.
+# AC10's full-suite claim is asserted by run-selftests.sh wiring this file
+# in, not by anything here.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -27,6 +31,7 @@ LINT="$HERE/prd-lint.sh"
 SCAN="$HERE/scan-prds.sh"
 VC="$HERE/verified-completed.sh"
 ARCHIVE_REFUSAL="$HERE/archive-live-ac-refusal.sh"
+REALITY_CHECK="$HERE/live-ac-reality-check.sh"
 LOOP_TOOLING_REPOS_FILE="$HERE/loop-tooling-repos.txt"
 export LOOP_TOOLING_REPOS_FILE
 
@@ -232,6 +237,135 @@ rc5_after=$?
 ck "AC5: archive-live-ac-refusal.sh goes silent (exit 0, no output) once the named evidence exists" \
   '[ "$rc5_after" -eq 0 ] && [ -z "$refusal5_after" ]' "rc=$rc5_after out=$refusal5_after"
 rm -rf "$T5"
+
+# ---- AC6: live-ac-reality-check.sh -- once the fixture journal gains the
+# matching line, a `built` loop-tooling PRD's (Live AC pairs, the archive
+# trailer's evidence is recorded, and the file moves build-queue ->
+# built-prds with MANIFEST.md flipped to shipped. Needs a REAL (if
+# throwaway) git checkout, same bare-origin/clone shape
+# archive-commit-selftest.sh's own new_prd_fixture uses, so
+# archive-commit.sh's atomic git-mv + push runs for real, hermetically ----
+T6="$(mktemp -d "${TMPDIR:-/tmp}/live-ac-selftest-ac6.XXXXXX")"
+gc6() { git -C "$1" -c user.email=t@t -c user.name=t "${@:2}"; }
+git init -q --bare "$T6/origin.git"
+git clone -q "$T6/origin.git" "$T6/prds" 2>/dev/null
+mkdir -p "$T6/prds/build-queue" "$T6/prds/built-prds" "$T6/repo/tests" "$T6/journal" "$T6/pending" "$T6/receipts"
+printf '# MANIFEST\n\n## build-queue\n- PRD-fixture-ac6.md — built · shell · 2026-09-17\n\n## built-prds\n' > "$T6/prds/MANIFEST.md"
+gc6 "$T6/prds" add -A
+gc6 "$T6/prds" commit -qm init
+defbr6="$(git -C "$T6/prds" symbolic-ref --short HEAD)"
+git -C "$T6/prds" push -q origin "$defbr6"
+cat > "$T6/loop-tooling-repos.txt" <<EOF
+$T6/repo
+EOF
+echo receipt > "$T6/receipts/r.txt"
+cat > "$T6/bmanifest.json" <<EOF
+{"prds":{"fixture-ac6":{"slug":"fixture-ac6","receipts_dir":"$T6/receipts","gate":{"verdict":"pass"}}}}
+EOF
+f6="$T6/prds/build-queue/PRD-fixture-ac6.md"
+cat > "$f6" <<EOF
+# PRD: fixture-ac6
+
+- Status: built
+- build_target: shell
+- build_into: $T6/repo
+- test_prefix: liveac
+- Drafted: 2026-09-17
+- Grounding: failure-derived
+- Vision: x.md
+
+## Acceptance criteria
+
+1. P0 — Given a real loop, When it runs, Then it proves this. (Live; evidence: journal:UNIQUE_TOKEN_AC6)
+EOF
+gc6 "$T6/prds" add -A
+gc6 "$T6/prds" commit -qm "add fixture-ac6"
+git -C "$T6/prds" push -q origin "$defbr6"
+
+run_rc6() { # <label of run>
+  LOOP_TOOLING_REPOS_FILE="$T6/loop-tooling-repos.txt" VC_JOURNAL_DIR="$T6/journal" \
+    LIVE_AC_PENDING_DIR="$T6/pending" LIVE_AC_MAX_WALL=60s BUILD_JOURNAL_ROOT="$T6/journal" \
+    PRD_DIR="$T6/prds" BUILD_MANIFEST="$T6/bmanifest.json" \
+    "$REALITY_CHECK" check "$f6"
+}
+out6_before="$(run_rc6)"; rc6_before=$?
+ck "AC6: still unproven -- reality check declines to ship (PRD stays in build-queue)" \
+  '[ -f "$T6/prds/build-queue/PRD-fixture-ac6.md" ] && [ ! -f "$T6/prds/built-prds/PRD-fixture-ac6.md" ]' \
+  "out: $out6_before rc=$rc6_before"
+
+echo "2026-09-17T20:05:00Z  liveac  UNIQUE_TOKEN_AC6  ok" > "$T6/journal/2026-09-17.md"
+out6_after="$(run_rc6)"; rc6_after=$?
+ck "AC6: reality check exits 0 once the fixture journal line appears" '[ "$rc6_after" -eq 0 ]' "out: $out6_after"
+ck "AC6: build-queue/PRD-fixture-ac6.md is gone (archived for real)" \
+  '[ ! -f "$T6/prds/build-queue/PRD-fixture-ac6.md" ]' "listing: $(ls "$T6/prds/build-queue" 2>/dev/null)"
+ck "AC6: built-prds/PRD-fixture-ac6.md exists" \
+  '[ -f "$T6/prds/built-prds/PRD-fixture-ac6.md" ]' "listing: $(ls "$T6/prds/built-prds" 2>/dev/null)"
+ck "AC6: the archived copy records the (Live AC's evidence path" \
+  'grep -q "^- Live-AC-evidence: AC1: journal:" "$T6/prds/built-prds/PRD-fixture-ac6.md" 2>/dev/null' \
+  "content: $(cat "$T6/prds/built-prds/PRD-fixture-ac6.md" 2>/dev/null)"
+ck "AC6: MANIFEST.md's line for the slug flips to shipped" \
+  'grep -q "PRD-fixture-ac6.md — shipped" "$T6/prds/MANIFEST.md"' "manifest: $(cat "$T6/prds/MANIFEST.md")"
+ck "AC6: the pending-state file for the slug is cleaned up once shipped" \
+  '[ ! -f "$T6/pending/fixture-ac6.json" ]' "listing: $(ls "$T6/pending" 2>/dev/null)"
+rm -rf "$T6"
+
+# ---- AC7: live-ac-reality-check.sh -- a `(Live` AC unproven for
+# LIVE_AC_MAX_WALL (fixture: 60s, backdated so the very first check already
+# trips it) opens exactly one decision naming the PRD, the AC number, and
+# the missing evidence form; a second tick against the SAME still-missing
+# evidence opens no second decision (decisions.sh's own idempotent-by-
+# question-hash `open`) ----
+T7="$(mktemp -d "${TMPDIR:-/tmp}/live-ac-selftest-ac7.XXXXXX")"
+mkdir -p "$T7/repo/tests" "$T7/queue" "$T7/journal" "$T7/pending" "$T7/decisions"
+cat > "$T7/loop-tooling-repos.txt" <<EOF
+$T7/repo
+EOF
+f7="$T7/queue/PRD-fixture-ac7.md"
+cat > "$f7" <<EOF
+# PRD: fixture-ac7
+
+- Status: built
+- build_target: shell
+- build_into: $T7/repo
+- test_prefix: liveac
+- Drafted: 2026-09-17
+- Grounding: failure-derived
+- Vision: x.md
+
+## Acceptance criteria
+
+1. P0 — Given a real loop, When it runs, Then it proves this. (Live; evidence: journal:UNIQUE_TOKEN_AC7)
+EOF
+run_rc7() {
+  LOOP_TOOLING_REPOS_FILE="$T7/loop-tooling-repos.txt" VC_JOURNAL_DIR="$T7/journal" \
+    LIVE_AC_PENDING_DIR="$T7/pending" LIVE_AC_MAX_WALL=60s BUILD_JOURNAL_ROOT="$T7/journal" \
+    DECISIONS_FILE="$T7/decisions/decisions.jsonl" \
+    "$REALITY_CHECK" check "$f7"
+}
+run_rc7 >/dev/null 2>&1
+# Backdate first_seen_unproven_at well past LIVE_AC_MAX_WALL=60s so the
+# NEXT check trips the bound -- the fixture equivalent of "3 ticks" the
+# PRD's own AC7 prose names before the wall-clock rewrite.
+python3 -c "
+import json
+f='$T7/pending/fixture-ac7.json'
+d=json.load(open(f))
+d['first_seen_unproven_at']='2020-01-01T00:00:00Z'
+json.dump(d, open(f,'w'))
+"
+out7="$(run_rc7 2>&1)"
+ck "AC7: after LIVE_AC_MAX_WALL, exactly one decision is opened" \
+  '[ "$(wc -l < "$T7/decisions/decisions.jsonl" 2>/dev/null)" = 1 ]' \
+  "out: $out7 file: $(cat "$T7/decisions/decisions.jsonl" 2>/dev/null)"
+decision7="$(cat "$T7/decisions/decisions.jsonl" 2>/dev/null)"
+ck "AC7: the decision names the PRD, AC1, and the missing evidence form" \
+  '[[ "$decision7" == *"fixture-ac7"* && "$decision7" == *"AC1"* && "$decision7" == *"journal:UNIQUE_TOKEN_AC7"* ]]' \
+  "decision: $decision7"
+run_rc7 >/dev/null 2>&1
+ck "AC7: a second tick against the same still-missing evidence opens no second decision" \
+  '[ "$(wc -l < "$T7/decisions/decisions.jsonl" 2>/dev/null)" = 1 ]' \
+  "file: $(cat "$T7/decisions/decisions.jsonl" 2>/dev/null)"
+rm -rf "$T7"
 
 # ---- AC8: an AC marked both `(Live` and `(Real-box`, deferred -> the
 # `(Real-box` rule applies, no live-ac-* diagnostic emitted ----
