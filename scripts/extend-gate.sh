@@ -1644,8 +1644,10 @@ checked out at HEAD $head_now at $repo — read whatever you need under it.
 $(cat "$req")
 ---
 Reply with ONLY one JSON object, no prose, no markdown fences, matching
-schema autobuilder.reviewer_agent_receipt.v1:
-{\"schema\":\"autobuilder.reviewer_agent_receipt.v1\",\"head_sha\":\"...\",\"intent_card_sha\":\"...\",\"decision\":\"pass|concern|block\",\"block_reasons\":[...],\"concern_reasons\":[{\"id\":\"...\",\"note\":\"...\"}],\"falsification\":{\"test_audit\":\"...\",\"panic_audit\":\"...\",\"unsafe_audit\":\"...\",\"public_api_audit\":\"...\",\"deps_audit\":\"...\",\"drift_audit\":\"...\",\"counter_attack\":{\"description\":\"...\",\"test_skeleton\":\"...\"}}}"
+schema autobuilder.reviewer_agent_receipt.v1. intent_card_sha is copied
+verbatim from review-request.json's intent_card_sha256 (prefix included) —
+do not recompute it yourself:
+{\"schema\":\"autobuilder.reviewer_agent_receipt.v1\",\"head_sha\":\"...\",\"intent_card_sha\":\"<copy intent_card_sha256 from review-request.json verbatim>\",\"decision\":\"pass|concern|block\",\"block_reasons\":[...],\"concern_reasons\":[{\"id\":\"...\",\"note\":\"...\"}],\"falsification\":{\"test_audit\":\"...\",\"panic_audit\":\"...\",\"unsafe_audit\":\"...\",\"public_api_audit\":\"...\",\"deps_audit\":\"...\",\"drift_audit\":\"...\",\"counter_attack\":{\"description\":\"...\",\"test_skeleton\":\"...\"}}}"
 
   if ! ( cd "$repo" && claude -p "$prompt" --model sonnet --permission-mode bypassPermissions --output-format text ) 9>&- >"$raw" 2>"$raw.err"; then
     local _cp_rc=$?
