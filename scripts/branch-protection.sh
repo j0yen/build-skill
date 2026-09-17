@@ -55,11 +55,15 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SKILL_DIR="$(cd "$HERE/.." && pwd)"
 STATE_DIR="${BUILD_STATE_DIR:-$SKILL_DIR/state}"
 OWNER="${BRANCH_PROTECTION_OWNER:-j0yen}"
+# shellcheck source=lib/journal.sh
+source "$HERE/lib/journal.sh"
 
 usage() {
   echo "usage: branch-protection.sh enable <repo> [--check <name>]..." >&2
   echo "       branch-protection.sh status <repo>" >&2
   echo "       branch-protection.sh push <repo> <slug> [--base <branch>]" >&2
+  echo "       branch-protection.sh landing-check <repo> <slug>" >&2
+  echo "       branch-protection.sh sync <repo>" >&2
 }
 
 die() { local rc="$1"; shift; echo "branch-protection: $*" >&2; exit "$rc"; }
@@ -352,12 +356,200 @@ cmd_push() {
   echo "branch-protection: auto-merge armed for $OWNER/$repo_slug#$pr_number — main advances once required checks pass"
 }
 
+# landing_record_path <repo_slug> <slug> — PRD-build-main-push-gate-pr-path
+# Technical considerations: "state/landings/<repo>/<slug>.json; one file per
+# in-flight landing". Written by gate-then-land.sh's push_via_branch path
+# (this PRD's requirement 1, a separate step) once `cmd_push` above has
+# opened/reused a PR and armed auto-merge; read here by `landing-check` and
+# consumed by `sync` once merged.
+landing_record_path() {
+  local repo_slug="$1" slug="$2"
+  echo "$STATE_DIR/landings/$repo_slug/$slug.json"
+}
+
+# cmd_landing_check — requirement 2 / AC3: reads the landing record for
+# <repo>/<slug>, makes exactly ONE `gh pr view` call, and reduces the PR's
+# state + its required contexts' statusCheckRollup entries to one of:
+#   merged <sha>   exit 0   PR MERGED, every required context SUCCESS
+#   pending        exit 3   PR open (or merged with unresolved contexts —
+#                           should not happen under real branch protection,
+#                           treated conservatively as still-pending), any
+#                           required context not yet COMPLETED/SUCCESS
+#   red <check>    exit 4   any required context completed non-success
+#   closed         exit 5   PR CLOSED, unmerged
+# `red` outranks `closed` (a red-then-closed PR is reported as red, naming
+# the failing check, not a bare "closed"); `merged` requires every required
+# context SUCCESS -- a MERGED state with an unresolved/failing required
+# context is never reported as `merged` (branch protection should make
+# that state unreachable, but this call never claims a merge it cannot
+# also vouch the required checks for).
+cmd_landing_check() {
+  local repo_arg="${1:-}" slug="${2:-}"
+  [ -n "$repo_arg" ] && [ -n "$slug" ] || { usage; exit 2; }
+  local repo_dir; repo_dir="$(resolve_repo_dir "$repo_arg")" || die 4 "repo not found locally: $repo_arg"
+  local repo_slug; repo_slug="$(basename "$repo_dir")"
+  local record; record="$(landing_record_path "$repo_slug" "$slug")"
+  [ -f "$record" ] || die 4 "no landing record at $record"
+
+  local pr_number
+  pr_number="$(python3 -c "
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except (OSError, json.JSONDecodeError):
+    d = {}
+print(d.get('pr_number') or '')
+" "$record")"
+  [ -n "$pr_number" ] || die 4 "landing record $record has no pr_number"
+
+  local required_json="[]" state_file="$STATE_DIR/branch-protection.json"
+  if [ -f "$state_file" ]; then
+    required_json="$(python3 -c "
+import json, sys
+try:
+    state = json.load(open(sys.argv[1]))
+except (OSError, json.JSONDecodeError):
+    state = {}
+rec = state.get(sys.argv[2]) or {}
+print(json.dumps(rec.get('required_contexts', [])))
+" "$state_file" "$repo_slug")"
+  fi
+
+  local pr_json rc
+  pr_json="$(gh pr view "$pr_number" --repo "$OWNER/$repo_slug" --json state,mergeCommit,statusCheckRollup 2>&1)"
+  rc=$?
+  [ "$rc" -eq 0 ] || die 5 "gh pr view failed for $OWNER/$repo_slug#$pr_number: $pr_json"
+
+  python3 - "$pr_json" "$required_json" <<'PY'
+import json, sys
+
+pr = json.loads(sys.argv[1])
+required = list(dict.fromkeys(json.loads(sys.argv[2])))  # de-dup, keep order
+state = pr.get("state")
+merge_sha = (pr.get("mergeCommit") or {}).get("oid")
+rollup = pr.get("statusCheckRollup") or []
+
+# Reduce each reported context/check to "success" | "pending" | "red" --
+# later entries win (a rerun's own final conclusion, not its first attempt).
+by_name = {}
+for item in rollup:
+    name = item.get("context") or item.get("name")
+    if not name:
+        continue
+    if "conclusion" in item or "status" in item:
+        # Checks API shape (GitHub Actions job/check run).
+        verdict = (
+            "pending" if item.get("status") != "COMPLETED"
+            else "success" if item.get("conclusion") == "SUCCESS"
+            else "red"
+        )
+    else:
+        # Legacy Status API shape.
+        legacy = (item.get("state") or "").upper()
+        verdict = "success" if legacy == "SUCCESS" else "pending" if legacy in ("", "PENDING") else "red"
+    by_name[name] = verdict
+
+if not required:
+    # No branch-protection.json entry for this repo -- fall back to
+    # whatever the rollup itself reported (should not occur for a
+    # push_via_branch=true repo, which `enable` always records).
+    required = list(by_name.keys())
+
+red = [n for n in required if by_name.get(n) == "red"]
+unresolved = [n for n in required if by_name.get(n, "pending") != "success"]
+
+if red:
+    print(f"red {red[0]}")
+    sys.exit(4)
+if state == "MERGED" and merge_sha and not unresolved:
+    print(f"merged {merge_sha}")
+    sys.exit(0)
+if state == "CLOSED":
+    print("closed")
+    sys.exit(5)
+print("pending")
+sys.exit(3)
+PY
+  exit $?
+}
+
+# cmd_sync — requirement 3 / AC4/AC5: fast-forward (or, when the merge
+# produced a squash commit with the SAME tree as local main, re-point) local
+# `main` to `origin/main` after a `landing-check merged <sha>` verdict.
+# Never `--force`, never `reset --hard` -- a refusal leaves `main` byte-for-
+# byte untouched and is always recoverable from `git reflog main`.
+cmd_sync() {
+  local repo_arg="${1:-}"
+  [ -n "$repo_arg" ] || { usage; exit 2; }
+  local repo_dir; repo_dir="$(resolve_repo_dir "$repo_arg")" || die 4 "repo not found locally: $repo_arg"
+  local repo_slug; repo_slug="$(basename "$repo_dir")"
+
+  git -C "$repo_dir" fetch origin main >/dev/null 2>&1 || true
+
+  local cur_branch
+  cur_branch="$(git -C "$repo_dir" symbolic-ref --short -q HEAD || true)"
+  if [ "$cur_branch" != "main" ]; then
+    sync_refuse "$repo_slug" "not-on-main"
+    exit 6
+  fi
+
+  # Dirty TRACKED tree only -- untracked build artifacts never block a sync
+  # (same convention as self-push.sh).
+  if ! git -C "$repo_dir" diff --quiet -- || ! git -C "$repo_dir" diff --cached --quiet --; then
+    sync_refuse "$repo_slug" "dirty"
+    exit 6
+  fi
+
+  local old_sha new_sha
+  old_sha="$(git -C "$repo_dir" rev-parse main)"
+  new_sha="$(git -C "$repo_dir" rev-parse origin/main 2>/dev/null)" || die 4 "no origin/main ref for $repo_slug (fetch it first)"
+
+  if [ "$old_sha" = "$new_sha" ]; then
+    echo "branch-protection: $repo_slug main already synced at $new_sha"
+    exit 0
+  fi
+
+  if git -C "$repo_dir" merge --ff-only origin/main >/dev/null 2>&1; then
+    sync_log "$repo_slug" "$old_sha" "$new_sha" "ff-only"
+    echo "branch-protection: $repo_slug main fast-forwarded $old_sha -> $new_sha"
+    exit 0
+  fi
+
+  local old_tree new_tree
+  old_tree="$(git -C "$repo_dir" rev-parse "main^{tree}")"
+  new_tree="$(git -C "$repo_dir" rev-parse "origin/main^{tree}" 2>/dev/null)"
+  if [ -n "$new_tree" ] && [ "$old_tree" = "$new_tree" ]; then
+    # checkout -B moves the branch ref -- $old_sha stays reachable via
+    # `git reflog main` (AC4), never lost, never `reset --hard`.
+    git -C "$repo_dir" checkout -B main origin/main >/dev/null 2>&1 \
+      || die 5 "checkout -B main origin/main failed for $repo_slug"
+    sync_log "$repo_slug" "$old_sha" "$new_sha" "identical"
+    echo "branch-protection: $repo_slug main synced (tree-identical) $old_sha -> $new_sha"
+    exit 0
+  fi
+
+  sync_refuse "$repo_slug" "tree-diff"
+  exit 6
+}
+
+sync_log() {
+  local repo_slug="$1" old="$2" new="$3" tree="$4"
+  journal_line "$(date -u +%Y-%m-%dT%H:%M:%SZ)  branch-protection  $repo_slug  main-synced old=$old new=$new tree=$tree"
+}
+
+sync_refuse() {
+  local repo_slug="$1" reason="$2"
+  journal_line "$(date -u +%Y-%m-%dT%H:%M:%SZ)  branch-protection  $repo_slug  main-sync-refused reason=$reason"
+}
+
 [ $# -ge 1 ] || { usage; exit 2; }
 cmd="$1"; shift
 case "$cmd" in
-  enable) cmd_enable "$@" ;;
-  status) cmd_status "$@" ;;
-  push)   cmd_push "$@" ;;
+  enable)        cmd_enable "$@" ;;
+  status)        cmd_status "$@" ;;
+  push)          cmd_push "$@" ;;
+  landing-check) cmd_landing_check "$@" ;;
+  sync)          cmd_sync "$@" ;;
   -h|--help) usage; exit 0 ;;
   *) usage; exit 2 ;;
 esac
