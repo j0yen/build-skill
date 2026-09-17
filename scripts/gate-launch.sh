@@ -98,6 +98,8 @@ SYSTEMCTL="${GATE_LAUNCH_SYSTEMCTL:-systemctl}"
 JQ="${JQ:-jq}"
 # shellcheck source=lib/journal.sh
 source "$HERE/lib/journal.sh"
+# shellcheck source=lib/push-via-branch.sh
+source "$HERE/lib/push-via-branch.sh"
 journal="${GATE_LAUNCH_JOURNAL:-$(journal_root)/$(date -u +%Y-%m-%d).md}"
 
 die() { echo "gate-launch: $2" >&2; exit "${1:-4}"; }
@@ -157,6 +159,28 @@ fi
 if [ "$main_health" -eq 1 ]; then
   [ "$scope" = main ] || die 4 "--main-health requires --scope main"
   [ "$pinned_landing" -eq 0 ] || die 4 "--main-health and --pinned-landing are mutually exclusive"
+fi
+
+# PRD-build-skill-instruction-single-source R3: a raw `--scope main --slug
+# <slug>` call (the pre-fix form seven SKILL.md sites duplicated in
+# prose) is refused for a push_via_branch=true repo once a landing record
+# exists for that slug — the caller must resolve --pinned-landing itself
+# via archive-gate.sh instead of re-deriving --head from the checkout's
+# current HEAD, which may already belong to a LATER-landed PRD (the
+# 2026-09-17 05:15:46Z regression this whole PRD chain exists to close).
+# --main-health and an explicit --pinned-landing are both exempt above by
+# construction (this check only runs for the plain extend-gate.sh form);
+# a direct-push repo (push_via_branch=false, no landing record) is
+# unaffected. Exit 6 is distinct from every other exit this script uses.
+if [ "$scope" = main ] && [ "$pinned_landing" -eq 0 ] && [ "$main_health" -eq 0 ]; then
+  repo_slug_pv="$(basename "$repo")"
+  if [ "$(push_via_branch_for "$repo_slug_pv")" = true ]; then
+    record_pv="$(landing_record_path "$repo_slug_pv" "$slug")"
+    if [ -f "$record_pv" ]; then
+      jlog "$slug" "refused (raw --scope main for push_via_branch=true repo $repo_slug_pv, use archive-gate.sh)"
+      die 6 "refusing --scope main --slug $slug without --pinned-landing for push_via_branch=true repo $repo_slug_pv (landing record exists at $record_pv) — call scripts/archive-gate.sh instead"
+    fi
+  fi
 fi
 
 mkdir -p "$INFLIGHT_DIR"

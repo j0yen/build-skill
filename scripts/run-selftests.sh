@@ -82,6 +82,7 @@ SELFTEST_REGISTRY=(
   scripts/canary-selftest.sh
   scripts/main-push-pr-path-selftest.sh
   scripts/main-verdict-pin-selftest.sh
+  scripts/skill-single-source-selftest.sh
 )
 
 usage() { echo "usage: run-selftests.sh <name-or-path>... | --all" >&2; exit 2; }

@@ -1,0 +1,14 @@
+# scripts/skill-prose-lint.patterns — PRD-build-skill-instruction-single-
+# source R4: one extended grep -E pattern per line, checked against every
+# fenced code block in SKILL.md OUTSIDE the canonical section marked
+# `<!-- single-source: archive-gate -->`. A match fails skill-prose-
+# lint.sh, naming the offending line. Blank lines and lines starting with
+# `#` are ignored.
+#
+# This is the "raw main-gate command form" list the archive-gate.sh
+# single-source PRD exists to keep at zero copies outside its own
+# section. Extend this file (do not hardcode a new pattern into
+# skill-prose-lint.sh) the next time a duplicated command needs the same
+# treatment — see the PRD's Open question about worktree-extend.sh add.
+gate-launch\.sh .*--scope main
+extend-gate\.sh .*--head

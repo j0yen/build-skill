@@ -957,6 +957,68 @@ read it before assuming a step is "the last one this tick".
   `wm-publish`'s ALLOW and `~/wintermute/REPOS.md`. Counts as one tick
   action.
   # After push succeeds (direct or auto-merge armed): answerable-emit.sh push <repo> "v<ver> — <one-line>" false
+
+### Archive gate (single source)
+<!-- single-source: archive-gate -->
+
+Every site below that gates a landed slug at `--scope main` — the **gate**
+ship action just below, the **Post-land main check**, the Mixed-tick/
+Full-gate burst-routing local fallbacks, `verified-completed`'s check #6,
+and the shared-target chain's own step 6 — calls exactly ONE command and
+never derives the sha or the form itself:
+
+```
+scripts/archive-gate.sh <build_into> <slug> [--wait]
+```
+
+`archive-gate.sh` (PRD-build-skill-instruction-single-source R1) reads
+`state/branch-protection.json` for the repo's `push_via_branch` flag and
+resolves both the sha and the FORM on the caller's behalf:
+
+- **`push_via_branch=false`** (direct-push repo — no landing record, the
+  historical/common case): gates `git -C <build_into> rev-parse HEAD` —
+  the bump commit right after the push — with the plain form
+  (`gate-launch.sh <build_into> --head <sha> --scope main --slug <slug>
+  [--wait]`).
+- **`push_via_branch=true`** (PRD-build-main-verdict-pinned-to-landing
+  R1): NEVER derive the sha from the checkout's current HEAD — a later
+  dispatch may have moved it past this slug's own landing (the
+  2026-09-17 05:15:46Z regression, and the 15:42:50Z one this PRD itself
+  fixes: agent-wake's agent obeyed a stale copy of this exact command
+  and gated mcphost's checkout HEAD instead of the slug's own merge sha).
+  `archive-gate.sh` requires `state/landings/<repo>/<slug>.json`
+  (reconstructing it from `gh pr view loop/<slug>` of the merged PR when
+  the record is absent, writing `reconstructed_from`) and calls the
+  pinned form (`gate-launch.sh <build_into> --head <any value —
+  unit-name/idempotence-marker only> --scope main --slug <slug>
+  --pinned-landing [--wait]`) — `main-verdict-pin-gate.sh` re-resolves
+  the slug's OWN merge sha M from that record and gates a detached
+  worktree at M, never the checkout's HEAD.
+
+Either form ends up a **cache hit**, not a fresh producer run, whenever a
+branch/land step already gated the same tree this tick
+(`worktree-extend.sh integrate` transfers the branch's verdict onto
+main's cache under the merge's tree key, PRD-build-gate-before-land
+requirement 4) — the journal reads `(cached tree=... from=branch
+slug=<slug>)` instead of a fresh `gate ... wall=<n>s` line.
+
+**Never call `gate-launch.sh`/`extend-gate.sh` directly at `--scope main`
+for a `push_via_branch=true` repo without `--pinned-landing`** —
+`gate-launch.sh` itself refuses that now (PRD-build-skill-instruction-
+single-source R3, exit 6, naming `archive-gate.sh`) once a landing
+record exists for the slug. `--main-health` (the bare "is main green
+right now" question, no PRD card) and an explicit `--pinned-landing`
+call are both unaffected by that refusal.
+
+This section is the single canonical description of the archive/land
+main-gate command — every other mention below is a one-line reference to
+it. The foreground/`--wait` rule (never a backgrounded job of the
+coordinator session), patience derivation, shared-target
+gate-before-land ordering, and branch-scope policy are unchanged by this
+PRD and still documented at their own sites below; this section covers
+only which sha/form a main-scope gate call uses.
+<!-- /single-source: archive-gate -->
+
 - **gate** [rust-extend only — the PRD's non-goals exclude python-* (already
   gated by `pybuilder gate ready`) and kernel-extend (gated by `makepkg`,
   no autobuilder receipts)] — the SOLO `wm-buildtree land` path only (a
@@ -971,52 +1033,26 @@ read it before assuming a step is "the last one this tick".
   **Never start a gate as a background job of the coordinator session:
   the tick's cgroup kills it on exit (2026-09-15 16:07Z/16:12Z) — `ps`
   showed zero extend-gate/cargo processes afterward and nothing detected
-  it.** Launch it via `scripts/gate-launch.sh`, which runs
-  `extend-gate.sh` under a `systemd-run --user --collect` unit that
-  outlives the tick regardless: either `--wait` in the FOREGROUND of the
-  tool call, or without `--wait`, ending this step with
-  `scripts/gate-status.sh <slug>` (`running` — resume next step/tick;
-  `finished:<rc>` — treat `<rc>` as `extend-gate.sh`'s own verdict below;
-  `lost` — chain-guard.sh already relaunches this once on its own, don't
-  hand-relaunch). Run:
+  it.** Launch it via `scripts/gate-launch.sh` (wrapped by
+  `archive-gate.sh` below), which runs `extend-gate.sh` under a
+  `systemd-run --user --collect` unit that outlives the tick regardless:
+  either `--wait` in the FOREGROUND of the tool call, or without
+  `--wait`, ending this step with `scripts/gate-status.sh <slug>`
+  (`running` — resume next step/tick; `finished:<rc>` — treat `<rc>` as
+  `extend-gate.sh`'s own verdict below; `lost` — chain-guard.sh already
+  relaunches this once on its own, don't hand-relaunch). Run the ONE
+  command **Archive gate (single source)** above documents:
 
   ```
-  scripts/gate-launch.sh <build_into> --head <landed sha> --scope main --slug <slug> --wait
+  scripts/archive-gate.sh <build_into> <slug> --wait
   ```
 
-  `<landed sha>` is the bump commit's sha on `origin/<default>` right after
-  the push above (`git -C <build_into> rev-parse HEAD`). `extend-gate.sh`
-  regenerates all 25 receipts at that HEAD on the main checkout (never in a
-  worktree — the worktree's `target/` holds none of the crate's real
-  receipts) and runs `autobuilder gate --project .` as the single verdict.
-  Counts as one tick action.
-
-  **`push_via_branch=true` (PRD-build-main-verdict-pinned-to-landing R1):
-  never derive `<landed sha>` from `git rev-parse HEAD` for this step —
-  add `--pinned-landing` instead and drop the `--head`/`--scope`
-  computation above entirely:**
-
-  ```
-  scripts/gate-launch.sh <build_into> --head <any value — see below> --scope main --slug <slug> --pinned-landing --wait
-  ```
-
-  `main-verdict-pin-gate.sh` (what `--pinned-landing` routes the unit to,
-  gate-launch.sh's own header) re-resolves the slug's OWN merge sha M from
-  `state/landings/<repo>/<slug>.json` itself and gates a detached worktree
-  at M — `--head` here is used ONLY for the unit's name/idempotence
-  marker (pass `git -C <build_into> rev-parse HEAD` if nothing else is
-  handy; it is never what gets gated). This is the fix for the
-  2026-09-17 05:15:46Z regression: the DOCUMENTED derivation above
-  (`git rev-parse HEAD` "right after the push") is only ever true within
-  the SAME dispatch a `push_via_branch=true` land's PR just merged in —
-  the moment this step instead runs on a LATER tick (after
-  `landing-resume.sh` already cleared `last_step`, handing the PRD back
-  to ordinary dispatch — see "Resuming a landing-pending PRD" below), the
-  checkout's current HEAD may already belong to a DIFFERENT, later-landed
-  PRD, and the derivation above silently gates the wrong commit. Direct-
-  push repos (`push_via_branch=false`, no landing record) are unaffected —
-  keep the plain `--head <landed sha> --scope main --slug <slug> --wait`
-  form exactly as documented above (AC6).
+  `extend-gate.sh` regenerates all 25 receipts at the resolved HEAD on the
+  main checkout (never in a worktree — the worktree's `target/` holds none
+  of the crate's real receipts) and runs `autobuilder gate --project .` as
+  the single verdict. Counts as one tick action. `push_via_branch=true`
+  and `push_via_branch=false` repos both use this exact same call —
+  `archive-gate.sh` is what decides the sha and the form (AC6).
 
   **Patience is derived, not a fixed 60s/90s (PRD-build-gate-patience-
   from-queue-depth).** Neither `extend-gate.sh` nor `chain-guard.sh` waits
@@ -1135,8 +1171,8 @@ read it before assuming a step is "the last one this tick".
     exit-11 `post-land-main-gate-block` path).
 
   **Post-land main check is now a cache hit, not a re-run.** After `push`,
-  still run the SAME `scripts/gate-launch.sh <build_into> --head <landed
-  sha> --scope main --slug <slug> --wait` command shown above (same
+  still run the SAME **Archive gate (single source)** command shown above
+  (`scripts/archive-gate.sh <build_into> <slug> --wait`; same
   foreground-or-gate-status.sh rule as above — never backgrounded) — but
   because `worktree-extend.sh integrate`
   just transferred the branch's verdict onto main's cache under the
@@ -1181,13 +1217,16 @@ read it before assuming a step is "the last one this tick".
   and no reviewer, so a remoted `extend-gate.sh` can only 127. The working
   pattern (proven 19:07Z, exit=0, 2.76 GB target pulled back) is: run
   `extend-gate.sh` LOCALLY with the burst PATH shims armed, so its
-  cargo-heavy producers execute on the box while orchestration stays here:
+  cargo-heavy producers execute on the box while orchestration stays here
+  — the SAME **Archive gate (single source)** command, with the shim
+  PATH exported first:
   ```
   export PATH="$HOME/.claude/skills/build/scripts/burst-lane-bin:$PATH" BURST_LANE=1
-  scripts/gate-launch.sh <build_into> --head <landed sha> --scope main --slug <slug> --wait
+  scripts/archive-gate.sh <build_into> <slug> --wait
   ```
-  (`gate-launch.sh` inherits the exported `PATH`/`BURST_LANE` for its own
-  unit — never background this call either, same rule as above.)
+  (`archive-gate.sh` and the `gate-launch.sh` unit it launches both
+  inherit the exported `PATH`/`BURST_LANE` — never background this call
+  either, same rule as above.)
   `should-route` reporting `local` (or any shim fallback) means the same
   command simply runs its cargo locally — today's behavior, unchanged, and
   the ONLY behavior when burst is not configured. `gate-burst.sh run`'s own
@@ -1208,7 +1247,9 @@ read it before assuming a step is "the last one this tick".
   autobuilder, and no reviewer. PRD-build-gate-on-casper's `burst-lane.sh`
   now provisions all of that at `up` (requirement 1), so when
   `BURST_GATE_REMOTE=1` AND burst is configured, the tick calls this
-  INSTEAD of the local `extend-gate.sh` invocation above:
+  INSTEAD of the local **Archive gate (single source)** call above
+  (`archive-gate.sh` does not wrap this remote form — it is a distinct
+  command, kept as-is):
   ```
   scripts/burst-lane.sh gate <build_into> --head <landed sha>
   ```
@@ -1225,10 +1266,11 @@ read it before assuming a step is "the last one this tick".
   `Receipts:` line below are all unchanged. Any failure before the remote
   gate starts (routing disabled, burst not configured, parity unknown/diff,
   provisioning, ssh, rsync) prints `fallback: <cause>` and exits 3: treat
-  exactly like `gate-burst.sh run`'s own fallback — run the LOCAL command
-  (foreground, never backgrounded — same rule as above):
+  exactly like `gate-burst.sh run`'s own fallback — run the LOCAL
+  **Archive gate (single source)** command (foreground, never
+  backgrounded — same rule as above):
   ```
-  scripts/gate-launch.sh <build_into> --head <landed sha> --scope main --slug <slug> --wait
+  scripts/archive-gate.sh <build_into> <slug> --wait
   ```
   A failure AFTER the remote gate starts is a normal gate verdict (0 or
   1), carried in the synced-back receipts, not a fallback. Default is
@@ -1620,35 +1662,27 @@ read it before assuming a step is "the last one this tick".
   - Check #4 becomes: `~/wintermute/REPOS.md` is unchanged by this
     PRD's tick history (negative AC — the extended repo is already listed).
   - **Check #6 (new; updated 2026-09-06 for PRD-build-gate-delta-baseline;
-    updated 2026-09-17 for PRD-build-main-verdict-pinned-to-landing R1)**:
-    for a `push_via_branch=false` repo (no landing record), unchanged:
-    `scripts/extend-gate.sh <build_into> --head <HEAD>` at a HEAD equal to
-    `origin/<default>` exits 0 — `pass` (`block=0`) OR `delta-pass` (block>0
-    but every blocking receipt is named in the committed
-    `agent/gate-baseline.json`) both satisfy this check; only `verdict=block`
-    (exit 1) fails it. This is what the `gate` ship action (above) already
-    established and recorded in the `Receipts:` line — archive re-checks it
-    (via the verdict cache, so re-checking a HEAD the same tick's `gate`
-    action just verified is cheap) rather than trusting a stale line.
-    **For a `push_via_branch=true` repo, never gate `<HEAD>` here — the
-    checkout's current HEAD may already belong to a later-landed PRD
-    (the 2026-09-17 05:15:46Z regression this PRD exists to fix).** Run
-    `scripts/gate-launch.sh <build_into> --head <any value> --scope main
-    --slug <slug> --pinned-landing --wait` (same form as the `gate` ship
-    action's `push_via_branch=true` branch above) — `main-verdict-pin-
-    gate.sh` re-resolves the slug's own merge sha M and checks the
-    verdict pinned at M (R4: a cache hit, no producer run, if the `gate`
-    or post-land re-verify step already recorded `pass`/`delta-pass` at
-    M this tick or any earlier one). Check #6 passes on `pass` or
-    `delta-pass` AT M, exactly the same two outcomes as the
-    `push_via_branch=false` form above; `landing-record-unusable:<field|
-    sha>` (R7) or `verdict=block` at M both fail it.
+    updated 2026-09-17 for PRD-build-main-verdict-pinned-to-landing R1;
+    updated 2026-09-17 for PRD-build-skill-instruction-single-source R1 —
+    this is the exact check a stale copy of this command caused to gate
+    the wrong sha at 15:42:50Z, 2026-09-17)**: run the **Archive gate
+    (single source)** command above (`scripts/archive-gate.sh
+    <build_into> <slug> --wait`), which resolves the correct HEAD/M for
+    either `push_via_branch` state itself — never derive it here by hand.
+    `pass` (`block=0`) OR `delta-pass` (block>0 but every blocking
+    receipt is named in the committed `agent/gate-baseline.json`) both
+    satisfy this check; only `verdict=block` fails it, as does R7's
+    `landing-record-unusable:<field|sha>` for a `push_via_branch=true`
+    repo whose landing record can't be resolved. This is usually a cache
+    hit (no producer run) when the `gate` or post-land re-verify step
+    already recorded a verdict at the same sha/M this tick or any earlier
+    one, rather than trusting a stale `Receipts:` line.
     **The archive gate refuses otherwise, naming check #6** — a PRD whose
-    `gate` action last blocked, whose verdict at M is block, or (direct-
-    push only) whose `build_into` HEAD has since moved without a fresh
-    `gate` run, fails archive here and stays in `build-queue/` with
-    `Status: in_progress`, not silently treated as shipped on the
-    strength of checks #1/#5 alone.
+    `gate` action last blocked, whose verdict at the resolved sha is
+    block, or (direct-push only) whose `build_into` HEAD has since moved
+    without a fresh `gate` run, fails archive here and stays in
+    `build-queue/` with `Status: in_progress`, not silently treated as
+    shipped on the strength of checks #1/#5 alone.
   - **Check #7 (new; PRD-build-post-ship-reality-check, all shapes) — a
     deferral or a receipt is a testable claim, not prose to trust.** Two
     sub-checks, both run via `verified-completed.sh`, both must pass
@@ -3039,25 +3073,18 @@ python-specific contract.
    dispatch as `push` — step 5 above already stopped at
    `last_step=landing-pending`, so this text applies only to the LATER
    dispatch that resumes via `landing-resume.sh` ("Resuming a
-   `landing-pending` PRD" earlier). For that resumed run, never derive
-   `<landed sha>` from `git rev-parse HEAD` here either — the checkout's
-   current HEAD may already belong to a later-landed sibling on the same
-   shared target, exactly the 2026-09-17 05:15:46Z regression this PRD
-   fixes. Run `scripts/gate-launch.sh <repo> --head <any value — see the
-   non-shared gate action above> --scope main --slug <slug>
-   --pinned-landing --wait` instead — `main-verdict-pin-gate.sh`
-   re-resolves the slug's own merge sha M from
-   `state/landings/<repo>/<slug>.json` and gates a detached worktree at
-   M, so a concurrently-landed sibling's HEAD movement cannot shift what
-   this slug's re-verify checks.** The plain command below — this step is
-   the same command as the non-shared rust-extend path —
-   `scripts/gate-launch.sh <repo> --head <landed sha> --scope main --slug
-   <slug> --wait` (foreground, never a
-   backgrounded job of the coordinator session — 2026-09-15 16:07Z/16:12Z)
-   after `push`, before the PRD reads `built` — applies to
-   `push_via_branch=false` only, where step 6 always runs in the same
-   dispatch as `push` and `<landed sha>` is a real, stable, already-final
-   HEAD. Either form is now
+   `landing-pending` PRD" earlier). For that resumed run, never derive the
+   sha from `git rev-parse HEAD` here either — the checkout's current
+   HEAD may already belong to a later-landed sibling on the same shared
+   target, exactly the 2026-09-17 05:15:46Z regression this PRD fixes.**
+   Run the SAME **Archive gate (single source)** command as the
+   non-shared rust-extend path — `scripts/archive-gate.sh <repo> <slug>
+   --wait` (foreground, never a backgrounded job of the coordinator
+   session — 2026-09-15 16:07Z/16:12Z) — after `push`, before the PRD
+   reads `built`. `archive-gate.sh` itself resolves the correct sha/form
+   for either `push_via_branch` state, so this one call is right whether
+   step 6 runs in the same dispatch as `push` (`push_via_branch=false`)
+   or a later resumed one (`push_via_branch=true`). It is now
    expected to be a CACHE HIT: `worktree-extend.sh integrate` transferred
    the branch's verdict onto main's cache under the merge's tree key
    (PRD-build-gate-before-land requirement 4), so this run replays it (no
