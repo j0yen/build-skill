@@ -67,6 +67,8 @@ DECISIONS="${LANDING_RESUME_DECISIONS:-$HERE/decisions.sh}"
 source "$HERE/lib/journal.sh"
 # shellcheck source=lib/push-via-branch.sh
 source "$HERE/lib/push-via-branch.sh"
+# shellcheck source=lib/repo-slug.sh
+source "$HERE/lib/repo-slug.sh"
 
 die() { echo "landing-resume: $2" >&2; exit "$1"; }
 usage() { echo "usage: landing-resume.sh <repo> <slug> [--pending-max SECONDS]" >&2; }
@@ -83,7 +85,7 @@ done
 repo="${pos[0]:-}"; slug="${pos[1]:-}"
 [ -n "$repo" ] && [ -n "$slug" ] || { usage; die 1 "missing <repo>/<slug>"; }
 repo="$(cd "$repo" 2>/dev/null && pwd)" || die 1 "no such directory: ${pos[0]:-}"
-repo_slug="$(basename "$repo")"
+repo_slug="$(repo_slug_for_ci "$repo")"
 
 journal="${LANDING_RESUME_JOURNAL:-$HOME/brain/journal/build/$(date -u +%Y-%m-%d).md}"
 if [ -r "$HERE/isolation-guard.sh" ]; then

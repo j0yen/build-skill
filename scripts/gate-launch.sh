@@ -100,6 +100,8 @@ JQ="${JQ:-jq}"
 source "$HERE/lib/journal.sh"
 # shellcheck source=lib/push-via-branch.sh
 source "$HERE/lib/push-via-branch.sh"
+# shellcheck source=lib/repo-slug.sh
+source "$HERE/lib/repo-slug.sh"
 journal="${GATE_LAUNCH_JOURNAL:-$(journal_root)/$(date -u +%Y-%m-%d).md}"
 
 die() { echo "gate-launch: $2" >&2; exit "${1:-4}"; }
@@ -173,7 +175,7 @@ fi
 # a direct-push repo (push_via_branch=false, no landing record) is
 # unaffected. Exit 6 is distinct from every other exit this script uses.
 if [ "$scope" = main ] && [ "$pinned_landing" -eq 0 ] && [ "$main_health" -eq 0 ]; then
-  repo_slug_pv="$(basename "$repo")"
+  repo_slug_pv="$(repo_slug_for_ci "$repo")"
   if [ "$(push_via_branch_for "$repo_slug_pv")" = true ]; then
     record_pv="$(landing_record_path "$repo_slug_pv" "$slug")"
     if [ -f "$record_pv" ]; then

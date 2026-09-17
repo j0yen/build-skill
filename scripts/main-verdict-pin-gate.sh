@@ -65,6 +65,8 @@ STATE_DIR="${BUILD_STATE_DIR:-$SKILL_DIR/state}"
 WT_ROOT="${BUILD_WT_ROOT:-$HOME/.cache/build-worktrees}"
 LANDING_VERDICT_RESOLVE="${MAIN_VERDICT_PIN_GATE_LANDING_VERDICT_RESOLVE:-$HERE/landing-verdict-resolve.sh}"
 EXTEND_GATE="${MAIN_VERDICT_PIN_GATE_EXTEND_GATE:-$HERE/extend-gate.sh}"
+# shellcheck source=lib/repo-slug.sh
+source "$HERE/lib/repo-slug.sh"
 
 die() { echo "main-verdict-pin-gate: $2" >&2; exit "$1"; }
 usage() { echo "usage: main-verdict-pin-gate.sh <repo> <slug> [extend-gate.sh args...]" >&2; }
@@ -77,7 +79,7 @@ extra_args=("$@")
 [ -x "$EXTEND_GATE" ] || die 2 "missing $EXTEND_GATE"
 
 repo="$(cd "$repo_arg" 2>/dev/null && pwd)" || { usage; die 1 "no such directory: $repo_arg"; }
-repo_slug="$(basename "$repo")"
+repo_slug="$(repo_slug_for_ci "$repo")"
 
 # --- R1: resolve M (or propagate R7 unchanged) --------------------------
 merge_sha="$("$LANDING_VERDICT_RESOLVE" "$repo" "$slug")"

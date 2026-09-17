@@ -182,6 +182,8 @@ GATE_INFRA_STATE_DIR="$STATE_DIR/gate-infra"
 GATE_INFRA_MAX_ATTEMPTS="${GATE_INFRA_MAX_ATTEMPTS:-3}"
 # shellcheck source=lib/push-via-branch.sh
 source "$HERE/lib/push-via-branch.sh"
+# shellcheck source=lib/repo-slug.sh
+source "$HERE/lib/repo-slug.sh"
 
 die() { echo "gate-then-land: $2" >&2; exit "$1"; }
 usage() {
@@ -489,7 +491,7 @@ while [ "$attempt" -le "$max_retries" ]; do
       # exit 0 pending" — the deferred-receipt re-verify (die 11 path)
       # below never runs for it, checked BEFORE that block, regardless of
       # whether this land's own verdict deferred anything.
-      repo_slug_pvb="$(basename "$repo")"
+      repo_slug_pvb="$(repo_slug_for_ci "$repo")"
       if [ "$(push_via_branch_for "$repo_slug_pvb")" = "true" ]; then
         echo "gate-then-land: [$slug] $repo_slug_pvb is push_via_branch=true — landing via PR path (branch-protection.sh push), not a direct main-scope re-verify" >&2
         push_out="$("$BRANCH_PROTECTION" push "$repo" "$slug" 2>&1)"

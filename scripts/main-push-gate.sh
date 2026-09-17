@@ -116,6 +116,8 @@ STATE_DIR="${BUILD_STATE_DIR:-$SKILL_DIR/state}"
 source "$HERE/lib/journal.sh"
 # shellcheck source=lib/push-via-branch.sh
 source "$HERE/lib/push-via-branch.sh"
+# shellcheck source=lib/repo-slug.sh
+source "$HERE/lib/repo-slug.sh"
 
 CHECK_TIMEOUT_SECS="${MAIN_PUSH_GATE_TIMEOUT:-900}"   # 15 minutes (AC9)
 
@@ -169,7 +171,7 @@ else
   die 2 "not a git repo: $repo_arg (checked as given and as ~/wintermute/$repo_arg)"
 fi
 
-slug="$(basename "$repo")"
+slug="$(repo_slug_for_ci "$repo")"
 
 # --- resolve --project-root (PRD-build-main-push-gate-nested-project-root) ---
 # Same explicit-only handling as extend-gate.sh's own --project-root: no

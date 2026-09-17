@@ -145,6 +145,9 @@
 #       3 nothing to resolve (resolve only, no conflicted paths).
 set -uo pipefail
 
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+# shellcheck source=lib/repo-slug.sh
+source "$HERE/lib/repo-slug.sh"
 SKILL_DIR="${BUILD_SKILL_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 STATE_DIR="${BUILD_STATE_DIR:-$SKILL_DIR/state}"
 LAND_POLICY_DIR="${LAND_POLICY_DIR:-$STATE_DIR/land-policy}"
@@ -187,7 +190,7 @@ ledger_record() {
   # Same LAND_RESOLVE_POLICY_BASENAME override policy_path_for() uses (see
   # its comment) — a worktree-invoked resolve should log the real target
   # repo's name, not the worktree directory's own `<repo>-<slug>` name.
-  local repo_field="${LAND_RESOLVE_POLICY_BASENAME:-$(basename "$repo")}"
+  local repo_field="${LAND_RESOLVE_POLICY_BASENAME:-$(repo_slug_for_ci "$repo")}"
   line="$(jq -nc \
     --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     --arg repo "$repo_field" \
@@ -216,7 +219,7 @@ policy_path_for() {
   # error, just quietly worse classification. Defaults to `basename $repo`
   # (unchanged behavior) when unset, so every existing direct-repo caller
   # (classify/resolve invoked on a real repo, not a worktree) is unaffected.
-  local base="${LAND_RESOLVE_POLICY_BASENAME:-$(basename "$repo")}"
+  local base="${LAND_RESOLVE_POLICY_BASENAME:-$(repo_slug_for_ci "$repo")}"
   echo "$LAND_POLICY_DIR/$base.json"
 }
 

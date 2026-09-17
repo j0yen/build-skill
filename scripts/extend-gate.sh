@@ -1103,7 +1103,7 @@ if ! $record_baseline && ! $force && [ -f "$cache_file" ] && ! jq -e . "$cache_f
   # gate below still runs fresh either way, but now with a named cause
   # instead of an empty-verdict path nobody can explain afterward.
   journal_line --file "$journal" "$(printf '%s  gate  %s  verdict-cache  corrupt  (path=%s)' \
-    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(basename "$repo")" "$cache_file")"
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(basename "$repo")" "$cache_file")"  # lint:basename-label
   rm -f "$cache_file" 2>/dev/null || true
 fi
 if ! $record_baseline && ! $force && [ -f "$cache_file" ]; then
@@ -1161,7 +1161,7 @@ if ! $record_baseline && ! $force && [ -f "$cache_file" ]; then
       # all since it has no tree_sha to match on).
       cached_from_scope="$(jq -r '.scope // "main"' "$cache_file" 2>/dev/null || echo main)"
       cached_from_slug="$(jq -r '.slug // empty' "$cache_file" 2>/dev/null || true)"
-      _cache_crate_name="$(basename "$repo")"
+      _cache_crate_name="$(basename "$repo")"  # lint:basename-label
       if [ -n "$cached_from_slug" ]; then
         journal_line --file "$journal" "$(printf '%s  gate  %s  %s  (cached tree=%s from=%s slug=%s)' \
           "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$_cache_crate_name" "$cached_verdict" "$tree_now" "$cached_from_scope" "$cached_from_slug")"
@@ -1193,7 +1193,7 @@ fi
 # routed cargo cost to THIS gate's own slug (requirement 6) instead of
 # whatever attribution_slug_for()'s worktree-basename convention would
 # otherwise guess for a main checkout that isn't a worktree at all.
-crate_name="$(basename "$repo")"
+crate_name="$(basename "$repo")"  # lint:basename-label
 route_log_file="$project_abs/target/autobuilder/route.log"
 mkdir -p "$(dirname "$route_log_file")" 2>/dev/null || true
 : > "$route_log_file"
@@ -2194,7 +2194,7 @@ if [ -z "$summary" ]; then
   # placeholder is ever substituted in.
   _gs_err_line="$(printf '%s\n' "$gate_out" | grep -v '^[[:space:]]*$' | tail -n1 | cut -c1-160)"
   journal_line --file "$journal" "$(printf '%s  gate  %s  gate-summary  missing  (rc=%s err="%s")' \
-    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(basename "$repo")" "$gate_rc" "$_gs_err_line")"
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(basename "$repo")" "$gate_rc" "$_gs_err_line")"  # lint:basename-label
 fi
 
 # --- cargo-route postcondition (P0 requirement 4, AC4) --------------------

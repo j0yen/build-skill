@@ -47,6 +47,8 @@ BRANCH_PROTECTION="${LANDING_VERDICT_RESOLVE_BRANCH_PROTECTION:-$HERE/branch-pro
 source "$HERE/lib/journal.sh"
 # shellcheck source=lib/push-via-branch.sh
 source "$HERE/lib/push-via-branch.sh"
+# shellcheck source=lib/repo-slug.sh
+source "$HERE/lib/repo-slug.sh"
 
 die_unusable() {
   local slug="$1" field="$2"
@@ -76,7 +78,7 @@ repo_arg="$1" slug="$2"
 [ -n "$repo_arg" ] && [ -n "$slug" ] || usage
 
 repo_dir="$(resolve_repo_dir "$repo_arg")" || { echo "landing-verdict-resolve: repo not found locally: $repo_arg" >&2; exit 2; }
-repo_slug="$(basename "$repo_dir")"
+repo_slug="$(repo_slug_for_ci "$repo_dir")"
 record="$(landing_record_path "$repo_slug" "$slug")"
 
 [ -f "$record" ] || die_unusable "$slug" "record"

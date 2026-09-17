@@ -58,6 +58,8 @@ GH="${ARCHIVE_GATE_GH:-gh}"
 source "$HERE/lib/journal.sh"
 # shellcheck source=lib/push-via-branch.sh
 source "$HERE/lib/push-via-branch.sh"
+# shellcheck source=lib/repo-slug.sh
+source "$HERE/lib/repo-slug.sh"
 journal="${ARCHIVE_GATE_JOURNAL:-$(journal_root)/$(date -u +%Y-%m-%d).md}"
 
 die() { echo "archive-gate: $2" >&2; exit "$1"; }
@@ -81,7 +83,7 @@ done
 
 [ -x "$GATE_LAUNCH" ] || die 2 "missing $GATE_LAUNCH"
 repo="$(cd "$repo_arg" 2>/dev/null && pwd)" || die 3 "no such directory: $repo_arg"
-repo_slug="$(basename "$repo")"
+repo_slug="$(repo_slug_for_ci "$repo")"
 
 pvb="$(push_via_branch_for "$repo_slug")"
 
