@@ -4409,16 +4409,60 @@ _canary_release_inflight_lock() {
   flock -u "$_CANARY_LOCK_FD" 2>/dev/null || true
 }
 
+# canary_print_report [server_id] -> stdout, the last canary.json for that
+# box as a table (R10, AC-adjacent "burst-lane.sh canary --report"). Never
+# runs a canary itself -- a purely read-only render of R5's own recorded
+# state. Exit 1 with nothing fabricated when the box has never run one.
+canary_print_report() {
+  local server_id="${1:-$(state_read server_id)}" cf
+  cf="$(box_path_for "$server_id" canary.json)"
+  if [ ! -f "$cf" ]; then
+    echo "canary --report: no canary.json recorded (server_id=${server_id:-none})" >&2
+    return 1
+  fi
+  python3 -c '
+import json, sys
+d = json.load(open(sys.argv[1]))
+print("head           %s" % d.get("head", ""))
+print("head_source    %s" % d.get("head_source", ""))
+print("image_id       %s" % d.get("image_id", ""))
+print("ts             %s" % d.get("ts", ""))
+v = d.get("variants") or {}
+print("variant main   %s" % v.get("main", ""))
+print("variant branch %s" % v.get("branch", ""))
+print("variant delta  %s" % v.get("delta", ""))
+print("baseline_dir   %s" % d.get("baseline_dir", ""))
+diverged = d.get("diverged") or []
+if diverged:
+    print("diverged:")
+    for x in diverged:
+        print("  %s local=%s box=%s route=%s" % (
+            x.get("producer"), x.get("local"), x.get("box"), x.get("route")))
+else:
+    print("diverged       none")
+' "$cf"
+}
+
 cmd_canary() {
-  local head="" variants="main,branch,delta" no_baseline=false
+  local head="" variants="main,branch,delta" no_baseline=false report=false
   while [ $# -gt 0 ]; do
     case "$1" in
       --head) head="${2:?canary: --head needs a value}"; shift 2 ;;
       --variants) variants="${2:?canary: --variants needs a value}"; shift 2 ;;
       --no-baseline) no_baseline=true; shift ;;
-      *) echo "usage: burst-lane.sh canary [--head <sha>] [--variants main,branch,delta] [--no-baseline]" >&2; exit 2 ;;
+      --report) report=true; shift ;;
+      *) echo "usage: burst-lane.sh canary [--head <sha>] [--variants main,branch,delta] [--no-baseline] [--report]" >&2; exit 2 ;;
     esac
   done
+
+  # R10: --report is read-only and never takes the inflight lock -- it must
+  # answer even while a real canary is running.
+  if [ "$report" = true ]; then
+    canary_print_report "$(state_read server_id)"
+    exit $?
+  fi
+
+  local canary_start_epoch; canary_start_epoch="$(now_epoch)"
 
   if ! _canary_take_inflight_lock; then
     journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  canary  refused  (cause=inflight)"
@@ -4434,6 +4478,16 @@ cmd_canary() {
   # operator-run) re-enables dispatch without operator action" (R7). A
   # no-green-head refusal (rc=4) never reaches here.
   [ "$rc" -eq 0 ] && canary_maybe_reenable "$CANARY_CORE_HEAD"
+
+  # R11: cost line through the existing cost-rate path (cost_rate_eur, the
+  # same €/h `prove`'s own cost line uses), scoped to this canary's own
+  # wall time so it folds additively into the box-day cost total. rc=4
+  # (no-green-head) never ran a variant -- nothing to cost, nothing printed.
+  if [ "$rc" -ne 4 ]; then
+    local canary_minutes; canary_minutes=$(( ($(now_epoch) - canary_start_epoch) / 60 ))
+    local canary_eur; canary_eur="$(awk -v m="$canary_minutes" -v r="$(cost_rate_eur)" 'BEGIN{printf "%.4f", (m/60.0)*r}')"
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  canary  cost  (eur=$canary_eur minutes=$canary_minutes)"
+  fi
 
   _canary_release_inflight_lock
   [ "$rc" -eq 4 ] && exit 4
