@@ -1762,8 +1762,19 @@ only which sha/form a main-scope gate call uses.
   `live-ac-deferred:<N>` string verbatim as `last_error`, and — unlike an
   ordinary check #5 MISSING/collision failure — leave `status` where it
   already was (`built`) rather than resetting to `in_progress`, since
-  nothing else about the PRD is wrong; it stays `built`, re-checked each
-  tick, until the reality check finds the named evidence.
+  nothing else about the PRD is wrong; it stays `built`, in `build-queue/`.
+
+  The retry that eventually finishes it is a specific command, not an
+  unnamed actor: every tick that selects a loop-tooling PRD parked at
+  `built` with a `live-ac-unproven:`/`live-ac-deferred:` `last_error` runs
+  `scripts/live-ac-reality-check.sh check <PRD-path>` once, as that PRD's
+  atomic step, ahead of any other archive action — it re-derives the
+  evidence and either completes the real archive (`shipped`) or opens one
+  operator decision after `LIVE_AC_MAX_WALL`. **This is NOT
+  `scripts/reality-check.sh`** (the post-ship substrate check further down
+  this file); that one knows nothing about `(Live` ACs and will silently
+  do nothing here. Contract for both is build-contract.md's "`(Live`
+  marker" section.
 
   **Clerical-only failures are auto-finishable.** If the only failing
   checks are C2/C3/C4 (publish/push, README/CHANGELOG, REPOS.md) and both
@@ -2035,6 +2046,18 @@ unprivileged-user — and each failed at first real use). Within one tick of
 an archive whose PRD has a non-empty `reality-check.sh plan <prd>` (a
 substrate-naming AC the plan could derive a command for), run
 `scripts/reality-check.sh run <archived-prd-path>`:
+
+**Two reality checks, different jobs.**
+Read this literally: do not substitute one for the other.
+`reality-check.sh` (this section) runs AFTER archive, against a
+PRD already in `built-prds/`, and probes substrate-naming ACs (box,
+endpoint, unit). `scripts/live-ac-reality-check.sh check <prd>` runs
+BEFORE archive, against a loop-tooling PRD still parked at `built` in
+`build-queue/` because a `(Live` AC is unproven, and is the thing that
+performs the `built` → `shipped` flip in the first place (see the "`(Live`
+AC no-defer" paragraph in the archive checklist above). Neither one does
+the other's job; `reality-check.sh` has no `(Live` handling at all.
+
 - Reachability is probed per AC kind (`burst-lane.sh status --json` for a
   box, `curl -m 8` for an endpoint, `systemctl --user is-active` for a
   unit) before anything real runs. For `endpoint`/`unit` kind ACs an
