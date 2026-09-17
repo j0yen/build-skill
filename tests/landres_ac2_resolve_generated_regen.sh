@@ -28,7 +28,6 @@ cat >"$REPO/regen.sh" <<'EOF'
 echo "generated-canonical-v1" > gen.txt
 EOF
 chmod +x "$REPO/regen.sh"
-"$REPO/regen.sh" 2>/dev/null || true
 ( cd "$REPO" && ./regen.sh )
 git -C "$REPO" add -A
 git -C "$REPO" commit -q -m base
