@@ -335,6 +335,27 @@ cargo_budget_bin="$SKILL_DIR/scripts/cargo-budget-bin"
 path_prefix=""
 [ -f "$repo/Cargo.toml" ] && [ -d "$cargo_budget_bin" ] && path_prefix="$cargo_budget_bin:"
 
+# PRD-build-main-push-gate-pr-path requirement 8 / AC11 (P1): this is the
+# ONE place that actually execs the resolved command, so cargo resolution
+# belongs here, not just in the pre-push hook that calls this script (the
+# hook has no idea whether $resolved_cmd even needs cargo). A bare `ssh
+# host git push` commonly runs with a PATH that never sourced the login
+# shell's rc file, so `~/.cargo/bin` is missing even though cargo is
+# installed there (the exact 2026-09-16 defect: `bash -c "cargo test
+# --workspace"` under such a PATH fails rc=127, "cargo: command not
+# found", which this script previously let through unexamined as an
+# ordinary check failure). Only probed when $resolved_cmd actually
+# invokes cargo as a command word — never misfires a non-cargo check.
+if [[ "$resolved_cmd" =~ (^|[[:space:]])cargo([[:space:]]|$) ]] && ! command -v cargo >/dev/null 2>&1; then
+  cargo_bin="${CARGO:-$HOME/.cargo/bin/cargo}"
+  if [ -x "$cargo_bin" ]; then
+    path_prefix="$(dirname "$cargo_bin"):$path_prefix"
+  else
+    journal_line "$(date -u +%Y-%m-%dT%H:%M:%SZ)  $slug  main-push  refused  (repo=$slug gated=${gated_now:0:7} head=${head_now:0:7} delta=$delta_n check=\"$resolved_cmd\" reason=cargo-not-found)"
+    die 4 "main-push refused reason=cargo-not-found path=$PATH"
+  fi
+fi
+
 start_epoch="$(date -u +%s)"
 ( cd "$repo" && PATH="${path_prefix}$PATH" timeout "$CHECK_TIMEOUT_SECS" bash -c "$resolved_cmd" ) >/tmp/main-push-gate.$$.out 2>&1
 rc=$?
