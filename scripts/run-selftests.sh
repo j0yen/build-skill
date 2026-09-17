@@ -81,6 +81,7 @@ SELFTEST_REGISTRY=(
   scripts/routepar-selftest.sh
   scripts/canary-selftest.sh
   scripts/main-push-pr-path-selftest.sh
+  scripts/main-verdict-pin-selftest.sh
 )
 
 usage() { echo "usage: run-selftests.sh <name-or-path>... | --all" >&2; exit 2; }
