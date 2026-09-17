@@ -13,10 +13,27 @@
 # tick's own process tree, so it is unaffected by that teardown.
 #
 # usage: gate-launch.sh <build_into> --head <sha> --scope main|branch
-#                        --slug <slug> [--wait] [-- <extra extend-gate.sh args>]
+#                        --slug <slug> [--wait] [--pinned-landing]
+#                        [-- <extra extend-gate.sh args>]
 #
 # Any argument not recognized above (e.g. --project-root <rel>) is passed
 # straight through to extend-gate.sh unchanged.
+#
+# --pinned-landing (PRD-build-main-verdict-pinned-to-landing R1): for a
+# push_via_branch=true repo's post-land re-verify / landing-resume
+# resumption / archive main-green question, the caller resolves M (the
+# slug's OWN merge sha, via scripts/landing-verdict-resolve.sh) and passes
+# it as --head — used here ONLY for the unit's name and the idempotence/
+# head-conflict marker, per the usual contract. The unit itself execs
+# scripts/main-verdict-pin-gate.sh <build_into> <slug>, which re-resolves
+# M independently and gates a DETACHED worktree at it, never the
+# checkout's HEAD (--scope main required; --scope branch + --pinned-
+# landing is a usage error). This is the fix for the 2026-09-17 05:15:46Z
+# regression: a re-verify launched with `--head` computed from the
+# checkout's then-current HEAD, one PRD later than the slug's own landing.
+# A direct-push repo (no landing record) never passes this flag — see
+# SKILL.md's "gate" step and "Resuming a landing-pending PRD" section for
+# exactly which callers do.
 #
 # PATH the unit runs with: scripts/lib/cargo-route.sh's
 # cargo_route_path_prefix() prepended to $PATH when that file exists at
@@ -46,6 +63,17 @@ SKILL_DIR="${BUILD_SKILL_DIR:-$(cd "$HERE/.." && pwd)}"
 STATE_DIR="${BUILD_STATE_DIR:-$SKILL_DIR/state}"
 INFLIGHT_DIR="$STATE_DIR/gate-inflight"
 EXTEND_GATE="${GATE_LAUNCH_EXTEND_GATE:-$HERE/extend-gate.sh}"
+# PRD-build-main-verdict-pinned-to-landing R1 (consumer wiring): with
+# --pinned-landing, the unit execs main-verdict-pin-gate.sh <repo> <slug>
+# instead of extend-gate.sh <repo> --head ... --scope ... --slug ... —
+# main-verdict-pin-gate.sh resolves the slug's OWN merge sha M from its
+# landing record itself (never trusts a caller-computed --head for what
+# to actually gate), which is the fix for the 2026-09-17 05:15:46Z
+# regression: a re-verify that ran at the checkout's current HEAD instead
+# of the landed PRD's own merge sha. This still gets the systemd-run
+# survive-tick-teardown wrapping below unchanged — only the exec target
+# inside the unit changes.
+MAIN_VERDICT_PIN_GATE="${GATE_LAUNCH_MAIN_VERDICT_PIN_GATE:-$HERE/main-verdict-pin-gate.sh}"
 CARGO_ROUTE_LIB="${GATE_LAUNCH_CARGO_ROUTE_LIB:-$HERE/lib/cargo-route.sh}"
 BURST_ENV="${GATE_LAUNCH_BURST_ENV:-$HOME/.config/wm-burst/.env}"
 SYSTEMD_RUN="${GATE_LAUNCH_SYSTEMD_RUN:-systemd-run}"
@@ -77,7 +105,7 @@ repo_arg="$1"; shift
 [ -n "$repo_arg" ] || usage
 repo="$(cd "$repo_arg" 2>/dev/null && pwd)" || die 1 "no such directory: $repo_arg"
 
-head_sha="" scope="" slug="" wait_flag=0
+head_sha="" scope="" slug="" wait_flag=0 pinned_landing=0
 extra=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -85,6 +113,7 @@ while [ $# -gt 0 ]; do
     --scope) scope="${2:-}"; shift 2 ;;
     --slug) slug="${2:-}"; shift 2 ;;
     --wait) wait_flag=1; shift ;;
+    --pinned-landing) pinned_landing=1; shift ;;
     --) shift; extra+=("$@"); break ;;
     *) extra+=("$1"); shift ;;
   esac
@@ -94,6 +123,10 @@ case "$scope" in
   main|branch) ;;
   *) usage ;;
 esac
+if [ "$pinned_landing" -eq 1 ]; then
+  [ "$scope" = main ] || die 4 "--pinned-landing requires --scope main"
+  [ -x "$MAIN_VERDICT_PIN_GATE" ] || die 2 "missing $MAIN_VERDICT_PIN_GATE"
+fi
 
 mkdir -p "$INFLIGHT_DIR"
 marker="$INFLIGHT_DIR/$slug.json"
@@ -127,7 +160,17 @@ fi
 launch_path="${path_prefix:+$path_prefix:}$PATH"
 
 # --- build the unit's command: plain `bash -c`, never `bash -lc` ----------
-inner="exec $(printf '%q' "$EXTEND_GATE") $(printf '%q' "$repo") --head $(printf '%q' "$head_sha") --scope $(printf '%q' "$scope") --slug $(printf '%q' "$slug")"
+# PRD-build-main-verdict-pinned-to-landing R1: --pinned-landing execs
+# main-verdict-pin-gate.sh <repo> <slug> instead — it resolves the slug's
+# OWN merge sha M and gates a detached worktree at M itself (its own
+# header); $head_sha/$scope above were only ever used for this unit's
+# name and the idempotence/head-conflict marker check, never passed
+# through as what to actually gate.
+if [ "$pinned_landing" -eq 1 ]; then
+  inner="exec $(printf '%q' "$MAIN_VERDICT_PIN_GATE") $(printf '%q' "$repo") $(printf '%q' "$slug")"
+else
+  inner="exec $(printf '%q' "$EXTEND_GATE") $(printf '%q' "$repo") --head $(printf '%q' "$head_sha") --scope $(printf '%q' "$scope") --slug $(printf '%q' "$slug")"
+fi
 for a in "${extra[@]}"; do
   inner+=" $(printf '%q' "$a")"
 done
