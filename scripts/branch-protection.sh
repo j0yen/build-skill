@@ -461,11 +461,12 @@ print(json.dumps(rec.get('required_contexts', [])))
   rc=$?
   [ "$rc" -eq 0 ] || die 5 "gh pr view failed for $OWNER/$repo_slug#$pr_number: $pr_json"
 
-  python3 - "$pr_json" "$required_json" <<'PY'
+  python3 - "$pr_json" "$required_json" "$record" <<'PY'
 import json, sys
 
 pr = json.loads(sys.argv[1])
 required = list(dict.fromkeys(json.loads(sys.argv[2])))  # de-dup, keep order
+record_path = sys.argv[3]
 state = pr.get("state")
 merge_sha = (pr.get("mergeCommit") or {}).get("oid")
 rollup = pr.get("statusCheckRollup") or []
@@ -503,6 +504,30 @@ if red:
     print(f"red {red[0]}")
     sys.exit(4)
 if state == "MERGED" and merge_sha and not unresolved:
+    # PRD-build-main-verdict-pinned-to-landing R1: persist merge_sha into
+    # the landing record itself, not just this call's stdout -- a later
+    # re-verify/archive step (possibly a different process, possibly after
+    # more PRDs have landed and moved HEAD) needs S's merge sha M from the
+    # record on disk, not from a `landing-check` stdout line nobody kept.
+    # Idempotent (same field, same value on every re-run) and best-effort:
+    # a write failure here never turns a real "merged" verdict into a
+    # failure -- the caller already has merge_sha on stdout either way.
+    try:
+        with open(record_path, encoding="utf-8") as fh:
+            rec = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        rec = {}
+    if rec.get("merge_sha") != merge_sha:
+        rec["merge_sha"] = merge_sha
+        tmp_path = record_path + ".tmp"
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as fh:
+                json.dump(rec, fh, indent=2)
+                fh.write("\n")
+            import os
+            os.replace(tmp_path, record_path)
+        except OSError:
+            pass
     print(f"merged {merge_sha}")
     sys.exit(0)
 if state == "CLOSED":
