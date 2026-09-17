@@ -90,10 +90,32 @@ while read -r local_ref local_sha remote_ref remote_sha; do
   gated_arg="$remote_sha"
   [ "$remote_sha" = "$zero_sha" ] && gated_arg=""   # first push of main: nothing to diff against
 
+  # PRD-autobuilder-reviewer-intent-card-sha: main-push-gate.sh's own
+  # --project-root handling is explicit-only by design (PRD-build-
+  # main-push-gate-nested-project-root: "no auto-detection ... this PRD
+  # deliberately does not duplicate [extend-gate.sh's] find_cargo_root")
+  # — but this hook is invoked by a bare `git push` with no PRD context
+  # at all, so for a nested-Cargo repo (Cargo.toml one level under the
+  # repo root, e.g. autobuilder/, rustbuild/autobuilder/) it had no way to
+  # supply one, and the gated-repo branch-verdict check silently checked
+  # $repo_root/target/autobuilder/last-verdict.json — a path that can
+  # never exist for such a repo — refusing every push forever once the
+  # hook was installed (discovered live, 2026-09-17, the first push to
+  # autobuilder's main after this hook was installed there). An optional
+  # one-line `.buildloop/project-root` file is this hook's own explicit,
+  # per-repo declaration (same philosophy as `.buildloop/ci-equivalent.toml`
+  # next to it) — absent for every repo with a root-level Cargo.toml, so
+  # this is a no-op there.
+  project_root_args=()
+  if [ -f "$repo_root/.buildloop/project-root" ]; then
+    pr_rel="$(tr -d '[:space:]' <"$repo_root/.buildloop/project-root")"
+    [ -n "$pr_rel" ] && project_root_args=(--project-root "$pr_rel")
+  fi
+
   if [ -n "$gated_arg" ]; then
-    "$main_push_gate" "$repo_root" --gated "$gated_arg" --head "$local_sha"
+    "$main_push_gate" "$repo_root" --gated "$gated_arg" --head "$local_sha" "${project_root_args[@]}"
   else
-    "$main_push_gate" "$repo_root" --head "$local_sha"
+    "$main_push_gate" "$repo_root" --head "$local_sha" "${project_root_args[@]}"
   fi
   rc=$?
   if [ "$rc" -eq 5 ] && ! is_fleet_repo "$(basename "$repo_root")"; then
