@@ -58,7 +58,12 @@ EOF
 out1="$(BUILD_JOURNAL_ROOT="$D/journal" BUILD_STATE_DIR="$D/state" "$GRS" --now 2026-01-01T01:00:00Z --window-h 2)"
 rc1=$?
 expect "AC1 exit 0" "[ $rc1 -eq 0 ]"
-expect "AC1 exact line" "[ \"\$out1\" = 'GATES(2h): green=2 red=1 blockers: a x2 b x1 oldest-red=2026-01-01T00:00:00Z red_slugs: slug2' ]"
+# PRD-build-gate-infra-outcome R6: the summary line gained `incomplete=<n>`
+# (right after red=) and an `incomplete_infra:` family field (right after
+# `blockers:`) — both `0`/`none` here since this fixture has no
+# gate-incomplete lines. Format only, not this PRD's own behavior under
+# test (see gate-infra-selftest.sh for that).
+expect "AC1 exact line" "[ \"\$out1\" = 'GATES(2h): green=2 red=1 incomplete=0 blockers: a x2 b x1 incomplete_infra: none oldest-red=2026-01-01T00:00:00Z red_slugs: slug2' ]"
 json1="$(cat "$D/state/gate-red.json")"
 expect "AC1 json green=2" "[ \"\$(printf '%s' \"\$json1\" | jq -r .green)\" = 2 ]"
 expect "AC1 json red=1" "[ \"\$(printf '%s' \"\$json1\" | jq -r .red)\" = 1 ]"

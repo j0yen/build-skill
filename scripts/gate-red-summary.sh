@@ -19,6 +19,15 @@
 #   <ts>  <slug>  archive  archived  (...)
 #   <ts>  gate  <crate>  <pass|block>  (scope=main slug=<S> head=<M> ...) pinned=landing
 #   <ts>  gate  <crate>  <pass|block>  (scope=main slug=main-health head=<N> ...) main-health
+#   <ts>  gate-then-land  <slug>  gate-incomplete attempt=<n> infra=<phase>[,<phase>]
+#   <ts>  gate-then-land  <slug>  gate-infra-attempts-exhausted attempts=<n> infra=<phase>
+#   <ts>  gate  <crate>  incomplete  (scope=... head=<M> ... infra=<phase>[,<phase>] ...)
+# The last three (PRD-build-gate-infra-outcome R6): a phase that could not
+# run at all is neither red nor green — it gets its own `incomplete=<n>`
+# column (newest-wins against that slug's/pin_key's red_ts/green_ts too, so
+# a later real pass or real block still supersedes a stale incomplete, and
+# vice versa) and its own family tally keyed by `infra=<csv>` tokens,
+# entirely separate from the `blockers=<csv>` family tally above.
 # The last two (PRD-build-main-verdict-pinned-to-landing R9) are
 # extend-gate.sh's own journal_line, not gate-then-land's — tracked under
 # a slug@sha7 (or repo@sha7 main-health) composite key so a block at one
@@ -142,6 +151,14 @@ awk '
     n = split(csv, arr, ",")
     for (i = 1; i <= n; i++) if (arr[i] != "") fam_count[arr[i]]++
   }
+  # PRD-build-gate-infra-outcome R6: separate family tally for `infra=`
+  # tokens — a phase that could not run is never conflated with a real
+  # `blockers=` family, even when both appear on the same line (a mixed
+  # real-block + infra run, AC3 of this PRD).
+  function infam_add(csv,    n, arr, i) {
+    n = split(csv, arr, ",")
+    for (i = 1; i <= n; i++) if (arr[i] != "") infam_count[arr[i]]++
+  }
   {
     ts = $1
     # PRD-build-reviewer-receipt-primary R6/R10: a family name can now be
@@ -150,6 +167,19 @@ awk '
     # truncating every reason-qualified name back to the bare producer.
     if (match($0, /blockers=[A-Za-z0-9,_:-]+/)) {
       fam_add(substr($0, RSTART + 9, RLENGTH - 9))
+    }
+    if (match($0, /infra=[A-Za-z0-9,_:-]+/)) {
+      infam_add(substr($0, RSTART + 6, RLENGTH - 6))
+    }
+    is_incomplete = 0
+    incomplete_slug = ""
+    if ($2 == "gate-then-land" && ($4 ~ /^gate-incomplete/ || $4 ~ /^gate-infra-attempts-exhausted/)) {
+      is_incomplete = 1; incomplete_slug = $3
+    }
+    if (is_incomplete && incomplete_slug != "") {
+      if (!(incomplete_slug in incomplete_ts) || ts > incomplete_ts[incomplete_slug]) incomplete_ts[incomplete_slug] = ts
+      seen[incomplete_slug] = 1
+      next
     }
     is_red = 0
     slug = ""
@@ -194,24 +224,35 @@ awk '
         } else if ($4 == "pass") {
           if (!(pin_key in green_ts) || ts > green_ts[pin_key]) green_ts[pin_key] = ts
           seen[pin_key] = 1
+        } else if ($4 == "incomplete") {
+          # PRD-build-gate-infra-outcome R2/R6: extend-gate.sh own pinned/
+          # main-health line can carry `incomplete` too (same fourth outcome,
+          # same pin_key scheme) — tracked here so a phase that could not
+          # run on a main-scope/pinned run is never misread as either a
+          # red or a green.
+          if (!(pin_key in incomplete_ts) || ts > incomplete_ts[pin_key]) incomplete_ts[pin_key] = ts
+          seen[pin_key] = 1
         }
       }
     }
   }
   END {
     green_n = 0
+    incomplete_n = 0
     for (s in seen) {
-      isgreen = 0
-      if (s in green_ts) {
-        if (!(s in red_ts)) isgreen = 1
-        else if (green_ts[s] > red_ts[s]) isgreen = 1
-      }
-      if (isgreen) { green_n++ }
+      best_ts = ""; best_class = "red"
+      if (s in red_ts) { best_ts = red_ts[s]; best_class = "red" }
+      if ((s in green_ts) && (best_ts == "" || green_ts[s] > best_ts)) { best_ts = green_ts[s]; best_class = "green" }
+      if ((s in incomplete_ts) && (best_ts == "" || incomplete_ts[s] > best_ts)) { best_ts = incomplete_ts[s]; best_class = "incomplete" }
+      if (best_class == "green") { green_n++ }
+      else if (best_class == "incomplete") { incomplete_n++; print "INCOMPLETE_SLUG\t" s }
       else { print "RED_SLUG\t" s }
     }
     print "COUNT_GREEN\t" green_n
+    print "COUNT_INCOMPLETE\t" incomplete_n
     print "OLDEST_RED\t" oldest_red
     for (f in fam_count) print "FAM\t" f "\t" fam_count[f]
+    for (f in infam_count) print "INFAM\t" f "\t" infam_count[f]
   }
 ' "$filtered" > "$class_out"
 
@@ -220,6 +261,12 @@ red_n="$(printf '%s\n' "$red_slugs" | grep -c . || true)"
 [ -z "$red_slugs" ] && red_n=0
 green_n="$(awk -F'\t' '$1=="COUNT_GREEN"{print $2}' "$class_out")"
 green_n="${green_n:-0}"
+# PRD-build-gate-infra-outcome R6/AC6: a phase that could not run is its
+# own column, never counted toward red (Goals: "GATES red hours caused by
+# infra failures... target 0").
+incomplete_slugs="$(awk -F'\t' '$1=="INCOMPLETE_SLUG"{print $2}' "$class_out" | sort -u)"
+incomplete_n="$(awk -F'\t' '$1=="COUNT_INCOMPLETE"{print $2}' "$class_out")"
+incomplete_n="${incomplete_n:-0}"
 oldest_red="$(awk -F'\t' '$1=="OLDEST_RED"{print $2}' "$class_out")"
 
 # Families sorted by count desc, then name asc, for a deterministic line.
@@ -234,12 +281,25 @@ if [ -n "$fam_sorted" ]; then
 fi
 [ -z "$fam_display" ] && fam_display="none"
 
+# Same shape, for the `infra=` family (R6: "an incomplete family per phase").
+infam_sorted="$(awk -F'\t' '$1=="INFAM"{printf "%s\t%s\n", $3, $2}' "$class_out" | sort -t$'\t' -k1,1nr -k2,2)"
+infam_display=""
+infam_json="{}"
+if [ -n "$infam_sorted" ]; then
+  infam_display="$(printf '%s\n' "$infam_sorted" | awk -F'\t' '{printf "%s x%s ", $2, $1}' | sed 's/ $//')"
+  infam_json="$(printf '%s\n' "$infam_sorted" | awk -F'\t' '{printf "%s\t%s\n", $2, $1}' | "$JQ" -R -s '
+    split("\n") | map(select(length > 0) | split("\t")) | map({(.[0]): (.[1] | tonumber)}) | add // {}
+  ')"
+fi
+[ -z "$infam_display" ] && infam_display="none"
+
 red_slugs_display="$(printf '%s\n' "$red_slugs" | grep -c . >/dev/null; printf '%s' "$red_slugs" | tr '\n' ' ' | sed 's/[[:space:]]*$//')"
 red_slugs_json="$(printf '%s\n' "$red_slugs" | "$JQ" -R -s 'split("\n") | map(select(length > 0))')"
+incomplete_slugs_json="$(printf '%s\n' "$incomplete_slugs" | "$JQ" -R -s 'split("\n") | map(select(length > 0))')"
 
 oldest_display="${oldest_red:-none}"
 
-summary_line="GATES(${window_h}h): green=${green_n} red=${red_n} blockers: ${fam_display} oldest-red=${oldest_display} red_slugs: ${red_slugs_display}"
+summary_line="GATES(${window_h}h): green=${green_n} red=${red_n} incomplete=${incomplete_n} blockers: ${fam_display} incomplete_infra: ${infam_display} oldest-red=${oldest_display} red_slugs: ${red_slugs_display}"
 
 write_ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
@@ -259,8 +319,13 @@ tmp_json="$(mktemp "$STATE_DIR/.gate-red.json.XXXXXX")"
   --arg oldest_red "$oldest_display" \
   --argjson red_slugs "$red_slugs_json" \
   --argjson parse_skipped "$parse_skipped" \
+  --argjson incomplete "$incomplete_n" \
+  --argjson incomplete_families "$infam_json" \
+  --argjson incomplete_slugs "$incomplete_slugs_json" \
   '{ts:$ts, window_h:$window_h, green:$green, red:$red, families:$families,
-    oldest_red:$oldest_red, red_slugs:$red_slugs, parse_skipped:$parse_skipped}' \
+    oldest_red:$oldest_red, red_slugs:$red_slugs, parse_skipped:$parse_skipped,
+    incomplete:$incomplete, incomplete_families:$incomplete_families,
+    incomplete_slugs:$incomplete_slugs}' \
   > "$tmp_json"
 mv -f "$tmp_json" "$JSON_FILE"
 

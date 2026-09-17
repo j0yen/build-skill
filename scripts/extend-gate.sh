@@ -134,6 +134,14 @@
 #      requirement 3) — refused before any producer ran, rather than
 #      running the whole producer sequence locally and reporting a
 #      verdict that never touched the box it was supposed to.
+#   9  gate verdict incomplete (PRD-build-gate-infra-outcome R2): at least
+#      one phase could not run at all (reviewer-agent's `claude -p` failed
+#      under quota, a producer's binary was missing, a crash rc>=2 — see
+#      note_infra call sites) and no OTHER receipt blocked — distinct from
+#      both 0 (pass) and 1 (block): this is "the harness could not tell",
+#      never "the code is broken". The journal line reads `gate <target>
+#      incomplete (… infra=<phase>[,<phase>] …)`; the caller (gate-then-
+#      land.sh) retries rather than treating this as a red gate.
 #
 # --record-baseline: runs the full producer sequence exactly as a normal
 # invocation, then instead of computing a delta verdict, writes
@@ -1250,6 +1258,20 @@ note_block() { blocking_notes+=("$1"); echo "extend-gate: $1" >&2; }
 # field and `last-verdict.json.deferred_receipts` (requirement 4).
 deferred_notes=()
 note_defer() { deferred_notes+=("$1"); echo "extend-gate: DEFERRED: $1" >&2; }
+# PRD-build-gate-infra-outcome R1/R2: a phase that could not run at all
+# (mechanism trouble — a subagent invocation failed under quota, a binary
+# is missing, a producer crashed) is tracked here, separate from both
+# blocking_notes (a real verdict) and deferred_notes (a legitimate scope
+# skip) — note_infra names never join blockers_csv, so a `block` line never
+# gets padded with a phase that did not actually block anything, but their
+# presence is what turns the run's outcome from `pass`/`delta-pass` into
+# `incomplete` below (never silently reported as a clean pass). Each
+# receipt-writing branch also writes an on-disk `skip_reason: "infra:..."`
+# receipt (see run_reviewer's call site) so `autobuilder gate` itself never
+# reads the missing file as a block — this array is only the SHELL-side
+# record used for the journal's `infra=` field and the incomplete verdict.
+infra_notes=()
+note_infra() { infra_notes+=("$1"); echo "extend-gate: INFRA: $1" >&2; }
 
 # --- per-step phase timing (PRD-build-gate-phase-timing) -----------------
 # Every invoked producer below is wrapped in a `date +%s` pair and recorded
@@ -1558,15 +1580,38 @@ fi
 # flag, never by re-reading reviewer-agent.json itself (that re-read is
 # exactly the bug this PRD fixes: it could not tell a fresh verdict from a
 # stale leftover).
+# PRD-build-gate-infra-outcome R8: last 20 lines of the failing command's
+# stderr (when one was captured) plus its exit code, set alongside
+# _reviewer_verdict="infra" at every early-exit below. Not every infra
+# branch has a subprocess to attribute (a plain `[ -f ... ]` test has no
+# stderr) — those set a bare "rc=<n>" or leave it empty rather than
+# fabricate detail that was never captured.
+# PRD-build-gate-infra-outcome AC12 (2026-09-17 amendment, proof-lane
+# 15:54:42Z regression): `finalize` can reject a reviewer object that DID
+# carry a real decision (a sha-prefix mismatch on an otherwise-valid block
+# verdict) — treating that purely as generic infra would make a genuine
+# finding invisible. `_reviewer_infra_kind` distinguishes this one infra
+# sub-case ("finalize-rejected") from every other early-return above (all
+# of which leave it empty); `_reviewer_rejected_verdict` carries the
+# rejected object's own decision/block_reasons through to the written
+# receipt (see the `infra)` call site) even though the RUN's own verdict
+# stays `infra`, never `block` — R4's rule (a mechanism failure is never
+# reported as a verdict) is unchanged, this only keeps the finding legible.
 _reviewer_fail_note=""
+_reviewer_infra_detail=""
+_reviewer_infra_kind=""
+_reviewer_rejected_verdict='{}'
 _reviewer_verdict="ok"          # ok | block | infra
 _reviewer_block_reasons_csv=""
 run_reviewer() {
   _reviewer_fail_note=""
+  _reviewer_infra_detail=""
+  _reviewer_infra_kind=""
+  _reviewer_rejected_verdict='{}'
   _reviewer_verdict="ok"
   _reviewer_block_reasons_csv=""
   ( cd "$repo" && autobuilder reviewer-agent prepare --project "$project_rel" --base "$base_ref" ) 9>&- \
-    || { _reviewer_fail_note="reviewer-agent — prepare exited non-zero"; _reviewer_verdict="infra"; return 1; }
+    || { local _rp_rc=$?; _reviewer_fail_note="reviewer-agent — prepare exited non-zero"; _reviewer_infra_detail="rc=$_rp_rc"; _reviewer_verdict="infra"; return 1; }
   local req="$project_abs/target/autobuilder/review-request.json"
   [ -f "$req" ] || { _reviewer_fail_note="reviewer-agent — prepare did not write $req"; _reviewer_verdict="infra"; return 1; }
   local prepare_epoch
@@ -1591,7 +1636,18 @@ schema autobuilder.reviewer_agent_receipt.v1:
 {\"schema\":\"autobuilder.reviewer_agent_receipt.v1\",\"head_sha\":\"...\",\"intent_card_sha\":\"...\",\"decision\":\"pass|concern|block\",\"block_reasons\":[...],\"concern_reasons\":[{\"id\":\"...\",\"note\":\"...\"}],\"falsification\":{\"test_audit\":\"...\",\"panic_audit\":\"...\",\"unsafe_audit\":\"...\",\"public_api_audit\":\"...\",\"deps_audit\":\"...\",\"drift_audit\":\"...\",\"counter_attack\":{\"description\":\"...\",\"test_skeleton\":\"...\"}}}"
 
   if ! ( cd "$repo" && claude -p "$prompt" --model sonnet --permission-mode bypassPermissions --output-format text ) 9>&- >"$raw" 2>"$raw.err"; then
+    local _cp_rc=$?
     _reviewer_fail_note="reviewer-agent — claude -p subagent invocation failed (see $raw.err)"
+    # R8: the 2026-09-17 failures had an EMPTY .err file, so the cause was
+    # unknown after the fact — this captures whatever is there (rc always,
+    # stderr tail when non-empty) so the next such failure is diagnosable
+    # from the receipt alone, no worktree required.
+    _reviewer_infra_detail="rc=$_cp_rc"
+    if [ -s "$raw.err" ]; then
+      _reviewer_infra_detail="$_reviewer_infra_detail stderr_tail=$(tail -n 20 "$raw.err" | tr '\n' ' ' | cut -c1-2000)"
+    else
+      _reviewer_infra_detail="$_reviewer_infra_detail stderr_tail=<empty>"
+    fi
     _reviewer_verdict="infra"
     return 1
   fi
@@ -1606,10 +1662,26 @@ schema autobuilder.reviewer_agent_receipt.v1:
   if [ "$fresh" = "true" ]; then
     # R1: the subagent's own receipt is the phase's input — stdout is not
     # parsed for the verdict, only compared against it for R3 below.
-    ( cd "$repo" && autobuilder reviewer-agent finalize --project "$project_rel" --input "$receipt" ) 9>&- \
-      || { _reviewer_fail_note="reviewer-agent — finalize rejected the subagent's receipt"; _reviewer_verdict="infra"; return 1; }
-    local receipt_decision stdout_found stdout_decision
+    # AC12: receipt_decision/reasons are read BEFORE calling finalize (not
+    # after, as before this amendment) so a finalize rejection still has
+    # the object's own verdict on hand to carry into rejected_verdict.
+    local receipt_decision receipt_reasons_csv
     receipt_decision="$(printf '%s' "$resolve_json" | jq -r '.receipt_decision // empty')"
+    receipt_reasons_csv="$(printf '%s' "$resolve_json" | jq -r '(.receipt_reasons // []) | join(",")')"
+    local _finalize_err
+    _finalize_err="$(mktemp "${TMPDIR:-/tmp}/extend-gate-finalize-err.XXXXXX")"
+    if ! ( cd "$repo" && autobuilder reviewer-agent finalize --project "$project_rel" --input "$receipt" ) 9>&- 2>"$_finalize_err"; then
+      _reviewer_fail_note="reviewer-agent — finalize rejected the subagent's receipt"
+      _reviewer_infra_kind="finalize-rejected"
+      _reviewer_infra_detail="$(tail -n 20 "$_finalize_err" | tr '\n' ' ' | cut -c1-2000)"
+      _reviewer_rejected_verdict="$(jq -n --arg d "$receipt_decision" --arg r "$receipt_reasons_csv" \
+        '{decision: $d, block_reasons: ($r | if . == "" then [] else split(",") end)}')"
+      rm -f "$_finalize_err"
+      _reviewer_verdict="infra"
+      return 1
+    fi
+    rm -f "$_finalize_err"
+    local stdout_found stdout_decision
     stdout_found="$(printf '%s' "$resolve_json" | jq -r '.stdout_object_found // false')"
     if [ "$stdout_found" = "true" ]; then
       stdout_decision="$(printf '%s' "$resolve_json" | jq -r '.stdout_decision // empty')"
@@ -1619,7 +1691,7 @@ schema autobuilder.reviewer_agent_receipt.v1:
       fi
     fi
     if [ "$receipt_decision" = "block" ]; then
-      _reviewer_block_reasons_csv="$(printf '%s' "$resolve_json" | jq -r '.receipt_reasons | join(",")')"
+      _reviewer_block_reasons_csv="$receipt_reasons_csv"
       _reviewer_fail_note="reviewer-agent — decision=block reasons=${_reviewer_block_reasons_csv}"
       _reviewer_verdict="block"
       return 1
@@ -1635,12 +1707,26 @@ schema autobuilder.reviewer_agent_receipt.v1:
   stdout_found="$(printf '%s' "$resolve_json" | jq -r '.stdout_object_found // false')"
   if [ "$stdout_found" = "true" ]; then
     printf '%s' "$resolve_json" | jq -c '._stdout_object' > "$out"
-    ( cd "$repo" && autobuilder reviewer-agent finalize --project "$project_rel" --input "$out" ) 9>&- \
-      || { _reviewer_fail_note="reviewer-agent — finalize rejected the subagent's output"; _reviewer_verdict="infra"; return 1; }
-    local stdout_decision
+    # AC12: same as the receipt path above — read the object's own
+    # decision/reasons before finalize can reject it.
+    local stdout_decision stdout_reasons_csv
     stdout_decision="$(printf '%s' "$resolve_json" | jq -r '.stdout_decision // empty')"
+    stdout_reasons_csv="$(printf '%s' "$resolve_json" | jq -r '(.stdout_reasons // []) | join(",")')"
+    local _finalize_err2
+    _finalize_err2="$(mktemp "${TMPDIR:-/tmp}/extend-gate-finalize-err.XXXXXX")"
+    if ! ( cd "$repo" && autobuilder reviewer-agent finalize --project "$project_rel" --input "$out" ) 9>&- 2>"$_finalize_err2"; then
+      _reviewer_fail_note="reviewer-agent — finalize rejected the subagent's output"
+      _reviewer_infra_kind="finalize-rejected"
+      _reviewer_infra_detail="$(tail -n 20 "$_finalize_err2" | tr '\n' ' ' | cut -c1-2000)"
+      _reviewer_rejected_verdict="$(jq -n --arg d "$stdout_decision" --arg r "$stdout_reasons_csv" \
+        '{decision: $d, block_reasons: ($r | if . == "" then [] else split(",") end)}')"
+      rm -f "$_finalize_err2"
+      _reviewer_verdict="infra"
+      return 1
+    fi
+    rm -f "$_finalize_err2"
     if [ "$stdout_decision" = "block" ]; then
-      _reviewer_block_reasons_csv="$(printf '%s' "$resolve_json" | jq -r '.stdout_reasons | join(",")')"
+      _reviewer_block_reasons_csv="$stdout_reasons_csv"
       _reviewer_fail_note="reviewer-agent — decision=block reasons=${_reviewer_block_reasons_csv}"
       _reviewer_verdict="block"
       return 1
@@ -1922,6 +2008,36 @@ elif { [ "$scope" = branch ] && [ "$intent_card_stale" != true ]; } || [ "${#blo
       # for a reviewer block.
       echo "extend-gate: ${_reviewer_fail_note} (infra — not a verdict)" >&2
       record_phase reviewer $(( $(date +%s) - _phase_t0 )) fail
+      # PRD-build-gate-infra-outcome R1/R8: write the missing receipt so
+      # `autobuilder gate` never reads an absent reviewer-agent.json as a
+      # block (the 2026-09-17 false-red root cause) — shaped exactly like
+      # the main-health synthetic receipt above (decision: "pass",
+      # scope_deferred: true), distinguished only by its `skip_reason`
+      # prefix. R2 below is what turns this into `incomplete` (not a
+      # silent pass), purely from note_infra's record, never from
+      # re-reading this file.
+      # AC12: a finalize-rejected verdict gets its own phase tag
+      # ("reviewer-agent:finalize-rejected") distinct from plain
+      # "reviewer-agent" — journal's infra= field then names the specific
+      # sub-case, and the rejected object's own decision/block_reasons
+      # ride along in the receipt so a real finding stays legible even
+      # though this run's own verdict is `infra`, never `block`.
+      _reviewer_infra_phase="reviewer-agent"
+      [ "$_reviewer_infra_kind" = "finalize-rejected" ] && _reviewer_infra_phase="reviewer-agent:finalize-rejected"
+      _reviewer_infra_receipt="$project_abs/target/autobuilder/receipts/reviewer-agent.json"
+      mkdir -p "$(dirname "$_reviewer_infra_receipt")" 2>/dev/null || true
+      jq -n --arg head "$head_now" --arg captured "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --arg reason "infra:${_reviewer_infra_phase}:${_reviewer_fail_note}" \
+            --arg detail "${_reviewer_infra_detail}" \
+            --argjson rejected "${_reviewer_rejected_verdict}" '{
+        schema: "autobuilder.reviewer_agent_receipt.v1",
+        head_sha: $head, intent_card_sha: "", decision: "pass",
+        block_reasons: [], concern_reasons: [],
+        scope_deferred: true, skip_reason: $reason, infra_detail: $detail,
+        rejected_verdict: $rejected,
+        captured_at: $captured, receipt_digest: ""
+      }' > "$_reviewer_infra_receipt" 2>/dev/null
+      note_infra "${_reviewer_infra_phase} — ${_reviewer_fail_note}"
       ;;
     *)
       record_phase reviewer $(( $(date +%s) - _phase_t0 )) ok
@@ -1997,11 +2113,18 @@ fi
 # producer's line, the note text itself, or autobuilder gate's own
 # pass/block accounting (sed runs on the already-captured text, after
 # gate_rc is read).
+# PRD-build-gate-infra-outcome R7: the `_reviewer_verdict = infra` relabel
+# (`✗ reviewer-agent —` -> `✗ reviewer-agent:infra —`) that used to sit here
+# is removed — since R1 above, an infra reviewer run writes a `decision:
+# "pass"` receipt, so `autobuilder gate` never emits a "✗ reviewer-agent —"
+# line for it in the first place; relabeling a line that no longer exists
+# was dead code the moment R1 landed. The aggregator's own output is left
+# exactly as it wrote it for every case except a real block (below,
+# unchanged — PRD-build-reviewer-receipt-primary R6, preserved per this
+# PRD's AC2).
 if [ "$_reviewer_verdict" = block ] && [ -n "$_reviewer_block_reasons_csv" ]; then
   _reviewer_first_reason="${_reviewer_block_reasons_csv%%,*}"
   gate_out="$(printf '%s\n' "$gate_out" | sed "s/✗ reviewer-agent —/✗ reviewer-agent:${_reviewer_first_reason} —/")"
-elif [ "$_reviewer_verdict" = infra ]; then
-  gate_out="$(printf '%s\n' "$gate_out" | sed 's/✗ reviewer-agent —/✗ reviewer-agent:infra —/')"
 fi
 printf '%s\n' "$gate_out"
 summary="$(printf '%s\n' "$gate_out" | grep -m1 '^gate: ' || true)"
@@ -2340,6 +2463,45 @@ if [ -n "$producer_unattested_first" ]; then
 fi
 # END canary-r15-producer-attestation-block
 
+# --- PRD-build-gate-infra-outcome R2/R3 (P0): the fourth outcome ---------
+# infra_notes (populated only by note_infra — a phase that could not run,
+# never a verdict) never widened blocking_notes/blockers_csv above, so a
+# run whose ONLY trouble was mechanism failure still computed a clean
+# `outcome=pass` here — this is what makes that silently wrong: applied
+# after every canary/delta override above (so a genuine block for any
+# OTHER reason is never downgraded) but BEFORE the pinned/main-health
+# suffixes just below, since gate-red-summary.sh's own pin-key classifier
+# requires those two tokens to stay the trailing text on the line (AC11 —
+# `$0 ~ / main-health$/` / `$0 ~ / pinned=landing$/`). Only a run that
+# would otherwise have reported a clean pass/delta-pass is relabeled
+# `incomplete`, with its own distinct exit code (9 — see the Exit codes
+# header; distinct from 0 pass / 1 block).
+infra_csv=""
+infra_notes_json='[]'
+if [ "${#infra_notes[@]}" -gt 0 ]; then
+  for _in in "${infra_notes[@]}"; do
+    _iname="$(printf '%s' "$_in" | sed -E 's/^([^ ]+) — .*$/\1/')"
+    if [ -n "$infra_csv" ]; then infra_csv="$infra_csv,$_iname"; else infra_csv="$_iname"; fi
+    # Full "<phase> — <note>" text, for gate-then-land.sh's last_error (it
+    # needs the note, not just the phase name infra_csv above carries).
+    infra_notes_json="$(jq -c --arg n "$_in" '. + [$n]' <<<"$infra_notes_json")"
+  done
+  journal_suffix="$journal_suffix infra=$infra_csv"
+  if [ "$outcome" != "block" ]; then
+    outcome="incomplete"
+    final_rc=9
+  fi
+fi
+# R3: a `block` line always names at least one blocker — this is a safety
+# net for any block path this PRD did not instrument with note_infra (the
+# aggregator's own gate_rc/delta_verdict can still say block off a receipt
+# this script never ran note_block/note_infra against), so `verdict=block
+# … blocking=none` (the exact shape from the 2026-09-17 grounding) can
+# never be written again even by a case this PRD's R1/R6 scope missed.
+if [ "$outcome" = "block" ] && [ -z "$blockers_csv" ]; then
+  blockers_csv="unattributed-block — verdict=block but no phase recorded a block reason (see gate: summary line above)"
+fi
+
 # PRD-build-main-verdict-pinned-to-landing AC1: appended last, after every
 # suffix above, so a pinned run's journal line always ends with
 # `pinned=landing` regardless of what else this run's own suffixes named.
@@ -2420,7 +2582,8 @@ jq -n --arg head "$head_now" --arg tree "$tree_now" --arg hash "$self_hash" --ar
      --arg scope "$scope" --arg slug "$slug" \
      --argjson deferred "$deferred_json" \
      --arg gate_route "$GATE_ROUTE" --argjson routed_n "$routed_n" --argjson receipts_total "$receipts_total" \
-     --argjson over "$phase_over_tolerance" --argjson unattr "$phase_unattributed" '
+     --argjson over "$phase_over_tolerance" --argjson unattr "$phase_unattributed" \
+     --argjson infra "$infra_notes_json" '
   {
     head_sha: $head,
     head: $head,
@@ -2439,7 +2602,8 @@ jq -n --arg head "$head_now" --arg tree "$tree_now" --arg hash "$self_hash" --ar
     wall_s: $wall_s,
     scope: $scope,
     slug: $slug,
-    deferred_receipts: $deferred
+    deferred_receipts: $deferred,
+    infra_notes: $infra
   } + (if $over then {unattributed_s: $unattr} else {} end)
 ' > "$cache_file" 2>/dev/null || true
 

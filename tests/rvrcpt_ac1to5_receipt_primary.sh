@@ -67,8 +67,19 @@ expect "AC2: note reads 'no fresh receipt (found head=none reviewed_at=none)'" \
   "[[ '$out_b' == *'reviewer-agent — no fresh receipt (found head=none reviewed_at=none)'* ]]"
 expect "AC2: no decision=block verdict text anywhere" \
   "[[ '$out_b' != *'decision=block'* ]]"
-expect "AC2: no receipt was ever written" \
-  "[ ! -f '$REPO/target/autobuilder/receipts/reviewer-agent.json' ]"
+# PRD-build-gate-infra-outcome R1: this used to assert NO receipt was ever
+# written for an infra failure — that absence is exactly what the
+# aggregator read as a false `block` (this PRD's whole Grounding). Now the
+# phase writes a `decision: "pass", scope_deferred: true` skip receipt so
+# `autobuilder gate` never blocks on it; R2's shell-side incomplete
+# classification is what surfaces the failure instead (covered by
+# gate-infra-selftest.sh, not here).
+expect "AC2: a skip receipt IS written (never absent — R1)" \
+  "[ -f '$REPO/target/autobuilder/receipts/reviewer-agent.json' ]"
+expect "AC2: receipt decision is pass (never block) so the aggregator does not block on it" \
+  "[ \"\$(jq -r '.decision' '$REPO/target/autobuilder/receipts/reviewer-agent.json')\" = pass ]"
+expect "AC2: receipt is scope_deferred with an infra: skip_reason" \
+  "[ \"\$(jq -r '.scope_deferred' '$REPO/target/autobuilder/receipts/reviewer-agent.json')\" = true ] && [[ \"\$(jq -r '.skip_reason' '$REPO/target/autobuilder/receipts/reviewer-agent.json')\" == infra:reviewer-agent:* ]]"
 
 echo "=== AC3 (c): receipt from a previous gate's head, prose-only stdout -> names stale head ==="
 fresh_case ac3

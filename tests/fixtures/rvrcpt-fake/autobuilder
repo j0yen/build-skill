@@ -84,6 +84,11 @@ case "$sub" in
         done
         sleep_for "${FAKE_REVFINALIZE_SLEEP:-0}"
         if [ "${FAKE_REVFINALIZE_RC:-0}" != "0" ]; then
+          # PRD-build-gate-infra-outcome AC12: opt-in stderr line for the
+          # "finalize rejected a valid verdict" scenario (e.g. a sha-prefix
+          # mismatch) — additive only, every other FAKE_REVFINALIZE_RC test
+          # is unaffected since this is empty unless explicitly set.
+          [ -n "${FAKE_REVFINALIZE_STDERR:-}" ] && echo "$FAKE_REVFINALIZE_STDERR" >&2
           exit "${FAKE_REVFINALIZE_RC}"
         fi
         if [ -n "$rev_input" ] && [ -f "$rev_input" ]; then

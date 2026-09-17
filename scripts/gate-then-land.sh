@@ -116,6 +116,20 @@
 #      the producer lock and never got it. Not a red gate, not retried here
 #      (extend-gate.sh's own flock already paid the wait once) — branch
 #      kept, main untouched, `next: gate-retry` for the next tick/step.
+#  13  gate-incomplete (PRD-build-gate-infra-outcome R4) — extend-gate.sh
+#      exited 9: at least one phase (e.g. reviewer-agent) could not run at
+#      all and no OTHER receipt blocked. NOT the same as exit 9 above —
+#      this is retryable: branch kept, main untouched, no `gate-block`
+#      line, `next: gate-retry` for the next tick/step, same as contended.
+#      Distinguished from contended by cause (harness trouble, not a busy
+#      lock) and by counting toward GATE_INFRA_MAX_ATTEMPTS (below).
+#  14  gate-infra-attempts-exhausted (PRD-build-gate-infra-outcome R5) —
+#      exit 13 happened GATE_INFRA_MAX_ATTEMPTS times (default 3) in a row
+#      at the SAME worktree head. Not retried again at this head: a
+#      decisions.sh operator decision is opened naming the phase, the last
+#      note, and the attempt count; the caller records the PRD
+#      `blocked/needs-user` and does not re-dispatch this head. A NEW
+#      commit at this slug resets the counter (see state file below).
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
@@ -132,9 +146,17 @@ WORKTREE_EXTEND="${GATE_THEN_LAND_WORKTREE_EXTEND:-$HERE/worktree-extend.sh}"
 BRANCH_PROTECTION="${GATE_THEN_LAND_BRANCH_PROTECTION:-$HERE/branch-protection.sh}"
 RESURRECTION_GUARD="$HERE/resurrection-guard.sh"
 SIDECAR="$HERE/manifest-sidecar.sh"
+DECISIONS="${GATE_THEN_LAND_DECISIONS:-$HERE/decisions.sh}"
 GIT_ID=(-c user.email=jyen.tech@gmail.com -c user.name="Joe Yen")
 SKILL_DIR="$(cd "$HERE/.." && pwd -P)"
 STATE_DIR="${BUILD_STATE_DIR:-$SKILL_DIR/state}"
+# PRD-build-gate-infra-outcome R5: attempts-at-head counter for `incomplete`
+# gates, one file per slug, so the cap is per HEAD (a new commit resets it)
+# and survives across separate gate-then-land.sh invocations/ticks (this
+# script's own process never loops on an incomplete result — see exit 13
+# below). GATE_INFRA_MAX_ATTEMPTS default 3, overridable for fixtures.
+GATE_INFRA_STATE_DIR="$STATE_DIR/gate-infra"
+GATE_INFRA_MAX_ATTEMPTS="${GATE_INFRA_MAX_ATTEMPTS:-3}"
 # shellcheck source=lib/push-via-branch.sh
 source "$HERE/lib/push-via-branch.sh"
 
@@ -219,6 +241,61 @@ while [ "$attempt" -le "$max_retries" ]; do
       [ -x "$SIDECAR" ] && "$SIDECAR" write "$slug" "outcome=contended, next=gate-retry" >&2 || true
       jlog "contended attempt=$attempt (see extend-gate.sh's own gate/contended journal line for holder identity)"
       die 12 "producer-lock-contended — extend-gate.sh exhausted this crate's derived patience; branch kept, main untouched, next=gate-retry"
+      ;;
+    9)
+      # PRD-build-gate-infra-outcome R4/R5: extend-gate.sh's own `incomplete`
+      # verdict — a phase (e.g. reviewer-agent) could not run at all, and no
+      # OTHER receipt blocked. Never a `gate-block` line — this is the exact
+      # bug this PRD fixes: a harness hiccup used to fall through to the
+      # `*)` catch-all below and read identically to a real infra failure,
+      # with no distinct retry path. Bounded by GATE_INFRA_MAX_ATTEMPTS at
+      # THIS head (state file below; a new commit resets it since $wt_head
+      # changes).
+      infra_first="$(jq -r '(.infra_notes // [])[0] // "unknown — no infra_notes on verdict file"' "$verdict_path" 2>/dev/null)"
+      [ -n "$infra_first" ] || infra_first="unknown — no infra_notes on verdict file"
+      infra_phase="${infra_first%% — *}"
+      infra_note="${infra_first#* — }"
+      mkdir -p "$GATE_INFRA_STATE_DIR"
+      infra_state_file="$GATE_INFRA_STATE_DIR/$slug.json"
+      prev_head="" prev_n=0
+      if [ -f "$infra_state_file" ]; then
+        prev_head="$(jq -r '.head // empty' "$infra_state_file" 2>/dev/null)"
+        prev_n="$(jq -r '.attempts // 0' "$infra_state_file" 2>/dev/null)"
+      fi
+      if [ "$prev_head" = "$wt_head" ]; then
+        infra_n=$((prev_n + 1))
+        # Once the cap is reached, the counter is pinned at the cap rather
+        # than left to grow unbounded on a caller that (against R5's own
+        # "not launched again at this head") retries anyway — an unbounded
+        # counter would change the decision question's own text every
+        # call ("...3x..." then "...4x..."), defeating decisions.sh's
+        # idempotency (it dedupes on exact question text) and opening a
+        # NEW row every retry instead of exactly one.
+        [ "$infra_n" -gt "$GATE_INFRA_MAX_ATTEMPTS" ] && infra_n="$GATE_INFRA_MAX_ATTEMPTS"
+      else
+        infra_n=1
+      fi
+      jq -n --arg head "$wt_head" --argjson n "$infra_n" --arg phase "$infra_phase" --arg note "$infra_note" \
+        '{head: $head, attempts: $n, phase: $phase, note: $note}' > "$infra_state_file.tmp" \
+        && mv -f "$infra_state_file.tmp" "$infra_state_file"
+      last_error="gate-infra:${infra_phase}:${infra_note}"
+      if [ "$infra_n" -lt "$GATE_INFRA_MAX_ATTEMPTS" ]; then
+        [ -x "$SIDECAR" ] && "$SIDECAR" write "$slug" "last_error=$last_error, next=gate-retry" >&2 || true
+        jlog "gate-incomplete attempt=$infra_n infra=$infra_phase"
+        die 13 "extend-gate.sh returned incomplete (infra=$infra_phase: $infra_note) — attempt $infra_n/$GATE_INFRA_MAX_ATTEMPTS, branch kept, main untouched, next=gate-retry"
+      else
+        # R5 cap reached at this head: escalate once (decisions.sh open is
+        # idempotent on question text — a later invocation at the SAME
+        # head/phase/note is a silent no-op, never a second decision row).
+        decision_q="gate-infra-outcome: $slug stuck incomplete ${GATE_INFRA_MAX_ATTEMPTS}x at head ${wt_head:0:7} (phase=$infra_phase note=$infra_note) — needs a human look"
+        decision_id=""
+        if [ -x "$DECISIONS" ]; then
+          decision_id="$("$DECISIONS" open "$decision_q" --owner joe --repo "$slug" 2>/dev/null | tail -n1)"
+        fi
+        [ -x "$SIDECAR" ] && "$SIDECAR" write "$slug" "last_error=$last_error" >&2 || true
+        jlog "gate-infra-attempts-exhausted attempts=$infra_n infra=$infra_phase decision=${decision_id:-unknown}"
+        die 14 "extend-gate.sh returned incomplete $GATE_INFRA_MAX_ATTEMPTS consecutive times at head ${wt_head:0:7} (infra=$infra_phase: $infra_note) — blocked/needs-user, decision ${decision_id:-unknown} opened, not retried again at this head"
+      fi
       ;;
     *)
       [ -x "$SIDECAR" ] && "$SIDECAR" write "$slug" "last_error=gate-infra-failure:$gate_rc" >&2 || true
