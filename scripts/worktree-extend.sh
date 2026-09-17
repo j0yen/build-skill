@@ -137,9 +137,33 @@ EXTEND="$(dirname "$0")/extend-handler.sh"
 SIDECAR="$(dirname "$0")/manifest-sidecar.sh"
 SERIAL_FALLBACK="$(dirname "$0")/loom-serial-fallback.sh"
 GIT_ID=(-c user.email=jyen.tech@gmail.com -c user.name="Joe Yen")
+# PRD-build-land-conflict-resolver R8: cmd_land's own conflict paths get
+# the same policy-classified resolve gate-then-land.sh's rebase_onto_main
+# already has (regen/union any generated/append_only conflict before
+# giving up) — see land_resolve_attempt() below. Missing script (an older
+# checkout) degrades to today's behavior exactly, same fallback
+# gate-then-land.sh uses for $LAND_RESOLVE.
+LAND_RESOLVE="$(dirname "$0")/land-resolve.sh"
 
 die() { echo "worktree-extend: $2" >&2; exit "$1"; }
 need() { [ -n "${1:-}" ] || die 1 "$2"; }
+
+# land_resolve_attempt <git-target> <slug> — R8: <git-target> is either a
+# worktree mid-rebase or $repo itself mid-merge (land-resolve.sh's
+# git_conflict_continue, R8, tells the two apart and finishes whichever
+# is actually in progress). Classifies every conflicted path against
+# state/land-policy/<basename $repo>.json — LAND_RESOLVE_POLICY_BASENAME
+# is always $repo's own basename here, whether <git-target> is $repo
+# itself (the two direct-merge conflict sites) or a worktree named
+# `<repo>-<slug>` by convention (the two rebase conflict sites) — same
+# convention gate-then-land.sh's rebase_onto_main established. Returns 0
+# (conflict resolved, git-target's tree finalized) or 1 (still
+# conflicted — caller aborts and dies exactly as before this PRD).
+land_resolve_attempt() {
+  local git_target="$1" slug="$2"
+  [ -x "$LAND_RESOLVE" ] || return 1
+  LAND_RESOLVE_POLICY_BASENAME="$(basename "$repo")" "$LAND_RESOLVE" resolve "$git_target" "$slug" >&2 2>&1
+}
 
 wt_path() { echo "$WT_ROOT/$(basename "$1")-$2"; }
 
@@ -679,7 +703,22 @@ cmd_land() {
     default_tip="$(git -C "$repo" rev-parse "$default" 2>/dev/null)"
     if [ -n "$branch_base" ] && [ -n "$default_tip" ] && [ "$branch_base" != "$default_tip" ]; then
       local pre_commits; pre_commits="$(git -C "$repo" rev-list --count "$branch_base..$branch" 2>/dev/null || echo 0)"
+      # PRD-build-land-conflict-resolver R8: a rebase conflict here tries
+      # land_resolve_attempt (regen/union any policy-classified path, or
+      # R4's bounded coder for a genuine source conflict — see that
+      # function's doc comment) BEFORE giving up — same shape gate-then-
+      # land.sh's rebase_onto_main already has for rust-extend. A resolved
+      # conflict leaves $wt's rebase already continued (land-resolve.sh's
+      # git_conflict_continue), so it is treated exactly like the plain
+      # rebase succeeding outright.
+      local _rebase_ok=""
       if git -C "$wt" "${GIT_ID[@]}" rebase "$default_tip" >&2; then
+        _rebase_ok=1
+      elif land_resolve_attempt "$wt" "$slug"; then
+        echo "worktree-extend: $slug: land-resolve resolved the pre-ff-merge rebase conflict onto $default_tip" >&2
+        _rebase_ok=1
+      fi
+      if [ -n "$_rebase_ok" ]; then
         checkout_or_die "$repo" "$default"
         if git -C "$repo" merge --ff-only "$branch" >&2; then
           local rj="${WORKTREE_EXTEND_JOURNAL:-$HOME/brain/journal/build/$(date -u +%Y-%m-%d).md}"
@@ -724,36 +763,56 @@ cmd_land() {
 
   checkout_or_die "$repo" "$default"
   if ! git -C "$repo" "${GIT_ID[@]}" merge --no-ff --no-edit "$branch" >&2; then
-    git -C "$repo" merge --abort 2>/dev/null
-    if [ -n "$no_rebase" ] || [ ! -d "$wt" ]; then
-      local _early_cf; _early_cf="$(git -C "$repo" diff --name-only --diff-filter=U 2>/dev/null | sort | tr '\n' ',' | sed 's/,$//')"
-      [ -z "$_early_cf" ] && _early_cf="unknown"
-      [ -x "$SIDECAR" ] && "$SIDECAR" write "$slug" "last_error=land-conflict:${_early_cf}" >&2 || true
-      [ -x "$SERIAL_FALLBACK" ] && "$SERIAL_FALLBACK" streak-record "$repo" "$_early_cf" >&2 || true
-      die 4 "merge conflict landing $slug; aborted (branch kept for next tick, worktree commits intact)"
-    fi
-    echo "worktree-extend: $slug: merge conflict landing — attempting rebase onto current $default HEAD" >&2
-    local main_head; main_head="$(git -C "$repo" rev-parse "$default")"
-    if ! git -C "$wt" "${GIT_ID[@]}" rebase "$main_head" >&2; then
-      git -C "$wt" rebase --abort 2>/dev/null
-      local conflict_files; conflict_files="$(git -C "$wt" diff --name-only --diff-filter=U 2>/dev/null | tr '\n' ',' | sed 's/,$//')"
-      [ -z "$conflict_files" ] && conflict_files="unknown"
-      [ -x "$SIDECAR" ] && "$SIDECAR" write "$slug" "last_error=land-conflict:${conflict_files}" >&2 || true
-      [ -x "$SERIAL_FALLBACK" ] && "$SERIAL_FALLBACK" streak-record "$repo" "$conflict_files" >&2 || true
-      die 4 "rebase conflict landing $slug; aborted (branch kept for next tick, worktree commits intact)"
-    fi
-    # No cargo-check guard here (unlike integrate) — language-agnostic;
-    # the caller's own test suite (uv run pytest / pybuilder gate) is a
-    # separate step run before land, not something this script re-verifies.
-    if ! git -C "$repo" "${GIT_ID[@]}" merge --no-ff --no-edit "$branch" >&2; then
+    # R8: this merge is directly against $repo (HEAD already checked out
+    # on $default), not a worktree rebase — land-resolve.sh's
+    # git_conflict_continue tells the two apart itself (MERGE_HEAD vs
+    # rebase-merge/rebase-apply) and finishes whichever is in progress
+    # with the right git command (commit, not rebase --continue).
+    if land_resolve_attempt "$repo" "$slug"; then
+      echo "worktree-extend: $slug: land-resolve resolved the merge conflict landing onto $default" >&2
+    else
       git -C "$repo" merge --abort 2>/dev/null
-      local _retry_cf; _retry_cf="$(git -C "$repo" diff --name-only --diff-filter=U 2>/dev/null | sort | tr '\n' ',' | sed 's/,$//')"
-      [ -z "$_retry_cf" ] && _retry_cf="unknown"
-      [ -x "$SIDECAR" ] && "$SIDECAR" write "$slug" "last_error=land-conflict:${_retry_cf}" >&2 || true
-      [ -x "$SERIAL_FALLBACK" ] && "$SERIAL_FALLBACK" streak-record "$repo" "$_retry_cf" >&2 || true
-      die 4 "merge still conflicted after rebase landing $slug; aborted (branch kept)"
+      if [ -n "$no_rebase" ] || [ ! -d "$wt" ]; then
+        local _early_cf; _early_cf="$(git -C "$repo" diff --name-only --diff-filter=U 2>/dev/null | sort | tr '\n' ',' | sed 's/,$//')"
+        [ -z "$_early_cf" ] && _early_cf="unknown"
+        [ -x "$SIDECAR" ] && "$SIDECAR" write "$slug" "last_error=land-conflict:${_early_cf}" >&2 || true
+        [ -x "$SERIAL_FALLBACK" ] && "$SERIAL_FALLBACK" streak-record "$repo" "$_early_cf" >&2 || true
+        die 4 "merge conflict landing $slug; aborted (branch kept for next tick, worktree commits intact)"
+      fi
+      echo "worktree-extend: $slug: merge conflict landing — attempting rebase onto current $default HEAD" >&2
+      local main_head; main_head="$(git -C "$repo" rev-parse "$default")"
+      local _rebase2_ok=""
+      if git -C "$wt" "${GIT_ID[@]}" rebase "$main_head" >&2; then
+        _rebase2_ok=1
+      elif land_resolve_attempt "$wt" "$slug"; then
+        echo "worktree-extend: $slug: land-resolve resolved the rebase-retry conflict onto $main_head" >&2
+        _rebase2_ok=1
+      fi
+      if [ -z "$_rebase2_ok" ]; then
+        git -C "$wt" rebase --abort 2>/dev/null
+        local conflict_files; conflict_files="$(git -C "$wt" diff --name-only --diff-filter=U 2>/dev/null | tr '\n' ',' | sed 's/,$//')"
+        [ -z "$conflict_files" ] && conflict_files="unknown"
+        [ -x "$SIDECAR" ] && "$SIDECAR" write "$slug" "last_error=land-conflict:${conflict_files}" >&2 || true
+        [ -x "$SERIAL_FALLBACK" ] && "$SERIAL_FALLBACK" streak-record "$repo" "$conflict_files" >&2 || true
+        die 4 "rebase conflict landing $slug; aborted (branch kept for next tick, worktree commits intact)"
+      fi
+      # No cargo-check guard here (unlike integrate) — language-agnostic;
+      # the caller's own test suite (uv run pytest / pybuilder gate) is a
+      # separate step run before land, not something this script re-verifies.
+      if ! git -C "$repo" "${GIT_ID[@]}" merge --no-ff --no-edit "$branch" >&2; then
+        if land_resolve_attempt "$repo" "$slug"; then
+          echo "worktree-extend: $slug: land-resolve resolved the retry-merge conflict landing onto $default" >&2
+        else
+          git -C "$repo" merge --abort 2>/dev/null
+          local _retry_cf; _retry_cf="$(git -C "$repo" diff --name-only --diff-filter=U 2>/dev/null | sort | tr '\n' ',' | sed 's/,$//')"
+          [ -z "$_retry_cf" ] && _retry_cf="unknown"
+          [ -x "$SIDECAR" ] && "$SIDECAR" write "$slug" "last_error=land-conflict:${_retry_cf}" >&2 || true
+          [ -x "$SERIAL_FALLBACK" ] && "$SERIAL_FALLBACK" streak-record "$repo" "$_retry_cf" >&2 || true
+          die 4 "merge still conflicted after rebase landing $slug; aborted (branch kept)"
+        fi
+      fi
+      echo "worktree-extend: $slug: rebase-retry succeeded (land)" >&2
     fi
-    echo "worktree-extend: $slug: rebase-retry succeeded (land)" >&2
   fi
   [ -x "$SERIAL_FALLBACK" ] && "$SERIAL_FALLBACK" streak-reset "$repo" >&2 || true
   # PRD-build-gate-before-land requirement 2 (P0, AC3): the merge + commit

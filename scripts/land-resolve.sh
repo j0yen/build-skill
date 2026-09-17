@@ -56,8 +56,13 @@
 #       no test or caller accidentally spawns a real coder subagent.
 #
 #       If zero source conflicts remain (either none existed, or R4's
-#       coder resolved what did), runs `git rebase --continue` and prints
-#       `resolved=all`, exit 0. If source conflicts remain after a coder
+#       coder resolved what did), finishes whichever git operation <repo>
+#       is actually mid-way through (git_conflict_continue, R8: a real
+#       `git rebase --continue`, or — worktree-extend.sh's cmd_land can
+#       hit this same conflict as a plain `git merge` directly against
+#       the target repo, not a worktree rebase — a `git commit` instead,
+#       since no rebase is in progress there) and prints `resolved=all`,
+#       exit 0. If source conflicts remain after a coder
 #       attempt (or none was attempted), the rebase is left open (NOT
 #       continued), prints `source_conflicts=<comma-list>` — with a
 #       trailing ` coder=unresolved` when R4's attempt ran and failed, so
@@ -147,6 +152,15 @@ LAND_CONFLICTS_LEDGER="${LAND_CONFLICTS_LEDGER:-$STATE_DIR/land-conflicts.jsonl}
 # R4 — see the header comment above for the full contract. Unset
 # LAND_RESOLVE_CODER (the default) means R4 never runs.
 LAND_RESOLVE_MAX_S="${LAND_RESOLVE_MAX_S:-900}"
+# R8: identity used for the `git commit` that finishes a resolved MERGE
+# conflict (git_conflict_continue below) — a rebase's `--continue` needs
+# no identity of its own (it replays the branch's existing commits), but
+# a merge's finishing commit is a new commit. Same literal identity every
+# other script here uses (gate-then-land.sh's GIT_ID, worktree-extend.sh's
+# GIT_ID) — a plain array, like theirs, not env-overridable (bash arrays
+# don't cross a subprocess boundary; a test that needs a different author
+# would set repo-local git config instead).
+LAND_RESOLVE_GIT_ID=(-c user.email=jyen.tech@gmail.com -c user.name="Joe Yen")
 
 usage() {
   echo "usage: land-resolve.sh policy-path <repo>" >&2
@@ -338,6 +352,43 @@ try_coder_resolve() {
   return 0
 }
 
+# git_conflict_continue <repo> — R8: worktree-extend.sh's cmd_land hits a
+# conflicted rebase in TWO places (a real `git rebase`, same shape
+# gate-then-land.sh's rebase_onto_main already resolves) but ALSO a
+# conflicted regular `git merge --no-ff` directly against the main
+# checkout ($repo, not a worktree) — `--ours`/stage 2 already means "main"
+# there too (HEAD is $default at merge time, no inversion — unlike
+# rebase), but finishing the operation is `git commit`, never
+# `rebase --continue` (no rebase is in progress; that call would just
+# fail with "no rebase in progress"). Detects which operation <repo> is
+# actually mid-way through via git's own git-path plumbing and finishes
+# it the right way. Returns whatever that finishing command returns;
+# non-zero (including "neither a rebase nor a merge is in progress",
+# a caller bug this function refuses to guess past) is treated by
+# cmd_resolve exactly like a rebase --continue failure always was.
+git_conflict_continue() {
+  local repo="$1"
+  # `--git-path` prints a path RELATIVE TO $repo (not to our own cwd, and
+  # not always absolute even under `-C`) — `--absolute-git-dir` is the one
+  # call that's unambiguous regardless of where THIS script itself runs
+  # from (the exact `--git-path`-vs-cwd bug landres_ac6_resolve_source_
+  # conflict_untouched.sh's own comment already warns about for
+  # `--git-path` alone; sidestepped here by resolving against the
+  # absolute git-dir instead of trusting --git-path's own path shape).
+  local gitdir; gitdir="$(git -C "$repo" rev-parse --absolute-git-dir 2>/dev/null)"
+  [ -n "$gitdir" ] || { echo "land-resolve: $repo is not a git repo — nothing to continue" >&2; return 1; }
+  if [ -d "$gitdir/rebase-merge" ] || [ -d "$gitdir/rebase-apply" ]; then
+    GIT_EDITOR=true git -C "$repo" rebase --continue
+    return $?
+  fi
+  if [ -f "$gitdir/MERGE_HEAD" ]; then
+    git -C "$repo" "${LAND_RESOLVE_GIT_ID[@]}" commit --no-edit
+    return $?
+  fi
+  echo "land-resolve: neither a rebase nor a merge is in progress at $repo — nothing to continue" >&2
+  return 1
+}
+
 cmd_resolve() {
   local repo="${1:-}" slug="${2:-}"
   [ -n "$repo" ] || usage
@@ -407,11 +458,11 @@ cmd_resolve() {
   fi
 
   if [ "${#source_files[@]}" -eq 0 ]; then
-    if GIT_EDITOR=true git -C "$repo" rebase --continue >&2; then
+    if git_conflict_continue "$repo" >&2; then
       echo "resolved=all"
       return 0
     fi
-    # rebase --continue itself hit a NEW conflict (e.g. a follow-on commit
+    # The continue step itself hit a NEW conflict (e.g. a follow-on commit
     # in the same rebase) — surface it as a source conflict rather than
     # claiming success.
     local newly; newly="$(git -C "$repo" diff --name-only --diff-filter=U 2>/dev/null | tr '\n' ',' | sed 's/,$//')"
