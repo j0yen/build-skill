@@ -9,10 +9,11 @@
 # piece: a reader for the per-repo policy file (R2) that classifies a
 # conflicted path as `generated`, `append_only`, or `source` — the
 # classification gate-then-land.sh and worktree-extend.sh will call
-# before treating a rebase conflict as fatal. Regen/union execution (R3),
-# the bounded coder resolve (R4), and the ledger (R5) are later steps in
-# this same PRD; this step lands only the schema + the classifier, wired
-# to nothing yet (Non-goal for THIS step: no caller changed).
+# before treating a rebase conflict as fatal. Regen/union execution (R3)
+# and this step's ledger (R5) are landed; the bounded coder resolve (R4)
+# and wiring this script into gate-then-land.sh/worktree-extend.sh (R1/R8)
+# are later steps in this same PRD (Non-goal for THIS step: still no
+# caller changed — `resolve` is exercised only by this PRD's own tests).
 #
 # Policy file: state/land-policy/<repo-basename>.json
 #   {
@@ -51,6 +52,27 @@
 #       those), prints `source_conflicts=<comma-list>`, exit 1. Prints
 #       `no-conflict` and exits 3 if <repo> has no conflicted paths at all
 #       (nothing to resolve — a caller bug, not a land-resolve failure).
+#       Every path this script itself resolves without escalating (i.e.
+#       `generated`->regen or `append_only`->union, never `source`) appends
+#       one record to the ledger (R5) — see below.
+#
+# Ledger (R5): state/land-conflicts.jsonl, one JSON record per resolved
+# FILE (not per resolve() call — a single conflicted rebase touching two
+# files yields two records), append-only, one line per `jq -c` object:
+#   {"ts": "<ISO-8601>", "repo": "<basename>", "slug": "<slug>",
+#    "file": "<repo-relative path>", "class": "generated"|"append_only",
+#    "resolution": "regen"|"union", "wall_seconds": <int>}
+# This script only ever writes `class`/`resolution` pairs it can attest to
+# directly (regen, union) — `source`/`coder`/`unresolved` records (AC4/AC5)
+# belong to R4's bounded-coder step, a later caller that owns the
+# succeed/fail/timeout verdict this script has no visibility into (a file
+# left as a source conflict here might still be resolved by that coder a
+# moment later). `wall_seconds` is elapsed time since this `resolve` call
+# started, not a per-file timer — regen/union are near-instant in practice
+# and the ledger's purpose is trend visibility (R5's "operator can see
+# which files conflict and how often"), not a profiler.
+# `scripts/land-conflicts-report.sh` reads this file and prints conflicts
+# by frequency.
 #
 #       Stage semantics (confirmed empirically, not just per git's docs,
 #       because `git rebase` INVERTS ours/theirs vs a normal merge): during
@@ -72,11 +94,42 @@ set -uo pipefail
 SKILL_DIR="${BUILD_SKILL_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 STATE_DIR="${BUILD_STATE_DIR:-$SKILL_DIR/state}"
 LAND_POLICY_DIR="${LAND_POLICY_DIR:-$STATE_DIR/land-policy}"
+LAND_CONFLICTS_LEDGER="${LAND_CONFLICTS_LEDGER:-$STATE_DIR/land-conflicts.jsonl}"
 
 usage() {
   echo "usage: land-resolve.sh policy-path <repo>" >&2
   echo "       land-resolve.sh classify <repo> <path> [slug]" >&2
+  echo "       land-resolve.sh resolve <repo> [slug]" >&2
   exit 2
+}
+
+# ledger_record <repo> <slug> <file> <class> <resolution> <wall_seconds>
+# Appends one JSON line to $LAND_CONFLICTS_LEDGER (R5). Never fails the
+# caller — a ledger write is telemetry, not a land precondition; a failure
+# to `mkdir`/append is logged to stderr and swallowed.
+ledger_record() {
+  local repo="$1" slug="$2" file="$3" class="$4" resolution="$5" wall="$6"
+  if ! command -v jq >/dev/null 2>&1; then
+    echo "land-resolve: jq unavailable — skipping ledger record for $file" >&2
+    return 0
+  fi
+  mkdir -p "$(dirname "$LAND_CONFLICTS_LEDGER")" 2>/dev/null || {
+    echo "land-resolve: cannot create $(dirname "$LAND_CONFLICTS_LEDGER") — skipping ledger record for $file" >&2
+    return 0
+  }
+  local line
+  line="$(jq -nc \
+    --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    --arg repo "$(basename "$repo")" \
+    --arg slug "$slug" \
+    --arg file "$file" \
+    --arg class "$class" \
+    --arg resolution "$resolution" \
+    --argjson wall "${wall:-0}" \
+    '{ts: $ts, repo: $repo, slug: $slug, file: $file, class: $class, resolution: $resolution, wall_seconds: $wall}')" \
+    || { echo "land-resolve: jq failed building ledger record for $file" >&2; return 0; }
+  printf '%s\n' "$line" >>"$LAND_CONFLICTS_LEDGER" 2>/dev/null \
+    || echo "land-resolve: append to $LAND_CONFLICTS_LEDGER failed for $file" >&2
 }
 
 policy_path_for() {
@@ -139,6 +192,7 @@ cmd_classify() {
 cmd_resolve() {
   local repo="${1:-}" slug="${2:-}"
   [ -n "$repo" ] || usage
+  local resolve_start; resolve_start="$(date +%s)"
   local conflicted; conflicted="$(git -C "$repo" diff --name-only --diff-filter=U 2>/dev/null)"
   if [ -z "$conflicted" ]; then
     echo "no-conflict"
@@ -168,6 +222,7 @@ cmd_resolve() {
           fi
         fi
         git -C "$repo" add -- "$f"
+        ledger_record "$repo" "$slug" "$f" generated regen "$(( $(date +%s) - resolve_start ))"
         ;;
       class=append_only)
         echo "land-resolve: $f classified append_only — union-merging" >&2
@@ -178,6 +233,7 @@ cmd_resolve() {
         if git merge-file --union "$tmp/ours" "$tmp/base" "$tmp/theirs" >/dev/null 2>&1; then
           cp "$tmp/ours" "$repo/$f"
           git -C "$repo" add -- "$f"
+          ledger_record "$repo" "$slug" "$f" append_only union "$(( $(date +%s) - resolve_start ))"
         else
           echo "land-resolve: union merge failed for $f — leaving as source conflict" >&2
           source_files+=("$f")
