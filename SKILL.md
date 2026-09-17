@@ -2218,6 +2218,22 @@ why may still journal its own `select-tick  under-dispatched  (...
 cause=<text>)` line in the same tick as useful, optional context for that
 `cause=`.
 
+**Resuming a `landing-pending` PRD (PRD-build-main-push-gate-pr-path
+requirement 6, AC8).** `select-tick.sh` admits an `in_progress` PRD the
+same as a `queued` one (its own header names this as a known scope gap —
+it does not read `last_step` at all). Before building that PRD's normal
+dispatch prompt, check its manifest entry's `last_step`: when it reads
+`landing-pending`, the branch's job this tick is NOT the PRD's usual build
+phases — it is one call, `scripts/landing-resume.sh <build_into> <slug>`
+(from the PRD's own `build_into` main checkout, never a worktree — this
+call needs no worktree at all), then act on its exit code exactly as that
+script's own header documents (0 merged+synced -> resume the PRD's
+ordinary post-land steps, step 6 "gate" onward, at the sha printed on
+stdout; 2 sync-deferred / 3 pending -> no further action this tick, PRD
+stays `in_progress`; 4/5/6 -> the PRD is already `blocked` by
+`landing-resume.sh` itself, nothing left to do). Any other `last_step` (or
+none) means the PRD's normal dispatch prompt applies unchanged.
+
 **Model override (added 2026-05-28).** Each `admitted[]` entry already
 carries the `model` `select-tick.sh` computed for it (requirement 5) —
 pass it straight to the Agent call's `model` field rather than
@@ -2923,16 +2939,43 @@ python-specific contract.
    the non-shared push step — a protected `main`, e.g. mcphost since this
    PRD's live AC6/AC7 landing, refuses a direct push outright), then
    `worktree-extend.sh cleanup <repo> <slug>
-   --drop-branch`. Exit 4, same as any other deferred branch (dirty
-   target / conflict / red gate): run `cleanup` WITHOUT `--drop-branch` so
-   the next tick resumes the same branch via `add`, leave the PRD
-   `in_progress`, and set `last_error=main-push-refused` — no push is
-   made. Exit 5: same non-fleet-repo exemption as the non-shared push step
-   above (check `<repo>`'s basename against `scripts/lib/fleet-repos.sh`'s
+   --drop-branch` (this frees the shared-target worktree/`autobuilder/
+   <slug>` branch — `integrate` in step 3 already merged it onto local
+   `main`, so cleanup is unconditional here regardless of push_via_branch;
+   it is never the NEW `loop/<slug>` branch `branch-protection.sh push`
+   itself creates, which is GitHub's to close on merge). Exit 4, same as
+   any other deferred branch (dirty target / conflict / red gate): run
+   `cleanup` WITHOUT `--drop-branch` so the next tick resumes the same
+   branch via `add`, leave the PRD `in_progress`, and set
+   `last_error=main-push-refused` — no push is made. Exit 5: same
+   non-fleet-repo exemption as the non-shared push step above (check
+   `<repo>`'s basename against `scripts/lib/fleet-repos.sh`'s
    `FLEET_REPOS`) — a fleet repo defers exactly like exit 4
    (`last_error=main-push-unknown`); a non-fleet repo is `ok-unmapped`
    (journaled) and falls through to `branch-protection.sh push` same as
    exit 0.
+
+   **push_via_branch=true stops here, not at step 6** (PRD-build-main-
+   push-gate-pr-path requirement 1/6, AC1/AC8): `branch-protection.sh
+   push` against a protected repo only opens/reuses a PR and arms
+   auto-merge — it does not push `main`, because it cannot. Step 6's
+   main-scope `ci-checks` re-verify has nothing to check yet (no runs
+   exist for an unpushed sha), so it MUST NOT run in the same dispatch as
+   this push: write `last_step=landing-pending` via `manifest-sidecar.sh`
+   (same sidecar write `gate-then-land.sh`'s own PR-path branch already
+   does for the non-shared path — see that script's header, "PR-path
+   landing"), journal `landing-pending`, and stop — leave the PRD
+   `in_progress`. A LATER tick (same one or a future one; never the same
+   dispatch) resumes it via `scripts/landing-resume.sh <repo> <slug>`
+   INSTEAD of re-running steps 1-5: `merged`+synced clears `last_step` and
+   hands the PRD back to step 6 below (now with a real merged sha `gh` can
+   verify); `pending` under `LANDING_PENDING_MAX` (default 6h) is a no-op
+   journal line; `pending` past that bound, `red <check>`, or `closed`
+   all end the same way — PRD `blocked`, a specific `last_error`, and (for
+   `red`) the red-gate alarm — see that script's own header for the exact
+   exit-code contract. `push_via_branch=false` repos are unaffected:
+   `cleanup --drop-branch` above already finished the landing and step 6
+   runs in the same dispatch, unchanged from before this PRD.
 6. **gate** — the real gate already ran, INSIDE `gate-then-land.sh`, BEFORE
    step 3 above (`extend-gate.sh <worktree> --head <worktree HEAD> --scope
    branch --slug <slug>`, no crate-wide lock — see the **gate** action's
