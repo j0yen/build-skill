@@ -1459,6 +1459,42 @@ else
   record_phase intent-card-refresh 0 skip
 fi
 
+# PRD-build-gate-infra-outcome R1/R2/R3 (live fix, found by the AC13 probe of
+# 2026-09-17T21:28-21:46Z on a real mcphost branch gate): the refresh phase
+# directly above COMMITS a new intent card, so HEAD moves. $head_now/$tree_now
+# were captured once at the top of this script (see the `git rev-parse HEAD`
+# above `resolve_base`), BEFORE that commit — but every receipt this script
+# writes ITSELF keys off them, while each producer resolves HEAD independently.
+# The two then disagree, and a receipt stamped with the pre-refresh sha reads
+# as STALE to the aggregator, which counts it as a block. Three of that probe's
+# five blocks were this single defect, not a real finding:
+#   * reviewer-agent  — R1's `infra:` skip receipt (head_sha=$head_now) was
+#     rejected as stale, so a phase that could not run was counted as a block
+#     again. This is exactly the outcome R1/R2 exist to make impossible, and it
+#     is why `incomplete` was unreachable on any live branch gate: the pre-gate
+#     refresh (PRD-build-intent-card-pregate-refresh) made a mid-gate commit
+#     routine, so the staleness is systematic, not incidental.
+#   * rollback-plan   — the head-untagged post-classification below compares the
+#     producer's own `head` against $head_now; stale $head_now made that
+#     comparison fail, so a scope-deferrable artifact blocked instead.
+#   * session-trace   — proof-receipt's producer is handed `--head-sha
+#     "$head_now"`, so its receipt inherited the stale sha too and its honest
+#     `tracer_unavailable` skip was counted as a block.
+# The `--head` conflict check ran far above, before this phase, so re-reading
+# here cannot weaken it: this gate still refuses to run against a HEAD the
+# caller did not ask for. What changes is only that everything AFTER the
+# refresh describes the tree actually gated. The cache key moves with it by
+# construction (tree_now), which is the correct key — a verdict recorded
+# against the pre-refresh tree was never a verdict about what ran.
+_head_before_icr="$head_now"
+head_now="$(git -C "$repo" rev-parse HEAD 2>/dev/null || echo "$head_now")"
+tree_now="$(git -C "$repo" rev-parse "$head_now^{tree}" 2>/dev/null || echo "$tree_now")"
+if [ -n "$_head_before_icr" ] && [ "$head_now" != "$_head_before_icr" ]; then
+  echo "extend-gate: head advanced by intent-card refresh: ${_head_before_icr:0:7} -> ${head_now:0:7} (receipts, summary and verdict cache now key off the gated tree)" >&2
+  journal_line --file "$journal" "$(printf '%s  gate  %s  head-advanced  (cause=intent-card-refresh from=%s to=%s slug=%s)' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${repo##*/}" "${_head_before_icr:0:7}" "${head_now:0:7}" "$slug")"
+fi
+
 # 2. intake — validates agent/intent-card.json against the schema and,
 #    with --project, writes target/autobuilder/receipts/intake.json fresh
 #    at HEAD. Before PRD-build-gate-producers, nothing in this sequence
