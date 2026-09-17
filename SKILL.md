@@ -1619,7 +1619,9 @@ read it before assuming a step is "the last one this tick".
     The repo's existing README.md is NOT required to be regenerated.
   - Check #4 becomes: `~/wintermute/REPOS.md` is unchanged by this
     PRD's tick history (negative AC — the extended repo is already listed).
-  - **Check #6 (new; updated 2026-09-06 for PRD-build-gate-delta-baseline)**:
+  - **Check #6 (new; updated 2026-09-06 for PRD-build-gate-delta-baseline;
+    updated 2026-09-17 for PRD-build-main-verdict-pinned-to-landing R1)**:
+    for a `push_via_branch=false` repo (no landing record), unchanged:
     `scripts/extend-gate.sh <build_into> --head <HEAD>` at a HEAD equal to
     `origin/<default>` exits 0 — `pass` (`block=0`) OR `delta-pass` (block>0
     but every blocking receipt is named in the committed
@@ -1628,11 +1630,25 @@ read it before assuming a step is "the last one this tick".
     established and recorded in the `Receipts:` line — archive re-checks it
     (via the verdict cache, so re-checking a HEAD the same tick's `gate`
     action just verified is cheap) rather than trusting a stale line.
+    **For a `push_via_branch=true` repo, never gate `<HEAD>` here — the
+    checkout's current HEAD may already belong to a later-landed PRD
+    (the 2026-09-17 05:15:46Z regression this PRD exists to fix).** Run
+    `scripts/gate-launch.sh <build_into> --head <any value> --scope main
+    --slug <slug> --pinned-landing --wait` (same form as the `gate` ship
+    action's `push_via_branch=true` branch above) — `main-verdict-pin-
+    gate.sh` re-resolves the slug's own merge sha M and checks the
+    verdict pinned at M (R4: a cache hit, no producer run, if the `gate`
+    or post-land re-verify step already recorded `pass`/`delta-pass` at
+    M this tick or any earlier one). Check #6 passes on `pass` or
+    `delta-pass` AT M, exactly the same two outcomes as the
+    `push_via_branch=false` form above; `landing-record-unusable:<field|
+    sha>` (R7) or `verdict=block` at M both fail it.
     **The archive gate refuses otherwise, naming check #6** — a PRD whose
-    `gate` action last blocked, or whose `build_into` HEAD has since moved
-    (another PRD landed on the same crate without a fresh `gate` run), fails
-    archive here and stays in `build-queue/` with `Status: in_progress`, not
-    silently treated as shipped on the strength of checks #1/#5 alone.
+    `gate` action last blocked, whose verdict at M is block, or (direct-
+    push only) whose `build_into` HEAD has since moved without a fresh
+    `gate` run, fails archive here and stays in `build-queue/` with
+    `Status: in_progress`, not silently treated as shipped on the
+    strength of checks #1/#5 alone.
   - **Check #7 (new; PRD-build-post-ship-reality-check, all shapes) — a
     deferral or a receipt is a testable claim, not prose to trust.** Two
     sub-checks, both run via `verified-completed.sh`, both must pass
