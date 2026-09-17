@@ -6,18 +6,21 @@
 #
 # Coverage in THIS revision: the lint-layer requirements landed so far --
 # R1 (marker + scan-prds.sh live_acs), R2 (loop-tooling scope file), R3
-# (prd-lint.sh live-ac-deferred / live-ac-missing), and R7/R8g (`(Real-box`
-# wins over `(Live` when both are present). That is PRD ACs 1, 2, 3, 8.
-# ACs 4-7 (verified-completed.sh pairing, archive refusal, the reality
-# check) and AC9/AC10's full-suite claim are follow-on chained steps --
-# NOT asserted here yet; the PRD stays `building`, not `built`, until they
-# land and this file grows their fixtures too. Never claim green on a rule
-# that isn't wired.
+# (prd-lint.sh live-ac-deferred / live-ac-missing), R4 (verified-completed.sh
+# --derive: a `(Live` AC pairs only with its own named evidence, never a
+# fixture; deferred -> live-ac-deferred), and R7/R8g (`(Real-box` wins over
+# `(Live` when both are present, in both the lint layer AND the derive
+# layer). That is PRD ACs 1, 2, 3, 4, 8.
+# ACs 5-7 (archive refusal, the reality check) and AC9/AC10's full-suite
+# claim are follow-on chained steps -- NOT asserted here yet; the PRD stays
+# `building`, not `built`, until they land and this file grows their
+# fixtures too. Never claim green on a rule that isn't wired.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 LINT="$HERE/prd-lint.sh"
 SCAN="$HERE/scan-prds.sh"
+VC="$HERE/verified-completed.sh"
 LOOP_TOOLING_REPOS_FILE="$HERE/loop-tooling-repos.txt"
 export LOOP_TOOLING_REPOS_FILE
 
@@ -126,6 +129,59 @@ ids3="$(lint_ids "$f3" failures)$(lint_ids "$f3" warnings)"
 ck "AC3: a product PRD deferring a (Live AC gets no live-ac-* diagnostic" \
   '[[ "$ids3" != *live-ac* ]]' "ids: $ids3"
 
+# ---- AC4: verified-completed.sh --derive -- a `(Live` AC naming
+# journal:<regex> pairs ONLY against that evidence, never a fixture tests/
+# file whose name would otherwise pair it (a real `<prefix>_ac4_*.sh` file
+# is planted here specifically to prove the fixture is ignored). Own
+# hermetic repo + own loop-tooling-repos.txt scratch file (never the
+# exported one above, which points at the real build-skill repo) so
+# resolve_repo() sees a scratch tests/ dir, not this repo's own ----
+T4="$(mktemp -d "${TMPDIR:-/tmp}/live-ac-selftest-ac4.XXXXXX")"
+mkdir -p "$T4/repo/tests" "$T4/queue" "$T4/journal"
+cat > "$T4/loop-tooling-repos.txt" <<EOF
+$T4/repo
+EOF
+cat > "$T4/repo/tests/liveac_ac4_something.sh" <<'EOF'
+echo fixture
+EOF
+f4="$T4/queue/PRD-fixture-ac4.md"
+cat > "$f4" <<EOF
+# PRD: fixture-ac4
+
+- Status: queued
+- build_target: shell
+- build_into: $T4/repo
+- test_prefix: liveac
+- Drafted: 2026-09-17
+- Grounding: failure-derived
+- Vision: x.md
+
+## Acceptance criteria
+
+1. P0 — Given a thing, When it happens, Then it works.
+2. P0 — Given a thing, When it happens, Then it works.
+3. P0 — Given a thing, When it happens, Then it works.
+4. P0 — Given a real loop, When it runs, Then it proves this. (Live; evidence: journal:UNIQUE_TOKEN_XYZ)
+EOF
+cls4_before="$(LOOP_TOOLING_REPOS_FILE="$T4/loop-tooling-repos.txt" VC_JOURNAL_DIR="$T4/journal" \
+  "$VC" "$f4" --derive --format table 2>/dev/null | awk -F'\t' '$1==4{print $4}')"
+ck "AC4: a fixture tests/ file never pairs a (Live AC (unproven before its own evidence exists)" \
+  '[ "$cls4_before" = "live-ac-unproven" ]' "got: $cls4_before"
+
+echo "2026-09-17T20:00:00Z  liveac  UNIQUE_TOKEN_XYZ  ok" > "$T4/journal/2026-09-17.md"
+cls4_after="$(LOOP_TOOLING_REPOS_FILE="$T4/loop-tooling-repos.txt" VC_JOURNAL_DIR="$T4/journal" \
+  "$VC" "$f4" --derive --format table 2>/dev/null | awk -F'\t' '$1==4{print $4}')"
+ck "AC4: the (Live AC pairs once its own named journal evidence exists" \
+  '[ "$cls4_after" = "PAIRED" ]' "got: $cls4_after"
+
+f4d="$T4/queue/PRD-fixture-ac4-deferred.md"
+sed 's/^- Vision: x.md$/- deferred_acs: [4]\n- mock_justifications: AC4 deferred for the fixture.\n- Vision: x.md/; s/fixture-ac4/fixture-ac4-deferred/' "$f4" > "$f4d"
+cls4d="$(LOOP_TOOLING_REPOS_FILE="$T4/loop-tooling-repos.txt" VC_JOURNAL_DIR="$T4/journal" \
+  "$VC" "$f4d" --derive --format table 2>/dev/null | awk -F'\t' '$1==4{print $4}')"
+ck "AC4: verified-completed.sh reports a deferred (Live AC as live-ac-deferred, not DEFERRED" \
+  '[ "$cls4d" = "live-ac-deferred" ]' "got: $cls4d"
+rm -rf "$T4"
+
 # ---- AC8: an AC marked both `(Live` and `(Real-box`, deferred -> the
 # `(Real-box` rule applies, no live-ac-* diagnostic emitted ----
 f8="$T/queue/PRD-fixture-ac8.md"
@@ -150,6 +206,10 @@ EOF
 ids8="$(lint_ids "$f8" failures)$(lint_ids "$f8" warnings)"
 ck "AC8: (Live + (Real-box on the same AC, deferred, raises no live-ac-* diagnostic" \
   '[[ "$ids8" != *live-ac* ]]' "ids: $ids8"
+
+cls8="$("$VC" "$f8" --derive --format table 2>/dev/null | awk -F'\t' '$1==3{print $4}')"
+ck "AC8: verified-completed.sh --derive classifies the same AC DEFERRED (the (Real-box rule), never live-ac-*" \
+  '[ "$cls8" = "DEFERRED" ]' "got: $cls8"
 
 # ---- Self-lint: this PRD's own file must not false-positive on its own
 # prose (AC1-AC10 quote "`(Live`" in backticks describing the convention;

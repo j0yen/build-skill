@@ -234,6 +234,30 @@ SCAN="$HERE/scan-prds.sh"
 SKILL_DIR="$(cd "$HERE/.." && pwd)"
 MANIFEST="${MANIFEST:-$SKILL_DIR/state/manifest.json}"
 JQ="${JQ:-$(command -v jq || echo /usr/sbin/jq)}"
+# PRD-build-live-ac-no-defer R4: same loop-tooling scope file prd-lint.sh
+# and scan-prds.sh already read (scripts/loop-tooling-repos.txt) -- one
+# shared list, never a second hardcoded copy.
+LOOP_TOOLING_REPOS_FILE="${LOOP_TOOLING_REPOS_FILE:-$HERE/loop-tooling-repos.txt}"
+
+# is_loop_tooling_build_into <build_into> -- true (rc 0) when build_into
+# equals, or is a subdirectory of, a path listed in LOOP_TOOLING_REPOS_FILE.
+# Mirrors prd-lint.sh's is_loop_tooling_build_into() exactly (same file,
+# same semantics) so the two never disagree about scope.
+is_loop_tooling_build_into() {
+  local bi="${1%/}" repo
+  [ -n "$bi" ] || return 1
+  [ -r "$LOOP_TOOLING_REPOS_FILE" ] || return 1
+  while IFS= read -r repo; do
+    repo="${repo%%#*}"
+    repo="$(printf '%s' "$repo" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+    [ -n "$repo" ] || continue
+    repo="${repo%/}"
+    if [ "$bi" = "$repo" ] || [[ "$bi" == "$repo"/* ]]; then
+      return 0
+    fi
+  done < "$LOOP_TOOLING_REPOS_FILE"
+  return 1
+}
 
 usage() {
   sed -n '2,121p' "$0" | sed 's/^# \{0,1\}//'
@@ -545,6 +569,70 @@ declare -A is_paired is_deferred reason_for paired_evidence
 declare -A derived_rule derived_path is_failing
 declare -A fnscan_path
 declare -A collision_rule collision_path collision_owner_slug
+declare -A live_ac_deferred live_ac_unproven
+
+# is_deferred populated here (not at its historical spot further down) so
+# rule h below (the `(Live` classifier) can consult it while classify_ac
+# runs, per-AC, before the final PAIRED/DEFERRED/MISSING pass. Same source
+# ($deferred, already resolved from scan-prds.sh above) either way.
+while IFS= read -r n; do
+  case "$n" in
+    ''|*[!0-9]*) continue ;;
+    *) is_deferred[$n]=1 ;;
+  esac
+done < <("$JQ" -r '.[]?' <<<"$deferred")
+
+# `(Live` tagging (PRD-build-live-ac-no-defer R4): which written AC numbers
+# carry the "(Live" marker AND belong to a loop-tooling PRD (build_into
+# under scripts/loop-tooling-repos.txt) — keyed by the literal AC number on
+# the line, same convention as ac_is_realbox above. An AC carrying BOTH
+# `(Live` and `(Real-box` is excluded here (R7/R8: `(Real-box` wins, no
+# live-ac-* diagnostic fires for it — ac_is_realbox's own rule f already
+# handles it, tried first in classify_ac). Backtick-quoted mentions (a
+# PRD's own prose describing the convention, e.g. this PRD's own AC1-AC10)
+# are stripped first so they never false-positive as the marker itself —
+# same guard prd-lint.sh's live_ac_nums extraction uses.
+declare -A ac_is_live=() ac_live_evidence=()
+this_build_into="$("$JQ" -r --arg s "$slug" '.[] | select(.slug==$s) | .build_into // empty' <<<"$json")"
+if is_loop_tooling_build_into "$this_build_into"; then
+  while IFS=$'\t' read -r acn evidence; do
+    [ -n "$acn" ] || continue
+    ac_is_live[$acn]=1
+    ac_live_evidence[$acn]="$evidence"
+  # Two copies of each AC line: a backtick-stripped copy decides whether a
+  # real (un-quoted) "(Live" marker is present at all (guards against prose
+  # that quotes the marker name in backticks, e.g. this repos own AC1-AC10
+  # text); evidence extraction below always reads the ORIGINAL line instead
+  # -- build-contract.md documents the evidence value itself backtick-
+  # quoted ("(Live; evidence: `journal:<regex>`)"), so stripping backticks
+  # first would delete the evidence text along with the false-positive
+  # guard.
+  done < <(awk '
+    /^##[[:space:]]+([[:digit:]]+\.[[:space:]]+)?Acceptance/ { in_block=1; next }
+    /^##[[:space:]]/ && in_block { in_block=0 }
+    in_block && match($0, /^[[:digit:]]+\./) {
+      n = substr($0, RSTART, RLENGTH-1) + 0
+      orig = $0
+      stripped = orig
+      gsub(/`[^`]*`/, "", stripped)
+      if (stripped ~ /\(Real-box/) next
+      # mawk has no \b; "(Live" followed by a non-letter (matches this
+      # convention: always "(Live;" or "(Live)" in practice) stands in for
+      # the word-boundary check prd-lint.sh does with a real regex engine.
+      if (stripped !~ /\(Live[^A-Za-z]/) next
+      if (match(orig, /\(Live[^)]*\)/)) {
+        tag = substr(orig, RSTART, RLENGTH)
+        evidence = ""
+        if (match(tag, /evidence:[[:space:]]*[^)]+/)) {
+          evidence = substr(tag, RSTART + 9, RLENGTH - 9)
+          gsub(/^[[:space:]]+|[[:space:]]+$/, "", evidence)
+          gsub(/`/, "", evidence)
+        }
+        print n "\t" evidence
+      }
+    }
+  ' "$prd")
+fi
 
 # ---- --derive: resolve repo + prefix candidates, classify each AC -----
 resolve_repo() {
@@ -738,6 +826,64 @@ print("%s (routed=true image=%s bytes=%s ts=%s)" % (
 ' "$repo" "$boot_image" "${candidates[@]}"
 }
 
+# check_live_evidence <spec> — stdout: one evidence line, rc 0, when the
+# `(Live` AC's own named evidence currently holds; rc 1 (no stdout)
+# otherwise. <spec> is the raw text after "evidence:" on the AC line (see
+# ac_live_evidence above) — build-contract.md documents the three forms:
+#   journal:<regex>   grep -E <regex> over $VC_JOURNAL_DIR/*.md (default
+#                      ~/brain/journal/build), freshest match wins.
+#   receipt:<path>    the path exists — tried as given, then relative to
+#                      $repo, then relative to $HOME.
+#   cmd:<command>      `bash -c <command>` exits 0.
+# An empty/unparseable spec (no "evidence:" clause on the AC line at all)
+# is never satisfied — PRD-build-live-ac-no-defer R4: a `(Live` AC pairs
+# ONLY with the evidence its own text names, never a fixture.
+check_live_evidence() {
+  local spec="$1" kind val
+  [ -n "$spec" ] || return 1
+  kind="${spec%%:*}"
+  val="${spec#*:}"
+  case "$kind" in
+    journal)
+      [ -n "$val" ] || return 1
+      local jdir="${VC_JOURNAL_DIR:-$HOME/brain/journal/build}"
+      [ -d "$jdir" ] || return 1
+      local f best_path="" best_mtime=-1 best_line=""
+      shopt -s nullglob
+      for f in "$jdir"/*.md; do
+        grep -qE -- "$val" "$f" 2>/dev/null || continue
+        local mtime; mtime="$(stat -c %Y "$f" 2>/dev/null || echo 0)"
+        if [ "$mtime" -gt "$best_mtime" ]; then
+          best_mtime="$mtime"; best_path="$f"
+          best_line="$(grep -mE1 -- "$val" "$f" 2>/dev/null)"
+        fi
+      done
+      shopt -u nullglob
+      [ -n "$best_path" ] || return 1
+      printf 'journal:%s: %s\n' "${best_path#"$HOME"/}" "$best_line"
+      ;;
+    receipt)
+      [ -n "$val" ] || return 1
+      local rp="$val"
+      if [ ! -e "$rp" ] && [ -n "${repo:-}" ]; then rp="$repo/$val"; fi
+      if [ ! -e "$rp" ]; then rp="$HOME/${val#"$HOME"/}"; fi
+      [ -e "$rp" ] || return 1
+      printf 'receipt:%s\n' "${rp}"
+      ;;
+    cmd)
+      [ -n "$val" ] || return 1
+      if bash -c "$val" >/dev/null 2>&1; then
+        printf 'cmd:%s (exit 0)\n' "$val"
+      else
+        return 1
+      fi
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
 # whole_suite_evidence <n> — stdout: evidence string, rc 0, when the AC's
 # own named selftest script (ac_wholesuite_script[$n]) has a fresh receipt,
 # scoped to THIS PRD's own slug, recording exit 0 from its most recent
@@ -787,6 +933,28 @@ classify_ac() {
       printf 'PAIRED|real-box|%s|\n' "$evidence"
     else
       printf 'MISSING|||\n'
+    fi
+    return
+  fi
+  # h. live — PRD-build-live-ac-no-defer R4: checked FIRST and EXCLUSIVELY
+  # (same posture as real-box above) for an AC tagged via ac_is_live — a
+  # loop-tooling PRD's `(Live` AC pairs ONLY with the evidence its own AC
+  # text names (ac_live_evidence[$n]); a tests/ file, even one that would
+  # otherwise match rules a-e, never satisfies it. A deferred `(Live` AC
+  # is reported `live-ac-deferred` (never `completed`) rather than falling
+  # into the ordinary DEFERRED bucket real-box ACs use — see build-
+  # contract.md's "(Live marker" section: no-defer, not defer-with-
+  # justification. Checked ahead of real-box only in the sense that both
+  # return before rule (a); an AC can't carry both without the (Real-box
+  # branch above already having claimed it (ac_is_live excludes
+  # (Real-box-tagged ACs at tagging time).
+  if [ -n "${ac_is_live[$n]:-}" ]; then
+    if [ -n "${is_deferred[$n]:-}" ]; then
+      printf 'LIVE-DEFERRED|||\n'
+    elif evidence="$(check_live_evidence "${ac_live_evidence[$n]:-}")"; then
+      printf 'PAIRED|live:%s|%s|\n' "${ac_live_evidence[$n]:-}" "$evidence"
+    else
+      printf 'LIVE-UNPROVEN|||\n'
     fi
     return
   fi
@@ -996,6 +1164,10 @@ if [ "$derive_mode" = on ]; then
       collision_rule[$i]="$rule"
       collision_path[$i]="$path"
       collision_owner_slug[$i]="$other"
+    elif [ "$cls" = LIVE-DEFERRED ]; then
+      live_ac_deferred[$i]=1
+    elif [ "$cls" = LIVE-UNPROVEN ]; then
+      live_ac_unproven[$i]=1
     fi
   done
 fi
@@ -1055,12 +1227,8 @@ if [ -n "$paired_csv" ]; then
   done
 fi
 
-while IFS= read -r n; do
-  case "$n" in
-    ''|*[!0-9]*) continue ;;
-    *) is_deferred[$n]=1 ;;
-  esac
-done < <("$JQ" -r '.[]?' <<<"$deferred")
+# is_deferred is populated earlier (see the `(Live` tagging block above) so
+# classify_ac's rule h can consult it too.
 
 # ---- --verify-run: re-run each real (non-asserted) paired test --------
 if [ "$verify_run" = true ]; then
@@ -1122,6 +1290,8 @@ fi
 missing=()
 failing=()
 collisions=()
+live_deferred=()
+live_unproven=()
 results=()
 for ((i=1; i<=num_acs; i++)); do
   if [ -n "${is_paired[$i]:-}" ]; then
@@ -1131,6 +1301,15 @@ for ((i=1; i<=num_acs; i++)); do
     else
       cls=PAIRED
     fi
+  elif [ -n "${live_ac_deferred[$i]:-}" ]; then
+    # PRD-build-live-ac-no-defer R4: a deferred `(Live` AC on a loop-tooling
+    # PRD is its own classification, never the ordinary DEFERRED bucket
+    # `(Real-box` ACs use — no-defer, not defer-with-justification.
+    cls=live-ac-deferred
+    live_deferred+=("$i")
+  elif [ -n "${live_ac_unproven[$i]:-}" ]; then
+    cls=live-ac-unproven
+    live_unproven+=("$i")
   elif [ -n "${is_deferred[$i]:-}" ]; then
     cls=DEFERRED
   elif [ -n "${collision_owner_slug[$i]:-}" ]; then
@@ -1206,6 +1385,12 @@ elif [ "$doctor" = true ]; then
         printf 'AC%s: %-8s — matched %s, which belongs to PRD %s\n' "$n" "$cls" \
           "${collision_path[$n]:-(unknown)}" "${collision_owner_slug[$n]:-(unknown)}"
         ;;
+      live-ac-deferred)
+        printf 'AC%s: %-8s — (Live AC cannot be deferred on a loop-tooling PRD)\n' "$n" "$cls"
+        ;;
+      live-ac-unproven)
+        printf 'AC%s: %-8s — evidence not yet found: %s\n' "$n" "$cls" "${ac_live_evidence[$n]:-(no evidence: clause)}"
+        ;;
       MISSING)
         printf 'AC%s: %-8s — %s\n' "$n" "$cls" "(not paired, not deferred)"
         ;;
@@ -1222,7 +1407,8 @@ else
   done
 fi
 
-if [ "${#missing[@]}" -gt 0 ] || [ "${#failing[@]}" -gt 0 ] || [ "${#collisions[@]}" -gt 0 ]; then
+if [ "${#missing[@]}" -gt 0 ] || [ "${#failing[@]}" -gt 0 ] || [ "${#collisions[@]}" -gt 0 ] \
+   || [ "${#live_deferred[@]}" -gt 0 ] || [ "${#live_unproven[@]}" -gt 0 ]; then
   for n in "${missing[@]}"; do
     echo "AC$n: not paired (and not declared deferred)" >&2
   done
@@ -1231,6 +1417,12 @@ if [ "${#missing[@]}" -gt 0 ] || [ "${#failing[@]}" -gt 0 ] || [ "${#collisions[
   done
   for n in "${collisions[@]}"; do
     echo "AC$n: ac-number-collision (matched ${collision_path[$n]:-} via ${collision_rule[$n]:-}, which belongs to PRD ${collision_owner_slug[$n]:-})" >&2
+  done
+  for n in "${live_deferred[@]}"; do
+    echo "AC$n: live-ac-deferred (a (Live AC on a loop-tooling PRD can never appear in deferred_acs)" >&2
+  done
+  for n in "${live_unproven[@]}"; do
+    echo "AC$n: live-ac-unproven (evidence not found: ${ac_live_evidence[$n]:-(no evidence: clause on the AC line)})" >&2
   done
   exit 1
 fi
