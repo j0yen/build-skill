@@ -101,7 +101,12 @@
 #   1  usage error
 #   6  land-retries-exhausted (stale base --max-retries times running)
 #   7  gate-block (branch's gate verdict was block, or missing) — no retry
-#   8  rebase-conflict while recovering from a stale base — no retry
+#   8  rebase-conflict — either the NEW pre-gate rebase onto main's current
+#      tip (PRD-build-land-conflict-resolver R1, checked every attempt
+#      before gating) or the existing post-gate stale-base recovery below;
+#      either way `rebase_onto_main()` already tried `land-resolve.sh
+#      resolve` first (regen/union any policy-classified conflict) before
+#      surfacing this — no retry
 #   9  extend-gate.sh returned an infra failure (not pass=0/block=1) — no retry
 #  10  worktree-extend.sh integrate returned an unexpected infra code — no retry
 #  11  post-land-main-gate-block, OR (push_via_branch=true) pr-path-push-
@@ -147,6 +152,12 @@ BRANCH_PROTECTION="${GATE_THEN_LAND_BRANCH_PROTECTION:-$HERE/branch-protection.s
 RESURRECTION_GUARD="$HERE/resurrection-guard.sh"
 SIDECAR="$HERE/manifest-sidecar.sh"
 DECISIONS="${GATE_THEN_LAND_DECISIONS:-$HERE/decisions.sh}"
+# PRD-build-land-conflict-resolver R1/R3: a policy-classified rebase
+# conflict (generated -> regen, append_only -> union) never has to fall
+# all the way to `die 8` — see rebase_onto_main() below. Missing script
+# (an older worktree checkout mid-rollout) degrades to today's behavior:
+# any conflict is fatal, exactly as before this PRD.
+LAND_RESOLVE="${GATE_THEN_LAND_LAND_RESOLVE:-$HERE/land-resolve.sh}"
 GIT_ID=(-c user.email=jyen.tech@gmail.com -c user.name="Joe Yen")
 SKILL_DIR="$(cd "$HERE/.." && pwd -P)"
 STATE_DIR="${BUILD_STATE_DIR:-$SKILL_DIR/state}"
@@ -198,14 +209,69 @@ jlog() { printf '%s  gate-then-land  %s  %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" 
 
 pr_args=(); [ -n "$project_root" ] && pr_args=(--project-root "$project_root")
 
+# rebase_onto_main <target-sha> — rebases $wt onto <target-sha> (globals:
+# $wt, $slug — same convention jlog() already uses). Already-up-to-date is
+# a no-op (returns 0 without touching the tree) — the common case, since
+# most of the time nothing has landed elsewhere since `worktree-extend.sh
+# add`. A conflicted rebase tries `land-resolve.sh resolve` (PRD-build-
+# land-conflict-resolver R1/R3) BEFORE giving up: a conflict entirely in
+# files the target repo's land-policy lists as generated/append-only
+# resolves (regen/union) and the rebase continues, all inside this call.
+# Any remaining source conflict aborts the rebase and returns 1, leaving
+# $wt exactly as it was before this call — the caller decides what "give
+# up" means (today: die 8, unchanged; R4's bounded coder attempt is a
+# later PRD step, not yet wired in here).
+#
+# `$wt`'s own basename is `<repo>-<slug>` (worktree-extend.sh's naming
+# convention), never the target repo's own basename land-resolve.sh's
+# policy file is keyed on — LAND_RESOLVE_POLICY_BASENAME tells it the real
+# name (`basename $repo`) so a worktree-invoked resolve still finds
+# `state/land-policy/<repo>.json` instead of silently missing it and
+# falling through to `source` for everything (found by this PRD's own
+# landres_ac1_pregate_rebase_resolves_generated.sh selftest).
+rebase_onto_main() {
+  local target="$1"
+  if git -C "$wt" merge-base --is-ancestor "$target" HEAD 2>/dev/null; then
+    return 0
+  fi
+  if git -C "$wt" "${GIT_ID[@]}" rebase "$target" >&2; then
+    return 0
+  fi
+  if [ -x "$LAND_RESOLVE" ]; then
+    if LAND_RESOLVE_POLICY_BASENAME="$(basename "$repo")" "$LAND_RESOLVE" resolve "$wt" "$slug" >&2 2>&1; then
+      return 0
+    fi
+  fi
+  git -C "$wt" rebase --abort 2>/dev/null
+  return 1
+}
+
 wt="$("$WORKTREE_EXTEND" add "$repo" "$slug")" || die 2 "worktree-extend.sh add failed for $slug"
 
 main_shas_seen=()
 attempt=1
 while [ "$attempt" -le "$max_retries" ]; do
-  wt_head="$(git -C "$wt" rev-parse HEAD)"
   main_sha="$(git -C "$repo" rev-parse HEAD)"
   main_shas_seen+=("$main_sha")
+
+  # PRD-build-land-conflict-resolver R1 (P0): rebase the worktree onto
+  # main's CURRENT tip BEFORE gating, not after — the grounding incident
+  # this PRD exists to fix (gate-debt-4f1112d) gated a tree that was
+  # already behind main, so the conflict only surfaced at land time, one
+  # tick too late to recover cheaply. A no-op in the common case (nothing
+  # landed elsewhere since `worktree-extend.sh add`). extend-gate.sh's own
+  # journal line already reports main's HEAD at gate start as `base=`
+  # (PRD-build-gate-before-land requirement 1) — this rebase is what makes
+  # that reported base match the tree actually gated, not just an
+  # informational field alongside a stale one.
+  if ! rebase_onto_main "$main_sha"; then
+    conflict_files="$(git -C "$wt" diff --name-only --diff-filter=U 2>/dev/null | tr '\n' ',' | sed 's/,$//')"
+    [ -z "$conflict_files" ] && conflict_files="unknown"
+    [ -x "$SIDECAR" ] && "$SIDECAR" write "$slug" "last_error=land-conflict:${conflict_files}" >&2 || true
+    jlog "rebase-conflict attempt=$attempt files=$conflict_files pre-gate=true"
+    die 8 "rebase conflict onto main=$main_sha before gating (pre-gate rebase); branch kept, not retried"
+  fi
+  wt_head="$(git -C "$wt" rev-parse HEAD)"
 
   echo "gate-then-land: [$slug] attempt $attempt/$max_retries — gating $wt_head against main=$main_sha" >&2
   "$EXTEND_GATE" "$wt" --head "$wt_head" --scope branch --slug "$slug" "${pr_args[@]}" >&2
@@ -431,8 +497,7 @@ while [ "$attempt" -le "$max_retries" ]; do
       new_main="$(git -C "$repo" rev-parse HEAD)"
       echo "gate-then-land: [$slug] stale base (main advanced to $new_main) — rebasing and re-gating" >&2
       before_wt_head="$(git -C "$wt" rev-parse HEAD)"
-      if ! git -C "$wt" "${GIT_ID[@]}" rebase "$new_main" >&2; then
-        git -C "$wt" rebase --abort 2>/dev/null
+      if ! rebase_onto_main "$new_main"; then
         conflict_files="$(git -C "$wt" diff --name-only --diff-filter=U 2>/dev/null | tr '\n' ',' | sed 's/,$//')"
         [ -z "$conflict_files" ] && conflict_files="unknown"
         [ -x "$SIDECAR" ] && "$SIDECAR" write "$slug" "last_error=land-conflict:${conflict_files}" >&2 || true
