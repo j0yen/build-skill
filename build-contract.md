@@ -104,9 +104,30 @@ of R1-R7). For an in-scope PRD:
   names (`journal:<regex>`, `receipt:<path>`, `cmd:<command>`); a fixture
   `tests/` file never satisfies it, and a deferred `(Live` AC reports
   `live-ac-deferred` (never `completed`).
-- The archive step refuses (`live-ac-deferred` / `live-ac-unproven`) and
-  journals it; the PRD stays `built`, not `shipped`, until the reality
-  check finds the named evidence.
+- The archive step runs `scripts/archive-live-ac-refusal.sh <prd-path>`
+  alongside its ordinary `--derive` check and refuses on exit 1
+  (`live-ac-deferred:<N>` / `live-ac-unproven:<N>`, recorded verbatim as
+  `last_error` and journaled); the PRD stays `built`, not `shipped`, and
+  stays in `build-queue/`.
+- **The retry that finishes the job is `scripts/live-ac-reality-check.sh
+  check <prd-path>`, and it is a DIFFERENT script from `reality-check.sh`
+  (the post-ship substrate reality check, PRD-build-post-ship-reality-check)
+  — do not substitute one for the other.** Every tick that selects a
+  loop-tooling PRD sitting at `built` with a `live-ac-unproven:` /
+  `live-ac-deferred:` `last_error` runs this command once as that PRD's
+  atomic step, before any other archive action. It re-derives each `(Live`
+  AC's own named evidence; when every AC pairs or is legitimately deferred
+  it records the evidence in the archive trailer, writes a durable
+  `Live-AC-evidence:` frontmatter line, and lets `archive-commit.sh` do the
+  real git-mv + `shipped` flip (journal: `reality-check  <slug>  shipped
+  (... evidence=...)`); otherwise it leaves the PRD untouched, tracks
+  first-seen-unproven in `state/live-ac-pending/<slug>.json`, and once
+  `LIVE_AC_MAX_WALL` (default `6h`; operator-set 2026-09-17, a wall-clock
+  bound, never a tick count) has elapsed opens exactly one `decisions.sh`
+  decision per still-unproven AC, idempotent by question hash across ticks.
+  A `(Live` AC that no script ever re-checks is the exact failure shape
+  this whole marker exists to prevent, so naming the runner here is
+  load-bearing, not documentation.
 - An AC carrying both `(Real-box` and `(Live` follows the `(Real-box` rule
   (deferrable with justification) — `(Real-box` wins; no `live-ac-*`
   diagnostic fires for it. `(Real-box`'s own scope and behavior are

@@ -496,5 +496,37 @@ fi
 
 rm -rf "$T"
 
+# ---- Anti-orphan: every script this PRD ships must have a caller in the
+# real loop's own contract files. live-ac-reality-check.sh was written,
+# selftested green, and then reachable from NOTHING for a full day --
+# SKILL.md and build-contract.md both said "the reality check" without
+# naming it, and the only script by that name (reality-check.sh) has no
+# `(Live` handling at all. A (Live mechanism that no caller ever runs is
+# precisely the failure shape this whole PRD exists to prevent, so the
+# wiring is asserted mechanically here rather than trusted to prose. ----
+REPO_ROOT="$(cd "$HERE/.." && pwd -P)"
+for doc in SKILL.md build-contract.md; do
+  ck "anti-orphan: $doc names scripts/live-ac-reality-check.sh as the (Live retry runner" \
+    'grep -q "live-ac-reality-check.sh" "$REPO_ROOT/$doc"' \
+    "$doc never names the runner -- the (Live built->shipped flip has no caller"
+  ck "anti-orphan: $doc names scripts/archive-live-ac-refusal.sh as the archive refusal" \
+    'grep -q "archive-live-ac-refusal.sh" "$REPO_ROOT/$doc"' \
+    "$doc never names the archive refusal script"
+done
+# The two reality checks are distinct scripts; both contract files must say
+# so out loud, because substituting one for the other is a silent no-op.
+# (No backticks in these patterns -- ck evals its argument, so a backtick
+# inside the pattern would be command-substituted, not matched.)
+for doc in SKILL.md build-contract.md; do
+  ck "anti-orphan: $doc warns the two reality checks are not interchangeable" \
+    'grep -q "do not substitute one for the other" "$REPO_ROOT/$doc"' \
+    "$doc does not warn that reality-check.sh is the wrong script for (Live ACs"
+done
+# This suite must itself be reachable from the one selftest entrypoint,
+# or a regression in any of the above is invisible to run-selftests.sh --all.
+ck "anti-orphan: run-selftests.sh --all registry includes live-ac-selftest.sh" \
+  'grep -q "scripts/live-ac-selftest.sh" "$REPO_ROOT/scripts/run-selftests.sh"' \
+  "live-ac-selftest.sh is not in SELFTEST_REGISTRY"
+
 echo "=== $([ "$FAIL" -eq 0 ] && echo PASS || echo FAIL) ==="
 exit "$FAIL"

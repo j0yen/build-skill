@@ -83,6 +83,7 @@ SELFTEST_REGISTRY=(
   scripts/main-push-pr-path-selftest.sh
   scripts/main-verdict-pin-selftest.sh
   scripts/skill-single-source-selftest.sh
+  scripts/live-ac-selftest.sh
 )
 
 usage() { echo "usage: run-selftests.sh <name-or-path>... | --all" >&2; exit 2; }
