@@ -3650,7 +3650,17 @@ cmd_prove() {
 # write_burst_knob_env() below — never touching any OTHER line in
 # $ENV_FILE (HCLOUD_TOKEN included; write_burst_knob_env() upserts exactly
 # one `BUILD_BURST_ENABLED=` line and leaves the rest of the file alone).
-cmd_enable() {
+# _enable_core: the actual "write the drop-in" logic, factored out of
+# cmd_enable (PRD-build-burst-gate-canary-invariant R7) so canary's own
+# auto-re-enable path (AC14 — "a later passing canary ... re-enables
+# dispatch without operator action") can call the SAME sanctioned write
+# path R17 requires ("BUILD_BURST_ENABLED=1 may be written only by
+# burst-lane.sh enable") without exiting the whole process — a bare
+# `cmd_enable` call from inside cmd_canary_daily would `exit` the daily
+# run's own script, which is never what a subroutine call should do.
+# Returns (never exits): 0 on success, 3 on any refusal — identical verdict
+# space to cmd_enable's own historical exit codes, just via `return`.
+_enable_core() {
   local boot_image_id boot_image_source
   read -r boot_image_id boot_image_source <<<"$(resolve_boot_image)"
 
@@ -3694,7 +3704,7 @@ print("allow", ts, proof.get("image_id", ""))
   if [ "$verdict" != "allow" ]; then
     journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  enable  refused  (cause=$cause_or_ts)"
     echo "enable refused (cause=$cause_or_ts)" >&2
-    exit 3
+    return 3
   fi
 
   # R6/AC5: enable requires a passing canary for the CURRENT box before it
@@ -3717,12 +3727,12 @@ print("allow", ts, proof.get("image_id", ""))
     if [ "$canary_verdict" = "missing" ]; then
       journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  enable  refused  (cause=canary-missing)"
       echo "enable refused (cause=canary-missing)" >&2
-      exit 3
+      return 3
     fi
     if [ "$canary_verdict" != "pass" ]; then
       journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  enable  refused  (cause=canary-diverged)"
       echo "enable refused (cause=canary-diverged)" >&2
-      exit 3
+      return 3
     fi
   fi
 
@@ -3748,7 +3758,15 @@ json.dump({"ts": ts, "canary_verdict": canary_verdict, "canary_ts": canary_ts, "
 
   journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  enable  done  (proof_ts=$cause_or_ts image_id=$image_id canary=$canary_verdict)"
   echo "enable done: image_id=$image_id"
-  exit 0
+  return 0
+}
+
+# cmd_enable: the CLI entry point, unchanged behavior for every existing
+# caller/selftest — just a process-exiting wrapper around _enable_core now.
+cmd_enable() {
+  _enable_core
+  local rc=$?
+  exit "$rc"
 }
 
 # R17: upserts exactly one `BUILD_BURST_ENABLED=<val>` line in $ENV_FILE,
@@ -3783,13 +3801,22 @@ remove_burst_dropin() {
   write_burst_knob_env 0
 }
 
-cmd_disable() {
+# _disable_core: same "return not exit" split as _enable_core above
+# (PRD-build-burst-gate-canary-invariant R7) — canary-daily's confirmed-
+# divergence path (AC13, confirm=2/2) calls this directly rather than
+# `exit`ing its own script mid-run.
+_disable_core() {
   # $1 optional cause — defaults to "operator" (a manual `disable` call).
   local cause="${1:-operator}"
   remove_burst_dropin
   journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  disable  done  (cause=$cause)"
   echo "disable done (cause=$cause)"
-  exit 0
+  return 0
+}
+
+cmd_disable() {
+  _disable_core "${1:-operator}"
+  exit $?
 }
 
 # ---- auto-disable (PRD-build-burst-dispatch-reenable requirement 5) --------
@@ -3987,8 +4014,27 @@ CANARY_REPO="${BURST_LANE_CANARY_REPO:-${BURST_PROVE_MCPHOST_REPO:-$HOME/winterm
 CANARY_GATE_LAUNCH="${BURST_LANE_CANARY_GATE_LAUNCH:-$HERE/gate-launch.sh}"
 CANARY_RECEIPT_DIFF="${BURST_LANE_CANARY_RECEIPT_DIFF:-$HERE/gate-receipt-diff.sh}"
 CANARY_GH="${BURST_LANE_GH:-gh}"
+# R7: shared gate-red alarm channel (PRD-build-gate-red-alarm-invariant),
+# same rule select-tick.sh's R17 knob-ownership alarm already uses — never
+# a second, competing notifier for burst-lane's own alarms.
+ALERT_DELIVER="${ALERT_DELIVER:-$HERE/alert-deliver.sh}"
 CANARY_BASELINE_ROOT="$STATE_DIR/canary-baseline"
 CANARY_RUNS_ROOT="$STATE_DIR/canary-runs"
+# canary_run_variant_main/_branch are invoked as `v="$(canary_run_variant_*
+# ...)"` — a command substitution, which bash always runs in a subshell.
+# A bash global assigned INSIDE that subshell (the original
+# CANARY_LAST_DIVERGED_LINES design) never survives back to the caller —
+# confirmed empirically while writing this PRD's own R7 selftest (a real
+# divergence journaled correctly via the function's own stdout-captured
+# verdict, but canary.json's diverged[] stayed permanently empty and
+# CANARY_CORE_FIRST_DIVERGED_PRODUCER was always blank, because nothing
+# ever actually exercised a full canary_run_variant_* call before now —
+# every earlier canary selftest short-circuited before reaching one, via
+# --head-only inflight/no-green-head refusals or a hand-seeded canary.json
+# skipping _canary_core entirely). Fixed by routing the diverged-lines
+# payload through a file instead of a variable — same tmp+mv-adjacent
+# pattern every other cross-boundary handoff in this file already uses.
+CANARY_DIVERGED_LINES_FILE="$STATE_DIR/.canary-last-diverged-lines"
 
 # canary_repo_slug <repo> -> stdout "owner/name" from origin's URL, or empty.
 canary_repo_slug() {
@@ -4144,7 +4190,7 @@ canary_build_baseline() {
 }
 
 # canary_run_variant_main <head_sha> <baseline_dir> <baseline_state> <server_id>
-# -> stdout verdict (pass|block|diverged); sets CANARY_LAST_DIVERGED_LINES.
+# -> stdout verdict (pass|block|diverged); writes $CANARY_DIVERGED_LINES_FILE.
 canary_run_variant_main() {
   local head_sha="$1" baseline_dir="$2" baseline_state="$3" server_id="$4"
   local ts rc=0 verdict="pass" n_diverged=0
@@ -4160,15 +4206,14 @@ canary_run_variant_main() {
     diverged_lines="$(canary_diverged_lines "$baseline_dir" "$run_dir")"
     [ -n "$diverged_lines" ] && verdict="diverged" && n_diverged="$(printf '%s\n' "$diverged_lines" | grep -c .)"
   fi
-  CANARY_LAST_DIVERGED_LINES="$diverged_lines"
-  CANARY_LAST_RUN_DIR="$run_dir"
+  printf '%s' "$diverged_lines" > "$CANARY_DIVERGED_LINES_FILE"
   local receipts_n; receipts_n="$(find "$run_dir" -maxdepth 1 -name '*.json' 2>/dev/null | grep -c .)"
   journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  canary  main  $verdict  (head=$head_sha receipts=$receipts_n diverged=$n_diverged route=burst:${server_id:-unknown})"
   printf '%s\n' "$verdict"
 }
 
 # canary_run_variant_branch <head_sha> <baseline_dir> <baseline_state> <server_id>
-# -> stdout verdict (pass|block|diverged); sets CANARY_LAST_DIVERGED_LINES.
+# -> stdout verdict (pass|block|diverged); writes $CANARY_DIVERGED_LINES_FILE.
 # The throwaway branch/worktree is never pushed and is deleted after (R3,
 # Technical considerations).
 canary_run_variant_branch() {
@@ -4179,7 +4224,7 @@ canary_run_variant_branch() {
   wt="$(mktemp -u "${TMPDIR:-/tmp}/burst-canary-branch.XXXXXX")"
   if ! git -C "$CANARY_REPO" worktree add -b "$branch" "$wt" "$head_sha" >/dev/null 2>&1; then
     journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  canary  branch  block  (head=$head_sha cause=worktree-add-failed)"
-    CANARY_LAST_DIVERGED_LINES=""
+    printf '' > "$CANARY_DIVERGED_LINES_FILE"
     printf 'block\n'
     return 0
   fi
@@ -4196,8 +4241,7 @@ canary_run_variant_branch() {
     diverged_lines="$(canary_diverged_lines "$baseline_dir" "$run_dir")"
     [ -n "$diverged_lines" ] && verdict="diverged" && n_diverged="$(printf '%s\n' "$diverged_lines" | grep -c .)"
   fi
-  CANARY_LAST_DIVERGED_LINES="$diverged_lines"
-  CANARY_LAST_RUN_DIR="$run_dir"
+  printf '%s' "$diverged_lines" > "$CANARY_DIVERGED_LINES_FILE"
   local receipts_n; receipts_n="$(find "$run_dir" -maxdepth 1 -name '*.json' 2>/dev/null | grep -c .)"
   journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  canary  branch  $verdict  (head=$branch_head receipts=$receipts_n diverged=$n_diverged route=burst:${server_id:-unknown})"
   git -C "$CANARY_REPO" worktree remove --force "$wt" >/dev/null 2>&1 || rm -rf "$wt"
@@ -4257,42 +4301,38 @@ json.dump(d, open(out_path, "w"), indent=2, sort_keys=True)
   mv -f "$tmp" "$out_file"
 }
 
-cmd_canary() {
-  local head="" variants="main,branch,delta" no_baseline=false
-  while [ $# -gt 0 ]; do
-    case "$1" in
-      --head) head="${2:?canary: --head needs a value}"; shift 2 ;;
-      --variants) variants="${2:?canary: --variants needs a value}"; shift 2 ;;
-      --no-baseline) no_baseline=true; shift ;;
-      *) echo "usage: burst-lane.sh canary [--head <sha>] [--variants main,branch,delta] [--no-baseline]" >&2; exit 2 ;;
-    esac
-  done
+# _canary_core <head> <variants> <no_baseline> -> return 0 (pass), 1
+# (block/diverged), 4 (no-green-head). NEVER exits, NEVER takes the
+# inflight lock -- both are the caller's job (PRD-build-burst-gate-canary-
+# invariant R7): cmd_canary and cmd_canary_daily's own re-run-the-diverged-
+# variant step both need to invoke "one canary run" more than once inside a
+# single inflight-lock hold, which an `exit`-terminated function can't do.
+# Sets, for the caller to read: CANARY_CORE_HEAD (resolved sha),
+# CANARY_CORE_HEAD_SOURCE, CANARY_CORE_SERVER_ID, CANARY_CORE_V_MAIN/
+# _V_BRANCH/_V_DELTA (each pass|block|diverged|delta-pass|unknown|skipped),
+# CANARY_CORE_DIVERGED_NDJSON (gate-receipt-diff.sh's own DIVERGED lines,
+# newline-joined across variants), CANARY_CORE_FIRST_DIVERGED_PRODUCER
+# (first token of the first diverged line, empty when nothing diverged).
+_canary_core() {
+  local head="$1" variants="$2" no_baseline="$3"
 
   mkdir -p "$BOX_STATE_DIR" "$CANARY_BASELINE_ROOT" "$CANARY_RUNS_ROOT"
-
-  # Non-functional: never more than one canary in flight per box.
-  local canary_lock="$BOX_STATE_DIR/canary.inflight.lock"
-  exec {_canary_lock_fd}>"$canary_lock"
-  if ! flock -n "$_canary_lock_fd"; then
-    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  canary  refused  (cause=inflight)"
-    echo "canary refused (cause=inflight)" >&2
-    exit 3
-  fi
-  printf 'pid=%s\nstart_epoch=%s\n' "$$" "$(now_epoch)" > "$BOX_STATE_DIR/canary.inflight"
-  trap 'rm -f "$BOX_STATE_DIR/canary.inflight"' EXIT
 
   local resolved head_sha head_source
   if ! resolved="$(canary_resolve_head "$CANARY_REPO" "$head")"; then
     journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  canary  refused  (cause=no-green-head)"
     echo "canary refused (cause=no-green-head)" >&2
-    exit 4
+    return 4
   fi
   read -r head_sha head_source <<<"$resolved"
+  CANARY_CORE_HEAD="$head_sha"
+  CANARY_CORE_HEAD_SOURCE="$head_source"
 
   local server_id; server_id="$(state_read server_id)"
   local image_id; image_id="$(state_read image_id)"
   local box_dir; box_dir="$(box_path_for "$server_id" "")"; box_dir="${box_dir%/}"
   mkdir -p "$box_dir"
+  CANARY_CORE_SERVER_ID="$server_id"
 
   local baseline_dir="" baseline_state="absent"
   if [ "$no_baseline" = true ]; then
@@ -4315,11 +4355,14 @@ cmd_canary() {
     case "$w" in
       main)
         v_main="$(canary_run_variant_main "$head_sha" "$baseline_dir" "$baseline_state" "$server_id")"
-        [ -n "$CANARY_LAST_DIVERGED_LINES" ] && diverged_ndjson="$diverged_ndjson$CANARY_LAST_DIVERGED_LINES"$'\n'
+        local _dl; _dl="$(cat "$CANARY_DIVERGED_LINES_FILE" 2>/dev/null || true)"
+        [ -n "$_dl" ] && diverged_ndjson="$diverged_ndjson$_dl"$'\n'
+        [ "$v_main" = "pass" ] && canary_record_routed_main_pass "$head_sha"
         ;;
       branch)
         v_branch="$(canary_run_variant_branch "$head_sha" "$baseline_dir" "$baseline_state" "$server_id")"
-        [ -n "$CANARY_LAST_DIVERGED_LINES" ] && diverged_ndjson="$diverged_ndjson$CANARY_LAST_DIVERGED_LINES"$'\n'
+        local _dl; _dl="$(cat "$CANARY_DIVERGED_LINES_FILE" 2>/dev/null || true)"
+        [ -n "$_dl" ] && diverged_ndjson="$diverged_ndjson$_dl"$'\n'
         ;;
       delta)
         v_delta="$(canary_run_variant_delta "$head_sha" "$server_id")"
@@ -4332,14 +4375,229 @@ cmd_canary() {
     "${image_id:-unknown}" "$baseline_dir" "$v_main" "$v_branch" "$v_delta" "$diverged_ndjson"
   cp -f "$box_dir/canary.json" "$STATE_DIR/canary.json" 2>/dev/null || true
 
-  rm -f "$BOX_STATE_DIR/canary.inflight"
-  trap - EXIT
-  flock -u "$_canary_lock_fd" 2>/dev/null || true
+  CANARY_CORE_V_MAIN="$v_main"; CANARY_CORE_V_BRANCH="$v_branch"; CANARY_CORE_V_DELTA="$v_delta"
+  CANARY_CORE_DIVERGED_NDJSON="$diverged_ndjson"
+  CANARY_CORE_FIRST_DIVERGED_PRODUCER="$(printf '%s\n' "$diverged_ndjson" | awk 'NF{print $1; exit}')"
 
   case " $v_main $v_branch $v_delta " in
-    *" block "*|*" diverged "*) exit 1 ;;
-    *) exit 0 ;;
+    *" block "*|*" diverged "*) return 1 ;;
+    *) return 0 ;;
   esac
+}
+
+# _canary_take_inflight_lock / _canary_release_inflight_lock: the
+# Non-functional "never more than one canary in flight per box" guard,
+# factored out so both cmd_canary and cmd_canary_daily (R7) share exactly
+# one lock file and exactly one inflight-marker convention — a daily-timer
+# run and an operator's `canary` invocation racing each other is exactly
+# what this lock exists to prevent, not just two `canary` calls.
+# Returns 1 (lock held elsewhere) without journaling -- callers journal
+# their own "refused (cause=inflight)" line since the two commands use
+# slightly different verbs (canary vs canary-daily).
+_canary_take_inflight_lock() {
+  mkdir -p "$BOX_STATE_DIR"
+  local canary_lock="$BOX_STATE_DIR/canary.inflight.lock"
+  exec {_CANARY_LOCK_FD}>"$canary_lock"
+  flock -n "$_CANARY_LOCK_FD" || return 1
+  printf 'pid=%s\nstart_epoch=%s\n' "$$" "$(now_epoch)" > "$BOX_STATE_DIR/canary.inflight"
+  trap 'rm -f "$BOX_STATE_DIR/canary.inflight"' EXIT
+  return 0
+}
+_canary_release_inflight_lock() {
+  rm -f "$BOX_STATE_DIR/canary.inflight"
+  trap - EXIT
+  flock -u "$_CANARY_LOCK_FD" 2>/dev/null || true
+}
+
+cmd_canary() {
+  local head="" variants="main,branch,delta" no_baseline=false
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --head) head="${2:?canary: --head needs a value}"; shift 2 ;;
+      --variants) variants="${2:?canary: --variants needs a value}"; shift 2 ;;
+      --no-baseline) no_baseline=true; shift ;;
+      *) echo "usage: burst-lane.sh canary [--head <sha>] [--variants main,branch,delta] [--no-baseline]" >&2; exit 2 ;;
+    esac
+  done
+
+  if ! _canary_take_inflight_lock; then
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  canary  refused  (cause=inflight)"
+    echo "canary refused (cause=inflight)" >&2
+    exit 3
+  fi
+
+  _canary_core "$head" "$variants" "$no_baseline"
+  local rc=$?
+
+  # AC14: an operator-run canary that comes back pass also clears a prior
+  # confirmed-divergence disable — "a later passing canary (daily or
+  # operator-run) re-enables dispatch without operator action" (R7). A
+  # no-green-head refusal (rc=4) never reaches here.
+  [ "$rc" -eq 0 ] && canary_maybe_reenable "$CANARY_CORE_HEAD"
+
+  _canary_release_inflight_lock
+  [ "$rc" -eq 4 ] && exit 4
+  [ "$rc" -eq 0 ] && exit 0
+  exit 1
+}
+
+# canary_record_routed_main_pass <head_sha> — R7's own signal for "a routed
+# --scope main gate at a green HEAD passed" (AC12's cadence check): the
+# main variant IS exactly that gate (BURST_LANE=1, --scope main, against a
+# green-resolved head — see canary_run_variant_main above), so its own pass
+# is what the daily timer's skip check reads, rather than inventing a
+# second, competing notion of "a routed main pass" from production
+# dispatch telemetry this PRD does not otherwise touch. Written atomically,
+# same tmp+mv convention as canary.json.
+canary_record_routed_main_pass() {
+  local head_sha="$1" out="$BOX_STATE_DIR/canary-last-routed-main-pass.json"
+  mkdir -p "$BOX_STATE_DIR"
+  local tmp; tmp="$(mktemp "$BOX_STATE_DIR/.routed-main-pass.XXXXXX")"
+  printf '{"head": "%s", "ts": "%s"}\n' "$head_sha" "$(now_iso)" > "$tmp"
+  mv -f "$tmp" "$out"
+}
+
+# canary_recent_routed_main_pass_age_h -> stdout age in hours (float) since
+# the last recorded routed main pass, or empty when none exists.
+canary_recent_routed_main_pass_age_h() {
+  local f="$BOX_STATE_DIR/canary-last-routed-main-pass.json"
+  [ -f "$f" ] || { printf ''; return 0; }
+  python3 -c '
+import calendar, json, time, sys
+try:
+    d = json.load(open(sys.argv[1]))
+    t = time.strptime(d.get("ts", ""), "%Y-%m-%dT%H:%M:%SZ")
+    print("%.4f" % ((time.time() - calendar.timegm(t)) / 3600.0))
+except Exception:
+    pass
+' "$f"
+}
+
+# canary_maybe_reenable <head_sha> — AC14: when dispatch is currently
+# disabled by a CONFIRMED canary divergence (marker written by
+# cmd_canary_daily's confirm=2/2 path below), a later passing canary
+# re-enables it via _enable_core (the one sanctioned R17 write path) and
+# journals `canary re-enable (after=diverged@<ts>)` — no operator command.
+# A marker with no matching successful _enable_core call (e.g. proof.json
+# stale/missing) is left in place; the next passing canary tries again.
+canary_maybe_reenable() {
+  local marker="$BOX_STATE_DIR/canary-disabled-since.json"
+  [ -f "$marker" ] || return 0
+  local diverged_ts; diverged_ts="$(python3 -c 'import json,sys
+try: print(json.load(open(sys.argv[1])).get("ts",""))
+except Exception: print("")' "$marker" 2>/dev/null)"
+  if _enable_core >/dev/null 2>&1; then
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  canary  re-enable  (after=diverged@${diverged_ts:-unknown})"
+    rm -f "$marker"
+  fi
+}
+
+# ---- daily cadence + confirm-twice divergence (PRD-build-burst-gate-
+# canary-invariant R7) ---------------------------------------------------
+# cmd_canary_daily is the ONLY thing claude-burst-canary.timer/.service
+# invoke. It is deliberately separate from `canary` itself (not a flag on
+# it): the cadence skip (AC12) and the confirm-twice/auto-disable state
+# machine (AC6/AC13/AC14) are timer-specific behavior an operator's own
+# `burst-lane.sh canary` call must never inherit (Migration: "burst-lane.sh
+# canary" stays a plain, single-shot proof run for a human at the terminal).
+#
+# Sequence per R7:
+#   1. Skip (no lock taken, nothing run) when a routed --scope main gate at
+#      a green HEAD already passed within the last 24h — AC12.
+#   2. Otherwise take the SAME inflight lock `canary` uses, run one full
+#      canary (_canary_core, default 3 variants).
+#   3. pass  -> canary_maybe_reenable, done.
+#      diverged/block -> alarm via alert-deliver.sh AT ONCE, journal
+#      `canary diverged (confirm=pending producer=<p> route=burst:<id>)`,
+#      immediately re-run ONLY the variant(s) that diverged against the
+#      SAME head (a fresh, independent second data point, not a cached
+#      re-read) — AC13.
+#        re-run pass     -> journal `canary flake (producer=<p>
+#                            route=burst:<id>)`, dispatch stays enabled.
+#        re-run diverged -> _disable_core canary (confirm=2/2), journal
+#                            `canary diverged (confirm=2/2 producer=<p>
+#                            route=burst:<id>)`, write the
+#                            canary-disabled-since.json marker
+#                            canary_maybe_reenable reads later (AC14).
+cmd_canary_daily() {
+  # R7: "fires once per box-day WHILE A SESSION IS ACTIVE" -- no active
+  # box means nothing to prove and no route=burst context for the journal/
+  # alarm lines below, so the timer's hourly wakeup is a silent no-op
+  # rather than a wasted canary run (or worse, one attributed to "unknown").
+  local active_server_id; active_server_id="$(state_read server_id)"
+  if [ -z "$active_server_id" ]; then
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  canary-daily  skipped  (cause=no-active-session)"
+    echo "canary-daily skipped (cause=no-active-session)"
+    exit 0
+  fi
+
+  local age_h; age_h="$(canary_recent_routed_main_pass_age_h)"
+  if [ -n "$age_h" ] && awk -v a="$age_h" 'BEGIN{exit !(a<24)}'; then
+    local head; head="$(python3 -c 'import json,sys
+try: print(json.load(open(sys.argv[1])).get("head",""))
+except Exception: print("")' "$BOX_STATE_DIR/canary-last-routed-main-pass.json" 2>/dev/null)"
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  canary  skipped  (cause=recent-routed-pass head=$head age_h=$age_h)"
+    echo "canary-daily skipped (cause=recent-routed-pass age_h=$age_h)"
+    exit 0
+  fi
+
+  if ! _canary_take_inflight_lock; then
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  canary-daily  refused  (cause=inflight)"
+    echo "canary-daily refused (cause=inflight)" >&2
+    exit 3
+  fi
+
+  _canary_core "" "main,branch,delta" false
+  local rc=$? head_sha="${CANARY_CORE_HEAD:-}" server_id="${CANARY_CORE_SERVER_ID:-}"
+
+  if [ "$rc" -eq 4 ]; then
+    _canary_release_inflight_lock
+    exit 4
+  fi
+
+  if [ "$rc" -eq 0 ]; then
+    canary_maybe_reenable "$head_sha"
+    _canary_release_inflight_lock
+    exit 0
+  fi
+
+  # rc==1: at least one variant diverged/blocked. Alarm at once (R7 "on
+  # divergence it alarms through alert-deliver.sh at once"), then re-run
+  # ONLY the diverged variant(s) against the same head.
+  local producer="${CANARY_CORE_FIRST_DIVERGED_PRODUCER:-unknown}"
+  journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  canary  diverged  (confirm=pending producer=$producer route=burst:${server_id:-unknown})"
+  local evidence; evidence="$(mktemp "${TMPDIR:-/tmp}/canary-daily-alarm.XXXXXX")"
+  printf 'value=1 -- canary diverged (confirm=pending producer=%s route=burst:%s head=%s)\n' \
+    "$producer" "${server_id:-unknown}" "$head_sha" > "$evidence"
+  "$ALERT_DELIVER" gate-red build-loop "$evidence" >/dev/null 2>&1 || true
+  rm -f "$evidence"
+
+  local -a rerun_variants=()
+  case "$CANARY_CORE_V_MAIN" in block|diverged) rerun_variants+=("main") ;; esac
+  case "$CANARY_CORE_V_BRANCH" in block|diverged) rerun_variants+=("branch") ;; esac
+  case "$CANARY_CORE_V_DELTA" in block|diverged) rerun_variants+=("delta") ;; esac
+  [ "${#rerun_variants[@]}" -gt 0 ] || rerun_variants=("main" "branch" "delta")
+  local rerun_csv; rerun_csv="$(IFS=,; printf '%s' "${rerun_variants[*]}")"
+
+  _canary_core "$head_sha" "$rerun_csv" false
+  local rerun_rc=$?
+
+  if [ "$rerun_rc" -eq 0 ]; then
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  canary  flake  (producer=$producer route=burst:${server_id:-unknown})"
+    canary_maybe_reenable "$head_sha"
+    _canary_release_inflight_lock
+    exit 0
+  fi
+
+  local rerun_producer="${CANARY_CORE_FIRST_DIVERGED_PRODUCER:-$producer}"
+  _disable_core canary
+  journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  canary  diverged  (confirm=2/2 producer=$rerun_producer route=burst:${server_id:-unknown})"
+  local marker_tmp; marker_tmp="$(mktemp "$BOX_STATE_DIR/.canary-disabled.XXXXXX")"
+  printf '{"ts": "%s", "producer": "%s", "head": "%s"}\n' "$(now_iso)" "$rerun_producer" "$head_sha" > "$marker_tmp"
+  mv -f "$marker_tmp" "$BOX_STATE_DIR/canary-disabled-since.json"
+
+  _canary_release_inflight_lock
+  exit 1
 }
 
 cmd_up() {
@@ -10492,6 +10750,7 @@ main() {
     enable)    cmd_enable "$@" ;;
     disable)   cmd_disable "$@" ;;
     canary)    cmd_canary "$@" ;;
+    canary-daily) cmd_canary_daily "$@" ;;
     # Undocumented/hidden — PRD-build-burst-unprivileged-user requirement 1:
     # a pure read-only print of the resolved remote identity/paths, no ssh,
     # no filesystem writes outside $STATE_DIR's own mkdir at file top. Exists

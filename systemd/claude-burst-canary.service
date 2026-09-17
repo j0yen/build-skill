@@ -1,0 +1,13 @@
+[Unit]
+Description=One burst-lane canary-daily decision (PRD-build-burst-gate-canary-invariant R7: cadence skip + confirm-twice divergence/auto-disable/auto-re-enable state machine all live inside canary-daily itself)
+
+[Service]
+Type=oneshot
+Environment=HOME=/home/jsy
+Environment=PATH=/home/jsy/.local/bin:/home/jsy/.cargo/bin:/home/jsy/.npm-global/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/home/jsy/.claude/skills/build/scripts/burst-lane.sh canary-daily
+# A real canary run costs up to one gate wall per variant re-run (Non-
+# functional: <=1 gate wall + 2min/extra variant, cold ~25min) -- generous
+# ceiling so a genuinely slow cold run/re-run pair is never killed mid-way
+# and left in an ambiguous confirm state.
+TimeoutStartSec=4200

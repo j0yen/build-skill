@@ -1,0 +1,12 @@
+[Unit]
+Description=Run burst-lane.sh canary-daily hourly (PRD-build-burst-gate-canary-invariant R7 -- the service itself enforces once-per-box-day + recent-routed-pass skip, so an hourly wakeup just gives the box's own day/session boundaries a chance to be caught promptly rather than missed for up to 24h)
+
+[Timer]
+OnBootSec=20min
+OnUnitActiveSec=1h
+AccuracySec=5min
+Persistent=true
+Unit=claude-burst-canary.service
+
+[Install]
+WantedBy=timers.target
