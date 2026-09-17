@@ -38,8 +38,17 @@
 set -uo pipefail
 
 SKILL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-# Allow override via environment for testing; default to skill's own state dir
-STATE_DIR="${STATE_DIR:-$SKILL_DIR/state}"
+# Allow override via environment for testing; default to skill's own state dir.
+# PRD-build-main-push-gate-pr-path: every sibling script in this family
+# (branch-protection.sh, decisions.sh, alert-deliver.sh, lib/push-via-branch.sh)
+# resolves its state root as `${BUILD_STATE_DIR:-$SKILL_DIR/state}` — this
+# script used to key off the bare `STATE_DIR` only, with no BUILD_STATE_DIR
+# fallback, so a caller (or a worktree selftest) that exported only
+# BUILD_STATE_DIR — the norm everywhere else — silently fell through to the
+# real skill's production state/ instead of the isolated one. `STATE_DIR` is
+# still honored (and still wins) for any existing direct caller, but
+# BUILD_STATE_DIR is now the primary knob, matching the rest of the family.
+STATE_DIR="${STATE_DIR:-${BUILD_STATE_DIR:-$SKILL_DIR/state}}"
 STATUS_DIR="${STATUS_DIR:-$STATE_DIR/status}"
 JQ="${JQ:-jq}"
 
