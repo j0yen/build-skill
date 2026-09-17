@@ -80,6 +80,7 @@ SELFTEST_REGISTRY=(
   scripts/secret-store-selftest.sh
   scripts/routepar-selftest.sh
   scripts/canary-selftest.sh
+  scripts/main-push-pr-path-selftest.sh
 )
 
 usage() { echo "usage: run-selftests.sh <name-or-path>... | --all" >&2; exit 2; }
