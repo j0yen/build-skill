@@ -59,6 +59,8 @@ OWNER="${BRANCH_PROTECTION_OWNER:-j0yen}"
 source "$HERE/lib/journal.sh"
 # shellcheck source=lib/push-via-branch.sh
 source "$HERE/lib/push-via-branch.sh"
+# shellcheck source=lib/repo-slug.sh
+source "$HERE/lib/repo-slug.sh"
 
 usage() {
   echo "usage: branch-protection.sh enable <repo> [--check <name>]..." >&2
@@ -186,7 +188,7 @@ cmd_enable() {
   [ -n "$repo_arg" ] || { usage; exit 2; }
 
   local repo_dir; repo_dir="$(resolve_repo_dir "$repo_arg")" || die 4 "repo not found locally: $repo_arg"
-  local repo_slug; repo_slug="$(basename "$repo_dir")"
+  local repo_slug; repo_slug="$(repo_slug_for_ci "$repo_dir")"
 
   local -a resolved=()
   if [ "${#checks[@]}" -eq 0 ]; then
@@ -245,7 +247,7 @@ cmd_status() {
   local repo_arg="${1:-}"
   [ -n "$repo_arg" ] || { usage; exit 2; }
   local repo_dir; repo_dir="$(resolve_repo_dir "$repo_arg")" || die 4 "repo not found locally: $repo_arg"
-  local repo_slug; repo_slug="$(basename "$repo_dir")"
+  local repo_slug; repo_slug="$(repo_slug_for_ci "$repo_dir")"
 
   local out rc
   out="$(gh api "repos/$OWNER/$repo_slug/branches/main/protection" 2>&1)"
@@ -351,7 +353,7 @@ cmd_push() {
   [ -n "$repo_arg" ] && [ -n "$slug" ] || { usage; exit 2; }
 
   local repo_dir; repo_dir="$(resolve_repo_dir "$repo_arg")" || die 4 "repo not found locally: $repo_arg"
-  local repo_slug; repo_slug="$(basename "$repo_dir")"
+  local repo_slug; repo_slug="$(repo_slug_for_ci "$repo_dir")"
   local via_branch; via_branch="$(push_via_branch_for "$repo_slug")"
 
   if [ "$via_branch" != "true" ]; then
@@ -428,7 +430,7 @@ cmd_landing_check() {
   local repo_arg="${1:-}" slug="${2:-}"
   [ -n "$repo_arg" ] && [ -n "$slug" ] || { usage; exit 2; }
   local repo_dir; repo_dir="$(resolve_repo_dir "$repo_arg")" || die 4 "repo not found locally: $repo_arg"
-  local repo_slug; repo_slug="$(basename "$repo_dir")"
+  local repo_slug; repo_slug="$(repo_slug_for_ci "$repo_dir")"
   local record; record="$(landing_record_path "$repo_slug" "$slug")"
   [ -f "$record" ] || die 4 "no landing record at $record"
 
@@ -559,7 +561,7 @@ cmd_pr_checks() {
   local repo_arg="${1:-}" slug="${2:-}"
   [ -n "$repo_arg" ] && [ -n "$slug" ] || { usage; exit 2; }
   local repo_dir; repo_dir="$(resolve_repo_dir "$repo_arg")" || die 4 "repo not found locally: $repo_arg"
-  local repo_slug; repo_slug="$(basename "$repo_dir")"
+  local repo_slug; repo_slug="$(repo_slug_for_ci "$repo_dir")"
   local record; record="$(landing_record_path "$repo_slug" "$slug")"
   [ -f "$record" ] || die 4 "no landing record at $record"
 
@@ -635,7 +637,7 @@ cmd_sync() {
   local repo_arg="${1:-}"
   [ -n "$repo_arg" ] || { usage; exit 2; }
   local repo_dir; repo_dir="$(resolve_repo_dir "$repo_arg")" || die 4 "repo not found locally: $repo_arg"
-  local repo_slug; repo_slug="$(basename "$repo_dir")"
+  local repo_slug; repo_slug="$(repo_slug_for_ci "$repo_dir")"
 
   git -C "$repo_dir" fetch origin main >/dev/null 2>&1 || true
 
