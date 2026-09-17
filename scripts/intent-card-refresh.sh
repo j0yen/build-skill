@@ -267,6 +267,30 @@ def strip_val(v):
     return v
 
 
+def truncate_utf8_bytes(text, max_bytes):
+    # PRD-mcphost-first-call-reliability: intake.rs's schema validates
+    # string-length limits as UTF-8 BYTE length (Rust String::len()), but
+    # Python's len() counts codepoints -- a string with em-dashes/ellipses/
+    # curly quotes (each 3 bytes in UTF-8, 1 codepoint in Python) truncated
+    # to <=max_bytes codepoints can still exceed max_bytes BYTES, so
+    # card-lint rejects the generated card. Truncate by encoded byte length
+    # instead, leaving room for the trailing "...", and never split a
+    # multi-byte UTF-8 sequence.
+    encoded = text.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return text
+    truncated = encoded[: max_bytes - 3]
+    while truncated:
+        try:
+            text = truncated.decode("utf-8")
+            break
+        except UnicodeDecodeError:
+            truncated = truncated[:-1]
+    else:
+        text = ""
+    return text.rstrip() + "..."
+
+
 def parse_frontmatter(path):
     fields = {}
     in_fence = False
@@ -342,22 +366,9 @@ def extract_root_motivation(all_lines):
     # near the boundary truncated to <=1000 codepoints yet still exceeded
     # 1000 bytes, so card-lint rejected the generated card and the refresh
     # silently no-opped (previous card left stale). Truncate by encoded
-    # byte length instead, leaving room for the trailing "...".
-    encoded = text.encode("utf-8")
-    if len(encoded) > 1000:
-        truncated = encoded[:997]
-        # Never split a multi-byte UTF-8 sequence: drop trailing bytes
-        # until what's left decodes cleanly.
-        while truncated:
-            try:
-                text = truncated.decode("utf-8")
-                break
-            except UnicodeDecodeError:
-                truncated = truncated[:-1]
-        else:
-            text = ""
-        text = text.rstrip() + "..."
-    return text
+    # byte length instead (see truncate_utf8_bytes), leaving room for the
+    # trailing "...".
+    return truncate_utf8_bytes(text, 1000)
 
 
 def ac_section_lines(all_lines):
@@ -402,8 +413,10 @@ def extract_acceptance_criteria(all_lines, test_map):
         num, level_code, first_desc = m.group(1), m.group(2), m.group(3)
         desc_parts = [first_desc] + it[1:]
         desc = " ".join(p.strip() for p in desc_parts if p.strip()).strip()
-        if len(desc) > 500:
-            desc = desc[:497].rstrip() + "..."
+        # Byte-safe truncation (see truncate_utf8_bytes) -- same defect
+        # class as extract_root_motivation above: intake.rs's schema
+        # validates this 500 limit as UTF-8 byte length, not codepoints.
+        desc = truncate_utf8_bytes(desc, 500)
         ac_id = f"AC{num}"
         test = test_map.get(ac_id) or f"tests/acceptance_ac{num}.rs"
         acs.append({
