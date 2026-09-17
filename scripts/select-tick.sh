@@ -62,10 +62,10 @@
 # select-guard.sh's caller-threaded branch-count/admitted-targets).
 #
 # Known scope gaps (iter-1 scaffold, PRD requirement 1's hard pre-filter):
-#   - "verified-within-24h": state/manifest.json has no `verified_at`
-#     timestamp field anywhere in this repo today, so there is nothing to
-#     key that leg on yet. Wired below to a `verified_at` manifest field if
-#     one ever appears; a no-op until then.
+#   - "verified-within-24h" is keyed on `action`/`last_action` (decision
+#     bced982e; SKILL.md's own contract) -- a `verified_at` field was tried
+#     first, but nothing in this repo ever writes it, so that leg was a
+#     permanent no-op.
 #   - `status: in_progress` is treated identically to `status: queued`
 #     (SKILL.md's "in_progress AND last_action >= 1h ago" staleness
 #     refinement is not mechanized this iteration).
@@ -189,7 +189,7 @@ queue_json="$(printf '%s' "$pool_json" | "$JQ" -c '[.[] | select(.path | test("/
 STAGE_PY="$(mktemp "${TMPDIR:-/tmp}/select-tick-stage.XXXXXX.py")"
 trap 'rm -f "$STAGE_PY"' EXIT
 cat > "$STAGE_PY" <<'PYEOF'
-import json, os, re, sys
+import datetime, json, os, re, sys
 
 manifest_path, lane = sys.argv[1], sys.argv[2]
 pool = json.loads(sys.stdin.read())
@@ -260,18 +260,20 @@ for c in pool:
     if status in HARD_BLOCK_STATUSES:
         prefiltered.append({"slug": slug, "reason": status, "detail": f"manifest status={status}"})
         continue
-    # requirement 1's "verified-within-24h" leg: no verified_at field exists
-    # in state/manifest.json anywhere in this repo yet (iter-1 scope gap,
-    # documented in select-tick.sh's own header) -- wired here so it starts
-    # working the moment one is added, a no-op until then.
-    verified_at = entry.get("verified_at")
-    if verified_at:
+    # requirement 1's "verified-within-24h" leg, keyed on the contract
+    # SKILL.md actually documents (`status: queued` but `last_action` is
+    # within 24h with `action: verified-*`) -- NOT the `verified_at` field
+    # nothing in this repo ever writes (build-burst-gate-canary-invariant
+    # burned 10 dispatches re-admitting a verified-blocked PRD every tick
+    # with no cooldown, decision bced982e).
+    action = (entry.get("action") or "").strip()
+    last_action = entry.get("last_action")
+    if status == "queued" and action.startswith("verified-") and last_action:
         try:
-            import datetime
-            vt = datetime.datetime.strptime(verified_at, "%Y-%m-%dT%H:%M:%SZ")
-            age_h = (datetime.datetime.utcnow() - vt).total_seconds() / 3600.0
-            if age_h < 24 and status == "queued":
-                prefiltered.append({"slug": slug, "reason": "verified-within-24h", "detail": f"verified_at={verified_at}"})
+            la = datetime.datetime.strptime(last_action, "%Y-%m-%dT%H:%M:%SZ")
+            age_h = (datetime.datetime.utcnow() - la).total_seconds() / 3600.0
+            if age_h < 24:
+                prefiltered.append({"slug": slug, "reason": "verified-within-24h", "detail": f"action={action} last_action={last_action}"})
                 continue
         except Exception:
             pass
