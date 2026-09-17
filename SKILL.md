@@ -1940,6 +1940,19 @@ this is the number the PRD's own "≥90% of lands" success metric reads.
 Read-only and journal-only: this script never mutates state, so it is safe
 to call even on a tick that admitted nothing (every field reads 0/0s).
 
+**Land-conflict digest line (P1, PRD-build-land-conflict-resolver R9).**
+Same slot as the serialization line above, run right after it: `scripts/
+land-conflicts-digest.sh` (no arguments — reads today's `state/
+land-conflicts.jsonl`, land-resolve.sh's own ledger, R5) and appends its
+one-line output verbatim to the journal: `land-conflicts: generated=<n>
+regen=<n> append_only=<n> union=<n> source=<n> coder=<n> unresolved=<n>`.
+This is the "daily digest / day ledger reports conflicts resolved by
+class" line — distinct from `scripts/land-conflicts-report.sh` (R5's other
+half, per-file frequency, operator-invoked any time) in that it is a
+single per-day class rollup appended automatically alongside the other
+end-of-tick summary lines. Read-only: never mutates the ledger, safe on a
+day with zero conflicts (every field reads 0).
+
 **Parent step (after all branches return, before releasing `tick.lock`):**
 - Run `scripts/manifest-set.sh --replay-orphans`. For every
   `state/intent/*.json` whose patch is not yet reflected in the manifest

@@ -33,6 +33,11 @@
 # tip) is AC1's own Scenario A/B, not a separate fixture. Requirement (g)
 # (ledger has one record per event with the right classes) is covered by
 # AC4/AC5's own ledger assertions plus landres_ac5_ledger_regen_and_union.sh.
+#   R9   — landres_r9_digest_by_class.sh covers scripts/land-conflicts-
+#          digest.sh (P1, no PRD AC number of its own — it's the "daily
+#          digest / day ledger" line, distinct from R5/AC7's per-file
+#          land-conflicts-report.sh): today's ledger records rolled up by
+#          class/resolution into one summary line.
 #
 # Usage: land-resolve-selftest.sh
 #
@@ -42,12 +47,15 @@ set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 SKILL_DIR="$(cd "$HERE/.." && pwd)"
 
-command -v jq >/dev/null 2>&1 || { echo "land-resolve-selftest: FAIL jq not on \$PATH (required by every landres_ac*.sh fixture)" >&2; exit 1; }
+command -v jq >/dev/null 2>&1 || { echo "land-resolve-selftest: FAIL jq not on \$PATH (required by every landres_*.sh fixture)" >&2; exit 1; }
 
 fail_n=0
 ran_n=0
 shopt -s nullglob
-for f in "$SKILL_DIR"/tests/landres_ac*.sh; do
+# landres_ac*.sh (PRD AC-numbered fixtures) plus landres_r*.sh (P1
+# requirements with no AC of their own, e.g. R9's digest) — same
+# test_prefix (landres) namespace, one entrypoint.
+for f in "$SKILL_DIR"/tests/landres_ac*.sh "$SKILL_DIR"/tests/landres_r*.sh; do
   ran_n=$((ran_n + 1))
   echo "== land-resolve-selftest: $(basename "$f") ==" >&2
   bash "$f"
@@ -60,7 +68,7 @@ done
 shopt -u nullglob
 
 if [ "$ran_n" -eq 0 ]; then
-  echo "land-resolve-selftest: FAIL no tests/landres_ac*.sh fixtures found" >&2
+  echo "land-resolve-selftest: FAIL no tests/landres_ac*.sh or landres_r*.sh fixtures found" >&2
   exit 1
 fi
 
