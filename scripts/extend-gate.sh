@@ -497,6 +497,21 @@ slug=""
 # landing-pinned verdict, per AC1's "journal line reads `gate … scope=main
 # slug=S head=M pinned=landing`, never head=H."
 pinned_landing=false
+# PRD-build-main-verdict-pinned-to-landing R4: a path OUTSIDE $repo that
+# survives past this run — set by main-verdict-pin-gate.sh, which gates a
+# DETACHED worktree it removes after every run (its own header: "removed
+# after the verdict is recorded"), so the ordinary tree-keyed cache_file
+# below (always `$project_abs/target/...`, i.e. INSIDE that worktree) is
+# destroyed with it and a second pinned question for the same landed slug
+# would otherwise re-run all 25 producers forever, never hitting the
+# cache that "should be a hit forever" (Technical considerations). When
+# set: seeded INTO cache_file before the cache-hit check below if
+# cache_file doesn't exist yet (so the existing tree/hash-keyed cache-hit
+# logic just above needs no change to recognize it), and mirrored back
+# OUT of cache_file after every write (cache-hit replay AND a fresh run
+# alike) so the NEXT pinned call for this slug has something to seed
+# from. A no-op when unset — ordinary (non-pinned) callers never pass it.
+verdict_cache_mirror=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -512,6 +527,7 @@ while [ $# -gt 0 ]; do
     --scope)            scope="${2:?extend-gate: --scope needs a value}"; shift 2 ;;
     --slug)             slug="${2:?extend-gate: --slug needs a value}"; shift 2 ;;
     --pinned-landing)   pinned_landing=true; shift ;;
+    --verdict-cache-mirror) verdict_cache_mirror="${2:?extend-gate: --verdict-cache-mirror needs a value}"; shift 2 ;;
     *) die 1 "unknown argument: $1 (see --help)" ;;
   esac
 done
@@ -1027,6 +1043,19 @@ fi
 # miss once — the first fresh run rewrites the file with the tree key.
 self_hash="$(sha256sum "$0" 2>/dev/null | awk '{print $1}')"
 cache_file="$project_abs/target/autobuilder/last-verdict.json"
+# R4 seed-in: cache_file lives inside $repo, which for a pinned-landing
+# call is a detached worktree that has never existed before this run — it
+# never has a cache_file of its own to find. If the caller gave us a
+# mirror and cache_file is genuinely absent (never overwrite a real,
+# fresher cache_file the worktree somehow already had), copy the mirror
+# in so the existing tree/hash-keyed cache-hit check right below sees it
+# exactly as if this worktree had gated M before. A missing or unreadable
+# mirror is a silent miss, same as no mirror at all — this is a
+# performance optimization, never a correctness gate (same failure
+# posture as gate_cache_transfer in worktree-extend.sh).
+if [ -n "$verdict_cache_mirror" ] && [ ! -f "$cache_file" ] && [ -f "$verdict_cache_mirror" ] && jq -e . "$verdict_cache_mirror" >/dev/null 2>&1; then
+  mkdir -p "$(dirname "$cache_file")" 2>/dev/null && cp "$verdict_cache_mirror" "$cache_file" 2>/dev/null || true
+fi
 if ! $record_baseline && ! $force && [ -f "$cache_file" ] && ! jq -e . "$cache_file" >/dev/null 2>&1; then
   # PRD-build-fail-loud-evidence-kept AC7: a genuinely CORRUPTED cache
   # (invalid JSON) is journaled and removed explicitly instead of falling
@@ -1087,6 +1116,12 @@ if ! $record_baseline && ! $force && [ -f "$cache_file" ]; then
       else
         journal_line --file "$journal" "$(printf '%s  gate  %s  %s  (cached tree=%s from=%s)' \
           "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$_cache_crate_name" "$cached_verdict" "$tree_now" "$cached_from_scope")"
+      fi
+      # R4 persist-out: keep the mirror in sync on a cache-hit replay too
+      # (not just a fresh write below) — best-effort, never affects the
+      # verdict this run already computed above.
+      if [ -n "$verdict_cache_mirror" ]; then
+        mkdir -p "$(dirname "$verdict_cache_mirror")" 2>/dev/null && cp "$cache_file" "$verdict_cache_mirror" 2>/dev/null || true
       fi
       exit "$cached_rc"
     fi
@@ -2339,6 +2374,15 @@ jq -n --arg head "$head_now" --arg tree "$tree_now" --arg hash "$self_hash" --ar
     deferred_receipts: $deferred
   } + (if $over then {unattributed_s: $unattr} else {} end)
 ' > "$cache_file" 2>/dev/null || true
+
+# R4 persist-out: a fresh run (producers actually ran) writes cache_file
+# above — mirror it out too, same as the cache-hit replay path does,
+# so a pinned-landing caller's NEXT question for this slug (a brand new
+# detached worktree, per main-verdict-pin-gate.sh's own header) has a
+# mirror to seed from instead of paying this same full run again.
+if [ -n "$verdict_cache_mirror" ]; then
+  mkdir -p "$(dirname "$verdict_cache_mirror")" 2>/dev/null && cp "$cache_file" "$verdict_cache_mirror" 2>/dev/null || true
+fi
 
 # --- best-effort: merge cargo_route into autobuilder's own release
 # receipt too (target/autobuilder/receipts/<head_sha>.json — gate.rs's

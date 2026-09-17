@@ -991,6 +991,33 @@ read it before assuming a step is "the last one this tick".
   receipts) and runs `autobuilder gate --project .` as the single verdict.
   Counts as one tick action.
 
+  **`push_via_branch=true` (PRD-build-main-verdict-pinned-to-landing R1):
+  never derive `<landed sha>` from `git rev-parse HEAD` for this step —
+  add `--pinned-landing` instead and drop the `--head`/`--scope`
+  computation above entirely:**
+
+  ```
+  scripts/gate-launch.sh <build_into> --head <any value — see below> --scope main --slug <slug> --pinned-landing --wait
+  ```
+
+  `main-verdict-pin-gate.sh` (what `--pinned-landing` routes the unit to,
+  gate-launch.sh's own header) re-resolves the slug's OWN merge sha M from
+  `state/landings/<repo>/<slug>.json` itself and gates a detached worktree
+  at M — `--head` here is used ONLY for the unit's name/idempotence
+  marker (pass `git -C <build_into> rev-parse HEAD` if nothing else is
+  handy; it is never what gets gated). This is the fix for the
+  2026-09-17 05:15:46Z regression: the DOCUMENTED derivation above
+  (`git rev-parse HEAD` "right after the push") is only ever true within
+  the SAME dispatch a `push_via_branch=true` land's PR just merged in —
+  the moment this step instead runs on a LATER tick (after
+  `landing-resume.sh` already cleared `last_step`, handing the PRD back
+  to ordinary dispatch — see "Resuming a landing-pending PRD" below), the
+  checkout's current HEAD may already belong to a DIFFERENT, later-landed
+  PRD, and the derivation above silently gates the wrong commit. Direct-
+  push repos (`push_via_branch=false`, no landing record) are unaffected —
+  keep the plain `--head <landed sha> --scope main --slug <slug> --wait`
+  form exactly as documented above (AC6).
+
   **Patience is derived, not a fixed 60s/90s (PRD-build-gate-patience-
   from-queue-depth).** Neither `extend-gate.sh` nor `chain-guard.sh` waits
   a flat constant for the producer lock any more: `patience_s = max(floor,
@@ -2228,11 +2255,23 @@ phases — it is one call, `scripts/landing-resume.sh <build_into> <slug>`
 (from the PRD's own `build_into` main checkout, never a worktree — this
 call needs no worktree at all), then act on its exit code exactly as that
 script's own header documents (0 merged+synced -> resume the PRD's
-ordinary post-land steps, step 6 "gate" onward, at the sha printed on
-stdout; 2 sync-deferred / 3 pending -> no further action this tick, PRD
+ordinary post-land steps, step 6 "gate" onward, using the `--pinned-
+landing` form (PRD-build-main-verdict-pinned-to-landing, "gate" step
+above) — the sha `landing-resume.sh` prints on stdout confirms the merge
+happened but is NOT what must be threaded into the gate call: `--pinned-
+landing` re-resolves the slug's own merge sha M itself, durably, from
+`state/landings/<repo>/<slug>.json`, so this still gates the right commit
+even if step 6 ends up running on a LATER tick than this resume (last_step
+is cleared the instant this call returns 0, so a chain-guard stop right
+here hands the PRD back to ordinary dispatch — see the "gate" step's own
+R1 note for why the sha-on-stdout was never safe to rely on across that
+boundary); 2 sync-deferred / 3 pending -> no further action this tick, PRD
 stays `in_progress`; 4/5/6 -> the PRD is already `blocked` by
 `landing-resume.sh` itself, nothing left to do). Any other `last_step` (or
-none) means the PRD's normal dispatch prompt applies unchanged.
+none) means the PRD's normal dispatch prompt applies unchanged — for a
+`push_via_branch=true` repo this still means step 6 "gate" uses
+`--pinned-landing`, not a fresh `git rev-parse HEAD` (the "gate" step's
+own text now names this unconditionally, not just for a same-tick resume).
 
 **Model override (added 2026-05-28).** Each `admitted[]` entry already
 carries the `model` `select-tick.sh` computed for it (requirement 5) —
