@@ -57,6 +57,24 @@ is_fleet_repo() {
   return 1
 }
 
+# PRD-build-main-push-gate-pr-path requirement 8 / AC11 (P1): a bare
+# `ssh host git push` (no login shell, no ~/.bashrc sourced) commonly
+# lacks ~/.cargo/bin on $PATH even though cargo is installed there — the
+# 2026-09-16 operator push hit exactly this (rc=127, "cargo: command not
+# found") before main-push-gate.sh's own check subprocess ever got a fair
+# run. Self-contained: resolve cargo onto $PATH here, once, before
+# main-push-gate.sh is ever invoked, so its check subprocess inherits a
+# working PATH in the common case; main-push-gate.sh's own guard is the
+# backstop for "cargo is absent everywhere" (never a bare rc=127 either
+# way).
+if ! command -v cargo >/dev/null 2>&1; then
+  cargo_bin="${CARGO:-$HOME/.cargo/bin/cargo}"
+  if [ -x "$cargo_bin" ]; then
+    cargo_dir="$(dirname "$cargo_bin")"
+    export PATH="$cargo_dir:$PATH"
+  fi
+fi
+
 zero_sha="0000000000000000000000000000000000000000"
 refused=0
 
