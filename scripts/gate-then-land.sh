@@ -158,6 +158,18 @@ DECISIONS="${GATE_THEN_LAND_DECISIONS:-$HERE/decisions.sh}"
 # (an older worktree checkout mid-rollout) degrades to today's behavior:
 # any conflict is fatal, exactly as before this PRD.
 LAND_RESOLVE="${GATE_THEN_LAND_LAND_RESOLVE:-$HERE/land-resolve.sh}"
+# R4 (bounded coder resolve for true source conflicts): OPT-IN, not
+# defaulted on — unlike LAND_RESOLVE above, an unset
+# GATE_THEN_LAND_LAND_RESOLVE_CODER leaves $LAND_RESOLVE_CODER empty,
+# which land-resolve.sh's own contract treats as "R4 never runs" (see its
+# header comment). Every existing selftest (gate-then-land-selftest.sh,
+# landres_ac1's Scenario B) relies on exactly this: a source conflict
+# during a fast, deterministic test run must never silently spawn a real
+# `claude -p` subagent. A deployment that wants R4 live sets
+# GATE_THEN_LAND_LAND_RESOLVE_CODER="$HERE/land-resolve-coder.sh"
+# (the default real coder, see that script) in its own environment.
+LAND_RESOLVE_CODER="${GATE_THEN_LAND_LAND_RESOLVE_CODER:-}"
+LAND_RESOLVE_MAX_S="${GATE_THEN_LAND_LAND_RESOLVE_MAX_S:-900}"
 GIT_ID=(-c user.email=jyen.tech@gmail.com -c user.name="Joe Yen")
 SKILL_DIR="$(cd "$HERE/.." && pwd -P)"
 STATE_DIR="${BUILD_STATE_DIR:-$SKILL_DIR/state}"
@@ -229,8 +241,16 @@ pr_args=(); [ -n "$project_root" ] && pr_args=(--project-root "$project_root")
 # `state/land-policy/<repo>.json` instead of silently missing it and
 # falling through to `source` for everything (found by this PRD's own
 # landres_ac1_pregate_rebase_resolves_generated.sh selftest).
+# $rebase_coder_unresolved (global, read by both die-8 call sites below):
+# set to 1 when land-resolve.sh's R4 bounded coder attempt ran and did NOT
+# resolve the rebase (so the caller writes `last_error=land-conflict-
+# unresolved:...` instead of the plain `land-conflict:...` it writes when
+# no coder attempt was ever made — R4/AC5 vs R6/AC6). Reset at the top of
+# every call so a PRIOR attempt's flag never leaks into this one's verdict.
+rebase_coder_unresolved=0
 rebase_onto_main() {
   local target="$1"
+  rebase_coder_unresolved=0
   if git -C "$wt" merge-base --is-ancestor "$target" HEAD 2>/dev/null; then
     return 0
   fi
@@ -238,9 +258,16 @@ rebase_onto_main() {
     return 0
   fi
   if [ -x "$LAND_RESOLVE" ]; then
-    if LAND_RESOLVE_POLICY_BASENAME="$(basename "$repo")" "$LAND_RESOLVE" resolve "$wt" "$slug" >&2 2>&1; then
+    local resolve_out
+    resolve_out="$(LAND_RESOLVE_POLICY_BASENAME="$(basename "$repo")" LAND_RESOLVE_CODER="$LAND_RESOLVE_CODER" LAND_RESOLVE_MAX_S="$LAND_RESOLVE_MAX_S" "$LAND_RESOLVE" resolve "$wt" "$slug" 2>&1)"
+    local resolve_rc=$?
+    printf '%s\n' "$resolve_out" >&2
+    if [ "$resolve_rc" -eq 0 ]; then
       return 0
     fi
+    case "$resolve_out" in
+      *' coder=unresolved'*) rebase_coder_unresolved=1 ;;
+    esac
   fi
   git -C "$wt" rebase --abort 2>/dev/null
   return 1
@@ -267,7 +294,15 @@ while [ "$attempt" -le "$max_retries" ]; do
   if ! rebase_onto_main "$main_sha"; then
     conflict_files="$(git -C "$wt" diff --name-only --diff-filter=U 2>/dev/null | tr '\n' ',' | sed 's/,$//')"
     [ -z "$conflict_files" ] && conflict_files="unknown"
-    [ -x "$SIDECAR" ] && "$SIDECAR" write "$slug" "last_error=land-conflict:${conflict_files}" >&2 || true
+    # R4/AC5 vs R6/AC6: a coder attempt that ran and failed gets its own
+    # distinct last_error so the ledger/operator can tell "tried, gave up"
+    # from "no policy/coder configured, today's behavior" — see
+    # rebase_onto_main()'s $rebase_coder_unresolved comment above.
+    if [ "$rebase_coder_unresolved" -eq 1 ]; then
+      [ -x "$SIDECAR" ] && "$SIDECAR" write "$slug" "last_error=land-conflict-unresolved:${conflict_files}" >&2 || true
+    else
+      [ -x "$SIDECAR" ] && "$SIDECAR" write "$slug" "last_error=land-conflict:${conflict_files}" >&2 || true
+    fi
     jlog "rebase-conflict attempt=$attempt files=$conflict_files pre-gate=true"
     die 8 "rebase conflict onto main=$main_sha before gating (pre-gate rebase); branch kept, not retried"
   fi

@@ -9,11 +9,10 @@
 # piece: a reader for the per-repo policy file (R2) that classifies a
 # conflicted path as `generated`, `append_only`, or `source` — the
 # classification gate-then-land.sh and worktree-extend.sh will call
-# before treating a rebase conflict as fatal. Regen/union execution (R3)
-# and this step's ledger (R5) are landed; the bounded coder resolve (R4)
-# and wiring this script into gate-then-land.sh/worktree-extend.sh (R1/R8)
-# are later steps in this same PRD (Non-goal for THIS step: still no
-# caller changed — `resolve` is exercised only by this PRD's own tests).
+# before treating a rebase conflict as fatal. Regen/union execution (R3),
+# this step's ledger (R5), the pre-gate rebase wiring (R1), and the
+# bounded coder resolve for true source conflicts (R4, below) are landed;
+# wiring this into worktree-extend.sh's integrate (R8) is a later step.
 #
 # Policy file: state/land-policy/<repo-basename>.json
 #   {
@@ -44,17 +43,32 @@
 #       conflicted path: `generated` -> take main's side, run its regen
 #       command, `git add`; `append_only` -> three-way union merge via
 #       `git merge-file --union`, `git add`; anything else -> collected as
-#       a source conflict, left untouched (conflict markers still in the
-#       working tree). If zero source conflicts remain, runs
-#       `git rebase --continue` and prints `resolved=all`, exit 0. If any
-#       source conflicts remain, the rebase is left open (NOT continued —
-#       R4's bounded coder step, a later PRD step, owns what happens to
-#       those), prints `source_conflicts=<comma-list>`, exit 1. Prints
-#       `no-conflict` and exits 3 if <repo> has no conflicted paths at all
-#       (nothing to resolve — a caller bug, not a land-resolve failure).
-#       Every path this script itself resolves without escalating (i.e.
-#       `generated`->regen or `append_only`->union, never `source`) appends
-#       one record to the ledger (R5) — see below.
+#       a source conflict.
+#
+#       R4 (bounded coder resolve): if any source conflicts remain AND
+#       `$LAND_RESOLVE_CODER` names an executable, ONE bounded attempt runs
+#       before giving up — see `try_coder_resolve()` below. Unset/missing
+#       `$LAND_RESOLVE_CODER` (the default — nothing sets it in a plain
+#       `classify`/`resolve` call or in a test that doesn't opt in) skips
+#       this entirely and falls straight to the pre-R4 behavior: source
+#       conflicts are left untouched, conflict markers still in the
+#       working tree. This keeps `resolve` side-effect-free by default —
+#       no test or caller accidentally spawns a real coder subagent.
+#
+#       If zero source conflicts remain (either none existed, or R4's
+#       coder resolved what did), runs `git rebase --continue` and prints
+#       `resolved=all`, exit 0. If source conflicts remain after a coder
+#       attempt (or none was attempted), the rebase is left open (NOT
+#       continued), prints `source_conflicts=<comma-list>` — with a
+#       trailing ` coder=unresolved` when R4's attempt ran and failed, so
+#       a caller can distinguish "gave up, no attempt made" (AC6) from
+#       "tried the bounded resolve, it didn't pan out" (AC5) — exit 1.
+#       Prints `no-conflict` and exits 3 if <repo> has no conflicted paths
+#       at all (nothing to resolve — a caller bug, not a land-resolve
+#       failure). Every path this script itself resolves without
+#       escalating (`generated`->regen, `append_only`->union, or
+#       `source`->coder, never a left-as-source file) appends one record
+#       to the ledger (R5) — see below.
 #
 # Ledger (R5): state/land-conflicts.jsonl, one JSON record per resolved
 # FILE (not per resolve() call — a single conflicted rebase touching two
@@ -62,17 +76,52 @@
 #   {"ts": "<ISO-8601>", "repo": "<basename>", "slug": "<slug>",
 #    "file": "<repo-relative path>", "class": "generated"|"append_only",
 #    "resolution": "regen"|"union", "wall_seconds": <int>}
-# This script only ever writes `class`/`resolution` pairs it can attest to
-# directly (regen, union) — `source`/`coder`/`unresolved` records (AC4/AC5)
-# belong to R4's bounded-coder step, a later caller that owns the
-# succeed/fail/timeout verdict this script has no visibility into (a file
-# left as a source conflict here might still be resolved by that coder a
-# moment later). `wall_seconds` is elapsed time since this `resolve` call
-# started, not a per-file timer — regen/union are near-instant in practice
-# and the ledger's purpose is trend visibility (R5's "operator can see
-# which files conflict and how often"), not a profiler.
+# This script writes every class/resolution pair it can attest to
+# directly: `generated`/regen and `append_only`/union always; `source`/
+# `coder` (R4 succeeded, verified by the repo's own tests) and `source`/
+# `unresolved` (R4 attempted and failed, or timed out) whenever
+# `$LAND_RESOLVE_CODER` is set and the resolve loop reaches that file.
+# `wall_seconds` is elapsed time since this `resolve` call (or, for a
+# coder attempt, since the coder was invoked) started — regen/union are
+# near-instant in practice; a coder attempt's wall_seconds is the more
+# useful number there and the ledger's purpose is trend visibility (R5's
+# "operator can see which files conflict and how often"), not a profiler.
 # `scripts/land-conflicts-report.sh` reads this file and prints conflicts
 # by frequency.
+#
+# R4 (bounded coder resolve) — env vars:
+#   LAND_RESOLVE_CODER   Path to an executable invoked as
+#                         `<coder> <repo> <slug> <file...>` against the
+#                         mid-rebase worktree with those files still
+#                         showing conflict markers. Expected to resolve
+#                         the markers in place and exit 0 when it believes
+#                         it has (a non-zero exit or a timeout is treated
+#                         as a failed attempt, no test run). Unset (the
+#                         default) -> R4 never runs; matches the pre-R4
+#                         contract exactly (AC6). A real deployment points
+#                         this at a small wrapper around `claude -p ...
+#                         --model sonnet` (extend-gate.sh's reviewer-agent
+#                         phase uses the same invocation shape); a
+#                         selftest points it at a fixture stub.
+#   LAND_RESOLVE_MAX_S   Wall-clock bound on the coder invocation, seconds
+#                         (default 900 — R4's stated default). Enforced
+#                         via `timeout`; exceeding it counts as a failed
+#                         attempt (ledger resolution=unresolved), same as
+#                         the coder exiting non-zero.
+#   LAND_RESOLVE_TEST_CMD The check the coder's claim is verified against,
+#                         run from $repo (default: `cargo test --workspace`
+#                         when Cargo.toml is present, else
+#                         `scripts/run-selftests.sh` when executable, else
+#                         `pytest -q` when pyproject.toml is present, else
+#                         empty). An empty/unresolvable test command means
+#                         a coder's resolution can never be trusted here —
+#                         fails closed (resolution=unresolved) rather than
+#                         landing an unverified conflict resolution.
+# R4 never trusts the coder's own exit code as the verdict — "tests pass"
+# (R4's own words: "with the crate's tests as the check") is the only
+# thing that turns an attempt into `source`/`coder` instead of
+# `source`/`unresolved`. A coder that resolves conflicts but leaves the
+# test command failing is recorded exactly like one that gave up outright.
 #
 #       Stage semantics (confirmed empirically, not just per git's docs,
 #       because `git rebase` INVERTS ours/theirs vs a normal merge): during
@@ -95,6 +144,9 @@ SKILL_DIR="${BUILD_SKILL_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 STATE_DIR="${BUILD_STATE_DIR:-$SKILL_DIR/state}"
 LAND_POLICY_DIR="${LAND_POLICY_DIR:-$STATE_DIR/land-policy}"
 LAND_CONFLICTS_LEDGER="${LAND_CONFLICTS_LEDGER:-$STATE_DIR/land-conflicts.jsonl}"
+# R4 — see the header comment above for the full contract. Unset
+# LAND_RESOLVE_CODER (the default) means R4 never runs.
+LAND_RESOLVE_MAX_S="${LAND_RESOLVE_MAX_S:-900}"
 
 usage() {
   echo "usage: land-resolve.sh policy-path <repo>" >&2
@@ -206,6 +258,86 @@ cmd_classify() {
   echo "class=source"
 }
 
+# test_cmd_for <repo> — prints the check R4 verifies a coder resolution
+# against (see LAND_RESOLVE_TEST_CMD in the header comment), empty if none
+# can be inferred. Never fails.
+test_cmd_for() {
+  local repo="$1"
+  if [ -n "${LAND_RESOLVE_TEST_CMD:-}" ]; then
+    printf '%s\n' "$LAND_RESOLVE_TEST_CMD"
+  elif [ -f "$repo/Cargo.toml" ]; then
+    printf '%s\n' "cargo test --workspace"
+  elif [ -x "$repo/scripts/run-selftests.sh" ]; then
+    printf '%s\n' "scripts/run-selftests.sh"
+  elif [ -f "$repo/pyproject.toml" ]; then
+    printf '%s\n' "pytest -q"
+  fi
+}
+
+# try_coder_resolve <repo> <slug> <file...> — R4's one bounded attempt.
+# Returns 0 and stages every file (plus a ledger `source`/`coder` record
+# each) only when the coder invocation exits 0 within
+# $LAND_RESOLVE_MAX_S AND the repo's test command (test_cmd_for) then
+# passes. Any other outcome (coder failure, timeout, no test command
+# available, test command fails) returns 1, leaves the files' conflict
+# markers exactly as the coder left them (the caller aborts the whole
+# rebase on a non-zero return — see cmd_resolve below — which discards
+# whatever the coder touched, restoring the pre-attempt state), and
+# records one `source`/`unresolved` ledger entry per file.
+try_coder_resolve() {
+  local repo="$1" slug="$2"; shift 2
+  local -a files=("$@")
+  local start; start="$(date +%s)"
+  local flist; flist="$(IFS=,; echo "${files[*]}")"
+
+  echo "land-resolve: source conflict in $flist — attempting bounded coder resolve via \$LAND_RESOLVE_CODER (max ${LAND_RESOLVE_MAX_S}s)" >&2
+  # Capture the REAL exit code directly (not via `if ! cmd; then $?`,
+  # which collapses `timeout`'s 124 down to a bare 1 — `!` flips the
+  # exit status the `if` sees, and $? afterward reflects that flipped
+  # 0/1, not the command's own code. Losing 124 here would silently break
+  # the timed-out/failed distinction in the log line below.)
+  timeout "${LAND_RESOLVE_MAX_S}s" "$LAND_RESOLVE_CODER" "$repo" "$slug" "${files[@]}"
+  local coder_rc=$?
+  if [ "$coder_rc" -ne 0 ]; then
+    if [ "$coder_rc" -eq 124 ]; then
+      echo "land-resolve: coder timed out after ${LAND_RESOLVE_MAX_S}s for $flist" >&2
+    else
+      echo "land-resolve: coder invocation failed (rc=$coder_rc) for $flist" >&2
+    fi
+    local f
+    for f in "${files[@]}"; do
+      ledger_record "$repo" "$slug" "$f" source unresolved "$(( $(date +%s) - start ))"
+    done
+    return 1
+  fi
+
+  local test_cmd; test_cmd="$(test_cmd_for "$repo")"
+  if [ -z "$test_cmd" ]; then
+    echo "land-resolve: no test command available to verify the coder's resolution of $flist — treating as unresolved" >&2
+    local f
+    for f in "${files[@]}"; do
+      ledger_record "$repo" "$slug" "$f" source unresolved "$(( $(date +%s) - start ))"
+    done
+    return 1
+  fi
+  echo "land-resolve: coder claims $flist resolved — verifying with: $test_cmd" >&2
+  if ! ( cd "$repo" && eval "$test_cmd" ); then
+    echo "land-resolve: post-coder check failed ($test_cmd) for $flist — treating as unresolved" >&2
+    local f
+    for f in "${files[@]}"; do
+      ledger_record "$repo" "$slug" "$f" source unresolved "$(( $(date +%s) - start ))"
+    done
+    return 1
+  fi
+
+  local f
+  for f in "${files[@]}"; do
+    git -C "$repo" add -- "$f"
+    ledger_record "$repo" "$slug" "$f" source coder "$(( $(date +%s) - start ))"
+  done
+  return 0
+}
+
 cmd_resolve() {
   local repo="${1:-}" slug="${2:-}"
   [ -n "$repo" ] || usage
@@ -263,6 +395,17 @@ cmd_resolve() {
     esac
   done <<<"$conflicted"
 
+  # R4: one bounded coder attempt at whatever remains classified `source`,
+  # only when a caller opted in via $LAND_RESOLVE_CODER. Unset (the
+  # default) skips this block entirely — pre-R4 behavior, unchanged.
+  local coder_attempted=0
+  if [ "${#source_files[@]}" -gt 0 ] && [ -n "${LAND_RESOLVE_CODER:-}" ]; then
+    coder_attempted=1
+    if try_coder_resolve "$repo" "$slug" "${source_files[@]}"; then
+      source_files=()
+    fi
+  fi
+
   if [ "${#source_files[@]}" -eq 0 ]; then
     if GIT_EDITOR=true git -C "$repo" rebase --continue >&2; then
       echo "resolved=all"
@@ -275,7 +418,16 @@ cmd_resolve() {
     echo "source_conflicts=${newly:-unknown}"
     return 1
   fi
-  printf 'source_conflicts=%s\n' "$(IFS=,; echo "${source_files[*]}")"
+  # A trailing ` coder=unresolved` marks the R4-attempted-and-failed case
+  # (AC5) distinctly from the never-attempted case (AC6, coder_attempted=0
+  # — $LAND_RESOLVE_CODER unset) so a caller like gate-then-land.sh can
+  # choose `last_error=land-conflict-unresolved:...` vs the plain
+  # `last_error=land-conflict:...` it already writes.
+  if [ "$coder_attempted" -eq 1 ]; then
+    printf 'source_conflicts=%s coder=unresolved\n' "$(IFS=,; echo "${source_files[*]}")"
+  else
+    printf 'source_conflicts=%s\n' "$(IFS=,; echo "${source_files[*]}")"
+  fi
   return 1
 }
 
