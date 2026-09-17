@@ -196,6 +196,9 @@ source "$BUILD_SCRIPTS/lib/journal.sh"
 # alone (that constant becomes the FLOOR, not the whole answer — see the
 # lib's own header).
 source "$BUILD_SCRIPTS/lib/gate-patience.sh"
+# shellcheck source=lib/push-via-branch.sh
+STATE_DIR="${BUILD_STATE_DIR:-$BUILD_SCRIPTS/../state}"
+source "$BUILD_SCRIPTS/lib/push-via-branch.sh"
 
 # --- PATH order guard (P0 requirement 1, PRD-build-gate-cargo-route-attest;
 #     rewritten under PRD-build-cargo-route-precedence) -------------------
@@ -1610,7 +1613,59 @@ elif [ "$scope" = branch ]; then
   fi
 else
   _phase_t0=$(date +%s)
-  if ( cd "$repo" && autobuilder ci-checks --project "$project_rel" ) 9>&-; then
+  _repo_slug_for_ci="$(basename "$repo")"
+  if [ "$(push_via_branch_for "$_repo_slug_for_ci")" = "true" ]; then
+    # PRD-build-main-push-gate-pr-path requirement 4 (P0, AC6): a
+    # push_via_branch=true repo's main-scope `ci-checks` can never be
+    # "runs at HEAD" — HEAD here is a local, unpushed commit on a repo
+    # whose main refuses a direct push (GH006); the only CI signal that
+    # will ever exist for this land is the PR's OWN required checks,
+    # captured via the landing record `branch-protection.sh push` wrote
+    # and read back here through `branch-protection.sh pr-checks` (one
+    # `gh` call, no push of `main`, no polling wait — this producer either
+    # has an answer already or it does not).
+    _ci_slug_for_ci="${slug:-$_repo_slug_for_ci}"
+    if _ci_pr_checks_json="$("$BUILD_SCRIPTS/branch-protection.sh" pr-checks "$repo" "$_ci_slug_for_ci" 2>/dev/null)"; then
+      jq -n --arg head "$head_now" --argjson pr "$_ci_pr_checks_json" '
+        ($pr.contexts // []) as $ctx |
+        {
+          schema: "autobuilder.ci_checks_receipt.v1",
+          head_sha: ($pr.merge_sha // "" | if . == "" then $head else . end),
+          repo: "", pr_number: $pr.pr_number, pr_state: $pr.state,
+          run_count: ($ctx | length),
+          success_count: ($ctx | map(select(.conclusion == "SUCCESS")) | length),
+          failure_count: ($ctx | map(select(.conclusion == "FAILURE")) | length),
+          pending_count: ($ctx | map(select(.conclusion == "PENDING")) | length),
+          runs: $ctx,
+          verdict: (if ($pr.state == "MERGED") and (($pr.merge_sha // "") != "")
+                       and (($ctx | length) > 0)
+                       and (($ctx | map(select(.conclusion != "SUCCESS")) | length) == 0)
+                    then "pass" else "block" end),
+          scope_deferred: false,
+          skip_reason: (if ($pr.state == "MERGED") and (($pr.merge_sha // "") != "")
+                           and (($ctx | length) > 0)
+                           and (($ctx | map(select(.conclusion != "SUCCESS")) | length) == 0)
+                        then "" else "pr-checks-not-green" end),
+          captured_at: (now | todateiso8601), receipt_digest: ""
+        }' > "$ci_checks_receipt" 2>/dev/null
+      if [ "$(jq -r '.verdict' "$ci_checks_receipt" 2>/dev/null)" = "pass" ]; then
+        record_phase ci-checks $(( $(date +%s) - _phase_t0 )) ok
+      else
+        note_block "ci-checks — push_via_branch=true, PR#$(jq -r '.pr_number' "$ci_checks_receipt" 2>/dev/null) required checks are not all SUCCESS yet (state=$(jq -r '.pr_state' "$ci_checks_receipt" 2>/dev/null); the next tick's landing-check/sync retries)"
+        record_phase ci-checks $(( $(date +%s) - _phase_t0 )) fail
+      fi
+    else
+      jq -n --arg head "$head_now" '{
+        schema: "autobuilder.ci_checks_receipt.v1",
+        head_sha: $head, repo: "", run_count: 0, success_count: 0,
+        failure_count: 0, pending_count: 0, runs: [],
+        verdict: "block", scope_deferred: false, skip_reason: "no-landing-record",
+        captured_at: (now | todateiso8601), receipt_digest: ""
+      }' > "$ci_checks_receipt" 2>/dev/null
+      note_block "ci-checks — push_via_branch=true, no landing record for $_repo_slug_for_ci (branch-protection.sh push never ran, or it was already consumed) — verdict=block, skip_reason=no-landing-record"
+      record_phase ci-checks $(( $(date +%s) - _phase_t0 )) fail
+    fi
+  elif ( cd "$repo" && autobuilder ci-checks --project "$project_rel" ) 9>&-; then
     record_phase ci-checks $(( $(date +%s) - _phase_t0 )) ok
   else
     note_block "ci-checks — workflow(s) on HEAD are not green, or still pending (the next tick retries)"

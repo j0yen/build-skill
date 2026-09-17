@@ -65,6 +65,7 @@ usage() {
   echo "       branch-protection.sh status <repo>" >&2
   echo "       branch-protection.sh push <repo> <slug> [--base <branch>]" >&2
   echo "       branch-protection.sh landing-check <repo> <slug>" >&2
+  echo "       branch-protection.sh pr-checks <repo> <slug>" >&2
   echo "       branch-protection.sh sync <repo>" >&2
 }
 
@@ -479,6 +480,93 @@ PY
   exit $?
 }
 
+# cmd_pr_checks — PRD-build-main-push-gate-pr-path requirement 4 (P0,
+# AC6): the main-scope `ci-checks` producer (extend-gate.sh) for a
+# push_via_branch=true repo needs the SAME one `gh pr view` data
+# `landing-check` reads, but as a full per-context breakdown (a receipt
+# needs "one entry per required context with its conclusion", not
+# landing-check's single collapsed verdict) — this is that data, in the
+# shape extend-gate.sh assembles its `autobuilder.ci_checks_receipt.v1`
+# from, without extend-gate.sh (a general-purpose gate script, not a
+# GitHub API client) making its own `gh pr view` call or re-deriving the
+# required-contexts reduction a second time.
+#   branch-protection.sh pr-checks <repo> <slug>
+# Prints one JSON object on stdout:
+#   {"pr_number": N, "state": "OPEN"|"MERGED"|"CLOSED",
+#    "merge_sha": "<oid>"|"", "contexts": [{"name": "...",
+#    "conclusion": "SUCCESS"|"PENDING"|"FAILURE"}, ...]}
+# Exit: 0 ok | 2 usage | 4 no landing record / no pr_number | 5 gh call failed.
+cmd_pr_checks() {
+  local repo_arg="${1:-}" slug="${2:-}"
+  [ -n "$repo_arg" ] && [ -n "$slug" ] || { usage; exit 2; }
+  local repo_dir; repo_dir="$(resolve_repo_dir "$repo_arg")" || die 4 "repo not found locally: $repo_arg"
+  local repo_slug; repo_slug="$(basename "$repo_dir")"
+  local record; record="$(landing_record_path "$repo_slug" "$slug")"
+  [ -f "$record" ] || die 4 "no landing record at $record"
+
+  local pr_number
+  pr_number="$(python3 -c "
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except (OSError, json.JSONDecodeError):
+    d = {}
+print(d.get('pr_number') or '')
+" "$record")"
+  [ -n "$pr_number" ] || die 4 "landing record $record has no pr_number"
+
+  local required_json="[]" state_file="$STATE_DIR/branch-protection.json"
+  if [ -f "$state_file" ]; then
+    required_json="$(python3 -c "
+import json, sys
+try:
+    state = json.load(open(sys.argv[1]))
+except (OSError, json.JSONDecodeError):
+    state = {}
+rec = state.get(sys.argv[2]) or {}
+print(json.dumps(rec.get('required_contexts', [])))
+" "$state_file" "$repo_slug")"
+  fi
+
+  local pr_json rc
+  pr_json="$(gh pr view "$pr_number" --repo "$OWNER/$repo_slug" --json state,mergeCommit,statusCheckRollup 2>&1)"
+  rc=$?
+  [ "$rc" -eq 0 ] || die 5 "gh pr view failed for $OWNER/$repo_slug#$pr_number: $pr_json"
+
+  python3 - "$pr_number" "$pr_json" "$required_json" <<'PY'
+import json, sys
+
+pr_number = sys.argv[1]
+pr = json.loads(sys.argv[2])
+required = list(dict.fromkeys(json.loads(sys.argv[3])))
+state = pr.get("state")
+merge_sha = (pr.get("mergeCommit") or {}).get("oid") or ""
+rollup = pr.get("statusCheckRollup") or []
+
+by_name = {}
+for item in rollup:
+    name = item.get("context") or item.get("name")
+    if not name:
+        continue
+    if "conclusion" in item or "status" in item:
+        conclusion = (
+            "PENDING" if item.get("status") != "COMPLETED"
+            else "SUCCESS" if item.get("conclusion") == "SUCCESS"
+            else "FAILURE"
+        )
+    else:
+        legacy = (item.get("state") or "").upper()
+        conclusion = "SUCCESS" if legacy == "SUCCESS" else "PENDING" if legacy in ("", "PENDING") else "FAILURE"
+    by_name[name] = conclusion
+
+if not required:
+    required = list(by_name.keys())
+
+contexts = [{"name": n, "conclusion": by_name.get(n, "PENDING")} for n in required]
+print(json.dumps({"pr_number": int(pr_number), "state": state, "merge_sha": merge_sha, "contexts": contexts}))
+PY
+}
+
 # cmd_sync — requirement 3 / AC4/AC5: fast-forward (or, when the merge
 # produced a squash commit with the SAME tree as local main, re-point) local
 # `main` to `origin/main` after a `landing-check merged <sha>` verdict.
@@ -555,6 +643,7 @@ case "$cmd" in
   status)        cmd_status "$@" ;;
   push)          cmd_push "$@" ;;
   landing-check) cmd_landing_check "$@" ;;
+  pr-checks)     cmd_pr_checks "$@" ;;
   sync)          cmd_sync "$@" ;;
   -h|--help) usage; exit 0 ;;
   *) usage; exit 2 ;;
