@@ -623,10 +623,34 @@ if is_loop_tooling_build_into "$this_build_into"; then
       if (match(orig, /\(Live[^)]*\)/)) {
         tag = substr(orig, RSTART, RLENGTH)
         evidence = ""
-        if (match(tag, /evidence:[[:space:]]*[^)]+/)) {
-          evidence = substr(tag, RSTART + 9, RLENGTH - 9)
-          gsub(/^[[:space:]]+|[[:space:]]+$/, "", evidence)
-          gsub(/`/, "", evidence)
+        # Bugfix (PRD-build-live-ac-no-defer, found live 2026-09-17 by a
+        # sibling PRD dispatch): the old capture ran to the tag closing
+        # paren, so an AC whose evidence clause names TWO backtick-quoted
+        # specs joined by connective prose (AC11 on this PRD itself:
+        # evidence: journal:X then journal:Y for one real slug) produced
+        # one mangled string instead of two clean specs. The documented/
+        # tested common case has NO backticks at all (plain "evidence:
+        # journal:foo)") -- that shape keeps the original to-closing-
+        # paren capture unchanged. Only when a backtick actually appears
+        # after evidence: do we switch to extracting each backtick-quoted
+        # token instead (ignoring connective prose between/after them),
+        # joined by ASCII RS (036 octal) so check_live_evidence can tell
+        # a compound spec from a single one.
+        if (match(tag, /evidence:/)) {
+          rest = substr(tag, RSTART + RLENGTH)
+          if (rest ~ /`/) {
+            count = 0
+            while (match(rest, /`[^`]*`/)) {
+              tok = substr(rest, RSTART + 1, RLENGTH - 2)
+              count++
+              evidence = (count == 1) ? tok : evidence "\036" tok
+              rest = substr(rest, RSTART + RLENGTH)
+            }
+          } else {
+            evidence = rest
+            sub(/\)$/, "", evidence)
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", evidence)
+          }
         }
         print n "\t" evidence
       }
@@ -838,9 +862,24 @@ print("%s (routed=true image=%s bytes=%s ts=%s)" % (
 # An empty/unparseable spec (no "evidence:" clause on the AC line at all)
 # is never satisfied — PRD-build-live-ac-no-defer R4: a `(Live` AC pairs
 # ONLY with the evidence its own text names, never a fixture.
+#
+# Compound spec (this PRD's own AC11 shape: "`journal:X` then `journal:Y`
+# for one real slug") — the tagging awk above joins each backtick-quoted
+# clause with ASCII RS (\036). Detected here and evaluated as a real
+# SEQUENCE, not "both exist somewhere": every clause must independently
+# find a match, and for two-or-more `journal:` clauses the LATER clause's
+# matched line must (a) name the same slug (the journal convention's own
+# 2nd whitespace-run field, `<ts>  <slug>  <verb>  ...`) as the FIRST
+# clause's matched line, and (b) sort at or after it (file path, then
+# line number within a shared file) — proving one real slug went through
+# the named sequence, not two unrelated greps that both happen to exist.
 check_live_evidence() {
   local spec="$1" kind val
   [ -n "$spec" ] || return 1
+  if [[ "$spec" == *$'\036'* ]]; then
+    check_live_evidence_seq "$spec"
+    return $?
+  fi
   kind="${spec%%:*}"
   val="${spec#*:}"
   case "$kind" in
@@ -855,7 +894,13 @@ check_live_evidence() {
         local mtime; mtime="$(stat -c %Y "$f" 2>/dev/null || echo 0)"
         if [ "$mtime" -gt "$best_mtime" ]; then
           best_mtime="$mtime"; best_path="$f"
-          best_line="$(grep -mE1 -- "$val" "$f" 2>/dev/null)"
+          # -Em1, not -mE1: GNU grep bundles a trailing digit into the
+          # PRECEDING arg-taking flag, so -mE1 parses as -m with the
+          # invalid count "E1" and errors (found live fixing AC11's
+          # compound-evidence path below, same bug, cosmetic-only here
+          # since best_line only feeds the printed description, never
+          # the pass/fail check, which relies on best_path alone).
+          best_line="$(grep -Em1 -- "$val" "$f" 2>/dev/null)"
         fi
       done
       shopt -u nullglob
@@ -882,6 +927,69 @@ check_live_evidence() {
       return 1
       ;;
   esac
+}
+
+# check_live_evidence_seq <spec> — helper for check_live_evidence's
+# compound-spec branch (ASCII-RS-joined clauses). stdout: one evidence
+# line, rc 0, when every clause independently matches AND, for two-or-
+# more `journal:` clauses, they resolve to the SAME slug and sort in the
+# order they were written (earlier clause's match at or before the later
+# clause's match). rc 1 otherwise. Non-`journal:` clauses in a compound
+# spec are checked via the single-clause path with no ordering/slug
+# claim (there is no live spec using that shape today; kept general
+# rather than assuming only journal ever appears here).
+check_live_evidence_seq() {
+  local spec="$1"
+  local -a clauses
+  IFS=$'\036' read -r -a clauses <<<"$spec"
+  [ "${#clauses[@]}" -ge 1 ] || return 1
+  local -a jfiles=() jlines=() jslugs=()
+  local c kind val
+  for c in "${clauses[@]}"; do
+    kind="${c%%:*}"; val="${c#*:}"
+    if [ "$kind" != journal ]; then
+      check_live_evidence "$c" >/dev/null || return 1
+      continue
+    fi
+    [ -n "$val" ] || return 1
+    local jdir="${VC_JOURNAL_DIR:-$HOME/brain/journal/build}"
+    [ -d "$jdir" ] || return 1
+    local f best_path="" best_mtime=-1 best_line="" best_lineno=0
+    shopt -s nullglob
+    for f in "$jdir"/*.md; do
+      grep -qE -- "$val" "$f" 2>/dev/null || continue
+      local mtime; mtime="$(stat -c %Y "$f" 2>/dev/null || echo 0)"
+      if [ "$mtime" -gt "$best_mtime" ]; then
+        best_mtime="$mtime"; best_path="$f"
+        # -Em1/-nEm1, not -mE1/-nmE1 -- see the sibling comment in
+        # check_live_evidence above. Not cosmetic here: same-slug
+        # correlation below reads best_line for real, so the invalid
+        # flag order would silently blank it and false-negative every
+        # compound spec.
+        best_line="$(grep -Em1 -- "$val" "$f" 2>/dev/null)"
+        best_lineno="$(grep -nEm1 -- "$val" "$f" 2>/dev/null | cut -d: -f1)"
+      fi
+    done
+    shopt -u nullglob
+    [ -n "$best_path" ] || return 1
+    jfiles+=("$best_path"); jlines+=("${best_lineno:-0}")
+    jslugs+=("$(awk -F'  +' '{print $2}' <<<"$best_line")")
+  done
+  local n=${#jfiles[@]}
+  [ "$n" -ge 1 ] || return 1
+  if [ "$n" -ge 2 ]; then
+    local i
+    for ((i = 1; i < n; i++)); do
+      [ -n "${jslugs[$i]}" ] && [ "${jslugs[$i]}" = "${jslugs[0]}" ] || return 1
+      if [ "${jfiles[$i]}" = "${jfiles[$((i - 1))]}" ]; then
+        [ "${jlines[$i]}" -ge "${jlines[$((i - 1))]}" ] || return 1
+      else
+        [[ "${jfiles[$i]}" > "${jfiles[$((i - 1))]}" || "${jfiles[$i]}" == "${jfiles[$((i - 1))]}" ]] || return 1
+      fi
+    done
+  fi
+  printf 'journal-seq:%s (slug=%s)\n' "$(IFS=,; echo "${jfiles[*]#"$HOME"/}")" "${jslugs[0]:-?}"
+  return 0
 }
 
 # whole_suite_evidence <n> — stdout: evidence string, rc 0, when the AC's
