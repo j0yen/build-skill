@@ -1378,15 +1378,32 @@ intent_card_stale=false
 # (e.g. one that always exits 5) without touching production behavior —
 # same convention as RUSTBUILD_SCRIPTS/EXTEND_GATE elsewhere in this file.
 INTENT_CARD_REFRESH_BIN="${INTENT_CARD_REFRESH_BIN:-$BUILD_SCRIPTS/intent-card-refresh.sh}"
-# PRD-build-main-verdict-pinned-to-landing R3/AC3: a pinned main-scope gate
-# (--scope main --pinned-landing --slug S, run in a detached worktree at
-# S's own merge sha M) needs this refresh to run FOR S too — same reason
-# branch scope needs it (the reviewer step right after this one must judge
-# the landing against S's own intent card, not whatever main last
-# refreshed for some other, later-landed slug) — so intake/reviewer never
-# read a stale card for a pinned verdict. An ordinary `--scope main` call
-# (no --pinned-landing) is unchanged: still skip, same as before this PRD.
-if [ "$scope" = branch ] || $pinned_landing; then
+# PRD-build-main-verdict-pinned-to-landing R3/AC3, REVISED 2026-09-17
+# 19:35 EDT (decision 42f14605 extended): a pinned main-scope gate
+# (--scope main --pinned-landing --slug S) runs in a DETACHED worktree at
+# S's own merge sha M — main-verdict-pin-gate.sh's own contract is that M
+# is immutable (its header: "M's tree is immutable, so a hit is a hit
+# forever"). The original R3/AC3 reasoning below (run the refresh for S
+# too, so intake/reviewer never read a stale card) is still right in
+# spirit, but running the ordinary refresh+commit here breaks the
+# contract it depends on: this phase COMMITS a new intent card when one
+# changed, moving the detached worktree's HEAD off M (e70af61 -> ea72956
+# on 2026-09-17's live mcphost-agent-wake run) — which is exactly what
+# made rollback-plan's M^..HEAD range and ci-checks' landing lookup miss
+# (main-verdict-pin-gate.sh keys `--head`/the landings dir on M, not on
+# wherever HEAD drifts to). S's own card is what landed IN M already (the
+# branch's own pre-gate refresh, PRD-build-intent-card-pregate-refresh,
+# committed it before this PR ever merged) — intake below validates that
+# committed card directly; nothing here needs to regenerate or commit
+# anything for a pinned verdict. Only branch scope still runs the refresh
+# (main-scope calls without --pinned-landing already skipped it, same as
+# before this PRD).
+if $pinned_landing; then
+  _phase_t0=$(date +%s)
+  journal_line --file "$journal" "$(printf '%s  intent-card-refresh  skipped  (pinned-landing: gating M as landed, head=%s)' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$head_now")"
+  record_phase intent-card-refresh $(( $(date +%s) - _phase_t0 )) skip
+elif [ "$scope" = branch ]; then
   _phase_t0=$(date +%s)
   _icr_prd_dir="${GATE_PATIENCE_PRD_DIR:-$gate_patience_prd_dir}"
   _icr_prd_path="$_icr_prd_dir/build-queue/PRD-$slug.md"
@@ -1493,6 +1510,10 @@ fi
 # refresh describes the tree actually gated. The cache key moves with it by
 # construction (tree_now), which is the correct key — a verdict recorded
 # against the pre-refresh tree was never a verdict about what ran.
+# Left in place unconditionally (harmless): under $pinned_landing the phase
+# above now always takes the `skip` branch and never commits, so $head_now
+# is byte-identical before and after this re-read and the `head-advanced`
+# journal line below can no longer fire for a pinned-landing run.
 _head_before_icr="$head_now"
 head_now="$(git -C "$repo" rev-parse HEAD 2>/dev/null || echo "$head_now")"
 tree_now="$(git -C "$repo" rev-parse "$head_now^{tree}" 2>/dev/null || echo "$tree_now")"
