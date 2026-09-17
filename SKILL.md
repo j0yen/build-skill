@@ -3034,11 +3034,30 @@ python-specific contract.
 6. **gate** — the real gate already ran, INSIDE `gate-then-land.sh`, BEFORE
    step 3 above (`extend-gate.sh <worktree> --head <worktree HEAD> --scope
    branch --slug <slug>`, no crate-wide lock — see the **gate** action's
-   "Shared-target path" earlier). This step is the same command as the
-   non-shared rust-extend path — `scripts/gate-launch.sh <repo> --head
-   <landed sha> --scope main --slug <slug> --wait` (foreground, never a
+   "Shared-target path" earlier). **`push_via_branch=true` (PRD-build-
+   main-verdict-pinned-to-landing R1): this step never runs in the same
+   dispatch as `push` — step 5 above already stopped at
+   `last_step=landing-pending`, so this text applies only to the LATER
+   dispatch that resumes via `landing-resume.sh` ("Resuming a
+   `landing-pending` PRD" earlier). For that resumed run, never derive
+   `<landed sha>` from `git rev-parse HEAD` here either — the checkout's
+   current HEAD may already belong to a later-landed sibling on the same
+   shared target, exactly the 2026-09-17 05:15:46Z regression this PRD
+   fixes. Run `scripts/gate-launch.sh <repo> --head <any value — see the
+   non-shared gate action above> --scope main --slug <slug>
+   --pinned-landing --wait` instead — `main-verdict-pin-gate.sh`
+   re-resolves the slug's own merge sha M from
+   `state/landings/<repo>/<slug>.json` and gates a detached worktree at
+   M, so a concurrently-landed sibling's HEAD movement cannot shift what
+   this slug's re-verify checks.** The plain command below — this step is
+   the same command as the non-shared rust-extend path —
+   `scripts/gate-launch.sh <repo> --head <landed sha> --scope main --slug
+   <slug> --wait` (foreground, never a
    backgrounded job of the coordinator session — 2026-09-15 16:07Z/16:12Z)
-   after `push`, before the PRD reads `built` — but now
+   after `push`, before the PRD reads `built` — applies to
+   `push_via_branch=false` only, where step 6 always runs in the same
+   dispatch as `push` and `<landed sha>` is a real, stable, already-final
+   HEAD. Either form is now
    expected to be a CACHE HIT: `worktree-extend.sh integrate` transferred
    the branch's verdict onto main's cache under the merge's tree key
    (PRD-build-gate-before-land requirement 4), so this run replays it (no
