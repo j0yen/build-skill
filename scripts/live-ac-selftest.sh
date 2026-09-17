@@ -8,20 +8,25 @@
 # (loop-tooling scope file), R3 (prd-lint.sh live-ac-deferred /
 # live-ac-missing), R4 (verified-completed.sh --derive: a `(Live` AC pairs
 # only with its own named evidence, never a fixture; deferred ->
-# live-ac-deferred), R7/R8g (`(Real-box` wins over `(Live` when both are
+# live-ac-deferred), R5 (archive-live-ac-refusal.sh: refuses + journals
+# live-ac-unproven:<N> for an unproven `(Live` AC, goes silent once its
+# evidence appears), R7/R8g (`(Real-box` wins over `(Live` when both are
 # present, in both the lint layer AND the derive layer), and R9
 # (live-ac-report.sh: the one-time deferred-live/real/box report, never
-# re-opening anything). That is PRD ACs 1, 2, 3, 4, 8, 9.
-# ACs 5-7 (archive refusal, the reality check) and AC10's full-suite claim
-# are follow-on chained steps -- NOT asserted here yet; the PRD stays
-# `building`, not `built`, until they land and this file grows their
-# fixtures too. Never claim green on a rule that isn't wired.
+# re-opening anything). That is PRD ACs 1, 2, 3, 4, 5, 8, 9.
+# AC6/AC7 (the reality check's built->shipped flip and its
+# LIVE_AC_MAX_TICKS decision-open) and AC10's full-suite claim remain
+# follow-on chained steps, blocked needs-user on this PRD's own open
+# question (LIVE_AC_MAX_TICKS default) -- NOT asserted here yet; the PRD
+# stays `in_progress`, not `built`, until they land and this file grows
+# their fixtures too. Never claim green on a rule that isn't wired.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 LINT="$HERE/prd-lint.sh"
 SCAN="$HERE/scan-prds.sh"
 VC="$HERE/verified-completed.sh"
+ARCHIVE_REFUSAL="$HERE/archive-live-ac-refusal.sh"
 LOOP_TOOLING_REPOS_FILE="$HERE/loop-tooling-repos.txt"
 export LOOP_TOOLING_REPOS_FILE
 
@@ -182,6 +187,51 @@ cls4d="$(LOOP_TOOLING_REPOS_FILE="$T4/loop-tooling-repos.txt" VC_JOURNAL_DIR="$T
 ck "AC4: verified-completed.sh reports a deferred (Live AC as live-ac-deferred, not DEFERRED" \
   '[ "$cls4d" = "live-ac-deferred" ]' "got: $cls4d"
 rm -rf "$T4"
+
+# ---- AC5: archive-live-ac-refusal.sh -- a `(Live` AC unproven refuses
+# (exit 1), prints live-ac-unproven:<N>, and journals it; once the named
+# evidence appears it goes silent (exit 0, nothing to refuse on live-ac-*
+# grounds). Own hermetic repo + own loop-tooling-repos.txt scratch file,
+# same isolation shape as AC4 ----
+T5="$(mktemp -d "${TMPDIR:-/tmp}/live-ac-selftest-ac5.XXXXXX")"
+mkdir -p "$T5/repo/tests" "$T5/queue" "$T5/journal"
+cat > "$T5/loop-tooling-repos.txt" <<EOF
+$T5/repo
+EOF
+f5="$T5/queue/PRD-fixture-ac5.md"
+cat > "$f5" <<EOF
+# PRD: fixture-ac5
+
+- Status: built
+- build_target: shell
+- build_into: $T5/repo
+- test_prefix: liveac
+- Drafted: 2026-09-17
+- Grounding: failure-derived
+- Vision: x.md
+
+## Acceptance criteria
+
+1. P0 — Given a real loop, When it runs, Then it proves this. (Live; evidence: journal:UNIQUE_TOKEN_AC5)
+EOF
+refusal5_before="$(LOOP_TOOLING_REPOS_FILE="$T5/loop-tooling-repos.txt" VC_JOURNAL_DIR="$T5/journal" \
+  ARCHIVE_LIVE_AC_JOURNAL="$T5/journal/refusal.md" "$ARCHIVE_REFUSAL" "$f5")"
+rc5_before=$?
+ck "AC5: archive-live-ac-refusal.sh refuses (exit 1) while the (Live AC is unproven" \
+  '[ "$rc5_before" -eq 1 ]' "rc=$rc5_before"
+ck "AC5: archive-live-ac-refusal.sh prints live-ac-unproven:1 on refusal" \
+  '[ "$refusal5_before" = "live-ac-unproven:1" ]' "got: $refusal5_before"
+ck "AC5: the refusal is journaled with live-ac-unproven:1" \
+  'grep -q "fixture-ac5  archive  refuse (live-ac-unproven:1)" "$T5/journal/refusal.md" 2>/dev/null' \
+  "journal: $(cat "$T5/journal/refusal.md" 2>/dev/null)"
+
+echo "2026-09-17T20:05:00Z  liveac  UNIQUE_TOKEN_AC5  ok" > "$T5/journal/2026-09-17.md"
+refusal5_after="$(LOOP_TOOLING_REPOS_FILE="$T5/loop-tooling-repos.txt" VC_JOURNAL_DIR="$T5/journal" \
+  ARCHIVE_LIVE_AC_JOURNAL="$T5/journal/refusal.md" "$ARCHIVE_REFUSAL" "$f5")"
+rc5_after=$?
+ck "AC5: archive-live-ac-refusal.sh goes silent (exit 0, no output) once the named evidence exists" \
+  '[ "$rc5_after" -eq 0 ] && [ -z "$refusal5_after" ]' "rc=$rc5_after out=$refusal5_after"
+rm -rf "$T5"
 
 # ---- AC8: an AC marked both `(Live` and `(Real-box`, deferred -> the
 # `(Real-box` rule applies, no live-ac-* diagnostic emitted ----

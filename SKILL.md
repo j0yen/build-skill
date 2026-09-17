@@ -1756,7 +1756,14 @@ only which sha/form a main-scope gate call uses.
   shipped, not just paired-or-deferred like every other AC above. Full
   contract (marker syntax, evidence forms, the `(Real-box` interaction) is
   build-contract.md's own "`(Live` marker" section — single-sourced there,
-  not repeated here.
+  not repeated here. Run `scripts/archive-live-ac-refusal.sh <PRD-path>`
+  alongside check #5's ordinary `--derive` run: exit 1 means refuse
+  archive, record its printed `live-ac-unproven:<N>` /
+  `live-ac-deferred:<N>` string verbatim as `last_error`, and — unlike an
+  ordinary check #5 MISSING/collision failure — leave `status` where it
+  already was (`built`) rather than resetting to `in_progress`, since
+  nothing else about the PRD is wrong; it stays `built`, re-checked each
+  tick, until the reality check finds the named evidence.
 
   **Clerical-only failures are auto-finishable.** If the only failing
   checks are C2/C3/C4 (publish/push, README/CHANGELOG, REPOS.md) and both
