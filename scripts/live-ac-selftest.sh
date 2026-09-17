@@ -4,15 +4,16 @@
 # tempdir, never touches ~/Documents/PRDs, ~/.claude/skills/build/state, or
 # ~/brain/journal. Run: bash scripts/live-ac-selftest.sh
 #
-# Coverage in THIS revision: the lint-layer requirements landed so far --
-# R1 (marker + scan-prds.sh live_acs), R2 (loop-tooling scope file), R3
-# (prd-lint.sh live-ac-deferred / live-ac-missing), R4 (verified-completed.sh
-# --derive: a `(Live` AC pairs only with its own named evidence, never a
-# fixture; deferred -> live-ac-deferred), and R7/R8g (`(Real-box` wins over
-# `(Live` when both are present, in both the lint layer AND the derive
-# layer). That is PRD ACs 1, 2, 3, 4, 8.
-# ACs 5-7 (archive refusal, the reality check) and AC9/AC10's full-suite
-# claim are follow-on chained steps -- NOT asserted here yet; the PRD stays
+# Coverage in THIS revision: R1 (marker + scan-prds.sh live_acs), R2
+# (loop-tooling scope file), R3 (prd-lint.sh live-ac-deferred /
+# live-ac-missing), R4 (verified-completed.sh --derive: a `(Live` AC pairs
+# only with its own named evidence, never a fixture; deferred ->
+# live-ac-deferred), R7/R8g (`(Real-box` wins over `(Live` when both are
+# present, in both the lint layer AND the derive layer), and R9
+# (live-ac-report.sh: the one-time deferred-live/real/box report, never
+# re-opening anything). That is PRD ACs 1, 2, 3, 4, 8, 9.
+# ACs 5-7 (archive refusal, the reality check) and AC10's full-suite claim
+# are follow-on chained steps -- NOT asserted here yet; the PRD stays
 # `building`, not `built`, until they land and this file grows their
 # fixtures too. Never claim green on a rule that isn't wired.
 set -uo pipefail
@@ -210,6 +211,86 @@ ck "AC8: (Live + (Real-box on the same AC, deferred, raises no live-ac-* diagnos
 cls8="$("$VC" "$f8" --derive --format table 2>/dev/null | awk -F'\t' '$1==3{print $4}')"
 ck "AC8: verified-completed.sh --derive classifies the same AC DEFERRED (the (Real-box rule), never live-ac-*" \
   '[ "$cls8" = "DEFERRED" ]' "got: $cls8"
+
+# ---- AC9: live-ac-report.sh -- a hermetic scratch built-prds/ with one
+# shipped loop-tooling PRD (block-list mock_justifications), one shipped
+# loop-tooling PRD (inline mock_justifications, reason mentions "real"),
+# one shipped loop-tooling PRD whose deferred AC's reason does NOT mention
+# live/real/box (must be excluded), and one shipped PRODUCT PRD deferring
+# a live-sounding AC (out of scope, must be excluded) ----
+REPORT="$HERE/live-ac-report.sh"
+T9="$(mktemp -d "${TMPDIR:-/tmp}/live-ac-selftest-ac9.XXXXXX")"
+mkdir -p "$T9/built-prds"
+cat > "$T9/loop-tooling-repos.txt" <<EOF
+/home/jsy/wintermute/build-skill
+EOF
+cat > "$T9/built-prds/PRD-fixture-ac9-block.md" <<'EOF'
+# PRD: fixture-ac9-block
+
+- Status: built
+- build_target: shell
+- build_into: /home/jsy/wintermute/build-skill
+- deferred_acs: [5, 6]
+- mock_justifications:
+  - AC5 requires a live burst-lane box; none reachable this session.
+  - AC6 covered by AC5's same real-hardware run.
+- Vision: x.md
+
+## Acceptance criteria
+
+5. P0 — Given a thing, When it happens, Then it works.
+6. P0 — Given a thing, When it happens, Then it works.
+EOF
+cat > "$T9/built-prds/PRD-fixture-ac9-inline.md" <<'EOF'
+# PRD: fixture-ac9-inline
+
+- Status: built
+- build_target: shell
+- build_into: /home/jsy/wintermute/build-skill
+- deferred_acs: [2]
+- mock_justifications: AC2 needs a real box, deferred for the fixture.
+- Vision: x.md
+
+## Acceptance criteria
+
+2. P0 — Given a thing, When it happens, Then it works.
+EOF
+cat > "$T9/built-prds/PRD-fixture-ac9-unrelated.md" <<'EOF'
+# PRD: fixture-ac9-unrelated
+
+- Status: built
+- build_target: shell
+- build_into: /home/jsy/wintermute/build-skill
+- deferred_acs: [1]
+- mock_justifications: AC1 skipped -- low priority, revisit later.
+- Vision: x.md
+
+## Acceptance criteria
+
+1. P0 — Given a thing, When it happens, Then it works.
+EOF
+cat > "$T9/built-prds/PRD-fixture-ac9-product.md" <<'EOF'
+# PRD: fixture-ac9-product
+
+- Status: built
+- build_target: shell
+- build_into: /home/jsy/wintermute/mcphost
+- deferred_acs: [1]
+- mock_justifications: AC1 needs a live real box, out of scope for this repo.
+- Vision: x.md
+
+## Acceptance criteria
+
+1. P0 — Given a thing, When it happens, Then it works.
+EOF
+report_json="$(LOOP_TOOLING_REPOS_FILE="$T9/loop-tooling-repos.txt" PRD_DIR="$T9" "$REPORT" --format json 2>/dev/null)"
+report_count="$(python3 -c "import json,sys; print(json.load(sys.stdin)['count'])" <<<"$report_json")"
+ck "AC9: live-ac-report.sh finds exactly the 3 live/real/box-justified deferred ACs (block AC5+AC6, inline AC2), excludes the unrelated-reason and out-of-scope-repo ones" \
+  '[ "$report_count" = 3 ]' "count=$report_count json=$report_json"
+report_slugs="$(python3 -c "import json,sys; print(','.join(sorted(c['slug']+':'+str(c['ac']) for c in json.load(sys.stdin)['candidates'])))" <<<"$report_json")"
+ck "AC9: report names slug+AC for each candidate (fixture-ac9-block:5, :6, fixture-ac9-inline:2)" \
+  '[ "$report_slugs" = "fixture-ac9-block:5,fixture-ac9-block:6,fixture-ac9-inline:2" ]' "got: $report_slugs"
+rm -rf "$T9"
 
 # ---- Self-lint: this PRD's own file must not false-positive on its own
 # prose (AC1-AC10 quote "`(Live`" in backticks describing the convention;

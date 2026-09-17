@@ -1749,6 +1749,15 @@ only which sha/form a main-scope gate call uses.
   PRD to `parked/`, the next scan detects it as `parked` and the
   skill stops trying to advance it.
 
+  **`(Live` AC no-defer (PRD-build-live-ac-no-defer)** — for a loop-tooling
+  PRD (`build_into` under build-skill/rustbuild/autobuilder, per
+  `scripts/loop-tooling-repos.txt`), a `(Live` AC can never be deferred and
+  must actually be proven in the real loop before this PRD counts as
+  shipped, not just paired-or-deferred like every other AC above. Full
+  contract (marker syntax, evidence forms, the `(Real-box` interaction) is
+  build-contract.md's own "`(Live` marker" section — single-sourced there,
+  not repeated here.
+
   **Clerical-only failures are auto-finishable.** If the only failing
   checks are C2/C3/C4 (publish/push, README/CHANGELOG, REPOS.md) and both
   C1 and C5 pass, do NOT re-build or re-queue — run the
