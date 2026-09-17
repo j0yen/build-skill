@@ -53,8 +53,17 @@
 #   archive step must be retried once, it is NOT done.
 # Exit 1 + "stop: <slug>: <reason>"       chaining stops; <reason> is one of:
 #   excluded-kernel-extend | excluded-reflect-candidate | archive-done |
-#   blockers | needs-user | cap | lock-contended | target-busy: <detail> |
-#   no-manifest-entry | gate-running | gate-relaunched | gate-lost-twice
+#   gate-incomplete | blockers | needs-user | cap | lock-contended |
+#   target-busy: <detail> | no-manifest-entry | gate-running |
+#   gate-relaunched | gate-lost-twice
+#   `gate-incomplete` (PRD-build-gate-infra-outcome R11, P1) fires instead
+#   of `blockers`/`needs-user` when the manifest's `last_error` reads
+#   `gate-infra:<phase>:<note>` — gate-then-land.sh exhausted
+#   GATE_INFRA_MAX_ATTEMPTS retrying a phase that never actually ran
+#   (reviewer-agent under a quota limit, a missing producer binary), not a
+#   real code block — kept out of the `blockers`/`needs-user` family so a
+#   day ledger or digest never clusters a harness hiccup with a real
+#   defect.
 #   `archive-done` is only returned when status is `shipped` AND the
 #   filesystem agrees (built-prds/ present, build-queue/ absent) —
 #   requirement 3, re-verified against --prd-dir on every call, never
@@ -286,6 +295,23 @@ cmd_check() {
     echo "continue: $slug: archive-incomplete"
     return 0
   fi
+
+  # PRD-build-gate-infra-outcome R11 (P1): a PRD blocked/needs-user because
+  # gate-then-land.sh exhausted GATE_INFRA_MAX_ATTEMPTS (last_error reads
+  # `gate-infra:<phase>:<note>`) stopped a real code block, not this one —
+  # it stopped on the harness never getting to run a phase at all. Naming
+  # it the same generic "blockers"/"needs-user" reason every actual red
+  # gate also uses would cluster a quota-limit hiccup with a real defect in
+  # the day ledger/digest; `gate-incomplete` keeps them apart, same
+  # convention gate-then-land.sh's own journal lines and gate-red-
+  # summary.sh's `incomplete=` field already use for this exact cause.
+  local last_error_precheck; last_error_precheck="$(manifest_field "$slug" last_error)"
+  case "$last_error_precheck" in
+    gate-infra:*)
+      echo "stop: $slug: gate-incomplete"
+      return 1
+      ;;
+  esac
 
   local blockers_n; blockers_n="$(manifest_field "$slug" blockers)"
   if [ "${blockers_n:-0}" -gt 0 ] 2>/dev/null; then

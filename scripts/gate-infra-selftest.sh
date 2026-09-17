@@ -15,13 +15,19 @@
 #              fields against a fixture journal, plus gates-banner.sh's
 #              pass-through.
 #   AC7      — the dead relabel sed is gone from extend-gate.sh.
+#   AC10     — (P1) a cached `incomplete` verdict is never replayed; the
+#              gate actually re-runs on the next call at the same tree.
+#   AC11     — (P1) chain-guard.sh's own stop reason reads
+#              `gate-incomplete`, not `blockers`/`needs-user`, when the
+#              manifest's last_error is a gate-infra exhaustion — a real
+#              block still stops as `blockers`, unchanged.
 #   AC12     — the 2026-09-17 amendment: a finalize-rejected verdict keeps
 #              its rejected_verdict/infra_detail, still reports `infra`.
 #
-# AC8 (producer binary-missing / crash rc>=2 for phases OTHER than
-# reviewer-agent) and AC10/AC11 (P1: verdict-tree cache / chain-stop
-# reason) are this PRD's own deferred_acs — see the PRD frontmatter for
-# the justification; this run does not claim them.
+# AC8/AC9(full) — a producer binary-missing / crash rc>=2 for phases OTHER
+# than reviewer-agent (risk-gate, intake, proof-receipt, session-trace,
+# the 17 extended producers) — is this PRD's own deferred_acs; see the
+# manifest patch for the justification. This run does not claim them.
 #
 # Usage: gate-infra-selftest.sh
 #

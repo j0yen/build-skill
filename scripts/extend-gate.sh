@@ -1129,7 +1129,19 @@ if ! $record_baseline && ! $force && [ -f "$cache_file" ]; then
   if [ -f "$cache_file" ]; then
     cached_deferred_n="$(jq -r '(.deferred_receipts // []) | length' "$cache_file" 2>/dev/null || echo 0)"
   fi
-  if [ -n "$cached_tree" ] && [ "$cached_tree" = "$tree_now" ] && [ -n "$cached_hash" ] && [ "$cached_hash" = "$self_hash" ] && [ "${cached_deferred_n:-0}" = "0" ]; then
+  # PRD-build-gate-infra-outcome R10 (P1): the same reasoning as the
+  # deferred-receipts guard just above applies to a cached `incomplete`
+  # verdict — it means a phase never actually ran (claude -p failed under
+  # quota, a producer's binary was missing), not that this tree is known
+  # green or known red. Replaying it would let a fixed quota limit / a
+  # binary that's now back on $PATH keep reporting the SAME stale
+  # incomplete forever instead of the next run actually trying again — a
+  # cache MISS here falls through to a full run, same as the deferred case.
+  cached_verdict_precheck=""
+  if [ -f "$cache_file" ]; then
+    cached_verdict_precheck="$(jq -r '.verdict // empty' "$cache_file" 2>/dev/null || true)"
+  fi
+  if [ -n "$cached_tree" ] && [ "$cached_tree" = "$tree_now" ] && [ -n "$cached_hash" ] && [ "$cached_hash" = "$self_hash" ] && [ "${cached_deferred_n:-0}" = "0" ] && [ "$cached_verdict_precheck" != "incomplete" ]; then
     cached_verdict="$(jq -r '.verdict // empty' "$cache_file" 2>/dev/null || true)"
     cached_rc="$(jq -r '.exit_code // empty' "$cache_file" 2>/dev/null || true)"
     if [ -n "$cached_verdict" ] && [ -n "$cached_rc" ]; then
