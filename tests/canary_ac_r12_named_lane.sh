@@ -18,6 +18,15 @@
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BL="$HERE/../scripts/burst-lane.sh"
+# Same fixture-bin PATH prefix canary_ac_r10_r11_report_cost.sh and every
+# other burst-lane.sh-invoking canary test use: burst-lane.sh unconditionally
+# isolation-guards its resolved hcloud/ssh/rsync binaries at load time
+# (isolation-guard.sh, armed by run-selftests.sh's BUILD_TEST=1) even though
+# this test's lane never shells out to any of the three — without this, the
+# real /usr/bin/ssh and /usr/bin/rsync resolve as live paths and every
+# scenario below refuses with `test-isolation: live path ... under
+# BURST_LANE_TEST` before cmd_canary's own lane logic ever runs.
+export PATH="$HERE/fixtures/burst-lane-fake:$PATH"
 
 fail=0
 expect() { local label="$1" cond="$2"; if eval "$cond"; then echo "ok  $label"; else echo "FAIL $label"; fail=1; fi; }
