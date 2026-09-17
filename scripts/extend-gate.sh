@@ -487,6 +487,16 @@ print_verdict_path_mode=false
 # byte-identical to prior behavior: same lockfile, same journal shape.
 scope="main"
 slug=""
+# PRD-build-main-verdict-pinned-to-landing R3/AC1: set by the pinned-gate
+# caller (scripts/main-verdict-pin-gate.sh) — never by an ordinary
+# `--scope main` call. It changes nothing about WHICH producers run or
+# how they run (the caller already arranged that by pointing $repo_arg at
+# a detached worktree checked out at M, and passing --head M --base M^);
+# it only widens the main-scope journal line's scope_prefix (ordinarily
+# empty for `--scope main`) to name the slug and mark the line as a
+# landing-pinned verdict, per AC1's "journal line reads `gate … scope=main
+# slug=S head=M pinned=landing`, never head=H."
+pinned_landing=false
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -501,6 +511,7 @@ while [ $# -gt 0 ]; do
     --print-verdict-path) print_verdict_path_mode=true; shift ;;
     --scope)            scope="${2:?extend-gate: --scope needs a value}"; shift 2 ;;
     --slug)             slug="${2:?extend-gate: --slug needs a value}"; shift 2 ;;
+    --pinned-landing)   pinned_landing=true; shift ;;
     *) die 1 "unknown argument: $1 (see --help)" ;;
   esac
 done
@@ -511,6 +522,9 @@ case "$scope" in
 esac
 if [ "$scope" = branch ] && [ -z "$slug" ]; then
   die 1 "--scope branch requires --slug <slug>"
+fi
+if $pinned_landing && { [ "$scope" != main ] || [ -z "$slug" ] || [ -z "$head_want" ]; }; then
+  die 1 "--pinned-landing requires --scope main, --slug <slug>, and --head <M>"
 fi
 
 repo="$(cd "$repo_arg" 2>/dev/null && pwd)" || die 1 "no such directory: $repo_arg"
@@ -1263,7 +1277,15 @@ intent_card_stale=false
 # (e.g. one that always exits 5) without touching production behavior —
 # same convention as RUSTBUILD_SCRIPTS/EXTEND_GATE elsewhere in this file.
 INTENT_CARD_REFRESH_BIN="${INTENT_CARD_REFRESH_BIN:-$BUILD_SCRIPTS/intent-card-refresh.sh}"
-if [ "$scope" = branch ]; then
+# PRD-build-main-verdict-pinned-to-landing R3/AC3: a pinned main-scope gate
+# (--scope main --pinned-landing --slug S, run in a detached worktree at
+# S's own merge sha M) needs this refresh to run FOR S too — same reason
+# branch scope needs it (the reviewer step right after this one must judge
+# the landing against S's own intent card, not whatever main last
+# refreshed for some other, later-landed slug) — so intake/reviewer never
+# read a stale card for a pinned verdict. An ordinary `--scope main` call
+# (no --pinned-landing) is unchanged: still skip, same as before this PRD.
+if [ "$scope" = branch ] || $pinned_landing; then
   _phase_t0=$(date +%s)
   _icr_prd_dir="${GATE_PATIENCE_PRD_DIR:-$gate_patience_prd_dir}"
   _icr_prd_path="$_icr_prd_dir/build-queue/PRD-$slug.md"
@@ -2224,6 +2246,11 @@ if [ -n "$producer_unattested_first" ]; then
 fi
 # END canary-r15-producer-attestation-block
 
+# PRD-build-main-verdict-pinned-to-landing AC1: appended last, after every
+# suffix above, so a pinned run's journal line always ends with
+# `pinned=landing` regardless of what else this run's own suffixes named.
+$pinned_landing && journal_suffix="$journal_suffix pinned=landing"
+
 # One journal line per gate run (requirement 8 / AC13): crate, HEAD, base
 # tag, pass/block counts, blocking receipt names, wall seconds, (PRD-
 # build-gate-phase-timing) a per-step phase breakdown right after wall=,
@@ -2234,6 +2261,13 @@ fi
 # stayed local.
 scope_prefix=""
 [ "$scope" = branch ] && scope_prefix="scope=branch slug=$slug "
+# PRD-build-main-verdict-pinned-to-landing AC1: a pinned main-scope run
+# names its slug too — ordinarily `--scope main` has no slug and this
+# stays empty (byte-identical to before this PRD). `pinned=landing` itself
+# lands in $journal_suffix (appended last, above) so it always prints
+# after every other field this line already carries, including head=$head_now
+# right after this prefix.
+$pinned_landing && scope_prefix="scope=main slug=$slug "
 # PRD-build-gate-route-parity-ledger requirement 2 (R2/AC2): `routed=<n>/
 # <receipts>` and `route=<value>` are appended at the very end, after the
 # pre-existing cargo=burst:.../local:... field — existing fields keep
