@@ -64,9 +64,18 @@ cache_fresh() {
 summary_line=""
 shipped_n=""
 
+landing_pending_lines=""
+
 if is_redbaron "$HOSTNAME_VAL"; then
   [ -r "$SUMMARY_FILE" ] && summary_line="$(sed -n '1p' "$SUMMARY_FILE" | cut -d' ' -f2-)"
   shipped_n="$("$HERE/shipped-count.sh" 2>/dev/null || echo 0)"
+  # PRD-build-main-push-gate-pr-path requirement 9 (P1, AC12): the
+  # landing-pending data only exists as real state ON the machine that
+  # ran the landing (RedBaron) -- the remote/cached branch below does not
+  # yet carry it (documented scope note, not an oversight: mcphost
+  # landings, this feature's only live user today, only ever happen on
+  # RedBaron).
+  landing_pending_lines="$("$HERE/landing-pending-summary.sh" 2>/dev/null || true)"
 else
   if cache_fresh; then
     summary_line="$(sed -n '1p' "$CACHE_FILE" 2>/dev/null | cut -d' ' -f2-)"
@@ -103,6 +112,13 @@ echo "PRDs shipped last 24h: ${shipped_n:-0}"
 red_n="$(printf '%s' "$summary_line" | grep -oE 'red=[0-9]+' | head -1 | cut -d= -f2)"
 if [ -n "$red_n" ] && [ "$red_n" -gt 0 ] 2>/dev/null; then
   echo "RED GATES PRESENT — lead every status with this."
+fi
+
+if [ -n "$landing_pending_lines" ]; then
+  lp_n="$(printf '%s\n' "$landing_pending_lines" | sed -n '1p' | cut -d= -f2)"
+  if [ -n "$lp_n" ] && [ "$lp_n" -gt 0 ] 2>/dev/null; then
+    printf '%s\n' "$landing_pending_lines"
+  fi
 fi
 
 exit 0

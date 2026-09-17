@@ -36,7 +36,7 @@ done
 # excludes comment lines (a `#`-led line, ignoring leading whitespace)
 # so this PRD's own header prose naming the forbidden flags doesn't trip
 # itself.
-for target in "$SKILL_DIR/scripts/branch-protection.sh" "$SKILL_DIR/scripts/landing-resume.sh"; do
+for target in "$SKILL_DIR/scripts/branch-protection.sh" "$SKILL_DIR/scripts/landing-resume.sh" "$SKILL_DIR/scripts/landing-pending-summary.sh"; do
   bad="$(grep -nE -- '--force|reset[[:space:]]+--hard' "$target" | grep -vE '^[0-9]+:[[:space:]]*#')"
   if [ -n "$bad" ]; then
     echo "main-push-pr-path-selftest: FAILED force/reset-hard guardrail in $target:" >&2
