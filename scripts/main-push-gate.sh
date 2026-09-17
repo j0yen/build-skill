@@ -100,13 +100,22 @@
 # (scripts/lib/journal.sh) —
 #   <ts>  <slug>  main-push  <ok|refused|unknown>  (repo=<repo> gated=<sha7>
 #     head=<sha7> delta=<n> check="<cmd>" rc=<n> wall=<s>)
+# For a push_via_branch=true repo (PRD-build-main-push-gate-pr-path
+# requirement 5, AC7), the line instead reads:
+#   <ts>  <slug>  main-push  ok|refused  (repo=<repo> via=pr-path
+#     gated=<sha> head=<sha> delta=0 [verdict=<v> reason=<r>])
+# — full (untruncated) shas, no `check`/`rc`/`wall` fields (no local
+# command runs; GitHub's own required checks on the PR are the check).
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SKILL_DIR="$(cd "$HERE/.." && pwd)"
+STATE_DIR="${BUILD_STATE_DIR:-$SKILL_DIR/state}"
 
 # shellcheck source=lib/journal.sh
 source "$HERE/lib/journal.sh"
+# shellcheck source=lib/push-via-branch.sh
+source "$HERE/lib/push-via-branch.sh"
 
 CHECK_TIMEOUT_SECS="${MAIN_PUSH_GATE_TIMEOUT:-900}"   # 15 minutes (AC9)
 
@@ -259,6 +268,43 @@ print(h)
     emit unknown "" "$head_now" "n/a" "n/a" "n/a" 0
     die 5 "no --gated given and no head/head_sha found in $verdict_file"
   fi
+fi
+
+# --- push_via_branch=true acceptance (PRD-build-main-push-gate-pr-path ---
+# requirement 5, P0, AC7): this repo's push target is `loop/<slug>`, not
+# main itself — GitHub's OWN required checks on that PR are the
+# CI-equivalent (armed by `branch-protection.sh push`), so there is no
+# local command this script could usefully run for a delta, and no delta
+# is tolerated: the head about to be pushed must be EXACTLY the head
+# extend-gate.sh already gated pass/delta-pass (a branch-scope verdict, in
+# the shared-target case — gate-then-land.sh's own pre-land intent-card
+# refresh already guarantees this by construction; see that script's
+# header). Checked BEFORE the identical-sha short-circuit below (this
+# check exits either way, itself) and BEFORE the ci-equivalent.toml delta
+# machinery (never reached for such a repo) — a repo with no protection
+# recorded, or `push_via_branch: false`, is entirely unaffected (falls
+# through unchanged, byte-for-byte, to the direct-push logic below).
+if [ "$(push_via_branch_for "$slug")" = "true" ]; then
+  pvb_verdict_file="$verdict_dir/target/autobuilder/last-verdict.json"
+  pvb_verdict_head="" pvb_verdict=""
+  if [ -f "$pvb_verdict_file" ] && command -v jq >/dev/null 2>&1; then
+    pvb_verdict_head="$(jq -r '.head // .head_sha // empty' "$pvb_verdict_file" 2>/dev/null)"
+    pvb_verdict="$(jq -r '.verdict // empty' "$pvb_verdict_file" 2>/dev/null)"
+  fi
+  # An explicit --gated always wins over the verdict file's own head (same
+  # override precedence as the ordinary --gated resolution above).
+  pvb_gated="$gated_now"
+  case "$pvb_verdict" in
+    pass|delta-pass) pvb_ok=true ;;
+    *) pvb_ok=false ;;
+  esac
+  if [ -n "$pvb_gated" ] && [ "$pvb_gated" = "$head_now" ] && $pvb_ok; then
+    journal_line "$(date -u +%Y-%m-%dT%H:%M:%SZ)  $slug  main-push  ok  (repo=$slug via=pr-path gated=$pvb_gated head=$head_now delta=0)"
+    echo "main-push-gate: ok via=pr-path — $slug gated==head (${head_now:0:7}), delta=0, PR-path required checks stand in for a local re-run"
+    exit 0
+  fi
+  journal_line "$(date -u +%Y-%m-%dT%H:%M:%SZ)  $slug  main-push  refused  (repo=$slug via=pr-path gated=${pvb_gated:-none} head=$head_now verdict=${pvb_verdict:-none} reason=head-mismatch-or-not-gated)"
+  die 4 "main-push refused via=pr-path: no fresh branch-scope pass/delta-pass verdict for head $head_now (verdict_head=${pvb_gated:-none} verdict=${pvb_verdict:-none})"
 fi
 
 # --- identical shas: short-circuit ok, delta=0, no command (requirement 2) ---
