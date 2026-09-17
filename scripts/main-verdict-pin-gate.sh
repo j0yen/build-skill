@@ -35,6 +35,16 @@
 #   5. The detached worktree is removed either way (pass or block) — it
 #      is read-only evidence, never a branch anything lands on.
 #
+# R4: extend-gate.sh's own tree-keyed verdict cache lives at
+# <worktree>/target/autobuilder/last-verdict.json — INSIDE the worktree
+# step 5 just deleted, so without help a repeat question for the same
+# slug/M would pay a full run every time. `--verdict-cache-mirror
+# state/main-verdict-cache/<repo>/<slug>.json` (a stable path this script
+# owns, never removed) is passed through: extend-gate.sh seeds its cache
+# from it before checking for a hit, and refreshes it after every write
+# (hit or fresh run) — see that script's own R4 comments. "M's tree is
+# immutable, so a hit is a hit forever" (Technical considerations).
+#
 # Exit codes:
 #   0/1  whatever extend-gate.sh itself returned (pass/block) — this
 #        script adds no verdict logic of its own.
@@ -51,6 +61,7 @@ set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 SKILL_DIR="${BUILD_SKILL_DIR:-$(cd "$HERE/.." && pwd)}"
+STATE_DIR="${BUILD_STATE_DIR:-$SKILL_DIR/state}"
 WT_ROOT="${BUILD_WT_ROOT:-$HOME/.cache/build-worktrees}"
 LANDING_VERDICT_RESOLVE="${MAIN_VERDICT_PIN_GATE_LANDING_VERDICT_RESOLVE:-$HERE/landing-verdict-resolve.sh}"
 EXTEND_GATE="${MAIN_VERDICT_PIN_GATE_EXTEND_GATE:-$HERE/extend-gate.sh}"
@@ -92,8 +103,14 @@ rm -rf "$wt_dir"
 git -C "$repo" worktree add --detach "$wt_dir" "$merge_sha" >/dev/null 2>&1 \
   || die 2 "git worktree add --detach $wt_dir $merge_sha failed"
 
+# --- R4: a stable mirror (outside the worktree this trap removes) so a
+# repeat question for the same slug/M is a cache hit, not a full re-run.
+# Mirrors state/landings/<repo>/<slug>.json's own path convention.
+mkdir -p "$STATE_DIR/main-verdict-cache/$repo_slug"
+verdict_cache_mirror="$STATE_DIR/main-verdict-cache/$repo_slug/$slug.json"
+
 # --- R3: gate M in that worktree, pinned -------------------------------
 "$EXTEND_GATE" "$wt_dir" --head "$merge_sha" --scope main --slug "$slug" \
-  --base "$base_sha" --pinned-landing "${extra_args[@]}"
+  --base "$base_sha" --pinned-landing --verdict-cache-mirror "$verdict_cache_mirror" "${extra_args[@]}"
 gate_rc=$?
 exit "$gate_rc"
