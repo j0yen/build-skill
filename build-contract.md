@@ -82,6 +82,40 @@ routed/fresh/image-matching state instead of a `tests/` file — a re-checked
 claim, not a one-time memo. Use it sparingly; it exists for burst-lane's
 one-time real-hardware ACs, not as a general escape from writing tests.
 
+**`(Live` marker (PRD-build-live-ac-no-defer).** An AC line that ends with a
+parenthetical starting `(Live` (e.g. "(Live; evidence: `journal:<regex>`)")
+names a proof that must come from the real loop on RedBaron — a journal
+line, a receipt path, or a live command's exit code — never a fixture.
+`scan-prds.sh` emits `live_acs: [N, …]` per PRD (the AC numbers carrying the
+marker, read-only diagnostics; it never itself refuses anything).
+
+Scope: a PRD whose `build_into` is under `/home/jsy/wintermute/build-skill`,
+`/home/jsy/wintermute/rustbuild`, or `/home/jsy/wintermute/autobuilder`
+(the shared list in `scripts/loop-tooling-repos.txt`, read by every check
+below — a PRD outside this scope, e.g. a product PRD, is unaffected by all
+of R1-R7). For an in-scope PRD:
+
+- `prd-lint.sh`: a `live_acs` number present in `deferred_acs` fails
+  `live-ac-deferred`; zero `(Live` ACs fails `live-ac-missing` for a PRD
+  `Drafted:` on or after 2026-09-17 (warning, exit 0, for an earlier one —
+  migration guard, see PRD's "Migration / compatibility").
+- `verified-completed.sh --derive`'s rule (beside rule f / `(Real-box`,
+  around :506) pairs a `(Live` AC only against the evidence its own AC text
+  names (`journal:<regex>`, `receipt:<path>`, `cmd:<command>`); a fixture
+  `tests/` file never satisfies it, and a deferred `(Live` AC reports
+  `live-ac-deferred` (never `completed`).
+- The archive step refuses (`live-ac-deferred` / `live-ac-unproven`) and
+  journals it; the PRD stays `built`, not `shipped`, until the reality
+  check finds the named evidence.
+- An AC carrying both `(Real-box` and `(Live` follows the `(Real-box` rule
+  (deferrable with justification) — `(Real-box` wins; no `live-ac-*`
+  diagnostic fires for it. `(Real-box`'s own scope and behavior are
+  unchanged by any of this.
+
+Use it for the one AC per loop-tooling PRD that only the real loop can
+prove — the mechanism actually running once, not a fixture standing in for
+it.
+
 ## Language routing
 
 - `rust-*` → `/rustbuild` (cargo runs on RedBaron: locally there, remotely from every other node via the skill's cargo shim).

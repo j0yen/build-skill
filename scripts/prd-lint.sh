@@ -50,6 +50,10 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # PRD-build-tenant-secret-continuity: exported so the python heredoc below
 # can resolve state/secrets/<slug>/ without re-deriving SKILL_DIR itself.
 export LINT_STATE_DIR="${BUILD_STATE_DIR:-$HERE/../state}"
+# PRD-build-live-ac-no-defer R2: the shared loop-tooling scope file, so the
+# python heredoc below and verified-completed.sh/archive-trailer.sh never
+# hardcode the build-skill/rustbuild/autobuilder list a second time.
+export LOOP_TOOLING_REPOS_FILE="${LOOP_TOOLING_REPOS_FILE:-$HERE/loop-tooling-repos.txt}"
 
 usage() {
   echo "usage: prd-lint.sh <file|dir>... [--format text|json|pass-fail] [--quiet] [--contract <path>]" >&2
@@ -275,6 +279,47 @@ REAL_BOX_RE = re.compile(
     re.I,
 )
 LINT_STATE_DIR = os.environ.get("LINT_STATE_DIR", "")
+# PRD-build-live-ac-no-defer R1/R3: an AC line ending with a parenthetical
+# starting "(Live" names a proof that must come from the real loop, never a
+# fixture -- see build-contract.md's "(Live marker" section.
+LIVE_AC_RE = re.compile(r"\(Live\b")
+LIVE_AC_CUTOFF = "2026-09-17"  # migration guard: error on/after, warning before
+LOOP_TOOLING_REPOS_FILE = os.environ.get("LOOP_TOOLING_REPOS_FILE", "")
+
+
+def _load_loop_tooling_repos():
+    """Lines of LOOP_TOOLING_REPOS_FILE, comments/blank lines stripped,
+    trailing slashes normalized off. Best-effort: an unreadable/missing
+    file yields an empty list (nothing is treated as loop-tooling), same
+    fail-open shape as the other optional-file reads in this script."""
+    repos = []
+    if not LOOP_TOOLING_REPOS_FILE:
+        return repos
+    try:
+        with open(LOOP_TOOLING_REPOS_FILE, encoding="utf-8", errors="replace") as fh:
+            for raw in fh:
+                line = raw.strip()
+                if not line or line.startswith("#"):
+                    continue
+                repos.append(line.rstrip("/"))
+    except OSError:
+        pass
+    return repos
+
+
+LOOP_TOOLING_REPOS = _load_loop_tooling_repos()
+
+
+def is_loop_tooling_build_into(build_into):
+    """True when build_into equals, or is a subdirectory of, one of the
+    configured loop-tooling repos (scripts/loop-tooling-repos.txt)."""
+    if not build_into:
+        return False
+    bi = build_into.rstrip("/")
+    for repo in LOOP_TOOLING_REPOS:
+        if bi == repo or bi.startswith(repo + "/"):
+            return True
+    return False
 
 
 def strip_val(v):
@@ -633,6 +678,9 @@ def lint_file(path):
     # (PRD-mcphost-tenant-tables) on a name mismatch between the lint and
     # the parsers it exists to front-run (2026-09-15 22:21:41Z).
     deferred_raw = fm.get("deferred_acs")
+    deferred_nums = []  # PRD-build-live-ac-no-defer: always defined, even
+                         # when deferred_raw is empty/absent, so the
+                         # (Live check below can consult it unconditionally.
     if deferred_raw:
         if re.match(r"^\[\s*\d+(\s*,\s*\d+)*\s*\]$", deferred_raw) or re.match(r"^\[\s*\]$", deferred_raw):
             is_list = True
@@ -764,6 +812,64 @@ def lint_file(path):
                 missing_tokens = [t for t in ("Given", "When", "Then") if t not in s]
                 if missing_tokens:
                     fail("ac-missing-gwt", f"AC line missing {', '.join(missing_tokens)}: {it[0]!r}")
+
+        # -- (Live AC marker: no-defer for loop-tooling PRDs -----------------
+        # PRD-build-live-ac-no-defer R3 / Operator-authorization "no-defer
+        # live ACs" (2026-09-17T16:30Z): scope is build_into under
+        # build-skill/rustbuild/autobuilder (scripts/loop-tooling-repos.txt).
+        # An AC both `(Live` and `(Real-box` follows the `(Real-box` rule
+        # (R7/R8g): it still counts toward "at least one `(Live` AC" (it IS
+        # one), but is excluded from the deferred-check set below, since
+        # `(Real-box` governs its own deferral -- deferring it must never
+        # raise live-ac-deferred.
+        #
+        # Backtick-quoted mentions of the marker (a PRD's own prose
+        # *describing* the `(Live` convention, e.g. this PRD's AC1-AC10:
+        # "an AC marked `(Live`...") must not count as that AC itself
+        # carrying the marker -- only a literal, un-quoted `(Live` in the
+        # AC's own text is the real tag. Strip inline-code spans first
+        # (real 2026-09-17 false positive found self-linting this PRD:
+        # AC1-AC10 all quote the marker name in backticks).
+        live_ac_nums = []
+        live_ac_nums_enforceable = []
+        for it in items:
+            m = AC_NUM_RE.match(it[0])
+            if not m:
+                continue
+            s = " ".join(it)
+            s_code_stripped = re.sub(r"`[^`]*`", "", s)
+            if LIVE_AC_RE.search(s_code_stripped):
+                n = int(m.group(1))
+                live_ac_nums.append(n)
+                if "(Real-box" not in s_code_stripped:
+                    live_ac_nums_enforceable.append(n)
+        if is_loop_tooling_build_into(build_into):
+            deferred_live = sorted(n for n in live_ac_nums_enforceable if n in deferred_nums)
+            if deferred_live:
+                named = ", ".join(str(n) for n in deferred_live)
+                fail(
+                    "live-ac-deferred",
+                    f"loop-tooling PRD (build_into under build-skill/rustbuild/"
+                    f"autobuilder) defers (Live AC(s) {named} -- the "
+                    f"Operator-authorization 'no-defer live ACs' scope covers "
+                    f"this build_into; a (Live AC here can never appear in "
+                    f"deferred_acs",
+                )
+            if not live_ac_nums:
+                drafted = fm.get("drafted", "")
+                msg = (
+                    "loop-tooling PRD has no `(Live` AC -- every loop-tooling "
+                    "PRD must name at least one AC the real loop (not a "
+                    "fixture) proves"
+                )
+                if drafted and drafted >= LIVE_AC_CUTOFF:
+                    fail("live-ac-missing", msg)
+                else:
+                    warn(
+                        "live-ac-missing",
+                        msg + f" (warning only: Drafted {drafted!r} is before "
+                        f"{LIVE_AC_CUTOFF}, or unset -- migration guard)",
+                    )
 
         # pattern check: pinned SHA in an AC of an extend PRD
         if build_target in EXTEND_TARGETS:

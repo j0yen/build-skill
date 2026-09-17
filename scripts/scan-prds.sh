@@ -214,6 +214,7 @@ is_collided() {
 # path below. Same known gap applies to `operator_authorization`/
 # `operator_authorization_unparsed` (PRD-build-operator-authorization-
 # contract) -- not backfilled onto vellum's rows either, for the same reason.
+# Same known gap applies to `live_acs` (PRD-build-live-ac-no-defer).
 # Emit BOTH top-level (buildable) and ARCHIVE/ (already-done) so Phase 1 diff
 # can distinguish archived from truly-vanished. Without this, PRDs moved to
 # ARCHIVE/ after shipping would be marked "vanished" on the next scan and
@@ -487,6 +488,32 @@ except Exception:
     fi
   fi
 
+  # PRD-build-live-ac-no-defer R1: which AC numbers carry the "(Live"
+  # marker -- same detection shape as verified-completed.sh's ac_is_realbox
+  # (see that script around :506), scanning the Acceptance-criteria block
+  # for a `N. ... (Live` line. Backtick-quoted mentions (a PRD's own prose
+  # *describing* the marker, e.g. this PRD's own AC1-AC10: "an AC marked
+  # `(Live`...") are stripped first so they don't false-positive as that AC
+  # itself carrying the tag (real 2026-09-17 self-lint find). No `\b` in the
+  # match -- mawk (this host's /usr/bin/awk) doesn't support it; mirrors the
+  # `(Real-box` check's plain-substring convention. Read-only diagnostics;
+  # scan-prds never itself refuses anything -- prd-lint.sh (R3) is the
+  # enforcement point. Known gap (mirrors the vellum/substrate gap noted
+  # above): only the bash-fallback path below computes this; vellum's rows
+  # aren't backfilled.
+  local live_acs
+  live_acs="$(awk '
+    /^##[[:space:]]+([[:digit:]]+\.[[:space:]]+)?Acceptance/ { in_block=1; next }
+    /^##[[:space:]]/ && in_block { in_block=0 }
+    in_block && match($0, /^[[:digit:]]+\./) {
+      n = substr($0, RSTART, RLENGTH-1) + 0
+      line = $0
+      gsub(/`[^`]*`/, "", line)
+      if (line ~ /\(Live/) print n
+    }
+  ' "$path" | "$JQ" -cs '.' 2>/dev/null)"
+  [ -n "$live_acs" ] || live_acs="[]"
+
   # PRD-build-selector-honors-priority requirement 2: a build_priority value
   # that isn't high/normal/low sorts in the normal band (priority_band()'s
   # default case handles that silently) but journals once here so a typo
@@ -526,7 +553,8 @@ except Exception:
     --arg mtime "$mtime" \
     --argjson gate_stale "$gate_stale" \
     --arg substrate "$substrate" \
-    '{slug:$slug, path:$path, build_auto:$build_auto, build_target:$build_target, build_priority:$build_priority, build_into:$build_into, build_version_bump:$build_version_bump, publish:$publish, deferred_acs:$deferred_acs, deferred_acs_unparsed:$deferred_acs_unparsed, deferred_ac_reasons:$deferred_ac_reasons, operator_authorization:$operator_authorization, operator_authorization_unparsed:$operator_authorization_unparsed, test_prefix:$test_prefix, status_line:$status_line, size_bytes:$size, mtime_iso:$mtime, gate_stale:$gate_stale, substrate:$substrate}'
+    --argjson live_acs "$live_acs" \
+    '{slug:$slug, path:$path, build_auto:$build_auto, build_target:$build_target, build_priority:$build_priority, build_into:$build_into, build_version_bump:$build_version_bump, publish:$publish, deferred_acs:$deferred_acs, deferred_acs_unparsed:$deferred_acs_unparsed, deferred_ac_reasons:$deferred_ac_reasons, operator_authorization:$operator_authorization, operator_authorization_unparsed:$operator_authorization_unparsed, test_prefix:$test_prefix, status_line:$status_line, size_bytes:$size, mtime_iso:$mtime, gate_stale:$gate_stale, substrate:$substrate, live_acs:$live_acs}'
 }
 
 # Emit top-level PRDs (buildable) AND ARCHIVE/ PRDs (already done).

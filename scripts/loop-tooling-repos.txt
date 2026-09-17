@@ -1,0 +1,12 @@
+# loop-tooling-repos.txt — PRD-build-live-ac-no-defer R2.
+#
+# One absolute path per line (blank lines and `#` comments ignored). A PRD
+# is "loop-tooling" (the `(Live` no-defer rule in build-contract.md applies)
+# when its `build_into` equals one of these paths or is a subdirectory of
+# one. Every check that needs the distinction (prd-lint.sh, verified-
+# completed.sh, archive-trailer.sh) reads THIS file rather than hardcoding
+# the list a second time, per the Operator-authorization scope string:
+# "loop-tooling PRDs (build_into under build-skill, rustbuild, autobuilder)".
+/home/jsy/wintermute/build-skill
+/home/jsy/wintermute/rustbuild
+/home/jsy/wintermute/autobuilder
