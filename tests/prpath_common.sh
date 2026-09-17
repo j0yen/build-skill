@@ -29,6 +29,13 @@ prpath_expect() {
 #     can assert "exactly one gh call" (AC3).
 #   - anything else exits 1 with a marker on stderr (never silently
 #     no-ops an unexpected call).
+#
+# Also handles the three `gh` calls `branch-protection.sh push` makes (AC1/
+# AC2/AC13 fixtures): `pr list` (existing-PR lookup — empty by default, so
+# `push` takes the "open a new PR" branch), `pr create` (prints a PR URL),
+# and `pr merge --auto --squash` (arms auto-merge). Each logs to its own
+# <bindir>/pr-<verb>-calls.log so a test can assert call counts (AC13:
+# exactly one open PR across two `push` calls for the same slug).
 prpath_install_gh_stub() {
   local bindir="$1"
   mkdir -p "$bindir"
@@ -49,11 +56,31 @@ if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
   printf '%s' "$body"
   exit "${PRPATH_GH_PR_VIEW_RC:-0}"
 fi
+if [ "$1" = "pr" ] && [ "$2" = "list" ]; then
+  echo "call" >> "$(dirname "$0")/pr-list-calls.log"
+  # Empty by default: no open PR found for the branch, so `push` takes the
+  # `gh pr create` branch below. Set PRPATH_GH_PR_LIST_URL to simulate an
+  # already-open PR (the reuse/idempotent path, AC13).
+  printf '%s' "${PRPATH_GH_PR_LIST_URL:-}"
+  exit 0
+fi
+if [ "$1" = "pr" ] && [ "$2" = "create" ]; then
+  echo "call" >> "$(dirname "$0")/pr-create-calls.log"
+  printf '%s\n' "${PRPATH_GH_PR_CREATE_URL:-https://github.com/j0yen/fixture-repo/pull/1}"
+  exit "${PRPATH_GH_PR_CREATE_RC:-0}"
+fi
+if [ "$1" = "pr" ] && [ "$2" = "merge" ]; then
+  echo "$3" >> "$(dirname "$0")/pr-merge-calls.log"
+  exit "${PRPATH_GH_PR_MERGE_RC:-0}"
+fi
 echo "gh-stub: unexpected invocation: $*" >&2
 exit 1
 STUB
   chmod +x "$bindir/gh"
   : > "$bindir/pr-view-calls.log"
+  : > "$bindir/pr-list-calls.log"
+  : > "$bindir/pr-create-calls.log"
+  : > "$bindir/pr-merge-calls.log"
 }
 
 # prpath_mk_repo <root> -> prints a bare "origin.git" + working clone

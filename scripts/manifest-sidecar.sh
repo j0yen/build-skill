@@ -22,6 +22,16 @@
 #   output_repo_url=<url>      only set if non-empty
 #   action=<string>            free-form description for journal
 #   outcome=<string>           free-form description for journal
+#   last_step=<string>         PRD-build-main-push-gate-pr-path Technical
+#                              considerations: a recognised in-progress step
+#                              name, currently only "landing-pending" (the
+#                              PRD landed on local main and pushed a PR via
+#                              branch-protection.sh push; origin/main
+#                              advances once that PR's required checks go
+#                              green — manifest-invariants must not flag
+#                              this slug stale while elapsed <
+#                              LANDING_PENDING_MAX). Cleared when omitted or
+#                              empty, same convention as last_error.
 #
 # On success: exits 0.  Sidecar is atomic (mktemp + mv within same dir).
 
@@ -66,6 +76,7 @@ output_repo_path=""
 output_repo_url=""
 action=""
 outcome=""
+last_step=""
 
 for pair in "$@"; do
   key="${pair%%=*}"
@@ -79,6 +90,7 @@ for pair in "$@"; do
     output_repo_url)   output_repo_url="$val" ;;
     action)            action="$val" ;;
     outcome)           outcome="$val" ;;
+    last_step)         last_step="$val" ;;
     *)                 echo "manifest-sidecar: unknown key '$key'" >&2 ;;
   esac
 done
@@ -96,6 +108,7 @@ tmp="$(mktemp "$STATUS_DIR/.sidecar-${slug}.XXXXXXXX")"
   --arg output_repo_url   "$output_repo_url" \
   --arg action        "$action" \
   --arg outcome       "$outcome" \
+  --arg last_step     "$last_step" \
   --arg written_at    "$now" \
   '{
     slug:              $slug,
@@ -107,6 +120,7 @@ tmp="$(mktemp "$STATUS_DIR/.sidecar-${slug}.XXXXXXXX")"
     output_repo_url:   (if $output_repo_url == "" then null else $output_repo_url end),
     action:            (if $action == "" then null else $action end),
     outcome:           (if $outcome == "" then null else $outcome end),
+    last_step:         (if $last_step == "" then null else $last_step end),
     written_at:        $written_at
   }' > "$tmp"
 

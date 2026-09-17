@@ -77,6 +77,25 @@
 # 6/7/8/9/10 family, all of which mean "branch kept, main untouched" —
 # that is NOT true here, so no caller may treat 11 as one of those.
 #
+# PR-path landing (PRD-build-main-push-gate-pr-path requirement 1, P0,
+# AC1/AC2): a `push_via_branch=true` repo (branch-protection.json — the
+# repo's main refuses a direct push, GH006) cannot use the deferred-
+# receipt re-verify above AT ALL — `ci-checks` at main scope needs Actions
+# runs at an unpushed sha, which never exist before a push, making that
+# re-verify a circular precondition (grounding: decision `ccaa7224`,
+# 2026-09-16). For such a repo, checked BEFORE the deferred-receipt block
+# and regardless of whether this land's own verdict deferred anything, the
+# landing sequence is instead: `branch-protection.sh push <repo> <slug>`
+# (pushes `loop/<slug>`, opens/reuses a PR, arms `gh pr merge --auto
+# --squash` — writes `state/landings/<repo>/<slug>.json` itself) -> a
+# `landing-pending` journal line -> exit 0 with the manifest sidecar's
+# `last_step=landing-pending` (the PRD landed on LOCAL main; `origin/main`
+# advances only once the PR's required checks go green — a later tick's
+# `branch-protection.sh landing-check` + `sync` finishes the job, not this
+# script). A failure IN that push step is exit 11 (below) — main already
+# holds this land locally, not reverted, same "branch already landed,
+# fix/retry forward" shape as the deferred-receipt block below.
+#
 # Exit codes:
 #   0  landed (prints the landed sha on stdout)
 #   1  usage error
@@ -85,11 +104,13 @@
 #   8  rebase-conflict while recovering from a stale base — no retry
 #   9  extend-gate.sh returned an infra failure (not pass=0/block=1) — no retry
 #  10  worktree-extend.sh integrate returned an unexpected infra code — no retry
-#  11  post-land-main-gate-block — the branch DID land on main (main is NOT
-#      untouched, unlike 6/7/8/9/10); the post-land `--scope main` re-run of
-#      this land's own deferred receipts blocked. Main is left gated-red at
-#      the landed head, not reverted — the next tick's ordinary main-scope
-#      gate/ship path fixes it forward like any other main-scope block.
+#  11  post-land-main-gate-block, OR (push_via_branch=true) pr-path-push-
+#      failed — either way the branch DID land on main (main is NOT
+#      untouched, unlike 6/7/8/9/10): either the post-land `--scope main`
+#      re-run of this land's own deferred receipts blocked, or
+#      `branch-protection.sh push` itself failed. Main is left at the
+#      landed head, not reverted — the next tick's ordinary main-scope
+#      gate/ship path (or a retried push) fixes it forward.
 #  12  contended (PRD-build-gate-patience-from-queue-depth) — extend-gate.sh
 #      exited 4: it already waited this crate's full derived patience for
 #      the producer lock and never got it. Not a red gate, not retried here
@@ -108,9 +129,14 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 # value-add is the loop around it.
 EXTEND_GATE="${GATE_THEN_LAND_EXTEND_GATE:-$HERE/extend-gate.sh}"
 WORKTREE_EXTEND="${GATE_THEN_LAND_WORKTREE_EXTEND:-$HERE/worktree-extend.sh}"
+BRANCH_PROTECTION="${GATE_THEN_LAND_BRANCH_PROTECTION:-$HERE/branch-protection.sh}"
 RESURRECTION_GUARD="$HERE/resurrection-guard.sh"
 SIDECAR="$HERE/manifest-sidecar.sh"
 GIT_ID=(-c user.email=jyen.tech@gmail.com -c user.name="Joe Yen")
+SKILL_DIR="$(cd "$HERE/.." && pwd -P)"
+STATE_DIR="${BUILD_STATE_DIR:-$SKILL_DIR/state}"
+# shellcheck source=lib/push-via-branch.sh
+source "$HERE/lib/push-via-branch.sh"
 
 die() { echo "gate-then-land: $2" >&2; exit "$1"; }
 usage() {
@@ -273,6 +299,35 @@ while [ "$attempt" -le "$max_retries" ]; do
             jlog "intent-card-drift fix-failed"
           fi
         fi
+      fi
+      # PRD-build-main-push-gate-pr-path requirement 1 (P0, AC1/AC2): a
+      # push_via_branch=true repo's `main` cannot pass the ordinary
+      # deferred-receipt re-verify below AT ALL — `ci-checks` at main scope
+      # needs Actions runs at an unpushed sha, which can never exist before
+      # a push, and this repo's push can only happen via a PR (branch
+      # protection refuses a direct push outright, GH006). So for such a
+      # repo the landing sequence stops being "gate, land, re-verify" and
+      # becomes "gate, land, push-branch, open-PR, arm-auto-merge, record,
+      # exit 0 pending" — the deferred-receipt re-verify (die 11 path)
+      # below never runs for it, checked BEFORE that block, regardless of
+      # whether this land's own verdict deferred anything.
+      repo_slug_pvb="$(basename "$repo")"
+      if [ "$(push_via_branch_for "$repo_slug_pvb")" = "true" ]; then
+        echo "gate-then-land: [$slug] $repo_slug_pvb is push_via_branch=true — landing via PR path (branch-protection.sh push), not a direct main-scope re-verify" >&2
+        push_out="$("$BRANCH_PROTECTION" push "$repo" "$slug" 2>&1)"
+        push_rc=$?
+        echo "$push_out" >&2
+        if [ "$push_rc" -ne 0 ]; then
+          [ -x "$SIDECAR" ] && "$SIDECAR" write "$slug" "last_error=pr-path-push-failed:$push_rc" >&2 || true
+          jlog "pr-path-push-failed attempt=$attempt sha=$landed_sha rc=$push_rc"
+          die 11 "branch-protection.sh push failed (rc=$push_rc) for the PR-path landing of $landed_sha on $repo_slug_pvb — main already advanced locally to $landed_sha (NOT reverted); retry next tick"
+        fi
+        pr_url_pvb="$(printf '%s\n' "$push_out" | grep -oE 'https://[^[:space:]]+/pull/[0-9]+' | head -1)"
+        [ -x "$SIDECAR" ] && "$SIDECAR" write "$slug" "status=in_progress" "last_step=landing-pending" \
+          "outcome=landing-pending pr=${pr_url_pvb:-unknown} head=$landed_sha" >&2 || true
+        jlog "landing-pending pr=${pr_url_pvb:-unknown} head=$landed_sha attempt=$attempt"
+        printf '%s\n' "$landed_sha"
+        exit 0
       fi
       # requirement 5 / AC7 — see file header and $deferred_list's own
       # comment above (captured before `integrate` deleted the worktree

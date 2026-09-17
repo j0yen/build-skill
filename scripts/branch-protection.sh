@@ -57,6 +57,8 @@ STATE_DIR="${BUILD_STATE_DIR:-$SKILL_DIR/state}"
 OWNER="${BRANCH_PROTECTION_OWNER:-j0yen}"
 # shellcheck source=lib/journal.sh
 source "$HERE/lib/journal.sh"
+# shellcheck source=lib/push-via-branch.sh
+source "$HERE/lib/push-via-branch.sh"
 
 usage() {
   echo "usage: branch-protection.sh enable <repo> [--check <name>]..." >&2
@@ -283,22 +285,8 @@ if rec and 'push_via_branch' in rec:
   fi
 }
 
-# push_via_branch_for <repo_slug> -> "true"/"false" (default "false" —
-# never assume the branch-only path for a repo `enable` never ran against).
-push_via_branch_for() {
-  local repo_slug="$1" state_file="$STATE_DIR/branch-protection.json"
-  [ -f "$state_file" ] || { echo false; return; }
-  python3 -c "
-import json, sys
-try:
-    with open(sys.argv[1], encoding='utf-8') as fh:
-        state = json.load(fh)
-except (OSError, json.JSONDecodeError):
-    state = {}
-rec = state.get(sys.argv[2]) or {}
-print('true' if rec.get('push_via_branch') else 'false')
-" "$state_file" "$repo_slug"
-}
+# push_via_branch_for is defined in lib/push-via-branch.sh (shared with
+# gate-then-land.sh and main-push-gate.sh — PRD-build-main-push-gate-pr-path).
 
 # cmd_push — AC7 / Technical considerations: the one command SKILL.md's
 # push steps call regardless of whether a repo's main is protected.
@@ -337,6 +325,7 @@ cmd_push() {
     exit 0
   fi
 
+  local head_sha; head_sha="$(git -C "$repo_dir" rev-parse HEAD)"
   local branch="loop/$slug"
   git -C "$repo_dir" branch -f "$branch" HEAD
   git -C "$repo_dir" push origin "$branch" || die 5 "push of $branch failed for $repo_slug"
@@ -354,18 +343,35 @@ cmd_push() {
   gh pr merge "$pr_number" --repo "$OWNER/$repo_slug" --auto --squash \
     || die 5 "gh pr merge --auto failed for $OWNER/$repo_slug#$pr_number (is auto-merge enabled on the repo? gh repo edit --enable-auto-merge)"
   echo "branch-protection: auto-merge armed for $OWNER/$repo_slug#$pr_number — main advances once required checks pass"
+
+  # requirement 1 / AC1, AC13 (P0/P1): record the landing so the tick can
+  # resume it (landing-check/sync, or a later tick after this one exits).
+  # Idempotent across ticks (AC13) — an existing record for this slug is
+  # REFRESHED (armed_at bumped, pr fields kept in sync with the PR `gh pr
+  # list`/`create` above just reused or opened), never duplicated: there is
+  # exactly one file per <repo>/<slug>, so "duplicated" here means never
+  # writing a second pr_number for the same slug, which this single
+  # write-the-whole-record-in-place approach can't do by construction.
+  local record; record="$(landing_record_path "$repo_slug" "$slug")"
+  mkdir -p "$(dirname "$record")"
+  local armed_at; armed_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  python3 -c "
+import json, sys
+path, pr_url, pr_number, head_sha, armed_at = sys.argv[1:6]
+with open(path, 'w', encoding='utf-8') as fh:
+    json.dump({
+        'pr_url': pr_url,
+        'pr_number': int(pr_number),
+        'head_sha': head_sha,
+        'armed_at': armed_at,
+    }, fh, indent=2)
+    fh.write('\n')
+" "$record" "$pr_url" "$pr_number" "$head_sha" "$armed_at"
 }
 
-# landing_record_path <repo_slug> <slug> — PRD-build-main-push-gate-pr-path
-# Technical considerations: "state/landings/<repo>/<slug>.json; one file per
-# in-flight landing". Written by gate-then-land.sh's push_via_branch path
-# (this PRD's requirement 1, a separate step) once `cmd_push` above has
-# opened/reused a PR and armed auto-merge; read here by `landing-check` and
-# consumed by `sync` once merged.
-landing_record_path() {
-  local repo_slug="$1" slug="$2"
-  echo "$STATE_DIR/landings/$repo_slug/$slug.json"
-}
+# landing_record_path is defined in lib/push-via-branch.sh. Written by
+# cmd_push below once it has opened/reused a PR and armed auto-merge;
+# read here by `landing-check` and consumed by `sync` once merged.
 
 # cmd_landing_check — requirement 2 / AC3: reads the landing record for
 # <repo>/<slug>, makes exactly ONE `gh pr view` call, and reduces the PR's
