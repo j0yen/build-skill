@@ -284,6 +284,40 @@ if rec and 'push_via_branch' in rec:
     print('  push_via_branch:', rec['push_via_branch'])
 " "$state_file" "$repo_slug"
   fi
+
+  # PRD-build-main-push-gate-pr-path requirement 11 (P2, AC 'status
+  # subcommand'): the landing record, if any, and the last `main-synced`
+  # line for this repo -- so an operator running `status` sees a pending
+  # PR-path landing without also having to know to go read
+  # state/landings/ or grep the journal by hand.
+  local landings_dir="$STATE_DIR/landings/$repo_slug"
+  if [ -d "$landings_dir" ]; then
+    local f
+    for f in "$landings_dir"/*.json; do
+      [ -f "$f" ] || continue
+      python3 -c "
+import json, sys
+slug = sys.argv[2]
+try:
+    d = json.load(open(sys.argv[1]))
+except (OSError, json.JSONDecodeError):
+    d = {}
+print(f\"  landing record ({slug}): pr={d.get('pr_url','?')} head={d.get('head_sha','?')} armed_at={d.get('armed_at','?')}\")
+" "$f" "$(basename "$f" .json)"
+    done
+  fi
+
+  # Last `main-synced` line for this repo, most recent match across the
+  # journal (today's file first, falling back across older files --
+  # `sync_log`'s own `journal_line` writes to journal_root()/<date>.md).
+  local jroot; jroot="$(journal_root)"
+  if [ -d "$jroot" ]; then
+    local last_sync
+    last_sync="$(grep -h "  $repo_slug  main-synced " "$jroot"/*.md 2>/dev/null | tail -1)"
+    if [ -n "$last_sync" ]; then
+      echo "  last main-synced: $last_sync"
+    fi
+  fi
 }
 
 # push_via_branch_for is defined in lib/push-via-branch.sh (shared with
