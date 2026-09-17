@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+# Fake `claude` CLI for reviewer-receipt-selftest.sh (PRD-build-reviewer-
+# receipt-primary, test_prefix rvrcpt). Stands in for the headless Sonnet
+# review spawn inside extend-gate.sh's run_reviewer. Unlike routepar-fake/
+# claude (which only ever prints the receipt JSON to stdout), this fake
+# separately controls what it WRITES to receipts/reviewer-agent.json (the
+# subagent's own deliverable, per its prompt) and what it PRINTS to
+# stdout (its final chat message) — the whole point of this PRD is that
+# those two can disagree (a background-agent notification on stdout,
+# a valid receipt already on disk) and the receipt must still win.
+#
+# Env vars (all optional):
+#   FAKE_REVCLAUDE_RC            force the invocation itself to fail
+#   FAKE_REVIEWER_WRITE_RECEIPT  1 (default) writes receipts/reviewer-
+#                                 agent.json as a side effect; 0 leaves
+#                                 whatever was already on disk (or nothing)
+#                                 untouched, for the "no fresh receipt" ACs
+#   FAKE_REVIEWER_RECEIPT_HEAD   head_sha written into the receipt
+#                                 (default: real `git rev-parse HEAD`)
+#   FAKE_REVIEWER_RECEIPT_REVIEWED_AT  reviewed_at written into the
+#                                 receipt (default: now)
+#   FAKE_REVIEWER_RECEIPT_DECISION     decision written into the receipt
+#                                 (default: pass)
+#   FAKE_REVIEWER_RECEIPT_REASONS      CSV block_reasons for the receipt
+#                                 (default: must-ac-failing-at-head when
+#                                 decision=block, else empty)
+#   FAKE_REVIEWER_STDOUT_MODE    json (default) | prose | prose_with_braces
+#                                 | empty — shape of the final stdout reply
+#   FAKE_REVIEWER_STDOUT_DECISION      decision embedded in the stdout
+#                                 JSON object, when STDOUT_MODE includes
+#                                 one (default: same as the receipt's own
+#                                 decision, so a test must override this
+#                                 explicitly to produce a mismatch)
+#   FAKE_REVIEWER_STDOUT_REASONS       CSV block_reasons for the stdout
+#                                 JSON object (default: same pattern as
+#                                 FAKE_REVIEWER_RECEIPT_REASONS)
+set -uo pipefail
+
+if [ "${FAKE_REVCLAUDE_RC:-0}" != "0" ]; then
+  echo "fake claude: forced failure" >&2
+  exit "$FAKE_REVCLAUDE_RC"
+fi
+
+receipt_head="${FAKE_REVIEWER_RECEIPT_HEAD:-$(git rev-parse HEAD 2>/dev/null || echo fake)}"
+receipt_reviewed_at="${FAKE_REVIEWER_RECEIPT_REVIEWED_AT:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
+receipt_decision="${FAKE_REVIEWER_RECEIPT_DECISION:-pass}"
+if [ -n "${FAKE_REVIEWER_RECEIPT_REASONS+x}" ]; then
+  receipt_reasons="$FAKE_REVIEWER_RECEIPT_REASONS"
+elif [ "$receipt_decision" = block ]; then
+  receipt_reasons="must-ac-failing-at-head"
+else
+  receipt_reasons=""
+fi
+
+json_reasons_array() {  # $1=csv -> ["a","b"] or []
+  local csv="$1"
+  [ -z "$csv" ] && { echo "[]"; return; }
+  python3 -c "import json,sys; print(json.dumps(sys.argv[1].split(',')))" "$csv"
+}
+
+receipt_json() {
+  local head="$1" reviewed_at="$2" decision="$3" reasons_csv="$4"
+  printf '{"schema":"autobuilder.reviewer_agent_receipt.v1","head_sha":"%s","intent_card_sha":"fake","decision":"%s","block_reasons":%s,"concern_reasons":[],"falsification":{"test_audit":"ok","panic_audit":"ok","unsafe_audit":"ok","public_api_audit":"ok","deps_audit":"ok","drift_audit":"ok","counter_attack":{"description":"n/a","test_skeleton":"n/a"}},"reviewed_at":"%s"}\n' \
+    "$head" "$decision" "$(json_reasons_array "$reasons_csv")" "$reviewed_at"
+}
+
+if [ "${FAKE_REVIEWER_WRITE_RECEIPT:-1}" = "1" ]; then
+  mkdir -p target/autobuilder/receipts
+  receipt_json "$receipt_head" "$receipt_reviewed_at" "$receipt_decision" "$receipt_reasons" \
+    > target/autobuilder/receipts/reviewer-agent.json
+fi
+
+stdout_decision="${FAKE_REVIEWER_STDOUT_DECISION:-$receipt_decision}"
+if [ -n "${FAKE_REVIEWER_STDOUT_REASONS+x}" ]; then
+  stdout_reasons="$FAKE_REVIEWER_STDOUT_REASONS"
+else
+  stdout_reasons="$receipt_reasons"
+fi
+
+case "${FAKE_REVIEWER_STDOUT_MODE:-json}" in
+  json)
+    receipt_json "$receipt_head" "$receipt_reviewed_at" "$stdout_decision" "$stdout_reasons"
+    ;;
+  prose)
+    # The 05:15:46Z incident shape: a background-agent notification reply,
+    # no JSON object anywhere in it.
+    echo "Third notification from the same background agent — pure confirmation, no new facts. Receipt finalized on disk."
+    ;;
+  prose_with_braces)
+    # AC4: prose containing its OWN unrelated '{' and '}' characters
+    # BEFORE the real JSON object — a greedy \{.*\} regex from the first
+    # '{' to the last '}' would swallow the prose braces too and fail to
+    # parse; balanced decoding (json.JSONDecoder.raw_decode from each
+    # '{') must still find the real object.
+    echo "Note: config was {\"unrelated\": true} before the real answer below."
+    receipt_json "$receipt_head" "$receipt_reviewed_at" "$stdout_decision" "$stdout_reasons"
+    echo "(end of turn — see {above})"
+    ;;
+  empty)
+    printf ''
+    ;;
+esac
+exit 0

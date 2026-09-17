@@ -1456,31 +1456,47 @@ fi
 #    `claude -p --model sonnet` (same tier /rustbuild routes it to; the
 #    autobuilder binary cannot spawn a Claude subagent itself), finalize.
 #
-# PRD-build-gate-route-parity-ledger requirement 4 (R4/AC4): a mechanism
-# failure in THIS run (prepare/claude/prompt/invocation/JSON-parse all
-# return here BEFORE `finalize` ever runs, so reviewer-agent.json on disk
-# is whatever the LAST successful run left — often a pass) used to call
-# note_block unconditionally, so a 25/25-pass gate line still carried a
-# "reviewer-agent — subagent did not return" note (09-15 22:48:50Z).
-# note_block moved out of this function — it only ever records the reason
-# in $_reviewer_fail_note now; the call site below decides whether that
-# reason is worth a note by reading reviewer-agent.json's own `.decision`
-# fresh off disk, so the note tracks the PRODUCER's verdict, never this
-# run's own plumbing trouble alone.
+# PRD-build-reviewer-receipt-primary: the subagent's own prompt (R7) says
+# receipts/reviewer-agent.json IS the deliverable — this function reads
+# that file as the phase's PRIMARY input (R1) and only falls back to
+# balanced-decoding the subagent's raw stdout (R2, reviewer-receipt-
+# resolve.py, replacing the old greedy `\{.*\}` regex this superseded)
+# when no fresh receipt exists. "Fresh" means: right schema, head_sha
+# matches THIS gate's head, and reviewed_at (or mtime) is at or after this
+# run's own `prepare` call — never a stale receipt left by a previous gate
+# on the same or a different head (05:15:46Z misdiagnosis, Grounding).
+#
+# PRD-build-gate-route-parity-ledger requirement 4 (R4/AC4) still holds:
+# a mechanism failure (prepare/claude/prompt/invocation all failing before
+# a verdict is ever reached) is never reported as `decision=block` — it
+# sets $_reviewer_verdict=infra, never `block`, so a 25/25-pass gate line
+# never again carries a false "reviewer-agent — ..." block line
+# (09-15 22:48:50Z). $_reviewer_verdict is one of: ok | block | infra —
+# the call site below decides note_block/record_phase purely off this
+# flag, never by re-reading reviewer-agent.json itself (that re-read is
+# exactly the bug this PRD fixes: it could not tell a fresh verdict from a
+# stale leftover).
 _reviewer_fail_note=""
+_reviewer_verdict="ok"          # ok | block | infra
+_reviewer_block_reasons_csv=""
 run_reviewer() {
   _reviewer_fail_note=""
+  _reviewer_verdict="ok"
+  _reviewer_block_reasons_csv=""
   ( cd "$repo" && autobuilder reviewer-agent prepare --project "$project_rel" --base "$base_ref" ) 9>&- \
-    || { _reviewer_fail_note="reviewer-agent — prepare exited non-zero"; return 1; }
+    || { _reviewer_fail_note="reviewer-agent — prepare exited non-zero"; _reviewer_verdict="infra"; return 1; }
   local req="$project_abs/target/autobuilder/review-request.json"
-  [ -f "$req" ] || { _reviewer_fail_note="reviewer-agent — prepare did not write $req"; return 1; }
+  [ -f "$req" ] || { _reviewer_fail_note="reviewer-agent — prepare did not write $req"; _reviewer_verdict="infra"; return 1; }
+  local prepare_epoch
+  prepare_epoch="$(stat -c %Y "$req" 2>/dev/null || stat -f %m "$req" 2>/dev/null || date +%s)"
   command -v claude >/dev/null 2>&1 \
-    || { _reviewer_fail_note="reviewer-agent — claude CLI not on \$PATH (needed to spawn the independent review subagent)"; return 1; }
+    || { _reviewer_fail_note="reviewer-agent — claude CLI not on \$PATH (needed to spawn the independent review subagent)"; _reviewer_verdict="infra"; return 1; }
   [ -f "$REVIEWER_PROMPT" ] \
-    || { _reviewer_fail_note="reviewer-agent — missing prompt $REVIEWER_PROMPT"; return 1; }
+    || { _reviewer_fail_note="reviewer-agent — missing prompt $REVIEWER_PROMPT"; _reviewer_verdict="infra"; return 1; }
 
   local out="$project_abs/target/autobuilder/review-output.json"
   local raw="$project_abs/target/autobuilder/review-output.raw.txt"
+  local receipt="$project_abs/target/autobuilder/receipts/reviewer-agent.json"
   local prompt
   prompt="$(cat "$REVIEWER_PROMPT")
 ---
@@ -1494,22 +1510,74 @@ schema autobuilder.reviewer_agent_receipt.v1:
 
   if ! ( cd "$repo" && claude -p "$prompt" --model sonnet --permission-mode bypassPermissions --output-format text ) 9>&- >"$raw" 2>"$raw.err"; then
     _reviewer_fail_note="reviewer-agent — claude -p subagent invocation failed (see $raw.err)"
+    _reviewer_verdict="infra"
     return 1
   fi
-  if ! python3 -c "
-import json, re, sys
-raw = open('$raw').read()
-m = re.search(r'\{.*\}', raw, re.S)
-if not m:
-    sys.exit(1)
-obj = json.loads(m.group(0))
-json.dump(obj, open('$out', 'w'))
-" 2>>"$raw.err"; then
-    _reviewer_fail_note="reviewer-agent — subagent did not return valid JSON (see $raw)"
-    return 1
+
+  local resolve_json
+  resolve_json="$(python3 "$BUILD_SCRIPTS/reviewer-receipt-resolve.py" "$receipt" "$raw" "$head_now" "$prepare_epoch" 2>>"$raw.err")"
+  [ -n "$resolve_json" ] || resolve_json='{}'
+
+  local fresh
+  fresh="$(printf '%s' "$resolve_json" | jq -r '.fresh // false' 2>/dev/null)"
+
+  if [ "$fresh" = "true" ]; then
+    # R1: the subagent's own receipt is the phase's input — stdout is not
+    # parsed for the verdict, only compared against it for R3 below.
+    ( cd "$repo" && autobuilder reviewer-agent finalize --project "$project_rel" --input "$receipt" ) 9>&- \
+      || { _reviewer_fail_note="reviewer-agent — finalize rejected the subagent's receipt"; _reviewer_verdict="infra"; return 1; }
+    local receipt_decision stdout_found stdout_decision
+    receipt_decision="$(printf '%s' "$resolve_json" | jq -r '.receipt_decision // empty')"
+    stdout_found="$(printf '%s' "$resolve_json" | jq -r '.stdout_object_found // false')"
+    if [ "$stdout_found" = "true" ]; then
+      stdout_decision="$(printf '%s' "$resolve_json" | jq -r '.stdout_decision // empty')"
+      # R3: receipt file wins on any disagreement; one journal line notes it.
+      if [ -n "$stdout_decision" ] && [ "$stdout_decision" != "$receipt_decision" ]; then
+        journal_line --file "$journal" "$(date -u +%FT%TZ)  gate  ${repo##*/}  reviewer-receipt-vs-stdout mismatch file=${receipt_decision} stdout=${stdout_decision} head=${head_now:0:7}"
+      fi
+    fi
+    if [ "$receipt_decision" = "block" ]; then
+      _reviewer_block_reasons_csv="$(printf '%s' "$resolve_json" | jq -r '.receipt_reasons | join(",")')"
+      _reviewer_fail_note="reviewer-agent — decision=block reasons=${_reviewer_block_reasons_csv}"
+      _reviewer_verdict="block"
+      return 1
+    fi
+    _reviewer_verdict="ok"
+    return 0
   fi
-  ( cd "$repo" && autobuilder reviewer-agent finalize --project "$project_rel" --input "$out" ) 9>&- \
-    || { _reviewer_fail_note="reviewer-agent — finalize rejected the subagent's output"; return 1; }
+
+  # No fresh receipt — R2 fallback: balanced-decode the raw stdout (never
+  # the greedy `\{.*\}` regex, which a background-agent notification's own
+  # prose braces can defeat, AC4).
+  local stdout_found
+  stdout_found="$(printf '%s' "$resolve_json" | jq -r '.stdout_object_found // false')"
+  if [ "$stdout_found" = "true" ]; then
+    printf '%s' "$resolve_json" | jq -c '._stdout_object' > "$out"
+    ( cd "$repo" && autobuilder reviewer-agent finalize --project "$project_rel" --input "$out" ) 9>&- \
+      || { _reviewer_fail_note="reviewer-agent — finalize rejected the subagent's output"; _reviewer_verdict="infra"; return 1; }
+    local stdout_decision
+    stdout_decision="$(printf '%s' "$resolve_json" | jq -r '.stdout_decision // empty')"
+    if [ "$stdout_decision" = "block" ]; then
+      _reviewer_block_reasons_csv="$(printf '%s' "$resolve_json" | jq -r '.stdout_reasons | join(",")')"
+      _reviewer_fail_note="reviewer-agent — decision=block reasons=${_reviewer_block_reasons_csv}"
+      _reviewer_verdict="block"
+      return 1
+    fi
+    _reviewer_verdict="ok"
+    return 0
+  fi
+
+  # R4: neither a fresh receipt nor a parseable stdout object — an infra
+  # failure, distinct from a verdict, and never `decision=block`.
+  local found_head found_head7 found_reviewed_at
+  found_head="$(printf '%s' "$resolve_json" | jq -r '.receipt_head // empty')"
+  found_head7="${found_head:0:7}"
+  [ -z "$found_head7" ] && found_head7="none"
+  found_reviewed_at="$(printf '%s' "$resolve_json" | jq -r '.receipt_reviewed_at // empty')"
+  [ -z "$found_reviewed_at" ] && found_reviewed_at="none"
+  _reviewer_fail_note="reviewer-agent — no fresh receipt (found head=${found_head7} reviewed_at=${found_reviewed_at})"
+  _reviewer_verdict="infra"
+  return 1
 }
 
 # 7. ci-checks — needs `gh` authenticated against the pushed HEAD.
@@ -1720,24 +1788,29 @@ fi
 # false and reviewer-agent is skipped via the same "skipped" branch below.
 _phase_t0=$(date +%s)
 if { [ "$scope" = branch ] && [ "$intent_card_stale" != true ]; } || [ "${#blocking_notes[@]}" -eq 0 ]; then
-  reviewer_run_ok=true
-  run_reviewer || reviewer_run_ok=false
-  # PRD-build-gate-route-parity-ledger requirement 4: the note (and this
-  # phase's own ok/fail) tracks reviewer-agent.json's OWN `.decision` field
-  # fresh off disk, not run_reviewer()'s bash return code — a mechanism
-  # failure that never reached `finalize` leaves whatever decision the
-  # LAST successful review wrote (see run_reviewer's own header comment).
-  reviewer_agent_receipt="$project_abs/target/autobuilder/receipts/reviewer-agent.json"
-  reviewer_decision="$(jq -r '.decision // empty' "$reviewer_agent_receipt" 2>/dev/null)"
-  if [ "$reviewer_decision" = "block" ]; then
-    note_block "${_reviewer_fail_note:-reviewer-agent — decision=block (see $reviewer_agent_receipt)}"
-    record_phase reviewer $(( $(date +%s) - _phase_t0 )) fail
-  else
-    if ! $reviewer_run_ok; then
-      echo "extend-gate: ${_reviewer_fail_note:-reviewer-agent — mechanism failure} (suppressed — reviewer-agent's last recorded decision is '${reviewer_decision:-none}', not block)" >&2
-    fi
-    record_phase reviewer $(( $(date +%s) - _phase_t0 )) ok
-  fi
+  run_reviewer || true
+  # PRD-build-reviewer-receipt-primary R5: the note (and this phase's own
+  # ok/fail) tracks run_reviewer()'s OWN $_reviewer_verdict — set from a
+  # FRESH receipt or a balanced-decoded stdout object (never a stale
+  # leftover re-read off disk, the 05:15:46Z misdiagnosis this replaces).
+  case "$_reviewer_verdict" in
+    block)
+      note_block "$_reviewer_fail_note"
+      record_phase reviewer $(( $(date +%s) - _phase_t0 )) fail
+      ;;
+    infra)
+      # An infra failure (mechanism trouble, or no fresh receipt/stdout at
+      # all) is never a verdict (R4) — no note_block, so it never joins
+      # blocking_notes/GATES; it still shows up in the phase-timing line
+      # (record_phase ... fail) so it is visible without being mistaken
+      # for a reviewer block.
+      echo "extend-gate: ${_reviewer_fail_note} (infra — not a verdict)" >&2
+      record_phase reviewer $(( $(date +%s) - _phase_t0 )) fail
+      ;;
+    *)
+      record_phase reviewer $(( $(date +%s) - _phase_t0 )) ok
+      ;;
+  esac
 else
   echo "extend-gate: reviewer skipped — ${#blocking_notes[@]} block(s) already recorded (no Sonnet spend on a red gate)"
   # Was a hardcoded ~/brain/journal path, ignoring EXTEND_GATE_JOURNAL and
@@ -1794,6 +1867,25 @@ if [ "$gate_rc" -eq 0 ]; then
   record_phase gate $(( $(date +%s) - _phase_t0 )) ok
 else
   record_phase gate $(( $(date +%s) - _phase_t0 )) fail
+fi
+# PRD-build-reviewer-receipt-primary R6: `autobuilder gate`'s own
+# "  ✗ reviewer-agent — ..." line (read by gate-delta.sh's parse_blocking
+# for GATES family clustering downstream in gate-red-summary.sh) never
+# named a reason — every reviewer block clustered as bare `reviewer-agent`
+# (Grounding: "reviewer-agent x3" for three different causes). This run's
+# own $_reviewer_verdict/$_reviewer_block_reasons_csv (set by
+# run_reviewer, above, from the FRESH receipt/stdout object — never a
+# stale re-read) already know the real reason, or that this was infra,
+# not a verdict; the producer NAME on that one line is qualified here,
+# shell-side, before gate-delta.sh ever parses it. Never touches any other
+# producer's line, the note text itself, or autobuilder gate's own
+# pass/block accounting (sed runs on the already-captured text, after
+# gate_rc is read).
+if [ "$_reviewer_verdict" = block ] && [ -n "$_reviewer_block_reasons_csv" ]; then
+  _reviewer_first_reason="${_reviewer_block_reasons_csv%%,*}"
+  gate_out="$(printf '%s\n' "$gate_out" | sed "s/✗ reviewer-agent —/✗ reviewer-agent:${_reviewer_first_reason} —/")"
+elif [ "$_reviewer_verdict" = infra ]; then
+  gate_out="$(printf '%s\n' "$gate_out" | sed 's/✗ reviewer-agent —/✗ reviewer-agent:infra —/')"
 fi
 printf '%s\n' "$gate_out"
 summary="$(printf '%s\n' "$gate_out" | grep -m1 '^gate: ' || true)"

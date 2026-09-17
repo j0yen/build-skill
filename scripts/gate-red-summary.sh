@@ -138,7 +138,11 @@ awk '
   }
   {
     ts = $1
-    if (match($0, /blockers=[A-Za-z0-9,_-]+/)) {
+    # PRD-build-reviewer-receipt-primary R6/R10: a family name can now be
+    # "<producer>:<reason>" (e.g. reviewer-agent:must-ac-failing-at-head)
+    # — the char class here used to stop at the first `:`, silently
+    # truncating every reason-qualified name back to the bare producer.
+    if (match($0, /blockers=[A-Za-z0-9,_:-]+/)) {
       fam_add(substr($0, RSTART + 9, RLENGTH - 9))
     }
     is_red = 0
