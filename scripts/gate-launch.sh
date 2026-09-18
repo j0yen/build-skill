@@ -102,6 +102,13 @@ source "$HERE/lib/journal.sh"
 source "$HERE/lib/push-via-branch.sh"
 # shellcheck source=lib/repo-slug.sh
 source "$HERE/lib/repo-slug.sh"
+# PRD-build-flow-ledger requirement 2: this script is the sole writer of
+# the ledger's `gate_start` event — every gate run (main-scope, branch-
+# scope, pinned-landing, main-health alike) launches through here, so one
+# call at the point the unit is actually started, never re-derived later
+# from a journal grep. flow_ledger_append never fails the caller.
+# shellcheck source=lib/flow-ledger.sh
+source "$HERE/lib/flow-ledger.sh"
 journal="${GATE_LAUNCH_JOURNAL:-$(journal_root)/$(date -u +%Y-%m-%d).md}"
 
 die() { echo "gate-launch: $2" >&2; exit "${1:-4}"; }
@@ -268,6 +275,7 @@ mv -f "$tmp_marker" "$marker"
 
 echo "$unit"
 jlog "$slug" "launched (unit=$unit head=$head_sha scope=$scope)"
+flow_ledger_append "$slug" "gate_start" --sha "$head_sha" --detail "scope=$scope"
 
 if [ "$wait_flag" -eq 1 ]; then
   # Poll via gate-status.sh, not a raw ExecMainStatus read: --collect

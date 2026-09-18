@@ -199,6 +199,15 @@ source "$BUILD_SCRIPTS/lib/probe.sh"
 source "$BUILD_SCRIPTS/lib/journal.sh"
 # shellcheck source=lib/repo-slug.sh
 source "$BUILD_SCRIPTS/lib/repo-slug.sh"
+# PRD-build-flow-ledger requirement 2: this script is the sole writer of
+# the ledger's `gate_verdict` event, appended once the outcome is final
+# (right after this run's own journal line, below) — never re-derived
+# later from a journal grep. Skipped when $slug is empty (a bare
+# --scope main run with neither --pinned-landing nor --main-health has no
+# PRD to attribute the verdict to, same condition scope_prefix above
+# already uses).
+# shellcheck source=lib/flow-ledger.sh
+source "$BUILD_SCRIPTS/lib/flow-ledger.sh"
 # shellcheck source=lib/gate-patience.sh
 # PRD-build-gate-patience-from-queue-depth requirement 1: derives how long
 # the producer-lock wait below should be from the ACTUAL queue in front of
@@ -2640,6 +2649,12 @@ journal_line --file "$journal" "$(printf '%s  gate  %s  %s  (%shead=%s base=%s %
   "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$crate_name" "$outcome" "$scope_prefix" "$head_now" "$journal_base_field" \
   "${summary:-gate: no-summary-line}" "${blockers_csv:-none}" "$wall" "$phases_field" "$lock_wait" \
   "$route_burst_n" "$route_local_n" "$routed_field" "$GATE_ROUTE" "$journal_suffix")"
+
+# PRD-build-flow-ledger requirement 1/2: gate_verdict, detail carries
+# verdict=pass|delta-pass|block|infra (whatever this run's own $outcome
+# is — never re-normalized). See the lib source comment above for why
+# this is skipped when $slug is empty.
+[ -n "$slug" ] && flow_ledger_append "$slug" "gate_verdict" --sha "$head_now" --detail "verdict=$outcome"
 
 # A route mismatch is a journaled guard event, never a block (Non-goals) —
 # the verdict computed above is unaffected either way (requirement 4, AC4).
