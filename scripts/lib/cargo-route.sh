@@ -120,43 +120,112 @@ cargo_route_export_path() {
 # repo's other env-seam overrides, e.g. BURST_LANE_NOW) so a selftest can
 # supply a canned `status --json` payload without a real box, hcloud, or
 # ssh in the loop; falls back to the real burst-lane.sh status --json.
+# cargo_route_session_id sets CARGO_ROUTE_SESSION_CAUSE on every failure
+# path (status-probe-failed: wrapper missing or the `status --json` call
+# itself failed/timed out; no-active-session: it answered but without
+# "active":true; no-server-id: active but the JSON carried no usable
+# server_id) so cargo_route_current() below can report WHY without
+# re-deriving the same checks a second time. Cleared (empty) on success.
+# Also mirrors its own stdout into CARGO_ROUTE_SESSION_ID, for the same
+# reason CARGO_ROUTE_CURRENT exists below: cargo_route_current() calls
+# this PLAIN (no command substitution) so both globals survive — `sid=
+# "$(cargo_route_session_id)"` would fork a subshell and lose
+# CARGO_ROUTE_SESSION_CAUSE exactly like the bug this whole mechanism
+# exists to avoid.
 cargo_route_session_id() {
+  CARGO_ROUTE_SESSION_CAUSE=""
+  CARGO_ROUTE_SESSION_ID=""
   local json
   if [ -n "${CARGO_ROUTE_STATUS_JSON:-}" ]; then
     json="$CARGO_ROUTE_STATUS_JSON"
   else
     local wrapper="$(cargo_route_scripts_dir)/burst-lane.sh"
-    [ -x "$wrapper" ] || return 1
-    json="$("$wrapper" status --json 2>/dev/null)" || return 1
+    if [ ! -x "$wrapper" ]; then
+      CARGO_ROUTE_SESSION_CAUSE="status-probe-failed"
+      return 1
+    fi
+    if ! json="$("$wrapper" status --json 2>/dev/null)"; then
+      CARGO_ROUTE_SESSION_CAUSE="status-probe-failed"
+      return 1
+    fi
   fi
-  case "$json" in *'"active":true'*) : ;; *) return 1 ;; esac
+  case "$json" in
+    *'"active":true'*) : ;;
+    *) CARGO_ROUTE_SESSION_CAUSE="no-active-session"; return 1 ;;
+  esac
   local id
   if command -v jq >/dev/null 2>&1; then
     id="$(printf '%s' "$json" | jq -r '.server_id // empty' 2>/dev/null)"
   else
     id="$(printf '%s' "$json" | sed -n 's/.*"server_id":"\{0,1\}\([^,"}]*\)"\{0,1\}.*/\1/p')"
   fi
-  [ -n "$id" ] || return 1
+  if [ -z "$id" ]; then
+    CARGO_ROUTE_SESSION_CAUSE="no-server-id"
+    return 1
+  fi
+  CARGO_ROUTE_SESSION_ID="$id"
   printf '%s' "$id"
 }
 
 # cargo_route_current -> stdout "local" or "burst:<server_id>", rc always 0
 # (a route resolver never fails the caller — an unresolvable session is
-# "local", not an error, same as the shim's own fallthrough).
+# "local", not an error, same as the shim's own fallthrough). Printed
+# stdout is UNCHANGED from before (existing callers parse it) — this also
+# sets the global CARGO_ROUTE_CAUSE to one of: burst, not-configured,
+# lane-unarmed, status-probe-failed, no-active-session, no-server-id, so a
+# caller that wants to know WHY a call went local (cargo-budget-bin/cargo's
+# route.log line, PRD's motivating gap) doesn't have to re-derive it.
+# CARGO_ROUTE_CURRENT mirrors this function's own stdout (see below) as a
+# global — a caller that wants CARGO_ROUTE_CAUSE too cannot get it via
+# ordinary command substitution (`x="$(cargo_route_current)"` forks a
+# subshell; any global the function sets inside that subshell never
+# reaches the caller back out). Such a caller instead invokes this
+# function PLAIN (no `$(...)`, stdout redirected away if unwanted) and
+# then reads $CARGO_ROUTE_CURRENT / $CARGO_ROUTE_CAUSE directly — see
+# cargo-budget-bin/cargo for the pattern. Existing callers that DO use
+# command substitution are unaffected: the printed text is unchanged.
 cargo_route_current() {
+  CARGO_ROUTE_CAUSE=""
+  CARGO_ROUTE_CURRENT="local"
   if ! burst_configured; then
-    printf 'local'
-    return 0
-  fi
-  if [ "${BURST_LANE:-0}" != "1" ]; then
-    printf 'local'
-    return 0
-  fi
-  local sid
-  if sid="$(cargo_route_session_id)" && [ -n "$sid" ]; then
-    printf 'burst:%s' "$sid"
+    CARGO_ROUTE_CAUSE="not-configured"
+  elif [ "${BURST_LANE:-0}" != "1" ]; then
+    CARGO_ROUTE_CAUSE="lane-unarmed"
   else
-    printf 'local'
+    # Called PLAIN, not "$(cargo_route_session_id)" — same subshell reason
+    # as this function's own header: a command substitution here would
+    # fork a subshell and CARGO_ROUTE_SESSION_CAUSE/_ID would never make
+    # it back out, exactly the bug that made case E (no-active-session)
+    # misreport as status-probe-failed before this fix.
+    if cargo_route_session_id >/dev/null 2>&1 && [ -n "${CARGO_ROUTE_SESSION_ID:-}" ]; then
+      CARGO_ROUTE_CAUSE="burst"
+      CARGO_ROUTE_CURRENT="burst:$CARGO_ROUTE_SESSION_ID"
+    else
+      CARGO_ROUTE_CAUSE="${CARGO_ROUTE_SESSION_CAUSE:-status-probe-failed}"
+    fi
   fi
+  printf '%s' "$CARGO_ROUTE_CURRENT"
+  return 0
+}
+
+# ---- cargo_route_log (PRD-build-gate-route-cause-parity) -----------------
+# Shared route.log writer so cargo-budget-bin/cargo's own local-decision
+# and defensive burst lines use the EXACT SAME file/format
+# burst-lane-bin/cargo's own route_log() writes (that shim is not sourced
+# from here — it predates this lib and keeps its own copy for its own
+# call sites — but this is the one place a NEW caller reuses instead of
+# re-deriving the STATE_DIR/BURST_ROUTE_LOG resolution a third time).
+# Fields: <ts> <pid> <sub> <decision> <cause> <cwd>. flock-guarded, never
+# fatal to the caller.
+cargo_route_log() {
+  local sub="${1:--}" decision="${2:-local}" cause="${3:--}"
+  local state_dir="${BURST_LANE_STATE_DIR:-$(cargo_route_scripts_dir)/../state/burst-lane}"
+  local route_log="${BURST_ROUTE_LOG:-$state_dir/route.log}"
+  mkdir -p "$(dirname "$route_log")" 2>/dev/null || return 0
+  (
+    flock -w 2 204 2>/dev/null || exit 0
+    printf '%s %s %s %s %s %s\n' \
+      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$$" "$sub" "$decision" "$cause" "$PWD" >&204
+  ) 204>>"$route_log" 2>/dev/null || true
   return 0
 }

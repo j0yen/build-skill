@@ -317,12 +317,20 @@ slot_holders_desc() {
 # `+toolchain` probe, ...) still gets exactly one ledger row so
 # extend-gate.sh's R15 producer-attestation check can see it, with
 # slotted:false marking that no budget/wait accounting applies to it.
+#
+# $18 (route_cause): defaults empty, like $17 (route) did when it was
+# added in bf960c4. Set from CARGO_BUDGET_ROUTE_CAUSE (cargo-budget-
+# bin/cargo exports it from cargo_route_current()'s CARGO_ROUTE_CAUSE —
+# see scripts/lib/cargo-route.sh) on the record-routed path and the
+# slotted (cmd_run) path, so a ledger row that says route:"local" also
+# says WHY (not-configured, lane-unarmed, status-probe-failed,
+# no-active-session, no-server-id) instead of just the bare word.
 write_ledger_row() {
   local ts_start="$1" ts_end="$2" wait_s="$3" peak_load="$4" slot="$5" pid="$6" \
         cmd="$7" exit_code="$8" mem_avail_gb_start="$9" sccache_pid="${10}" \
         sccache_started_at="${11}" parent_step="${12}" nested="${13}" \
         tree_cpu_s_val="${14}" idle_released="${15}" slotted="${16:-true}" \
-        route="${17:-local}"
+        route="${17:-local}" route_cause="${18:-}"
   mkdir -p "$STATE_DIR"
   local parent_step_json
   if [ -n "$parent_step" ]; then
@@ -349,7 +357,8 @@ write_ledger_row() {
     --argjson idle_released "$idle_released" \
     --argjson slotted "$slotted" \
     --arg route "$route" \
-    '{ts_start:$ts_start, ts_end:$ts_end, wait_s:$wait_s, peak_load:$peak_load, slot:$slot, pid:$pid, cmd:$cmd, exit_code:$exit_code, mem_avail_gb_start:$mem_avail_gb_start, sccache_server:{pid:$sccache_pid, started_at:$sccache_started_at}, parent_step:$parent_step, nested:$nested, tree_cpu_s:$tree_cpu_s, idle_released:$idle_released, slotted:$slotted, route:$route}')"
+    --arg route_cause "$route_cause" \
+    '{ts_start:$ts_start, ts_end:$ts_end, wait_s:$wait_s, peak_load:$peak_load, slot:$slot, pid:$pid, cmd:$cmd, exit_code:$exit_code, mem_avail_gb_start:$mem_avail_gb_start, sccache_server:{pid:$sccache_pid, started_at:$sccache_started_at}, parent_step:$parent_step, nested:$nested, tree_cpu_s:$tree_cpu_s, idle_released:$idle_released, slotted:$slotted, route:$route, route_cause:$route_cause}')"
   {
     exec {lfd}>>"$LEDGER.lock"
     flock -x "$lfd"
@@ -398,10 +407,11 @@ cmd_record_routed() {
   shift
   [ $# -ge 1 ] || usage
   local parent_step="${CARGO_BUDGET_PARENT_STEP:-}"
+  local route_cause="${CARGO_BUDGET_ROUTE_CAUSE:-}"
   local ts; ts="$(now_iso)"
   local meminfo_file="${CARGO_BUDGET_MEMINFO:-/proc/meminfo}"
   write_ledger_row "$ts" "$ts" 0 0 -1 "$$" "$*" null \
-    "$(mem_avail_gb "$meminfo_file")" unknown unknown "$parent_step" false 0 false false burst
+    "$(mem_avail_gb "$meminfo_file")" unknown unknown "$parent_step" false 0 false false burst "$route_cause"
   exec "$@"
 }
 
@@ -432,6 +442,7 @@ cmd_run() {
   local loadavg_file="${CARGO_BUDGET_LOADAVG:-/proc/loadavg}"
   local hostname_val="${CARGO_BUDGET_HOSTNAME:-$(hostname 2>/dev/null || echo unknown)}"
   local parent_step="${CARGO_BUDGET_PARENT_STEP:-}"
+  local route_cause="${CARGO_BUDGET_ROUTE_CAUSE:-}"
 
   mkdir -p "$STATE_DIR"
 
@@ -452,7 +463,7 @@ cmd_run() {
     n_rc=$?
     n_end="$(now_iso)"
     write_ledger_row "$n_start" "$n_end" 0 0 "$CARGO_BUDGET_HELD_SLOT" "$$" "$*" "$n_rc" \
-      "$(mem_avail_gb "$meminfo_file")" unknown unknown "$parent_step" true 0 false true
+      "$(mem_avail_gb "$meminfo_file")" unknown unknown "$parent_step" true 0 false true local "$route_cause"
     exit "$n_rc"
   fi
 
@@ -645,7 +656,7 @@ cmd_run() {
 
   local idle_released_json; [ "$idle_released" = true ] && idle_released_json=true || idle_released_json=false
   write_ledger_row "$run_start_iso" "$run_end_iso" "$total_wait_s" "$peak_load" "$slot_index" "$$" "$*" \
-    "$rc" "$avail_gb" "$sccache_pid" "$sccache_started_at" "$parent_step" false "$last_tree_cpu_s" "$idle_released_json" true
+    "$rc" "$avail_gb" "$sccache_pid" "$sccache_started_at" "$parent_step" false "$last_tree_cpu_s" "$idle_released_json" true local "$route_cause"
 
   exit "$rc"
 }

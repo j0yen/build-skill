@@ -83,7 +83,8 @@ if [ -r "$CARGO_ROUTE_LIB" ]; then
   source "$CARGO_ROUTE_LIB"
 else
   burst_configured() { return 1; }
-  cargo_route_current() { printf 'local'; return 0; }
+  cargo_route_current() { CARGO_ROUTE_CAUSE="not-configured"; CARGO_ROUTE_CURRENT="local"; printf 'local'; return 0; }
+  cargo_route_log() { return 0; }
 fi
 
 # Find the real cargo: walk $PATH entries in order, skip this shim's own
@@ -160,6 +161,16 @@ if [ -z "$REAL_CARGO" ]; then
   exit 127
 fi
 
+# PRD-build-gate-route-cause-parity: REAL_CARGO above was resolved inside
+# a command substitution (a subshell — any variable a function sets there
+# never reaches this shell), so whether real_cargo() picked the
+# burst-lane-bin shim is re-derived here by plain string comparison
+# instead of a flag the subshell couldn't hand back. Used below to avoid
+# writing a duplicate "burst routed" route.log line when burst-lane-bin
+# (about to run as $REAL_CARGO) will write its own.
+CARGO_ROUTE_VIA_BURST_SHIM=0
+[ "$REAL_CARGO" = "$HERE/../burst-lane-bin/cargo" ] && CARGO_ROUTE_VIA_BURST_SHIM=1
+
 route=0
 # PRD-build-burst-gate-canary-invariant R15 (2026-09-18): find the real
 # subcommand by skipping leading global flags/toolchain selectors
@@ -214,13 +225,42 @@ if [ "$route" -eq 1 ] && [ -x "$WRAPPER" ]; then
   # above), which makes the identical routing decision and actually sends
   # the call to the box. CARGO_BUDGET_SLOT_ROUTED=1 is the escape hatch
   # back to the old always-slot behavior.
+  # PRD-build-gate-route-cause-parity: cargo_route_current() (called next)
+  # also sets CARGO_ROUTE_CAUSE — one of burst, not-configured,
+  # lane-unarmed, status-probe-failed, no-active-session, no-server-id
+  # (scripts/lib/cargo-route.sh) — so a call that ends up local here
+  # leaves a route.log line saying WHY, the same file/format
+  # burst-lane-bin/cargo's own route_log() writes to
+  # (BURST_ROUTE_LOG/$STATE_DIR/route.log). Exported as
+  # CARGO_BUDGET_ROUTE_CAUSE so cargo-budget.sh can also carry it into the
+  # ledger row's route_cause field.
   if [ "${CARGO_BUDGET_SLOT_ROUTED:-0}" != "1" ]; then
-    current_route="$(cargo_route_current 2>/dev/null || printf local)"
+    # Called PLAIN (no command substitution) — see cargo_route_current()'s
+    # own header in cargo-route.sh: $(...)  forks a subshell, and the
+    # CARGO_ROUTE_CAUSE global it sets would never make it back out. This
+    # shell's own stdout is redirected away since the printed text isn't
+    # needed here — $CARGO_ROUTE_CURRENT (set by the same call) is used
+    # instead.
+    cargo_route_current >/dev/null 2>&1 || true
+    current_route="${CARGO_ROUTE_CURRENT:-local}"
+    export CARGO_BUDGET_ROUTE_CAUSE="${CARGO_ROUTE_CAUSE:-}"
     case "$current_route" in
       burst:*)
+        # burst-lane-bin/cargo (already $REAL_CARGO here — see real_cargo()
+        # above) always writes its own "burst routed" route.log line right
+        # before it execs into burst-lane.sh run, so this shim must not
+        # write a second one for the same call. CARGO_ROUTE_VIA_BURST_SHIM
+        # (set by real_cargo() above) is the check: only write here in the
+        # defensive case where $REAL_CARGO somehow resolved to something
+        # else (should not happen — same burst_configured() gates both —
+        # but never silently drop the line if it ever does).
+        if [ "${CARGO_ROUTE_VIA_BURST_SHIM:-0}" != "1" ]; then
+          cargo_route_log "${sub:--}" burst "budget:${CARGO_ROUTE_CAUSE:-burst}"
+        fi
         exec "$WRAPPER" record-routed -- "$REAL_CARGO" "$@"
         ;;
     esac
+    cargo_route_log "${sub:--}" local "budget:${CARGO_ROUTE_CAUSE:-unknown}"
   fi
 
   exec "$WRAPPER" run -- "$REAL_CARGO" "$@"
