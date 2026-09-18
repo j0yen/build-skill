@@ -97,7 +97,7 @@ fi
 
 export NOTIFY_CMD="${NOTIFY_CMD:-true}"
 
-TICK_OUTCOME_FILE="$STATE_DIR/tick-outcome.json"
+TICK_OUTCOME_FILE="$STATE_DIR/tick-outcome.json"  # lint:gate-red-not-rendered -- synchronous drill diagnostic, printed the instant it's read while the operator watches; not a cached/re-read-later status line
 echo "loop-arm-drill: state=$STATE_DIR outcome_file=$TICK_OUTCOME_FILE notify_cmd=$NOTIFY_CMD"
 
 run_drill_tick() {
