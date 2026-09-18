@@ -224,3 +224,14 @@ source it checked. If you see `auth-missing` in a gate line or receipt,
 stop with `needs-user` — the fix is to the auth source itself (rotate or
 re-export the token), not to retry the gate by hand. See
 history.md#reviewer-auth.
+
+## 14. Reviewer-restated inherited verdicts
+
+A gate line carrying `verdict=delta-pass` and a non-empty
+`reviewer_restated_inherited=[…]` means the reviewer subagent's block
+reasons all resolved to debt already attributed inherited (a receipt or
+commit that pre-dates this branch) — land it. Never "fix forward" a
+pre-branch commit or file just to satisfy the reviewer's restated
+finding; that finding is not this branch's to own. Only a `new_blocks=`
+entry naming an in-scope reviewer reason is this branch's own to fix. See
+history.md#reviewer-restated-inherited.

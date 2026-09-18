@@ -1427,6 +1427,271 @@ fi
 t0=$(date +%s)
 blocking_notes=()
 note_block() { blocking_notes+=("$1"); echo "extend-gate: $1" >&2; }
+
+# --- PRD-build-reviewer-block-inherited-attribution shared helpers -------
+# A reviewer block whose every reason resolves to an already-inherited
+# receipt or a pre-branch commit is inherited debt restated through the
+# reviewer's mouth, not a new in-scope finding (Grounding: burst-lane-
+# gate-debt-2b2982e gate 14:24:13Z). Defined early because they are used
+# both BEFORE reviewer-agent runs (R4/AC6's prompt injection) and again
+# after `autobuilder gate` runs (the verdict-shaping pass further down).
+# BEGIN rvblk-shared-helpers (tests/rvblk_p0_acs.sh extracts this exact
+# block by marker and sources it — proves the shipped functions, not a
+# transcription of them.)
+
+# resolve_attr_diff_base — sets globals attr_diff_base/attribution_range_
+# source from $repo/$scope/$base_ref/$head_now/$main_sha_at_gate_start/
+# $pinned_landing/$STATE_DIR/$slug (all resolved well before this point).
+# Deterministic and cheap (git calls only) -- safe to call more than once
+# in one gate run.
+resolve_attr_diff_base() {
+  attr_diff_base="$base_ref"
+  attribution_range_source=""
+  if [ "$scope" = branch ] && [ -n "${main_sha_at_gate_start:-}" ]; then
+    attr_diff_base="$(git -C "$repo" merge-base "$main_sha_at_gate_start" "$head_now" 2>/dev/null || echo "$main_sha_at_gate_start")"
+  fi
+  local parent_count
+  parent_count="$(git -C "$repo" rev-list --parents -n1 "$head_now" 2>/dev/null | awk '{print NF-1}')"
+  if [ "${parent_count:-0}" -eq 2 ]; then
+    attr_diff_base="${head_now}^1"
+  fi
+  if $pinned_landing; then
+    local _attr_landing_rec _attr_landing_sha
+    _attr_landing_rec="$STATE_DIR/landings/$(repo_slug_for_ci "$repo")/${slug}.json"
+    if [ -r "$_attr_landing_rec" ]; then
+      _attr_landing_sha="$(python3 -c 'import json,sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    raise SystemExit(0)
+print(d.get("merge_sha") or d.get("head_sha") or "")' "$_attr_landing_rec" 2>/dev/null)"
+      if [ -n "${_attr_landing_sha:-}" ] \
+        && git -C "$repo" rev-parse --verify --quiet "${_attr_landing_sha}^{commit}" >/dev/null 2>&1 \
+        && git -C "$repo" rev-parse --verify --quiet "${_attr_landing_sha}^1^{commit}" >/dev/null 2>&1; then
+        attr_diff_base="${_attr_landing_sha}^1"
+        attribution_range_source="landing-record"
+      fi
+    fi
+  fi
+}
+
+# gate_attribution_from_notes <notes-array-name> — runs $GATE_ATTRIBUTION
+# compute over the given bash array of note_block-shaped strings
+# ("<receipt> — <detail>") using the CURRENT resolve_attr_diff_base()
+# range, and echoes the resulting attribution JSON (or "" on any
+# failure/absence — never a hard error, same fail-open convention as the
+# main attribution pass further down).
+gate_attribution_from_notes() {
+  local -n _ganf_notes="$1"
+  { [ "${#_ganf_notes[@]}" -gt 0 ] && [ -x "$GATE_ATTRIBUTION" ]; } || { printf ''; return 0; }
+  local _ganf_notes_file
+  _ganf_notes_file="$(mktemp "${TMPDIR:-/tmp}/extend-gate-attr-notes.XXXXXX")"
+  local n
+  for n in "${_ganf_notes[@]}"; do
+    printf '%s\n' "$n" | sed -E 's/^([^ ]+) — (.*)$/\1\t\2/' >> "$_ganf_notes_file"
+  done
+  local _ganf_out
+  _ganf_out="$("$GATE_ATTRIBUTION" compute "$repo" "$attr_diff_base" "$head_now" "$_ganf_notes_file" 2>/dev/null)" || _ganf_out=""
+  rm -f "$_ganf_notes_file"
+  printf '%s' "$_ganf_out"
+}
+
+# _reviewer_inherited_prompt_section <inherited-blocks-json> — R4/AC6:
+# renders the "already attributed inherited" prompt section from a JSON
+# array of {"receipt":...,"finding":...[,"commits":...]} objects (the
+# shape gate-attribution.sh's own blocks[] already uses). Empty input ->
+# empty output (no section at all) so a gate with nothing inherited yet
+# never grows the prompt.
+_reviewer_inherited_prompt_section() {
+  local blocks_json="${1:-[]}"
+  python3 -c '
+import json, sys
+try:
+    blocks = json.loads(sys.argv[1])
+except Exception:
+    blocks = []
+if not blocks:
+    sys.exit(0)
+print("---")
+print("Findings already attributed inherited (pre-branch): do not block on")
+print("these; mention them as concerns if at all.")
+for b in blocks:
+    receipt = b.get("receipt", "unknown")
+    commits = b.get("commits", "") or "-"
+    finding = (b.get("finding") or "").strip() or "-"
+    print(f"- receipt={receipt} commit={commits} finding={finding}")
+' "$blocks_json"
+}
+
+# _reviewer_resolve_block_reasons <repo> <base> <head> <reasons-csv>
+# <inherited-blocks-json> — P0 requirements 1-2 (AC1-AC4): resolves each
+# comma-separated reason against (a) a receipt-name substring match
+# against the already-inherited set, and/or (b) a 7-40 hex commit token
+# that is an ancestor of <base> -- checked FIRST, and a veto: a reason
+# naming a token that resolves but is NOT an ancestor of <base> is
+# in-scope regardless of any receipt name it also mentions (AC3). A
+# reason resolving to neither is in-scope, conservative (AC4). Echoes one
+# line of JSON: {"scope":"inherited"|"in-scope","restated":[...],
+# "new":[...],"restated_receipts":[...]}.
+_reviewer_resolve_block_reasons() {
+  local repo="$1" base="$2" head="$3" reasons_csv="$4" inherited_json="${5:-[]}"
+  python3 -c '
+import json, re, subprocess, sys
+
+repo, base, reasons_csv, inherited_json = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+reasons = [r for r in reasons_csv.split(",") if r != ""]
+try:
+    inherited = json.loads(inherited_json)
+except Exception:
+    inherited = []
+inherited_names = [b.get("receipt", "") for b in inherited if b.get("receipt")]
+commit_owner = {}
+for b in inherited:
+    for c in (b.get("commits") or "").split(","):
+        c = c.strip()
+        if c:
+            commit_owner[c] = b.get("receipt", "")
+
+hex_re = re.compile(r"\b[0-9a-f]{7,40}\b")
+_cache = {}
+
+
+def resolve_commit(token):
+    if token in _cache:
+        return _cache[token]
+    result = None
+    try:
+        r = subprocess.run(
+            ["git", "-C", repo, "rev-parse", "--verify", "--quiet", token + "^{commit}"],
+            capture_output=True, text=True)
+        if r.returncode == 0:
+            full = r.stdout.strip()
+            anc = subprocess.run(
+                ["git", "-C", repo, "merge-base", "--is-ancestor", full, base],
+                capture_output=True, text=True)
+            result = ("ancestor", full) if anc.returncode == 0 else ("not-ancestor", full)
+    except Exception:
+        result = None
+    _cache[token] = result
+    return result
+
+restated = []
+new = []
+restated_receipts = []
+for reason in reasons:
+    veto = False
+    commit_hit = False
+    owner = None
+    for tok in hex_re.findall(reason):
+        res = resolve_commit(tok)
+        if res is None:
+            continue
+        kind, full = res
+        if kind == "not-ancestor":
+            veto = True
+            break
+        commit_hit = True
+        owner = owner or commit_owner.get(full) or commit_owner.get(tok)
+    if veto:
+        new.append(reason)
+        continue
+    if not commit_hit:
+        for name in inherited_names:
+            if name and name in reason:
+                commit_hit = True
+                owner = owner or name
+                break
+    if commit_hit:
+        restated.append(reason)
+        if owner:
+            restated_receipts.append(owner)
+    else:
+        new.append(reason)
+
+scope = "inherited" if restated and not new else "in-scope"
+print(json.dumps({"scope": scope, "restated": restated, "new": new,
+                   "restated_receipts": sorted(set(restated_receipts))}))
+' "$repo" "$base" "$reasons_csv" "$inherited_json"
+}
+
+# _reviewer_apply_resolution <attribution-json> <resolved-json> — merges
+# _reviewer_resolve_block_reasons' verdict onto the reviewer-agent block
+# inside <attribution-json> (matched by receipt name prefix "reviewer-
+# agent", since R7 below relabels it "reviewer-agent:<reason>"), and
+# recomputes in_scope/inherited. Echoes <attribution-json> unchanged when
+# it carries no reviewer-agent block at all (nothing to override).
+_reviewer_apply_resolution() {
+  local attribution_json="$1" resolved_json="$2"
+  python3 -c '
+import json, sys
+attribution = json.loads(sys.argv[1])
+resolved = json.loads(sys.argv[2])
+blocks = attribution.get("blocks") or []
+rb_idx = None
+for i, b in enumerate(blocks):
+    if (b.get("receipt") or "").startswith("reviewer-agent"):
+        rb_idx = i
+        break
+if rb_idx is None:
+    print(json.dumps(attribution))
+    sys.exit(0)
+rb = dict(blocks[rb_idx])
+if resolved.get("scope") == "inherited":
+    rb["scope"] = "inherited"
+    rb["attribution"] = "reviewer-restated"
+else:
+    rb["scope"] = "in-scope"
+    rb.pop("attribution", None)
+rb["restated"] = resolved.get("restated", [])
+rb["new"] = resolved.get("new", [])
+blocks[rb_idx] = rb
+attribution["blocks"] = blocks
+attribution["in_scope"] = sum(1 for b in blocks if b.get("scope") == "in-scope")
+attribution["inherited"] = sum(1 for b in blocks if b.get("scope") != "in-scope")
+print(json.dumps(attribution))
+' "$attribution_json" "$resolved_json"
+}
+
+# _reviewer_pick_representative_reason <repo> <reasons-csv> — PRD-build-
+# gate-finalize-verdict-split requirement 5 (P0, AC5): gate-delta.sh's
+# baseline match is a plain name lookup on ONE "reviewer-agent:<reason>"
+# line, so a multi-reason block's scope depends entirely on WHICH reason
+# becomes that line's name. The 11:25Z operator note's coarse rule --
+# inherited only when EVERY reason is already baselined, otherwise
+# in-scope -- means the representative reason must be an unbaselined one
+# whenever any exists; always taking the first CSV reason silently hid a
+# real in-scope reason behind an inherited one that happened to sort
+# first, which was a false delta-pass (reproduced: reasons=[baselined,new]
+# delta-passed). Reads the same committed-HEAD baseline gate-delta.sh
+# itself reads (`git show HEAD:agent/gate-baseline.json`) -- an
+# uncommitted working-tree copy never counts here either, same
+# fail-closed convention as gate-delta.sh's own. Defined early (moved up
+# from its original position below `autobuilder gate`, PRD-build-
+# reviewer-block-inherited-attribution R7) so the note_block() call below
+# can also label blocking_notes[] with it, not just the gate_out text
+# rewrite further down -- otherwise a reason-scoped baseline entry is
+# inert against gate-attribution.sh's own witness check (gate-
+# attribution.sh:207), which only ever sees the bare "reviewer-agent"
+# name blocking_notes[] carried before this fix.
+_reviewer_pick_representative_reason() {
+  local repo="$1" reasons_csv="$2"
+  local baseline_json="" baselined_reasons=""
+  baseline_json="$(git -C "$repo" show HEAD:agent/gate-baseline.json 2>/dev/null)"
+  if [ -n "$baseline_json" ] && printf '%s' "$baseline_json" | jq -e . >/dev/null 2>&1; then
+    baselined_reasons="$(printf '%s' "$baseline_json" | jq -r '.receipts[]?.name // empty' | sed -n 's/^reviewer-agent://p')"
+  fi
+  local reason
+  local IFS=','
+  for reason in $reasons_csv; do
+    if ! grep -qxF "$reason" <<<"$baselined_reasons"; then
+      printf '%s' "$reason"
+      return 0
+    fi
+  done
+  printf '%s' "${reasons_csv%%,*}"
+}
+# END rvblk-shared-helpers
+
 # PRD-build-branch-gate-scope-artifacts requirement 1/3/4: a scope-deferred
 # receipt (branch-scope artifact, not a real defect) is tracked separately
 # from a real block — it never suppresses reviewer-agent (requirement 3's
@@ -2242,6 +2507,7 @@ run_reviewer() {
 Below is this review's target/autobuilder/review-request.json. The repo is
 checked out at HEAD $head_now at $repo — read whatever you need under it.
 $(cat "$req")
+${_reviewer_inherited_prompt_section_text:-}
 ---
 Reply with ONLY one JSON object, no prose, no markdown fences, matching
 schema autobuilder.reviewer_agent_receipt.v1. intent_card_sha is copied
@@ -2648,6 +2914,23 @@ fi
 # branch scope with a stale card, blocking_notes already carries the
 # `intent-card-stale` note from that step, so the second disjunct is also
 # false and reviewer-agent is skipped via the same "skipped" branch below.
+# --- PRD-build-reviewer-block-inherited-attribution R4/AC6 ---------------
+# The inherited set as it stands right NOW, before reviewer-agent runs --
+# every other producer's blocking note above (intake, vti-plan, rollback-
+# plan, ci-checks, extended-receipts) has already run by this point in the
+# script -- so the prompt can be told what is already attributed inherited
+# BEFORE the reviewer reviews, not after `autobuilder gate` runs (too
+# late: the prompt has already been sent by then).
+_reviewer_pre_inherited_json='[]'
+if [ "${#blocking_notes[@]}" -gt 0 ]; then
+  resolve_attr_diff_base
+  _reviewer_pre_attr_out="$(gate_attribution_from_notes blocking_notes)"
+  if [ -n "$_reviewer_pre_attr_out" ]; then
+    _reviewer_pre_inherited_json="$(printf '%s' "$_reviewer_pre_attr_out" | jq -c '[.blocks[]? | select(.scope=="inherited")]' 2>/dev/null || echo '[]')"
+  fi
+fi
+_reviewer_inherited_prompt_section_text="$(_reviewer_inherited_prompt_section "$_reviewer_pre_inherited_json")"
+
 _phase_t0=$(date +%s)
 if [ "${#canary_skip_producers[@]}" -gt 0 ] && canary_skip_listed reviewer-agent; then
   # PRD-build-burst-canary-live-parity R6/AC9: reviewer-agent is a Sonnet
@@ -2701,7 +2984,17 @@ elif { [ "$scope" = branch ] && [ "$intent_card_stale" != true ]; } || [ "${#blo
   # leftover re-read off disk, the 05:15:46Z misdiagnosis this replaces).
   case "$_reviewer_verdict" in
     block)
-      note_block "$_reviewer_fail_note"
+      # PRD-build-reviewer-block-inherited-attribution R7: relabel the
+      # RECEIPT NAME (not just gate_out's text, further down) to
+      # "reviewer-agent:<reason>" so a reason-scoped baseline entry can
+      # match this exact receipt inside blocking_notes[] — gate-
+      # attribution.sh's own witness check only ever sees this array, and
+      # previously only a blanket "reviewer-agent" baseline entry (which
+      # excuses every future reviewer block) could rescue anything here.
+      _reviewer_note_label="reviewer-agent"
+      [ -n "$_reviewer_block_reasons_csv" ] && \
+        _reviewer_note_label="reviewer-agent:$(_reviewer_pick_representative_reason "$repo" "$_reviewer_block_reasons_csv")"
+      note_block "${_reviewer_note_label} — decision=block reasons=${_reviewer_block_reasons_csv}"
       record_phase reviewer $(( $(date +%s) - _phase_t0 )) fail
       ;;
     infra)
@@ -2845,23 +3138,9 @@ fi
 # same committed-HEAD baseline gate-delta.sh itself reads (`git show
 # HEAD:agent/gate-baseline.json`) — an uncommitted working-tree copy never
 # counts here either, same fail-closed convention as gate-delta.sh's own.
-_reviewer_pick_representative_reason() {
-  local repo="$1" reasons_csv="$2"
-  local baseline_json="" baselined_reasons=""
-  baseline_json="$(git -C "$repo" show HEAD:agent/gate-baseline.json 2>/dev/null)"
-  if [ -n "$baseline_json" ] && printf '%s' "$baseline_json" | jq -e . >/dev/null 2>&1; then
-    baselined_reasons="$(printf '%s' "$baseline_json" | jq -r '.receipts[]?.name // empty' | sed -n 's/^reviewer-agent://p')"
-  fi
-  local reason
-  local IFS=','
-  for reason in $reasons_csv; do
-    if ! grep -qxF "$reason" <<<"$baselined_reasons"; then
-      printf '%s' "$reason"
-      return 0
-    fi
-  done
-  printf '%s' "${reasons_csv%%,*}"
-}
+# (Function itself now defined early, near note_block() -- PRD-build-
+# reviewer-block-inherited-attribution R7 -- so this comment stays as the
+# historical record at the call site.)
 if [ "$_reviewer_verdict" = block ] && [ -n "$_reviewer_block_reasons_csv" ]; then
   _reviewer_first_reason="$(_reviewer_pick_representative_reason "$repo" "$_reviewer_block_reasons_csv")"
   gate_out="$(printf '%s\n' "$gate_out" | sed "s/✗ reviewer-agent —/✗ reviewer-agent:${_reviewer_first_reason} —/")"
@@ -3154,22 +3433,55 @@ print(d.get("merge_sha") or d.get("head_sha") or "")' "$_attr_landing_rec" 2>/de
     fi
   fi
   # END inhblocks-r2-landing-range
-  attr_notes_file="$(mktemp "${TMPDIR:-/tmp}/extend-gate-attr-notes.XXXXXX")"
-  for n in "${blocking_notes[@]}"; do
-    # note_block strings are always "<receipt> — <detail>" (em dash,
-    # consistent across every note_block call above); split on the first
-    # occurrence so a detail that itself contains " — " stays intact.
-    printf '%s\n' "$n" | sed -E 's/^([^ ]+) — (.*)$/\1\t\2/' >> "$attr_notes_file"
-  done
-  if attr_out="$("$GATE_ATTRIBUTION" compute "$repo" "$attr_diff_base" "$head_now" "$attr_notes_file" 2>/dev/null)"; then
+  attr_out="$(gate_attribution_from_notes blocking_notes)"
+  if [ -n "$attr_out" ]; then
     attribution_json="$attr_out"
     attribution_in_scope="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("in_scope",0))' "$attribution_json" 2>/dev/null || echo 0)"
     attribution_inherited="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("inherited",0))' "$attribution_json" 2>/dev/null || echo 0)"
     attribution_unknown_inputs="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("unknown_inputs",0))' "$attribution_json" 2>/dev/null || echo 0)"
     attribution_baseline_witness="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("baseline_witness",0))' "$attribution_json" 2>/dev/null || echo 0)"
     attribution_commit_range="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("commit_range",0))' "$attribution_json" 2>/dev/null || echo 0)"
+
+    # --- PRD-build-reviewer-block-inherited-attribution P0 R1/R2/R5 -------
+    # Re-attribute the reviewer-agent block (if any) from its raw block
+    # reasons rather than gate-attribution.sh's generic pathless-finding
+    # rule — a reviewer block whose every reason names an already-inherited
+    # receipt or a pre-branch commit is inherited debt restated through
+    # the reviewer's mouth (Grounding), not a fresh in-scope finding. Only
+    # runs when there IS a fresh, parseable reasons_csv (AC5: an
+    # unparsable/absent reasons_csv leaves the block exactly as gate-
+    # attribution.sh computed it — byte-identical to today).
+    reviewer_restated_inherited_csv=""
+    if [ -n "${_reviewer_block_reasons_csv:-}" ]; then
+      _reviewer_other_inherited_json="$(printf '%s' "$attribution_json" | python3 -c 'import json,sys
+d = json.load(sys.stdin)
+print(json.dumps([b for b in (d.get("blocks") or [])
+                   if b.get("scope") == "inherited"
+                   and not (b.get("receipt") or "").startswith("reviewer-agent")]))' 2>/dev/null)"
+      [ -n "$_reviewer_other_inherited_json" ] || _reviewer_other_inherited_json='[]'
+      _reviewer_resolved="$(_reviewer_resolve_block_reasons "$repo" "$attr_diff_base" "$head_now" "$_reviewer_block_reasons_csv" "$_reviewer_other_inherited_json")"
+      if [ -n "$_reviewer_resolved" ]; then
+        attribution_json="$(_reviewer_apply_resolution "$attribution_json" "$_reviewer_resolved")"
+        attribution_in_scope="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("in_scope",0))' "$attribution_json" 2>/dev/null || echo "$attribution_in_scope")"
+        attribution_inherited="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("inherited",0))' "$attribution_json" 2>/dev/null || echo "$attribution_inherited")"
+        reviewer_restated_inherited_csv="$(printf '%s' "$_reviewer_resolved" | python3 -c 'import json,sys; print(",".join(json.load(sys.stdin).get("restated_receipts") or []))' 2>/dev/null || echo "")"
+        # requirement 3: the reviewer receipt on disk gains its own
+        # restated_inherited key — cosmetic annotation only, patched AFTER
+        # `autobuilder gate` already read the receipt, so it never changes
+        # that aggregator's own pass/block accounting.
+        _reviewer_receipt_file="$project_abs/target/autobuilder/receipts/reviewer-agent.json"
+        if [ -f "$_reviewer_receipt_file" ]; then
+          _rr_tmp="$(mktemp "${TMPDIR:-/tmp}/extend-gate-reviewer-restated.XXXXXX")"
+          if jq --argjson ri "$(printf '%s' "$_reviewer_resolved" | jq -c '.restated_receipts // []')" \
+              '. + {restated_inherited: $ri}' "$_reviewer_receipt_file" > "$_rr_tmp" 2>/dev/null; then
+            mv "$_rr_tmp" "$_reviewer_receipt_file"
+          else
+            rm -f "$_rr_tmp"
+          fi
+        fi
+      fi
+    fi
   fi
-  rm -f "$attr_notes_file"
 fi
 # $journal was resolved (and the selftest isolation guard applied) right
 # after $head_now above, PRD-build-gate-before-land requirement 4 — the
@@ -3268,6 +3580,10 @@ fi
 # different axis: "known before" vs "whose diff introduced it").
 if [ "${#blocking_notes[@]}" -gt 0 ]; then
   journal_suffix="$journal_suffix inherited=$attribution_inherited in-scope=$attribution_in_scope"
+  # requirement 3 (AC1-AC4): reviewer-restated inherited findings, named —
+  # empty brackets when the reviewer never blocked, or blocked but nothing
+  # it named resolved inherited.
+  journal_suffix="$journal_suffix reviewer_restated_inherited=[${reviewer_restated_inherited_csv:-}]"
 fi
 # requirement 2 (AC3): a finding attributed in-scope for want of a known
 # producer-input mapping (fail-closed) is called out by name so it never

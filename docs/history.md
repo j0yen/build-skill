@@ -320,3 +320,33 @@ any receipt producer runs — a missing token ends the gate
 `incomplete infra=reviewer-agent:auth-missing` in well under the 276 s the
 old failure cost, naming every source checked, before paying for a single
 receipt.
+
+## reviewer-restated-inherited — 2026-09-18, PRD-build-reviewer-block-inherited-attribution
+
+Attribution (PRD-build-inherited-blocks-delta-pass) classifies receipt
+blocks by commit range, but the reviewer subagent's own block is not a
+receipt with a commit — it is free-form text in `block_reasons[]` — so it
+entered the attribution file as a plain in-scope block with no
+attribution at all. On the burst-lane-gate-debt-2b2982e gate, rollback-
+plan's finding on a pre-branch commit was correctly attributed inherited,
+and 331 s later the reviewer subagent independently read the SAME finding
+and blocked on it, re-entering the inherited debt as an in-scope block:
+`inherited=1 in-scope=1`, verdict `block`, on a branch waiting for the
+attribution fix that had already landed. `extend-gate.sh` now resolves
+each reviewer block reason against the inherited set computed so far
+(receipt-name substring match, or a 7–40-hex commit token that is an
+ancestor of `base` and not inside `base..head` — a token inside the range
+vetoes to in-scope regardless of any receipt name the reason also
+mentions) before folding the reviewer receipt into the attribution
+document; a block whose every reason resolves inherited gets
+`scope=inherited attribution=reviewer-restated`, and the reviewer prompt
+now lists the already-inherited findings up front so the restatement
+stops at the source. An unparsable or empty `block_reasons[]` leaves the
+block exactly as the generic pathless-finding rule computed it — no
+override, no regression. Separately, the receipt name folded into
+`blocking_notes[]` is now `reviewer-agent:<representative reason>`
+(previously bare `reviewer-agent`), so a reason-scoped
+`agent/gate-baseline.json` entry can baseline exactly one recurring
+reviewer reason without a blanket `reviewer-agent` entry excusing every
+future one — gate-attribution.sh's own witness check still honors a
+blanket entry's pre-existing meaning as a prefix fallback.

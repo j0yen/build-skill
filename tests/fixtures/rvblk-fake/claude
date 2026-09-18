@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# Fake `claude` CLI for tests/rvblk_p0_acs.sh AC6 (PRD-build-reviewer-
+# block-inherited-attribution, test_prefix rvblk). Modeled on tests/
+# fixtures/revauth-fake/claude (same probe-vs-real-call shape), with two
+# differences this PRD's AC6 needs:
+#
+#   - the real reviewer call's PROMPT is captured verbatim to
+#     $FAKE_RVBLK_PROMPT_CAPTURE (when set) so the test can assert the
+#     "already attributed inherited" section landed in it.
+#   - decision/block_reasons are scriptable via FAKE_RVBLK_DECISION
+#     (default "pass") and FAKE_RVBLK_BLOCK_REASONS (comma-separated).
+set -uo pipefail
+
+prompt=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -p) prompt="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+
+case "$prompt" in
+  "Reply with only the single word: ok")
+    echo "ok"
+    exit 0
+    ;;
+  *)
+    [ -n "${FAKE_RVBLK_PROMPT_CAPTURE:-}" ] && printf '%s' "$prompt" > "$FAKE_RVBLK_PROMPT_CAPTURE"
+    head_sha="$(git rev-parse HEAD 2>/dev/null || echo fake)"
+    decision="${FAKE_RVBLK_DECISION:-pass}"
+    reasons_json="[]"
+    if [ -n "${FAKE_RVBLK_BLOCK_REASONS:-}" ]; then
+      reasons_json="$(python3 -c 'import json,sys; print(json.dumps([r for r in sys.argv[1].split(",") if r]))' "$FAKE_RVBLK_BLOCK_REASONS")"
+    fi
+    mkdir -p target/autobuilder/receipts
+    python3 -c '
+import json, sys
+head, decision, reasons_json = sys.argv[1], sys.argv[2], sys.argv[3]
+doc = {
+    "schema": "autobuilder.reviewer_agent_receipt.v1",
+    "head_sha": head, "intent_card_sha": "fake", "decision": decision,
+    "block_reasons": json.loads(reasons_json), "concern_reasons": [],
+    "falsification": {"test_audit": "ok", "panic_audit": "ok", "unsafe_audit": "ok",
+                       "public_api_audit": "ok", "deps_audit": "ok", "drift_audit": "ok",
+                       "counter_attack": {"description": "n/a", "test_skeleton": "n/a"}},
+}
+print(json.dumps(doc))
+' "$head_sha" "$decision" "$reasons_json" | tee target/autobuilder/receipts/reviewer-agent.json
+    exit 0
+    ;;
+esac

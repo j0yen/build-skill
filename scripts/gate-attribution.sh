@@ -271,7 +271,18 @@ with open(notes_file) as fh:
                 # receipt the operator already recorded in the committed
                 # baseline HAS evidence: it was blocking at the recorded
                 # head, before this branch existed. Witness beats guess.
-                if receipt in baseline_names:
+                # PRD-build-reviewer-block-inherited-attribution R7: a
+                # reviewer-agent receipt arrives here relabelled
+                # "reviewer-agent:<reason>" (extend-gate.sh, reason-scoped
+                # baseline parity) -- a blanket "reviewer-agent" baseline
+                # entry must still excuse every reason (its pre-existing
+                # meaning), so it is also checked as a prefix fallback,
+                # never only the exact reason-scoped name.
+                blanket_reviewer = (
+                    receipt.startswith("reviewer-agent:")
+                    and "reviewer-agent" in baseline_names
+                )
+                if receipt in baseline_names or blanket_reviewer:
                     scope = "inherited"
                     witnessed = True
                 else:

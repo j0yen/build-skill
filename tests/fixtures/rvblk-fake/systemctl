@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Fake `systemctl` for revauth_ac*.sh — overrides the real systemctl on
+# $PATH (fixture dir goes first) so a test that wants to prove
+# `auth-missing` (no source yields a token) is not accidentally rescued by
+# this box's REAL user-manager environment, which really does carry a
+# live CLAUDE_CODE_OAUTH_TOKEN entry outside this fixture. Prints no
+# CLAUDE_CODE_OAUTH_TOKEN line by default; FAKE_SYSTEMCTL_TOKEN opts a
+# test into a resolvable value for the systemctl-source AC.
+set -uo pipefail
+case "${1:-} ${2:-}" in
+  "--user show-environment")
+    if [ -n "${FAKE_SYSTEMCTL_TOKEN:-}" ]; then
+      echo "CLAUDE_CODE_OAUTH_TOKEN=$FAKE_SYSTEMCTL_TOKEN"
+    fi
+    echo "PATH=/usr/bin:/bin"
+    exit 0
+    ;;
+  *) exit 0 ;;
+esac
