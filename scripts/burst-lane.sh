@@ -4020,6 +4020,12 @@ CANARY_GH="${BURST_LANE_GH:-gh}"
 ALERT_DELIVER="${ALERT_DELIVER:-$HERE/alert-deliver.sh}"
 CANARY_BASELINE_ROOT="$STATE_DIR/canary-baseline"
 CANARY_RUNS_ROOT="$STATE_DIR/canary-runs"
+# PRD-build-burst-canary-live-parity R1: baseline and main-variant
+# gate-launch.sh calls must never target CANARY_REPO directly (the loop's
+# shared checkout, whose HEAD moves out from under a canary mid-run — the
+# 2026-09-18 04:36Z incident this PRD exists to fix) — they target a
+# detached worktree pinned at the canary's resolved head instead.
+CANARY_WORKTREE_ROOT="${BURST_LANE_CANARY_WORKTREE_ROOT:-/mnt/data/jsy/tmp}"
 # canary_run_variant_main/_branch are invoked as `v="$(canary_run_variant_*
 # ...)"` — a command substitution, which bash always runs in a subshell.
 # A bash global assigned INSIDE that subshell (the original
@@ -4170,18 +4176,20 @@ canary_diverged_lines() {
   return 0
 }
 
-# canary_build_baseline <head_sha> <baseline_dir> — R2: a local --scope
-# main gate at that HEAD, nice -n 10, CARGO_BUDGET_TEST_THREADS=2 (never
-# BURST_LANE=1 — this IS the local baseline the box is compared against).
+# canary_build_baseline <head_sha> <baseline_dir> <repo_path> — R2: a local
+# --scope main gate at that HEAD, nice -n 10, CARGO_BUDGET_TEST_THREADS=2
+# (never BURST_LANE=1 — this IS the local baseline the box is compared
+# against). R1: repo_path is the pinned canary worktree, never CANARY_REPO
+# directly — the shared checkout's HEAD can move mid-run.
 canary_build_baseline() {
-  local head_sha="$1" baseline_dir="$2" ts rc=0
+  local head_sha="$1" baseline_dir="$2" repo_path="${3:-$CANARY_REPO}" ts rc=0
   ts="$(now_epoch)"
   journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  canary  baseline  building  (head=$head_sha)"
-  nice -n 10 env CARGO_BUDGET_TEST_THREADS=2 "$CANARY_GATE_LAUNCH" "$CANARY_REPO" \
+  nice -n 10 env CARGO_BUDGET_TEST_THREADS=2 "$CANARY_GATE_LAUNCH" "$repo_path" \
     --head "$head_sha" --scope main --slug "canary-baseline-$ts" --wait \
     >/dev/null 2>&1 || rc=$?
   mkdir -p "$baseline_dir"
-  cp -f "$CANARY_REPO"/target/autobuilder/receipts/*.json "$baseline_dir"/ 2>/dev/null || true
+  cp -f "$repo_path"/target/autobuilder/receipts/*.json "$baseline_dir"/ 2>/dev/null || true
   if [ -n "$(ls -A "$baseline_dir" 2>/dev/null)" ]; then
     journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  canary  baseline  built  (head=$head_sha rc=$rc)"
   else
@@ -4189,17 +4197,18 @@ canary_build_baseline() {
   fi
 }
 
-# canary_run_variant_main <head_sha> <baseline_dir> <baseline_state> <server_id>
+# canary_run_variant_main <head_sha> <baseline_dir> <baseline_state> <server_id> <repo_path>
 # -> stdout verdict (pass|block|diverged); writes $CANARY_DIVERGED_LINES_FILE.
+# R1: repo_path is the pinned canary worktree, never CANARY_REPO directly.
 canary_run_variant_main() {
-  local head_sha="$1" baseline_dir="$2" baseline_state="$3" server_id="$4"
+  local head_sha="$1" baseline_dir="$2" baseline_state="$3" server_id="$4" repo_path="${5:-$CANARY_REPO}"
   local ts rc=0 verdict="pass" n_diverged=0
   ts="$(now_epoch)"
-  BURST_LANE=1 "$CANARY_GATE_LAUNCH" "$CANARY_REPO" --head "$head_sha" --scope main \
+  BURST_LANE=1 "$CANARY_GATE_LAUNCH" "$repo_path" --head "$head_sha" --scope main \
     --slug "canary-main-$ts" --wait >/dev/null 2>&1 || rc=$?
   local run_dir="$CANARY_RUNS_ROOT/$ts-main/receipts"
   mkdir -p "$run_dir"
-  cp -f "$CANARY_REPO"/target/autobuilder/receipts/*.json "$run_dir"/ 2>/dev/null || true
+  cp -f "$repo_path"/target/autobuilder/receipts/*.json "$run_dir"/ 2>/dev/null || true
   [ "$rc" -eq 0 ] || verdict="block"
   local diverged_lines=""
   if [ "$baseline_state" = "present" ]; then
@@ -4382,7 +4391,7 @@ canary_run_variant_lane() {
 # newline-joined across variants), CANARY_CORE_FIRST_DIVERGED_PRODUCER
 # (first token of the first diverged line, empty when nothing diverged).
 _canary_core() {
-  local head="$1" variants="$2" no_baseline="$3"
+  local head="$1" variants="$2" no_baseline="$3" keep_worktree="${4:-false}"
 
   mkdir -p "$BOX_STATE_DIR" "$CANARY_BASELINE_ROOT" "$CANARY_RUNS_ROOT"
 
@@ -4395,6 +4404,19 @@ _canary_core() {
   read -r head_sha head_source <<<"$resolved"
   CANARY_CORE_HEAD="$head_sha"
   CANARY_CORE_HEAD_SOURCE="$head_source"
+
+  # R1: pin a detached worktree at the resolved head — baseline and
+  # main-variant gate-launch.sh calls target this, never CANARY_REPO
+  # itself, so a shared-checkout HEAD move mid-run (the 2026-09-18 04:36Z
+  # incident) cannot pull the rug out from under a canary in flight.
+  mkdir -p "$CANARY_WORKTREE_ROOT"
+  local canary_wt="$CANARY_WORKTREE_ROOT/burst-canary-$(now_epoch)"
+  if ! git -C "$CANARY_REPO" worktree add --detach "$canary_wt" "$head_sha" >/dev/null 2>&1; then
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  canary  refused  (cause=worktree-add-failed head=$head_sha)"
+    echo "canary refused (cause=worktree-add-failed)" >&2
+    return 4
+  fi
+  journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  canary  worktree  (path=$canary_wt head=$head_sha)"
 
   local server_id; server_id="$(state_read server_id)"
   # R5: canary.json's schema names `image_id` — a canary verdict that does
@@ -4422,7 +4444,7 @@ _canary_core() {
   else
     baseline_dir="$CANARY_BASELINE_ROOT/$head_sha/receipts"
     if [ ! -d "$baseline_dir" ] || [ -z "$(ls -A "$baseline_dir" 2>/dev/null)" ]; then
-      canary_build_baseline "$head_sha" "$baseline_dir"
+      canary_build_baseline "$head_sha" "$baseline_dir" "$canary_wt"
     fi
     [ -d "$baseline_dir" ] && [ -n "$(ls -A "$baseline_dir" 2>/dev/null)" ] && baseline_state="present"
   fi
@@ -4436,7 +4458,7 @@ _canary_core() {
   for w in "${want[@]}"; do
     case "$w" in
       main)
-        v_main="$(canary_run_variant_main "$head_sha" "$baseline_dir" "$baseline_state" "$server_id")"
+        v_main="$(canary_run_variant_main "$head_sha" "$baseline_dir" "$baseline_state" "$server_id" "$canary_wt")"
         local _dl; _dl="$(cat "$CANARY_DIVERGED_LINES_FILE" 2>/dev/null || true)"
         [ -n "$_dl" ] && diverged_ndjson="$diverged_ndjson$_dl"$'\n'
         [ "$v_main" = "pass" ] && canary_record_routed_main_pass "$head_sha"
@@ -4470,6 +4492,10 @@ _canary_core() {
   CANARY_CORE_V_LANE="$v_lane"; CANARY_CORE_LANE_ID="$lane_id"
   CANARY_CORE_DIVERGED_NDJSON="$diverged_ndjson"
   CANARY_CORE_FIRST_DIVERGED_PRODUCER="$(printf '%s\n' "$diverged_ndjson" | awk 'NF{print $1; exit}')"
+
+  if [ "$keep_worktree" != true ]; then
+    git -C "$CANARY_REPO" worktree remove --force "$canary_wt" >/dev/null 2>&1 || rm -rf "$canary_wt"
+  fi
 
   case " $v_main $v_branch $v_delta $v_lane " in
     *" block "*|*" diverged "*) return 1 ;;
@@ -4539,14 +4565,15 @@ else:
 }
 
 cmd_canary() {
-  local head="" variants="main,branch,delta" no_baseline=false report=false
+  local head="" variants="main,branch,delta" no_baseline=false report=false keep_worktree=false
   while [ $# -gt 0 ]; do
     case "$1" in
       --head) head="${2:?canary: --head needs a value}"; shift 2 ;;
       --variants) variants="${2:?canary: --variants needs a value}"; shift 2 ;;
       --no-baseline) no_baseline=true; shift ;;
       --report) report=true; shift ;;
-      *) echo "usage: burst-lane.sh canary [--head <sha>] [--variants main,branch,delta|<lane-id>] [--no-baseline] [--report]" >&2; exit 2 ;;
+      --keep-worktree) keep_worktree=true; shift ;;
+      *) echo "usage: burst-lane.sh canary [--head <sha>] [--variants main,branch,delta|<lane-id>] [--no-baseline] [--report] [--keep-worktree]" >&2; exit 2 ;;
     esac
   done
 
@@ -4565,7 +4592,7 @@ cmd_canary() {
     exit 3
   fi
 
-  _canary_core "$head" "$variants" "$no_baseline"
+  _canary_core "$head" "$variants" "$no_baseline" "$keep_worktree"
   local rc=$?
 
   # AC14: an operator-run canary that comes back pass also clears a prior
