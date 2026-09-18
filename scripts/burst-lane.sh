@@ -2519,6 +2519,60 @@ print(d.get("image_id", ""))
   fi
 }
 
+# PRD-build-burst-lane-enable-proof-inherited requirement 1: `prove` writes
+# proof.json under whatever box dir existed WHEN IT RAN, but a proof is
+# valid for any box booted from the same image — keyed by image_id (and
+# ts age, checked downstream), never by which box happens to hold the
+# file. A freshly created box (`up`) has no proof.json of its own even
+# when a sibling box's proof for the SAME image_id is still good, so
+# `enable`/`status` refused with cause=no-proof on every fresh box until
+# an operator copied proof.json over by hand. This resolves which proof
+# file to actually trust: $PROOF_STATE_FILE (this box's own) if it exists
+# and parses — unchanged fast path, no inheritance, no journal line —
+# otherwise the newest (by `ts`) sibling `$BOX_STATE_DIR/../*/proof.json`
+# (the boxes root box_path_for/box_context_at also use — $BOX_STATE_DIR is
+# normally the `current` symlink, so the literal `..` resolves through it
+# to boxes/, not to $STATE_DIR) whose `routed` is true and whose
+# `image_id` equals $1. Prints nothing when neither resolves; callers
+# treat that exactly like today's "no proof.json" absence.
+resolve_proof_file() {  # $1 = boot_image_id; stdout: path to trust, or ""
+  local boot_image_id="$1"
+  if [ -f "$PROOF_STATE_FILE" ] && python3 -c '
+import json, sys
+try:
+    json.load(open(sys.argv[1]))
+except Exception:
+    raise SystemExit(1)
+' "$PROOF_STATE_FILE" 2>/dev/null; then
+    printf '%s\n' "$PROOF_STATE_FILE"
+    return 0
+  fi
+  python3 -c '
+import glob, json, sys
+
+boxes_glob, boot_image_id = sys.argv[1:3]
+
+best_path = None
+best_ts = None
+for path in glob.glob(boxes_glob):
+    try:
+        d = json.load(open(path))
+    except Exception:
+        continue
+    if d.get("routed") is not True:
+        continue
+    if d.get("image_id") != boot_image_id:
+        continue
+    ts = d.get("ts", "")
+    if best_ts is None or ts > best_ts:
+        best_ts = ts
+        best_path = path
+
+if best_path:
+    print(best_path)
+' "$BOX_STATE_DIR/../*/proof.json" "$boot_image_id"
+}
+
 # requirement 6: the session-INDEPENDENT fields `status` (text and --json)
 # always reports — image_id/image_source (what `up` would boot right now,
 # via resolve_boot_image above), bake_age_h (hours since snapshot.json's
@@ -2531,6 +2585,13 @@ print(d.get("image_id", ""))
 status_extra_fields_json() {  # stdout: one JSON object (never fails/exits)
   local img_id img_source
   read -r img_id img_source <<<"$(resolve_boot_image)"
+  # PRD-build-burst-lane-enable-proof-inherited requirement 2: the same
+  # resolve_proof_file() `enable` consults, keyed to the SAME boot image
+  # `status` is about to report -- so a fresh box with an inherited
+  # sibling proof shows proof_routed/proof_age_h from that proof, not
+  # "never proved", and `enable`/`status` can never disagree about which
+  # proof.json is in play.
+  local resolved_proof_file; resolved_proof_file="$(resolve_proof_file "$img_id")"
   # R8: canary=<pass|diverged|missing>@<age_h>h head=<sha7>, read via the
   # same canary_read_status() the R6 gates use -- one definition of "the
   # box's canary state" for both gating and display.
@@ -2627,7 +2688,7 @@ print(json.dumps({
     "evidence": evidence,
     "canary": canary,
 }))
-' "$img_id" "$img_source" "$SNAPSHOT_STATE_FILE" "$PROOF_STATE_FILE" "$SYSTEMD_DROPIN" "$BOX_STATE_DIR/logs" "$(evidence_status_json "$EVIDENCE_DIR")" "$canary_raw"
+' "$img_id" "$img_source" "$SNAPSHOT_STATE_FILE" "$resolved_proof_file" "$SYSTEMD_DROPIN" "$BOX_STATE_DIR/logs" "$(evidence_status_json "$EVIDENCE_DIR")" "$canary_raw"
 }
 
 # Same fields, one text-mode summary line (requirement 6: "text and --json").
@@ -3726,6 +3787,26 @@ _enable_core() {
   local boot_image_id boot_image_source
   read -r boot_image_id boot_image_source <<<"$(resolve_boot_image)"
 
+  # PRD-build-burst-lane-enable-proof-inherited requirement 2: resolve the
+  # proof to trust BEFORE the allow/refuse decision below, and journal
+  # `proof-inherited` whenever that isn't this box's own proof.json --
+  # cause=no-proof (inside the decision) is now reserved for "neither this
+  # box's own proof.json NOR any sibling for this image_id resolved",
+  # never "this box just happens to be fresh".
+  local proof_file; proof_file="$(resolve_proof_file "$boot_image_id")"
+  if [ -n "$proof_file" ] && [ "$proof_file" != "$PROOF_STATE_FILE" ]; then
+    local inherited_ts inherited_image_id inherited_server_id
+    read -r inherited_ts inherited_image_id inherited_server_id <<<"$(python3 -c '
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    d = {}
+print(d.get("ts", ""), d.get("image_id", ""), d.get("server_id", ""))
+' "$proof_file" 2>/dev/null)"
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  enable  proof-inherited  (from_server=$inherited_server_id proof_ts=$inherited_ts image_id=$inherited_image_id)"
+  fi
+
   local decision
   decision="$(python3 -c '
 import calendar, json, sys, time
@@ -3758,7 +3839,7 @@ if proof.get("image_id") != boot_image_id:
     fail("image-mismatch")
 
 print("allow", ts, proof.get("image_id", ""))
-' "$PROOF_STATE_FILE" "$boot_image_id")"
+' "$proof_file" "$boot_image_id")"
 
   local verdict cause_or_ts image_id
   read -r verdict cause_or_ts image_id <<<"$decision"
@@ -11429,6 +11510,16 @@ main() {
       if [ "${1:-}" = "--head" ]; then _dcrh_head="${2:-}"; fi
       canary_resolve_head "$_dcrh_repo" "$_dcrh_head"
       exit $?
+      ;;
+    # Undocumented/hidden — PRD-build-burst-lane-enable-proof-inherited
+    # requirement 3: a direct call into resolve_proof_file() so a selftest
+    # can assert which proof.json path it resolves to for a given boot
+    # image_id, against fixture box dirs, without running any of `enable`
+    # (drop-in write, canary gate) at all. Same rationale as the other
+    # _debug-* entries above.
+    _debug-resolve-proof-file)
+      resolve_proof_file "${1:?usage: _debug-resolve-proof-file <boot_image_id>}"
+      exit 0
       ;;
     *) usage ;;
   esac
