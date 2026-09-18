@@ -122,4 +122,22 @@ echo "$out3" | grep -qx 'superseded=2' \
   || { echo "FAIL: no superseded=2 line:"; echo "$out3"; exit 1; }
 echo ok
 
+echo "== AC14 (PRD-build-prd-superseded-by): digest prints+journals transferred-acs: <n> (<k> chains) =="
+DIGEST_JOURNAL="$ROOT/digest.md"
+out4=$("$LS" digest --prd-dir "$ROOT/clone" --journal "$DIGEST_JOURNAL")
+echo "$out4" | grep -qx 'transferred-acs: 2 (2 chains)' \
+  || { echo "FAIL: no transferred-acs: 2 (2 chains) line on stdout:"; echo "$out4"; exit 1; }
+grep -qE 'transferred-acs: 2 \(2 chains\)' "$DIGEST_JOURNAL" \
+  || { echo "FAIL: no transferred-acs line journaled"; cat "$DIGEST_JOURNAL"; exit 1; }
+echo ok
+
+echo "== digest on a corpus with no superseded chains prints 0 (0 chains) =="
+EMPTY_ROOT=$(mktemp -d /tmp/lane-status-selftest-empty.XXXXXX)
+mkdir -p "$EMPTY_ROOT/build-queue"
+out5=$("$LS" digest --prd-dir "$EMPTY_ROOT" --journal "$ROOT/digest-empty.md")
+echo "$out5" | grep -qx 'transferred-acs: 0 (0 chains)' \
+  || { echo "FAIL: expected 0 (0 chains):"; echo "$out5"; exit 1; }
+rm -rf "$EMPTY_ROOT"
+echo ok
+
 echo "ALL PASS"

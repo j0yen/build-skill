@@ -14,6 +14,15 @@
 #       default 2), then every live claim and every stale claim found across
 #       build-queue/*.md (via lane-claim.sh status), then the last 5
 #       cargo-budget ledger rows (PRD-build-cargo-concurrency-budget).
+#   lane-status.sh digest [--prd-dir <dir>] [--journal <path>]
+#       PRD-build-prd-superseded-by P2 requirement 10 (AC14): prints AND
+#       journals one line, `transferred-acs: <n> (<k> chains)` — n is the
+#       total transferred_acs count and k the chain count (predecessors
+#       carrying `Superseded-by:`) across the whole corpus, same
+#       scan-prds.sh JSON `report`'s own `superseded=<n>` block already
+#       reads. Same interim-surface posture as gate-debt.sh's own
+#       `digest` subcommand: this is the reporting surface itself, not a
+#       weekly cadence — wiring it to one is a caller/cron concern.
 #
 # PRD-build-cargo-concurrency-budget (2026-09-09): `tick-summary` also
 # appends this tick's `cargo-budget: peak_load=... min_avail_gb=...
@@ -38,7 +47,7 @@ SCAN_PRDS="${SCAN_PRDS:-$HERE/scan-prds.sh}"
 JQ="${JQ:-$(command -v jq || echo /usr/sbin/jq)}"
 
 die() { echo "lane-status: $*" >&2; exit "${2:-4}"; }
-usage() { echo "usage: lane-status.sh {tick-summary|report} ..." >&2; exit 4; }
+usage() { echo "usage: lane-status.sh {tick-summary|report|digest} ..." >&2; exit 4; }
 
 now_iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
@@ -465,12 +474,40 @@ print("flow: prds_measured=%d lead_time_p50=%s p90=%s wait_p50=%s gate_p50=%s"
   fi
 }
 
+# PRD-build-prd-superseded-by P2 requirement 10 / AC14.
+cmd_digest() {
+  local prd_dir="${PRD_DIR:-$HOME/Documents/PRDs}"
+  local journal="${JOURNAL:-$HOME/brain/journal/build/$(date -u +%F).md}"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --prd-dir) prd_dir="$2"; shift 2 ;;
+      --journal) journal="$2"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  mkdir -p "$(dirname "$journal")" 2>/dev/null || true
+  local n=0 k=0
+  if [ -x "$SCAN_PRDS" ] && [ -x "$JQ" ]; then
+    read -r n k < <(PRD_DIR="$prd_dir" "$SCAN_PRDS" 2>/dev/null | "$JQ" -r '
+      [.[] | select(.superseded_by != null)] as $rows
+      | ($rows | length) as $k
+      | ([$rows[] | (.transferred_acs // []) | length] | add // 0) as $n
+      | "\($n) \($k)"
+    ' 2>/dev/null)
+  fi
+  [ -n "$n" ] || n=0
+  [ -n "$k" ] || k=0
+  echo "transferred-acs: $n ($k chains)"
+  printf '%s  transferred-acs: %s (%s chains)\n' "$(now_iso)" "$n" "$k" >> "$journal"
+}
+
 main() {
   [ $# -ge 1 ] || usage
   local sub="$1"; shift
   case "$sub" in
     tick-summary) [ $# -ge 3 ] || usage; cmd_tick_summary "$@" ;;
     report)       cmd_report "$@" ;;
+    digest)       cmd_digest "$@" ;;
     *) usage ;;
   esac
 }
