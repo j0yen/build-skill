@@ -1202,6 +1202,30 @@ fi
 if ! $record_baseline && ! $force && [ -f "$cache_file" ]; then
   cached_tree="$(jq -r '.tree_sha // empty' "$cache_file" 2>/dev/null || true)"
   cached_hash="$(jq -r '.script_sha256 // empty' "$cache_file" 2>/dev/null || true)"
+  # PRD-build-cargo-shim-recursion-guard P1 requirement 5 (AC6): rollback-
+  # plan and ci-checks read commit HISTORY (rollback-plan walks first-
+  # parent tags/commits, ci-checks reads the pushed CI run for this exact
+  # sha), not just the tree — a content-preserving reword (same tree, new
+  # head, e.g. `git commit --amend -m`) changes what those two producers
+  # would actually see, so replaying their old verdict under the new head
+  # would be a stale hit. Every other producer here reads only the tree,
+  # so the plain tree_sha key below stays correct for them. Operator
+  # design sign-off 2026-09-18T12:50Z (PRD iter_log) rejected per-producer
+  # partial replay (too risky in this 25-producer shared pipeline) in
+  # favor of a whole-gate key: when the CACHED run's own phases include
+  # rollback-plan or ci-checks actually having run (not `skip`), a hit
+  # also requires head_sha to match, so a reword re-runs the WHOLE gate
+  # (correct at the cost of one gate) instead of replaying a stale block.
+  # A cached run whose phases never touched either producer (pure tree-
+  # scoped work) keeps today's tree_sha-only key unchanged.
+  cached_head="$(jq -r '.head_sha // empty' "$cache_file" 2>/dev/null || true)"
+  cached_has_history_producer="$(jq -r '
+    ((.phases["rollback-plan"] // "skip") != "skip") or ((.phases["ci-checks"] // "skip") != "skip")
+  ' "$cache_file" 2>/dev/null || echo false)"
+  cached_history_key_ok=1
+  if [ "$cached_has_history_producer" = "true" ] && [ "$cached_head" != "$head_now" ]; then
+    cached_history_key_ok=0
+  fi
   # PRD-build-branch-gate-scope-artifacts requirement 5 (P0, AC7):
   # "a deferred verdict must not be reused at main scope — include scope
   # in the cache key" (Technical considerations) is deliberately NOT a
@@ -1241,7 +1265,7 @@ if ! $record_baseline && ! $force && [ -f "$cache_file" ]; then
   if [ -f "$cache_file" ]; then
     cached_verdict_precheck="$(jq -r '.verdict // empty' "$cache_file" 2>/dev/null || true)"
   fi
-  if [ -n "$cached_tree" ] && [ "$cached_tree" = "$tree_now" ] && [ -n "$cached_hash" ] && [ "$cached_hash" = "$self_hash" ] && [ "${cached_deferred_n:-0}" = "0" ] && [ "$cached_verdict_precheck" != "incomplete" ]; then
+  if [ -n "$cached_tree" ] && [ "$cached_tree" = "$tree_now" ] && [ -n "$cached_hash" ] && [ "$cached_hash" = "$self_hash" ] && [ "${cached_deferred_n:-0}" = "0" ] && [ "$cached_verdict_precheck" != "incomplete" ] && [ "$cached_history_key_ok" = "1" ]; then
     cached_verdict="$(jq -r '.verdict // empty' "$cache_file" 2>/dev/null || true)"
     cached_rc="$(jq -r '.exit_code // empty' "$cache_file" 2>/dev/null || true)"
     if [ -n "$cached_verdict" ] && [ -n "$cached_rc" ]; then
