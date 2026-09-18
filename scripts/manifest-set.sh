@@ -43,6 +43,10 @@ SLUG_COLLISIONS_PY="${SLUG_COLLISIONS_PY:-$SKILL_DIR/scripts/slug-collisions.py}
 # rewrite_ticks_invested_delta below), never trusted from a model-written
 # Phase 7 delta.
 LEDGER_FILE="${FLOW_LEDGER_FILE:-$STATE_DIR/flow-ledger.jsonl}"
+# requirement 2: manifest-set.sh is the named writer for blocked/unblocked
+# (see apply_patch_locked's blockers_transition below).
+# shellcheck source=lib/flow-ledger.sh
+source "$SKILL_DIR/scripts/lib/flow-ledger.sh"
 
 LOCK_RETRY_INTERVAL="${MANIFEST_LOCK_RETRY:-0.2}"
 LOCK_CEILING_SECS="${MANIFEST_LOCK_CEILING:-60}"
@@ -98,10 +102,20 @@ PY
 # Locked read-modify-write of ONLY prds.<slug>, merging the given patch.
 # Caller must hold the lock. Args: <slug> <patch-json-string-or-file> mode
 # mode = "file": $2 is a path; mode = "inline": $2 is a JSON string.
+#
+# PRD-build-flow-ledger requirement 2: manifest-set.sh is the named writer
+# for `blocked`/`unblocked` -- "when a patch sets/clears blockers". The
+# transition (empty/absent -> non-empty = blocked; non-empty -> empty =
+# unblocked) can only be seen from INSIDE this RMW, before/after the merge,
+# so the python below prints a one-line marker to stderr
+# (FLOWLEDGER:blocked / FLOWLEDGER:unblocked) that the caller reads from
+# $tmp.err and fires flow_ledger_append from, AFTER the mv below confirms
+# the write actually landed.
 apply_patch_locked() {
   local slug="$1" patch_src="$2" mode="$3"
   local tmp; tmp="$(mktemp "$STATE_DIR/.manifest.XXXXXX")" || return 4
-  if ! MANIFEST="$MANIFEST" python3 - "$slug" "$patch_src" "$mode" >"$tmp" 2>/dev/null <<'PY'
+  local tmp_err; tmp_err="$(mktemp "$STATE_DIR/.manifest-err.XXXXXX" 2>/dev/null)" || tmp_err="/dev/null"
+  if ! MANIFEST="$MANIFEST" python3 - "$slug" "$patch_src" "$mode" >"$tmp" 2>"$tmp_err" <<'PY'
 import json, os, sys
 slug, patch_src, mode = sys.argv[1], sys.argv[2], sys.argv[3]
 manifest_path = os.environ["MANIFEST"]
@@ -117,6 +131,20 @@ try:
         m = json.load(f)
 except FileNotFoundError:
     m = {}
+def blockers_transition(old_entry, patch):
+    # PRD-build-flow-ledger requirement 2: only fires when the patch
+    # itself carries a `blockers` key -- an unrelated patch leaving
+    # blockers untouched is neither a block nor an unblock.
+    if "blockers" not in patch:
+        return None
+    old_nonempty = bool((old_entry or {}).get("blockers"))
+    new_nonempty = bool(patch.get("blockers"))
+    if not old_nonempty and new_nonempty:
+        return "blocked"
+    if old_nonempty and not new_nonempty:
+        return "unblocked"
+    return None
+
 prds = m.get("prds", [])
 if isinstance(prds, list):
     entry = None
@@ -124,6 +152,8 @@ if isinstance(prds, list):
     for i, p in enumerate(prds):
         if isinstance(p, dict) and p.get("slug") == slug:
             entry = p; idx = i; break
+    old_entry = dict(entry) if entry is not None else {}
+    transition = blockers_transition(old_entry, patch)
     if entry is None:
         entry = {"slug": slug}
         prds.append(entry)
@@ -135,19 +165,30 @@ else:
     if not isinstance(prds, dict):
         prds = {}
     entry = prds.get(slug)
+    old_entry = dict(entry) if isinstance(entry, dict) else {}
+    transition = blockers_transition(old_entry, patch)
     if not isinstance(entry, dict):
         entry = {"slug": slug}
     entry.update(patch)
     prds[slug] = entry
     m["prds"] = prds
+if transition:
+    sys.stderr.write("FLOWLEDGER:%s\n" % transition)
 json.dump(m, sys.stdout, indent=2, sort_keys=False)
 sys.stdout.write("\n")
 PY
   then
-    rm -f "$tmp"
+    rm -f "$tmp" "$tmp_err"
     return 4
   fi
+  local flowledger_marker=""
+  [ -r "$tmp_err" ] && flowledger_marker="$(grep -o 'FLOWLEDGER:blocked\|FLOWLEDGER:unblocked' "$tmp_err" 2>/dev/null | head -1)"
+  rm -f "$tmp_err"
   mv -f "$tmp" "$MANIFEST" || { rm -f "$tmp"; return 4; }
+  case "$flowledger_marker" in
+    FLOWLEDGER:blocked)   flow_ledger_append "$slug" "blocked" ;;
+    FLOWLEDGER:unblocked) flow_ledger_append "$slug" "unblocked" ;;
+  esac
   return 0
 }
 

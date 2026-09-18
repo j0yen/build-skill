@@ -173,6 +173,31 @@ journal_hits2="$(grep -c '  ac7  archive  archived  (source=manifest-reconcile d
 ck "AC7 no duplicate line on steady-state re-run" '[ "$journal_hits2" = 1 ]'
 rm -rf "$T"
 
+# ---- PRD-build-flow-ledger requirement 2: a brand-new build-queue/ entry
+# (no prior manifest record at all) fires exactly one `queued` flow-ledger
+# event; an already-known slug's status churn does NOT (that's the "file/
+# dir wins" path, never "new entry created") --------------------------
+new_fixture
+cat > "$T/prds/build-queue/PRD-flowq-new.md" <<'EOF'
+- Status: queued
+EOF
+cat > "$T/prds/build-queue/PRD-flowq-known.md" <<'EOF'
+- Status: queued
+EOF
+cat > "$T/state/manifest.json" <<EOF
+{"prds": {"flowq-known": {"slug":"flowq-known","status":"building"}}}
+EOF
+run_rc >/dev/null
+ledger="$T/state/flow-ledger.jsonl"
+new_hits="$("$JQ" -c 'select(.slug=="flowq-new" and .stage=="queued")' "$ledger" 2>/dev/null | wc -l)"
+known_hits="$("$JQ" -c 'select(.slug=="flowq-known" and .stage=="queued")' "$ledger" 2>/dev/null | wc -l)"
+ck "flow-ledger: new build-queue entry fires one queued event" '[ "$new_hits" = 1 ]'
+ck "flow-ledger: an already-known slug's status churn fires no queued event" '[ "$known_hits" = 0 ]'
+run_rc >/dev/null   # steady-state re-run: still exactly one (never re-fires)
+new_hits2="$("$JQ" -c 'select(.slug=="flowq-new" and .stage=="queued")' "$ledger" 2>/dev/null | wc -l)"
+ck "flow-ledger: steady-state re-run does not re-fire queued" '[ "$new_hits2" = 1 ]'
+rm -rf "$T"
+
 echo "----"
 echo "manifest-reconcile-selftest: pass=$PASS fail=$FAIL"
 [ "$FAIL" -eq 0 ]

@@ -107,6 +107,10 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # shellcheck source=lib/journal.sh
 source "$HERE/lib/journal.sh"
+# PRD-build-flow-ledger requirement 2: mark-needs-classification.sh is the
+# named writer for the `needs_classification` stage.
+# shellcheck source=lib/flow-ledger.sh
+source "$HERE/lib/flow-ledger.sh"
 
 GIT_ID=(-c user.email=jyen.tech@gmail.com -c user.name="Joe Yen")
 PRD_DIR="${PRD_DIR:-$HOME/Documents/PRDs}"
@@ -411,5 +415,7 @@ push_or_die() {
 }
 
 push_or_die "$root"
+
+flow_ledger_append "$slug" "needs_classification" --sha "$commit_sha"
 
 echo "needs-classification-committed: $slug $commit_sha"

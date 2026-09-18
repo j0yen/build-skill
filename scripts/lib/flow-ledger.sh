@@ -7,7 +7,10 @@
 # entries because the only per-PRD counters were written by a model in a
 # Phase 7 patch. This library gives every lifecycle script (lane-claim.sh,
 # worktree-extend.sh, gate-launch.sh, extend-gate.sh, archive-commit.sh,
-# manifest-set.sh, scan-prds.sh, mark-needs-classification.sh) one call to
+# manifest-set.sh, manifest-reconcile.sh -- the actual first-sight-of-a-
+# new-PRD writer; scan-prds.sh itself never touches the manifest, only
+# emits JSON, see that script's own header -- mark-needs-classification.sh)
+# one call to
 # append a fact — `{ts, slug, stage, lane, sha?, detail?}` — to one
 # append-only ledger, at the point of action, never re-derived after the
 # fact by a model guessing at elapsed time.

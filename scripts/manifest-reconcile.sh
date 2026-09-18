@@ -69,6 +69,13 @@ VANISHED_GRACE_DAYS="${VANISHED_GRACE_DAYS:-7}"
 
 # shellcheck source=lib/journal.sh
 source "$HERE/lib/journal.sh"
+# PRD-build-flow-ledger requirement 2: scan-prds.sh is the named writer for
+# the `queued` stage ("first seen by scan"); this reconcile pass IS that
+# first-sight moment in practice (scan-prds.sh itself only emits JSON, it
+# never touches the manifest -- see that script's own header) since it is
+# the one place a brand-new manifest entry gets created from a file scan.
+# shellcheck source=lib/flow-ledger.sh
+source "$HERE/lib/flow-ledger.sh"
 
 log() { printf 'manifest-reconcile: %s\n' "$*" >&2; }
 die() { log "$*"; exit "${2:-1}"; }
@@ -248,6 +255,12 @@ drops = []     # slugs to hard-delete after grace period
 # saying the archive had happened). Bash journals these after patches
 # apply, via the one shared journal_line (never from python directly).
 archived_transitions = []
+# PRD-build-flow-ledger requirement 2: slugs getting a brand-new manifest
+# entry with status=queued this pass -- the `queued` stage's one legitimate
+# firing point ("first seen by scan"). A new entry landing straight at
+# archived/parked (discovered already shipped, or parked) never queued in
+# the observable sense, so it does not fire.
+new_queued = []
 
 for slug, f in file_map.items():
     entry = entries.get(slug, {})
@@ -272,6 +285,8 @@ for slug, f in file_map.items():
                          "manifest_value": None, "resolution": "new entry created"})
         if new_status == "archived":
             archived_transitions.append(slug)
+        elif new_status == "queued":
+            new_queued.append(slug)
     else:
         effective_target = dir_status
         if cur_status == "vanished" and effective_target is None:
@@ -350,7 +365,8 @@ for slug, entry in entries.items():
             ]})
 
 print(json.dumps({"results": results, "drops": drops,
-                   "archived_transitions": archived_transitions}, sort_keys=True))
+                   "archived_transitions": archived_transitions,
+                   "new_queued": new_queued}, sort_keys=True))
 PY
 )" || die "planning pass failed"
 
@@ -415,6 +431,32 @@ print((entry or {}).get("status") or "")
 import json, sys
 plan = json.load(sys.stdin)
 for s in plan["archived_transitions"]:
+    print(s)
+')
+
+  # PRD-build-flow-ledger requirement 2: fire the `queued` stage event for
+  # every slug that actually landed as a brand-new status=queued entry this
+  # pass -- same re-read-to-confirm pattern as archived_transitions above,
+  # so a manifest-set.sh failure never fires a ledger event for a patch
+  # that didn't actually land (the plan retries next run either way).
+  while IFS= read -r nq_slug; do
+    [ -n "$nq_slug" ] || continue
+    nq_status="$(MANIFEST="$MANIFEST" SLUG="$nq_slug" python3 -c '
+import json, os
+try:
+    m = json.load(open(os.environ["MANIFEST"]))
+except (OSError, ValueError):
+    m = {}
+prds = m.get("prds", {})
+entry = prds.get(os.environ["SLUG"]) if isinstance(prds, dict) else next(
+    (p for p in prds if isinstance(p, dict) and p.get("slug") == os.environ["SLUG"]), None)
+print((entry or {}).get("status") or "")
+')"
+    [ "$nq_status" = "queued" ] && flow_ledger_append "$nq_slug" "queued"
+  done < <(printf '%s' "$plan_json" | python3 -c '
+import json, sys
+plan = json.load(sys.stdin)
+for s in plan["new_queued"]:
     print(s)
 ')
 

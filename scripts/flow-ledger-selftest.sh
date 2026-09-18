@@ -175,4 +175,59 @@ jq -e '.flow.lead_time_p50_h | type == "number"' "$AC5_OUT" >/dev/null \
 rm -rf "$AC5_STATE"
 echo ok
 
+# =======================================================================
+# Requirement 2 — manifest-set.sh is the named writer for blocked/
+# unblocked: a patch that SETS blockers (empty/absent -> non-empty) fires
+# `blocked`; a patch that CLEARS them (non-empty -> empty) fires
+# `unblocked`; a patch that doesn't touch `blockers` at all fires neither.
+# =======================================================================
+echo "== Requirement 2: manifest-set.sh fires blocked/unblocked on blockers set/clear =="
+BLK_STATE=$(mktemp -d /tmp/flow-ledger-blk-state.XXXXXX)
+BLK_LEDGER="$BLK_STATE/flow-ledger.jsonl"
+echo '{"prds":[{"slug":"blk-smoke","status":"queued"}]}' > "$BLK_STATE/manifest.json"
+echo '{"blockers":["waiting on X"]}' > "$BLK_STATE/p-block.json"
+echo '{"blockers":[]}' > "$BLK_STATE/p-unblock.json"
+echo '{"status":"queued"}' > "$BLK_STATE/p-untouched.json"
+run_ms() { BUILD_STATE_DIR="$BLK_STATE" FLOW_LEDGER_FILE="$BLK_LEDGER" JOURNAL="$BLK_STATE/journal.md" "$MS" "$@"; }
+run_ms blk-smoke "$BLK_STATE/p-block.json" >/dev/null
+run_ms blk-smoke "$BLK_STATE/p-untouched.json" >/dev/null
+run_ms blk-smoke "$BLK_STATE/p-unblock.json" >/dev/null
+stages="$(jq -r '.stage' "$BLK_LEDGER" | paste -sd, -)"
+[ "$stages" = "blocked,unblocked" ] || fail "blocked/unblocked stages: got '$stages', want 'blocked,unblocked' (an untouched-blockers patch must fire neither)"
+rm -rf "$BLK_STATE"
+echo ok
+
+# =======================================================================
+# Requirement 2 — mark-needs-classification.sh is the named writer for
+# the `needs_classification` stage, fired once the commit is durably
+# pushed (same "only after the postcondition holds" convention
+# archive-commit.sh's own `archived` write already uses).
+# =======================================================================
+echo "== Requirement 2: mark-needs-classification.sh fires needs_classification =="
+MNC="$HERE/mark-needs-classification.sh"
+NC_ROOT=$(mktemp -d /tmp/flow-ledger-nc-state.XXXXXX)
+git init -q --bare "$NC_ROOT/origin.git"
+git clone -q "$NC_ROOT/origin.git" "$NC_ROOT/clone"
+mkdir -p "$NC_ROOT/clone/build-queue"
+cat > "$NC_ROOT/clone/build-queue/PRD-nc-smoke.md" <<'EOF'
+# PRD: nc-smoke
+
+- Status: queued
+- build_target: shell
+- build_into: /tmp/some-target-repo
+- build_priority: high
+EOF
+git -C "$NC_ROOT/clone" add -A
+git -C "$NC_ROOT/clone" -c user.name=t -c user.email=t@t commit -q -m init
+git -C "$NC_ROOT/clone" push -q origin master 2>/dev/null || git -C "$NC_ROOT/clone" push -q origin main 2>/dev/null || true
+NC_LEDGER="$NC_ROOT/flow-ledger.jsonl"
+NC_JOURNAL="$NC_ROOT/journal"
+out="$(FLOW_LEDGER_FILE="$NC_LEDGER" BUILD_JOURNAL_ROOT="$NC_JOURNAL" \
+  "$MNC" "$NC_ROOT/clone/build-queue/PRD-nc-smoke.md" "operator judgment call, no lint id" --force 2>&1)"
+echo "$out" | grep -q '^needs-classification-committed: nc-smoke' || fail "mark-needs-classification output: $out"
+nc_hits="$(jq -c 'select(.slug=="nc-smoke" and .stage=="needs_classification")' "$NC_LEDGER" 2>/dev/null | wc -l)"
+[ "$nc_hits" = 1 ] || fail "needs_classification event: got $nc_hits, want 1 ($(cat "$NC_LEDGER" 2>/dev/null))"
+rm -rf "$NC_ROOT"
+echo ok
+
 echo "flow-ledger-selftest: PASS"
