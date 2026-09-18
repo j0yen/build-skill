@@ -242,7 +242,7 @@ cmd_render() {
     echo
   fi
 
-  for n in 5 6 7 8 9 10 11 12; do
+  for n in 5 6 7 7a 8 9 10 11 12 13 14; do
     extract_directive "$n"
     echo
   done
