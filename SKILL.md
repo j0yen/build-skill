@@ -3583,6 +3583,35 @@ need, not on a schedule — restoring afterward is automatic by
 construction (nothing durable was pointed at throwaway state except the
 child's own `HOME`, which is discarded after each of the three ticks).
 
+**The drill owns `tick.lock` for its whole span, and waits for it
+(2026-09-18, same PRD).** "Operator-run, never called from a tick" was
+true and also unrunnable: on a host whose `claude-build.timer` fires
+every five minutes there is no idle window to hand an operator, and for
+ten consecutive dispatches every inner `tick-run.sh` call simply lost its
+`flock -n` to the very tick that wanted the drill, recorded `skipped
+cause=tick-lock-held`, and failed the drill's own
+`cause != auth-expired` assertion — AC16 was structurally unprovable, not
+merely unproven. `loop-arm-drill.sh` now takes `tick.lock` **itself**,
+once, waiting up to `LOOP_ARM_DRILL_LOCK_WAIT` (default 5400s) for an
+in-flight tick to finish, and **holds it across all three drill ticks**,
+running each child with `TICK_RUN_ASSUME_LOCK=1` so `tick-run.sh` neither
+re-takes the lock nor touches the holder file the drill owns. Holding it
+across all three is not convenience: a real tick landing between drill
+ticks writes its own `ok` record, which resets `streak_failed` to 0, so
+streak=3 — and therefore AC16's own alarm evidence — would never be
+reachable. This is stronger mutual exclusion than before, not weaker: one
+process holds the lock continuously for the drill, and a real launch
+arriving mid-drill takes its ordinary exit-75 path, whose `skipped`
+record leaves `streak_failed` untouched by design. `--no-wait` restores
+the old fail-fast behaviour (exit 4, no mutation); `--detach` re-launches
+the drill as a transient `systemd-run --user` unit that blocks on that
+same wait — which is how a live tick asks for a drill without ever
+running one in-line (a plain background job would die with the tick's own
+cgroup). `TICK_RUN_ASSUME_LOCK` is for a caller that genuinely holds the
+lock on an inherited fd and nothing else — setting it from a launcher
+that does not is exactly the 2026-09-15 two-concurrent-coordinators bug
+`tick-run.sh` exists to prevent.
+
 ## Local tool integration
 
 The tick has a small standard kit it reaches for. Prefer these over

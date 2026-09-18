@@ -60,6 +60,27 @@
 #                     reads SELECT_TICK_PIN as its --pin default, so the
 #                     coordinator's one Phase 2 call is already pinned
 #                     without ever seeing the slugs itself.
+#   TICK_RUN_ASSUME_LOCK
+#                     `1` = the CALLER already holds this same tick.lock on
+#                     an inherited fd, so do not acquire it again and do not
+#                     touch the holder file (the caller owns both for the
+#                     whole span). PRD-buildloop-tick-outcome-liveness AC16:
+#                     loop-arm-drill.sh must run THREE consecutive ticks with
+#                     no real tick slipping in between — a real tick landing
+#                     mid-drill would write its own `ok` record and reset
+#                     streak_failed to 0, so the drill can never reach the
+#                     streak=3 its own assertion (and AC16's journal evidence)
+#                     needs. The drill therefore takes tick.lock ONCE, for
+#                     itself, holds it across all three children, and sets
+#                     this. Mutual exclusion is strictly stronger this way,
+#                     not weaker: the lock is held continuously by one
+#                     process for the whole drill, and every concurrent real
+#                     launch still gets its ordinary exit-75 `skipped`
+#                     record (which by design leaves streak_failed
+#                     untouched). NEVER set this from a launcher that does
+#                     not actually hold the lock — that is the exact 2026-09-15
+#                     two-concurrent-coordinators bug this script exists to
+#                     prevent. Default 0.
 #
 # Exit: 0 coordinator ran and exited 0 | <n> the coordinator's own exit
 #       code (this script `exec`s it, so its exit code IS this script's) |
@@ -71,6 +92,9 @@ SKILL_DIR="${BUILD_SKILL_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 STATE_DIR="${BUILD_STATE_DIR:-$SKILL_DIR/state}"
 LOCKFILE="${TICK_LOCK_FILE:-$STATE_DIR/tick.lock}"
 HOLDERFILE="${TICK_LOCK_HOLDER_FILE:-$LOCKFILE.holder}"
+# See the Env block above. Only `1` enables it; anything else is off.
+ASSUME_LOCK=0
+[ "${TICK_RUN_ASSUME_LOCK:-0}" = 1 ] && ASSUME_LOCK=1
 # shellcheck source=lib/journal.sh
 source "$SKILL_DIR/scripts/lib/journal.sh"
 # shellcheck source=lib/tick-cause.sh
@@ -516,39 +540,55 @@ main() {
   mkdir -p "$STATE_DIR"
   : >>"$LOCKFILE"
 
-  # Fixed fd 9 (documented above): opened here, held across the `exec`
-  # below so the flock's lifetime is the coordinator process tree's
-  # lifetime, not this line's. The coordinator's own `flock -n` probe on
-  # the same path (Phase 0 verification) is expected to fail — that's
-  # the point.
-  exec 9>"$LOCKFILE"
+  # TICK_RUN_ASSUME_LOCK (Env block above): the caller holds tick.lock on
+  # fd 9 already and owns the holder file for the whole span, so this
+  # process neither acquires nor releases either. Everything after this
+  # block is identical either way — the child still gets `9>&-` below,
+  # which matters MORE in this mode, not less: fd 9 here is the CALLER's
+  # lock, and letting a grandchild inherit it would keep the drill's lock
+  # held after the drill itself exited.
+  if [ "$ASSUME_LOCK" -eq 0 ]; then
+    # Fixed fd 9 (documented above): opened here, held across the `exec`
+    # below so the flock's lifetime is the coordinator process tree's
+    # lifetime, not this line's. The coordinator's own `flock -n` probe on
+    # the same path (Phase 0 verification) is expected to fail — that's
+    # the point.
+    exec 9>"$LOCKFILE"
 
-  if ! flock -n 9; then
-    local age
-    if read_holder; then
-      age=$(( $(now_epoch) - ${H_STARTED:-0} ))
-    else
-      H_PID="unknown"; H_CMD="unknown"; age=0
+    if ! flock -n 9; then
+      local age
+      if read_holder; then
+        age=$(( $(now_epoch) - ${H_STARTED:-0} ))
+      else
+        H_PID="unknown"; H_CMD="unknown"; age=0
+      fi
+      local msg="tick-lock-held (pid=$H_PID age=${age}s cmd=$H_CMD)"
+      echo "$msg" >&2
+      journal "build-tick  skip  $msg"
+      write_tick_outcome 75 skipped tick-lock-held "$msg"
+      exit 75
     fi
-    local msg="tick-lock-held (pid=$H_PID age=${age}s cmd=$H_CMD)"
-    echo "$msg" >&2
-    journal "build-tick  skip  $msg"
-    write_tick_outcome 75 skipped tick-lock-held "$msg"
-    exit 75
-  fi
 
-  # We now hold the flock on fd 9. requirement 4 (stale holder): the
-  # kernel already released any PRIOR holder's lock the instant that
-  # holder's process died — flock -n succeeding above proves that, not
-  # this check. This check only decides whether to JOURNAL a reclaim (the
-  # holder file named a now-dead pid from this same boot).
-  if read_holder && [ "$H_BID" = "$(boot_id)" ] && ! kill -0 "$H_PID" 2>/dev/null; then
-    journal "tick-lock  reclaimed  (stale_pid=$H_PID)"
+    # We now hold the flock on fd 9. requirement 4 (stale holder): the
+    # kernel already released any PRIOR holder's lock the instant that
+    # holder's process died — flock -n succeeding above proves that, not
+    # this check. This check only decides whether to JOURNAL a reclaim (the
+    # holder file named a now-dead pid from this same boot).
+    if read_holder && [ "$H_BID" = "$(boot_id)" ] && ! kill -0 "$H_PID" 2>/dev/null; then
+      journal "tick-lock  reclaimed  (stale_pid=$H_PID)"
+    fi
   fi
 
   TICK_STARTED_EPOCH="$(now_epoch)"
   TICK_ID="${TICK_STARTED_EPOCH}-$$"
-  printf '%s %s %s %s\n' "$$" "$(boot_id)" "$TICK_STARTED_EPOCH" "${coord_cmd[*]}" > "$HOLDERFILE"
+  # Under ASSUME_LOCK the holder file already describes the caller that
+  # genuinely holds the lock (loop-arm-drill.sh writes its own); stomping
+  # it here would make `--status` name a pid that does not hold anything,
+  # and the EXIT trap below would delete the real holder's file out from
+  # under it after the first of three drill children.
+  if [ "$ASSUME_LOCK" -eq 0 ]; then
+    printf '%s %s %s %s\n' "$$" "$(boot_id)" "$TICK_STARTED_EPOCH" "${coord_cmd[*]}" > "$HOLDERFILE"
+  fi
 
   # requirement 1's tick-id handoff: select-tick.sh (run by the coordinator
   # below) reads these to persist state/select-tick/<TICK_ID>.json under the
@@ -565,7 +605,7 @@ main() {
   # under it. Fires on every exit from here on: normal, `exit "$rc"` below,
   # or this process itself being signaled. Releases fd 9's flock as a side
   # effect of process exit either way.
-  trap 'rm -f "$HOLDERFILE" 2>/dev/null || true' EXIT
+  [ "$ASSUME_LOCK" -eq 0 ] && trap 'rm -f "$HOLDERFILE" 2>/dev/null || true' EXIT
 
   # Print-mode ceiling (Technical considerations): a manual path that
   # forgets this loses its branches to the default wait ceiling (the
