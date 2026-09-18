@@ -853,9 +853,18 @@ print("%s (routed=true image=%s bytes=%s ts=%s)" % (
 # check_live_evidence <spec> — stdout: one evidence line, rc 0, when the
 # `(Live` AC's own named evidence currently holds; rc 1 (no stdout)
 # otherwise. <spec> is the raw text after "evidence:" on the AC line (see
-# ac_live_evidence above) — build-contract.md documents the three forms:
+# ac_live_evidence above) — build-contract.md documents the four forms:
 #   journal:<regex>   grep -E <regex> over $VC_JOURNAL_DIR/*.md (default
 #                      ~/brain/journal/build), freshest match wins.
+#   logfile:<regex>   grep -E <regex> over $VC_LOGFILE (default
+#                      ~/brain/journal/build-auto.log) — for evidence that
+#                      lives in the host-local operational log rather than
+#                      the git-tracked journal (added PRD-buildloop-tick-
+#                      outcome-liveness AC15: the LIVENESS line's
+#                      last_ok_age= is written there, once per tick, by
+#                      build-has-work.sh; a heartbeat line that fires every
+#                      ~5 min has no place in the tracked, durable journal,
+#                      so it is not there and `journal:` can never find it).
 #   receipt:<path>    the path exists — tried as given, then relative to
 #                      $repo, then relative to $HOME.
 #   cmd:<command>      `bash -c <command>` exits 0.
@@ -906,6 +915,14 @@ check_live_evidence() {
       shopt -u nullglob
       [ -n "$best_path" ] || return 1
       printf 'journal:%s: %s\n' "${best_path#"$HOME"/}" "$best_line"
+      ;;
+    logfile)
+      [ -n "$val" ] || return 1
+      local lf="${VC_LOGFILE:-$HOME/brain/journal/build-auto.log}"
+      [ -f "$lf" ] || return 1
+      grep -qE -- "$val" "$lf" 2>/dev/null || return 1
+      local lline; lline="$(grep -Em1 -- "$val" "$lf" 2>/dev/null)"
+      printf 'logfile:%s: %s\n' "${lf#"$HOME"/}" "$lline"
       ;;
     receipt)
       [ -n "$val" ] || return 1
@@ -976,7 +993,15 @@ check_live_evidence_seq() {
     jslugs+=("$(awk -F'  +' '{print $2}' <<<"$best_line")")
   done
   local n=${#jfiles[@]}
-  [ "$n" -ge 1 ] || return 1
+  # Bugfix (PRD-buildloop-tick-outcome-liveness AC15, found live authoring
+  # this exact AC): a compound spec with ZERO `journal:` clauses (e.g.
+  # `logfile:X` + `receipt:Y`, both already checked and passed in the loop
+  # above via the `continue` path) used to hard-fail here regardless --
+  # this gate required at least one journal-kind clause to exist at all,
+  # contradicting this function's own header comment ("Non-journal:
+  # clauses ... checked via the single-clause path"). The same-slug/
+  # ordering correlation below only ever applied to journal: clauses
+  # anyway, so it is skipped (not failed) when there are none.
   if [ "$n" -ge 2 ]; then
     local i
     for ((i = 1; i < n; i++)); do
@@ -988,7 +1013,11 @@ check_live_evidence_seq() {
       fi
     done
   fi
-  printf 'journal-seq:%s (slug=%s)\n' "$(IFS=,; echo "${jfiles[*]#"$HOME"/}")" "${jslugs[0]:-?}"
+  if [ "$n" -ge 1 ]; then
+    printf 'journal-seq:%s (slug=%s)\n' "$(IFS=,; echo "${jfiles[*]#"$HOME"/}")" "${jslugs[0]:-?}"
+  else
+    printf 'compound:%d clause(s) matched, no journal: clause in spec\n' "${#clauses[@]}"
+  fi
   return 0
 }
 

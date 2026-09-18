@@ -101,9 +101,13 @@ of R1-R7). For an in-scope PRD:
   migration guard, see PRD's "Migration / compatibility").
 - `verified-completed.sh --derive`'s rule (beside rule f / `(Real-box`,
   around :506) pairs a `(Live` AC only against the evidence its own AC text
-  names (`journal:<regex>`, `receipt:<path>`, `cmd:<command>`); a fixture
-  `tests/` file never satisfies it, and a deferred `(Live` AC reports
-  `live-ac-deferred` (never `completed`).
+  names (`journal:<regex>` — grepped against the git-tracked journal,
+  `~/brain/journal/build/*.md`; `logfile:<regex>` — grepped against the
+  host-local operational log, `~/brain/journal/build-auto.log`, for
+  evidence too frequent/routine to belong in the tracked journal, e.g. a
+  per-tick LIVENESS heartbeat; `receipt:<path>`; `cmd:<command>`); a
+  fixture `tests/` file never satisfies it, and a deferred `(Live` AC
+  reports `live-ac-deferred` (never `completed`).
 - The archive step runs `scripts/archive-live-ac-refusal.sh <prd-path>`
   alongside its ordinary `--derive` check and refuses on exit 1
   (`live-ac-deferred:<N>` / `live-ac-unproven:<N>`, recorded verbatim as
