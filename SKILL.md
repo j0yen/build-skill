@@ -3531,6 +3531,32 @@ that have stayed inactive across at least two consecutive checks (the
 noise filter for a digest/rollup reader); it never calls `systemctl`
 itself, so it's free to run outside the tick cadence too.
 
+**Outcome liveness, distinct from the unit check above
+(PRD-buildloop-tick-outcome-liveness).** A declared unit being active
+(the check above) is not the same claim as the loop actually building
+anything — units stayed `active` through fifteen consecutive failed
+ticks on 2026-09-18. `scripts/tick-run.sh` writes
+`$BUILD_STATE_DIR/tick-outcome.json` — `{ts, n, rc, outcome:
+ok|failed|skipped, cause, evidence, streak_failed, last_ok_ts, lane}` —
+atomically on every exit path (normal, classified failure, or a
+tick-lock-held skip), classifying a failure's cause via
+`scripts/lib/tick-cause.sh` (`auth-expired` / `quota-saturated` / `other`;
+secrets redacted). `scripts/loop-liveness.sh`'s plain-mode summary reads
+this record on its clean (unit-healthy) path and prints `LIVENESS ok
+n=<N> last_ok_age=<s|unknown> streak_failed=<n>`, or `LIVENESS degraded
+cause=<cause> streak=<n> last_ok_age=<s>` once `streak_failed` reaches
+`LOOP_TICK_FAIL_ALARM_STREAK` (env, default **3** — the one knob this
+PRD adds, same override convention as `GATE_RED_WINDOW_H`). At that same
+threshold (and again at 2x/4x it — 6 and 12 by default), `tick-run.sh`
+fires `alert-deliver.sh loop-tick-failed build-loop` through the same
+channel/idempotency `alert-deliver.sh` already gives every other
+repo-health alarm (journal line `ALARM  loop-tick-failed  cause=<cause>
+streak=<n> last_ok=<ts>`), skipping it entirely when `cause` is
+`quota-saturated` (that branch already has its own alarm — see
+`claude-build-tick.sh`'s quota-saturated marker — and must never be
+double-paged). The first `ok` tick after a delivered alarm resolves it
+(`alert-deliver.sh resolve loop-tick-failed build-loop`).
+
 ## Local tool integration
 
 The tick has a small standard kit it reaches for. Prefer these over
