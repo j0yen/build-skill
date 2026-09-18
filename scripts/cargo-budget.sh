@@ -134,7 +134,7 @@ CURSOR_FILE="$STATE_DIR/.summary-cursor"
 TIMEOUTS_LOG="$STATE_DIR/timeouts.jsonl"
 
 die() { echo "cargo-budget: $1" >&2; exit "${2:-2}"; }
-usage() { echo "usage: cargo-budget.sh {run -- <cmd...>|status|summary [--since <epoch>]|last [n]}" >&2; exit 2; }
+usage() { echo "usage: cargo-budget.sh {run -- <cmd...>|record-unslotted -- <cmd...>|status|summary [--since <epoch>]|last [n]}" >&2; exit 2; }
 
 now_iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 now_epoch() { date -u +%s; }
@@ -308,11 +308,20 @@ slot_holders_desc() {
 
 # write_ledger_row — one flock-serialized append, shared by the nested-reuse
 # and normal-acquisition paths.
+#
+# $16 (slotted): "true" for every pre-existing call site (a real budget
+# slot was held, or nested-reused, for this cargo invocation). "false" is
+# used only by cmd_record_unslotted (PRD-build-burst-gate-canary-invariant
+# R15 attestation gap, 2026-09-18): a cargo call the shim passed straight
+# through without ever acquiring a slot (cargo check/metadata, a
+# `+toolchain` probe, ...) still gets exactly one ledger row so
+# extend-gate.sh's R15 producer-attestation check can see it, with
+# slotted:false marking that no budget/wait accounting applies to it.
 write_ledger_row() {
   local ts_start="$1" ts_end="$2" wait_s="$3" peak_load="$4" slot="$5" pid="$6" \
         cmd="$7" exit_code="$8" mem_avail_gb_start="$9" sccache_pid="${10}" \
         sccache_started_at="${11}" parent_step="${12}" nested="${13}" \
-        tree_cpu_s_val="${14}" idle_released="${15}"
+        tree_cpu_s_val="${14}" idle_released="${15}" slotted="${16:-true}"
   mkdir -p "$STATE_DIR"
   local parent_step_json
   if [ -n "$parent_step" ]; then
@@ -337,13 +346,37 @@ write_ledger_row() {
     --argjson nested "$nested" \
     --argjson tree_cpu_s "$tree_cpu_s_val" \
     --argjson idle_released "$idle_released" \
-    '{ts_start:$ts_start, ts_end:$ts_end, wait_s:$wait_s, peak_load:$peak_load, slot:$slot, pid:$pid, cmd:$cmd, exit_code:$exit_code, mem_avail_gb_start:$mem_avail_gb_start, sccache_server:{pid:$sccache_pid, started_at:$sccache_started_at}, parent_step:$parent_step, nested:$nested, tree_cpu_s:$tree_cpu_s, idle_released:$idle_released}')"
+    --argjson slotted "$slotted" \
+    '{ts_start:$ts_start, ts_end:$ts_end, wait_s:$wait_s, peak_load:$peak_load, slot:$slot, pid:$pid, cmd:$cmd, exit_code:$exit_code, mem_avail_gb_start:$mem_avail_gb_start, sccache_server:{pid:$sccache_pid, started_at:$sccache_started_at}, parent_step:$parent_step, nested:$nested, tree_cpu_s:$tree_cpu_s, idle_released:$idle_released, slotted:$slotted}')"
   {
     exec {lfd}>>"$LEDGER.lock"
     flock -x "$lfd"
     printf '%s\n' "$row" >> "$LEDGER"
     exec {lfd}>&-
   }
+}
+
+# cmd_record_unslotted — PRD-build-burst-gate-canary-invariant R15
+# attestation gap fix (2026-09-18): cargo-budget-bin/cargo calls this
+# instead of exec'ing straight to the real cargo whenever it decides an
+# invocation doesn't need a budget slot (check, metadata, a `+toolchain`
+# probe, ...). Writes one ledger row with slotted:false (ts_start==ts_end,
+# exit_code null since we exec away and never see it) tagged with
+# whatever CARGO_BUDGET_PARENT_STEP the caller set, then execs the real
+# command — no gating, no waiting, no behavior change for the cargo call
+# itself. This is what makes msrv-verify's `cargo +<msrv> check` (never
+# routed — check is cheap/no-compile by design) and any other passthrough
+# producer call visible to R15's ledger scan.
+cmd_record_unslotted() {
+  [ "${1:-}" = "--" ] || usage
+  shift
+  [ $# -ge 1 ] || usage
+  local parent_step="${CARGO_BUDGET_PARENT_STEP:-}"
+  local ts; ts="$(now_iso)"
+  local meminfo_file="${CARGO_BUDGET_MEMINFO:-/proc/meminfo}"
+  write_ledger_row "$ts" "$ts" 0 0 -1 "$$" "$*" null \
+    "$(mem_avail_gb "$meminfo_file")" unknown unknown "$parent_step" false 0 false false
+  exec "$@"
 }
 
 record_timeout() {  # $1=reason $2=cmd
@@ -393,7 +426,7 @@ cmd_run() {
     n_rc=$?
     n_end="$(now_iso)"
     write_ledger_row "$n_start" "$n_end" 0 0 "$CARGO_BUDGET_HELD_SLOT" "$$" "$*" "$n_rc" \
-      "$(mem_avail_gb "$meminfo_file")" unknown unknown "$parent_step" true 0 false
+      "$(mem_avail_gb "$meminfo_file")" unknown unknown "$parent_step" true 0 false true
     exit "$n_rc"
   fi
 
@@ -586,7 +619,7 @@ cmd_run() {
 
   local idle_released_json; [ "$idle_released" = true ] && idle_released_json=true || idle_released_json=false
   write_ledger_row "$run_start_iso" "$run_end_iso" "$total_wait_s" "$peak_load" "$slot_index" "$$" "$*" \
-    "$rc" "$avail_gb" "$sccache_pid" "$sccache_started_at" "$parent_step" false "$last_tree_cpu_s" "$idle_released_json"
+    "$rc" "$avail_gb" "$sccache_pid" "$sccache_started_at" "$parent_step" false "$last_tree_cpu_s" "$idle_released_json" true
 
   exit "$rc"
 }
@@ -676,6 +709,7 @@ main() {
   local sub="$1"; shift
   case "$sub" in
     run) cmd_run "$@" ;;
+    record-unslotted) cmd_record_unslotted "$@" ;;
     status) cmd_status "$@" ;;
     summary) cmd_summary "$@" ;;
     last) cmd_last "$@" ;;

@@ -160,7 +160,21 @@ if [ -z "$REAL_CARGO" ]; then
 fi
 
 route=0
-sub="${1:-}"
+# PRD-build-burst-gate-canary-invariant R15 (2026-09-18): find the real
+# subcommand by skipping leading global flags/toolchain selectors
+# (`-q`, `-v`, `+<toolchain>`, ...) instead of trusting "$1" literally —
+# a producer that puts `-q`/`+<toolchain>` before the subcommand (e.g.
+# determinism.rs's `cargo -q build --release`, msrv-verify's
+# `cargo +<msrv> check`) used to see sub="-q"/"+<msrv>", which matched no
+# case below and silently skipped budget routing even for a `build
+# --release` that should have been slotted.
+sub=""
+for a in "$@"; do
+  case "$a" in
+    -*|+*) continue ;;
+    *) sub="$a"; break ;;
+  esac
+done
 case "$sub" in
   test|clippy|deny|nextest) route=1 ;;
   build)
@@ -195,5 +209,20 @@ fi
 BURST_LANE_SH="$HERE/../burst-lane.sh"
 if [ -x "$BURST_LANE_SH" ]; then
   "$BURST_LANE_SH" ensure-fresh "$PWD" >/dev/null 2>&1 || true
+fi
+
+# PRD-build-burst-gate-canary-invariant R15 (2026-09-18): this invocation
+# was passed straight through with no budget slot (check, metadata, a
+# `+toolchain` probe, ...) — behavior is unchanged, but route it via
+# cargo-budget.sh's record-unslotted so it still leaves exactly one
+# ledger row (slotted:false) tagged with CARGO_BUDGET_PARENT_STEP when a
+# producer set one. Before this, an unrouted producer cargo call left no
+# trace at all in the ledger, so extend-gate.sh's R15 attestation check
+# could never see msrv-verify's `cargo +<msrv> check` (never routed by
+# design — check is cheap/no-compile). Falls back to the direct exec if
+# the wrapper is missing so a stale checkout never loses cargo entirely.
+if [ -x "$WRAPPER" ]; then
+  export CARGO_BUDGET_PARENT_STEP="${CARGO_BUDGET_PARENT_STEP:-}"
+  exec "$WRAPPER" record-unslotted -- "$REAL_CARGO" "$@"
 fi
 exec "$REAL_CARGO" "$@"
