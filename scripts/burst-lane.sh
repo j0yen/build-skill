@@ -4444,7 +4444,9 @@ canary_build_baseline() {
   ts="$(now_epoch)"
   journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  canary  baseline  building  (head=$head_sha)"
   local slug="canary-baseline-$ts"
-  nice -n 10 env CARGO_BUDGET_TEST_THREADS=2 "$CANARY_GATE_LAUNCH" "$repo_path" \
+  nice -n 10 env CARGO_BUDGET_TEST_THREADS=2 \
+    EXTEND_GATE_SKIP_PRODUCERS=ci-checks,reviewer-agent,session-trace \
+    "$CANARY_GATE_LAUNCH" "$repo_path" \
     --head "$head_sha" --scope main --slug "$slug" --wait \
     >/dev/null 2>&1 || rc=$?
 
@@ -4511,7 +4513,8 @@ canary_run_variant_main() {
   local head_sha="$1" baseline_dir="$2" baseline_state="$3" server_id="$4" repo_path="${5:-$CANARY_REPO}"
   local ts rc=0 verdict="pass" cause="" n_diverged=0
   ts="$(now_epoch)"
-  BURST_LANE=1 "$CANARY_GATE_LAUNCH" "$repo_path" --head "$head_sha" --scope main \
+  BURST_LANE=1 EXTEND_GATE_SKIP_PRODUCERS=ci-checks,reviewer-agent,session-trace \
+    "$CANARY_GATE_LAUNCH" "$repo_path" --head "$head_sha" --scope main \
     --slug "canary-main-$ts" --wait >/dev/null 2>&1 || rc=$?
   local finish_ts; finish_ts="$(now_epoch)"
   local run_dir="$CANARY_RUNS_ROOT/$ts-main/receipts"
@@ -4557,7 +4560,8 @@ canary_run_variant_branch() {
   fi
   git -C "$wt" commit --allow-empty -m "canary: throwaway commit for --scope branch" >/dev/null 2>&1
   branch_head="$(git -C "$wt" rev-parse HEAD 2>/dev/null || echo "$head_sha")"
-  BURST_LANE=1 "$CANARY_GATE_LAUNCH" "$wt" --head "$branch_head" --scope branch \
+  BURST_LANE=1 EXTEND_GATE_SKIP_PRODUCERS=ci-checks,reviewer-agent,session-trace \
+    "$CANARY_GATE_LAUNCH" "$wt" --head "$branch_head" --scope branch \
     --slug "canary-branch-$ts" --wait >/dev/null 2>&1 || rc=$?
   local finish_ts; finish_ts="$(now_epoch)"
   local run_dir="$CANARY_RUNS_ROOT/$ts-branch/receipts"

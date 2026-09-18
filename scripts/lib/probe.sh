@@ -174,7 +174,20 @@ probe_bg() {
     if [ -n "$close_expr" ]; then
       eval "exec $close_expr" 2>/dev/null || true
     fi
-    setsid "$@" >/dev/null 2>"$log" &
+    # PRD-build-burst-canary-live-parity R11: `setsid "$@"` execs $1 as a
+    # real binary -- a bash function name isn't one, so every probe_bg
+    # call whose command is a shell function (cmd_parity being the only
+    # caller) died rc=127 "setsid: failed to execute ...: No such file or
+    # directory" and was never seen because the failure line below still
+    # fired correctly; only the caller (session parity) silently never ran.
+    # A function is inherited by this forked subshell already (no exec, no
+    # new session needed the way a real binary needs setsid to detach from
+    # a controlling terminal), so it runs directly instead.
+    if declare -F "$1" >/dev/null 2>&1; then
+      "$@" >/dev/null 2>"$log" &
+    else
+      setsid "$@" >/dev/null 2>"$log" &
+    fi
     child_pid=$!
     wait "$child_pid"
     rc=$?

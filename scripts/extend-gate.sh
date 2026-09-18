@@ -1409,6 +1409,39 @@ note_defer() { deferred_notes+=("$1"); echo "extend-gate: DEFERRED: $1" >&2; }
 infra_notes=()
 note_infra() { infra_notes+=("$1"); echo "extend-gate: INFRA: $1" >&2; }
 
+# --- PRD-build-burst-canary-live-parity R6 --------------------------------
+# EXTEND_GATE_SKIP_PRODUCERS names route-independent producers a canary
+# variant never needs to pay for (burst-lane.sh's canary_build_baseline /
+# canary_run_variant_main / canary_run_variant_branch export
+# "ci-checks,reviewer-agent,session-trace" before every $CANARY_GATE_LAUNCH
+# call) -- a canary run exists to compare ROUTE (burst vs local), and these
+# three producers' outcome does not depend on route, so running them twice
+# per comparison buys nothing. Honored ONLY when --slug matches `canary-*`
+# -- anything else setting this variable is a real misconfiguration (a
+# stray export could otherwise silently suppress a real gate's producers),
+# so it is refused and journaled, never silently ignored.
+canary_skip_producers=()
+if [ -n "${EXTEND_GATE_SKIP_PRODUCERS:-}" ]; then
+  case "$slug" in
+    canary-*)
+      IFS=',' read -r -a canary_skip_producers <<< "$EXTEND_GATE_SKIP_PRODUCERS"
+      ;;
+    *)
+      echo "extend-gate: EXTEND_GATE_SKIP_PRODUCERS set but slug=$slug does not match canary-* -- refusing" >&2
+      journal_line --file "$journal" "$(date -u +%FT%TZ)  gate  ${repo##*/}  skip-producers refused (slug=$slug)"
+      ;;
+  esac
+fi
+# canary_skip_listed <producer-name> -> 0 iff EXTEND_GATE_SKIP_PRODUCERS
+# named it AND the slug check above accepted the variable at all.
+canary_skip_listed() {
+  local p
+  for p in "${canary_skip_producers[@]}"; do
+    [ "$p" = "$1" ] && return 0
+  done
+  return 1
+}
+
 # --- per-step phase timing (PRD-build-gate-phase-timing) -----------------
 # Every invoked producer below is wrapped in a `date +%s` pair and recorded
 # here, in invocation order — never restructuring what a step does or its
@@ -1515,7 +1548,19 @@ INTENT_CARD_REFRESH_BIN="${INTENT_CARD_REFRESH_BIN:-$BUILD_SCRIPTS/intent-card-r
 # anything for a pinned verdict. Only branch scope still runs the refresh
 # (main-scope calls without --pinned-landing already skipped it, same as
 # before this PRD).
-if $pinned_landing; then
+# PRD-build-burst-canary-live-parity R6: a canary run's throwaway branch
+# was never claimed by any real PRD (canary_run_variant_branch's commit
+# message is literally "canary: throwaway commit for --scope branch"), so
+# the refresh would only ever find "no PRD/slug" and manufacture a false
+# intent-card-stale block -- checked first (canary_skip_producers is only
+# ever non-empty for a `canary-*` slug, see the gate above) so it wins
+# over both branches below.
+if [ "${#canary_skip_producers[@]}" -gt 0 ]; then
+  _phase_t0=$(date +%s)
+  journal_line --file "$journal" "$(printf '%s  intent-card-refresh  skipped  (slug=%s skip_reason=canary:excluded)' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$slug")"
+  record_phase intent-card-refresh $(( $(date +%s) - _phase_t0 )) skip
+elif $pinned_landing; then
   _phase_t0=$(date +%s)
   journal_line --file "$journal" "$(printf '%s  intent-card-refresh  skipped  (pinned-landing: gating M as landed, head=%s)' \
     "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$head_now")"
@@ -2067,7 +2112,25 @@ do not recompute it yourself:
 
 # 7. ci-checks — needs `gh` authenticated against the pushed HEAD.
 ci_checks_receipt="$project_abs/target/autobuilder/receipts/ci-checks.json"
-if ! command -v gh >/dev/null 2>&1; then
+# PRD-build-burst-canary-live-parity R6/AC9: checked before the `gh`
+# presence/auth probes below so a canary run never pays for either --
+# ci-checks is route-independent (CI does not care whether this box built
+# the branch itself or a burst worker did), and this is also the one
+# named producer whose real path can block for CI_CHECKS_BRANCH_WAIT
+# (default 900s), so short-circuiting here is what makes AC9's "under 10s"
+# possible at all.
+if [ "${#canary_skip_producers[@]}" -gt 0 ] && canary_skip_listed ci-checks; then
+  _phase_t0=$(date +%s)
+  jq -n --arg head "$head_now" '{
+    schema: "autobuilder.ci_checks_receipt.v1",
+    head_sha: $head, repo: "", run_count: 0, success_count: 0,
+    failure_count: 0, pending_count: 0, runs: [],
+    verdict: "pass", scope_deferred: true, skip_reason: "canary:excluded",
+    captured_at: (now | todateiso8601), receipt_digest: ""
+  }' > "$ci_checks_receipt" 2>/dev/null
+  journal_line --file "$journal" "$(date -u +%FT%TZ)  gate  ${repo##*/}  ci-checks  skipped  (slug=$slug skip_reason=canary:excluded)"
+  record_phase ci-checks $(( $(date +%s) - _phase_t0 )) skip
+elif ! command -v gh >/dev/null 2>&1; then
   note_block "ci-checks — gh CLI not on \$PATH (install: https://cli.github.com)"
   record_phase ci-checks 0 skip
 elif ! gh auth status >/dev/null 2>&1; then
@@ -2253,6 +2316,28 @@ else
   record_phase receipts $(( $(date +%s) - _phase_t0 )) fail
 fi
 
+# PRD-build-burst-canary-live-parity R6: session-trace is one of the 17
+# extended-gates producers extended-receipts.sh just fanned out to above
+# (an external script this file does not own) — there is no single call
+# site to short-circuit the way ci-checks/reviewer-agent get below, so the
+# canary skip is applied as a post-hoc receipt override instead: whatever
+# extended-receipts.sh did or did not write for session-trace is replaced
+# with the same scope_deferred/skip_reason shape the other two named
+# producers get, immediately after the one phase that could have touched
+# it. AC9 does not time-bound this phase the way it does ci-checks, so
+# there is no cost to letting extended-receipts.sh's fan-out run first.
+if [ "${#canary_skip_producers[@]}" -gt 0 ] && canary_skip_listed session-trace; then
+  _session_trace_receipt="$project_abs/target/autobuilder/receipts/session-trace.json"
+  mkdir -p "$(dirname "$_session_trace_receipt")" 2>/dev/null || true
+  jq -n --arg head "$head_now" --arg captured "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '{
+    schema: "autobuilder.session_trace_receipt.v1",
+    head_sha: $head, verdict: "pass", decision: "pass",
+    scope_deferred: true, skip_reason: "canary:excluded",
+    captured_at: $captured, receipt_digest: ""
+  }' > "$_session_trace_receipt" 2>/dev/null
+  journal_line --file "$journal" "$(date -u +%FT%TZ)  gate  ${repo##*/}  session-trace  skipped  (slug=$slug skip_reason=canary:excluded)"
+fi
+
 # 9. the risk gate itself — authoritative pass/block, reads all 25 receipts.
 # Quota guard (Joe 2026-09-11): the reviewer is a Sonnet `claude -p` call. It runs LAST, and only
 # when every other producer passed — a red gate never pays for a review it cannot use. The next gate
@@ -2280,7 +2365,25 @@ fi
 # `intent-card-stale` note from that step, so the second disjunct is also
 # false and reviewer-agent is skipped via the same "skipped" branch below.
 _phase_t0=$(date +%s)
-if $main_health; then
+if [ "${#canary_skip_producers[@]}" -gt 0 ] && canary_skip_listed reviewer-agent; then
+  # PRD-build-burst-canary-live-parity R6/AC9: reviewer-agent is a Sonnet
+  # `claude -p` call — route-independent (the diff being reviewed does not
+  # change with route), so a canary run never pays for it. Shaped exactly
+  # like the main-health synthetic receipt below (decision: "pass",
+  # scope_deferred: true), distinguished only by its skip_reason.
+  reviewer_receipt="$project_abs/target/autobuilder/receipts/reviewer-agent.json"
+  mkdir -p "$(dirname "$reviewer_receipt")" 2>/dev/null || true
+  jq -n --arg head "$head_now" --arg captured "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '{
+    schema: "autobuilder.reviewer_agent_receipt.v1",
+    head_sha: $head, intent_card_sha: "", decision: "pass",
+    block_reasons: [], concern_reasons: [],
+    scope_deferred: true, skip_reason: "canary:excluded",
+    captured_at: $captured, receipt_digest: ""
+  }' > "$reviewer_receipt" 2>/dev/null
+  echo "extend-gate: reviewer-agent scope-deferred (canary:excluded — slug=$slug)" >&2
+  journal_line --file "$journal" "$(date -u +%FT%TZ)  gate  ${repo##*/}  reviewer-deferred  (canary:excluded head=${head_now:0:7})"
+  record_phase reviewer 0 skip
+elif $main_health; then
   # PRD-build-main-verdict-pinned-to-landing R6/AC8: a bare-HEAD
   # main-health gate never has a PRD/slug to review a range against (no
   # landing, no card) — this is the "reviewer-agent ... scope-deferred
