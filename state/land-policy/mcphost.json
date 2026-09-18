@@ -6,6 +6,6 @@
   "append_only": [
     "CHANGELOG.md",
     "www/llms.txt",
-    ".buildloop/extended-gates.toml"
+    "extended-gates.toml"
   ]
 }
