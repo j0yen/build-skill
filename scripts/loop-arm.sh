@@ -22,6 +22,12 @@
 # Env overrides (test-only hooks; production defaults unchanged): same as
 # loop-liveness.sh — LOOP_UNITS_FILE, LOOP_LIVENESS_STATE_DIR/_FILE,
 # LOOP_LIVENESS_HOST. `systemctl` is resolved via $PATH.
+#
+# PRD-buildloop-tick-outcome-liveness R9: on the build host only
+# (LOOP_ARM_BUILD_HOST, default redbaron), also checks `systemctl --user
+# show-environment` for CLAUDE_CODE_OAUTH_TOKEN and prints a WARNING line
+# (stderr, never the value itself) when it's absent — visibility only,
+# does not affect this script's exit code.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
@@ -29,9 +35,28 @@ SKILL_DIR="${BUILD_SKILL_DIR:-$(cd "$HERE/.." && pwd)}"
 UNITS_FILE="${LOOP_UNITS_FILE:-$SKILL_DIR/scripts/loop-units.txt}"
 HOST="${LOOP_LIVENESS_HOST:-$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo unknown)}"
 LIVENESS="$HERE/loop-liveness.sh"
+# PRD-buildloop-tick-outcome-liveness R9: RedBaron is the fleet's always-on
+# Rust build machine (SKILL.md) -- the ONLY host where the loop's own
+# `claude -p /build` invocations need a live OAuth session in the user
+# manager environment. Overridable for selftests.
+LOOP_ARM_BUILD_HOST="${LOOP_ARM_BUILD_HOST:-redbaron}"
 
 same_host() { [ "${1,,}" = "${2,,}" ]; }
 trim() { sed -E 's/^[[:space:]]+|[[:space:]]+$//g'; }
+
+# check_oauth_token — R9: warns (stderr, exit code unaffected -- this is
+# visibility, not a new failure mode this script blocks arming on) when
+# CLAUDE_CODE_OAUTH_TOKEN is absent from `systemctl --user show-
+# environment` on the build host. Never prints the value itself, even in
+# the "present" case -- only ever tests for the KEY via grep.
+check_oauth_token() {
+  same_host "$HOST" "$LOOP_ARM_BUILD_HOST" || return 0
+  command -v systemctl >/dev/null 2>&1 || return 0
+  if ! systemctl --user show-environment 2>/dev/null | grep -q '^CLAUDE_CODE_OAUTH_TOKEN='; then
+    echo "loop-arm: WARNING CLAUDE_CODE_OAUTH_TOKEN not present in the user manager environment (systemctl --user show-environment) — the loop's own claude invocations will fail to authenticate" >&2
+  fi
+}
+check_oauth_token
 
 units=()
 if [ -f "$UNITS_FILE" ]; then
