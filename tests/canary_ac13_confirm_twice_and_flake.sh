@@ -76,6 +76,14 @@ cat > "\$repo/target/autobuilder/receipts/extended-receipts-receipt.json" <<JSON
 {"schema":"autobuilder.extended_receipts.v1","verdict":"\$verdict","route":"\$route","head_sha":"$head_sha"}
 JSON
 printf '{"verdict":"pass"}\n' > "\$repo/target/autobuilder/last-verdict.json"
+# PRD-build-burst-canary-live-parity R4: a variant only reaches "pass" with
+# routed_runs>=1 -- this fake gate-launch stands in for a real dispatched
+# run, so it appends the same \`run  routed\` journal line cmd_run's real
+# path writes (worktree=\$repo, matching canary_routed_runs' own grep) for
+# every main/branch invocation, never for the local baseline.
+if [ "\$scope" = "main" ] || [ "\$scope" = "branch" ]; then
+  echo "\$(date -u +%Y-%m-%dT%H:%M:%SZ)  burst-lane  run  routed  (server_id=testbox1 worktree=\$repo runs_served=1 exit=0 dirty=1 kind=test slug=\$slug wall_s=0 concurrent=0 warm=0 phase=test)" >> "$ROOT/journal.log"
+fi
 exit 0
 EOF
   chmod +x "$fake_gl"
@@ -99,6 +107,11 @@ EOF
   export BURST_LANE_GH="$fake_gh"
   export BURST_LANE_CANARY_GATE_LAUNCH="$fake_gl"
   export ALERT_DELIVER="$fake_alert"
+  # This fixture's fake gate-launch only ever writes one producer receipt
+  # (extended-receipts) -- R5's default CANARY_MIN_COMMON_PRODUCERS=3 would
+  # block every variant on too-few-common regardless of pass/diverge, so
+  # this test lowers the floor to match its single-producer fixture.
+  export CANARY_MIN_COMMON_PRODUCERS=1
   : > "$BURST_LANE_JOURNAL"
 
   local box_dir="$BURST_LANE_STATE_DIR/current"

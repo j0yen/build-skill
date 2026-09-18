@@ -51,10 +51,15 @@ EOF
 cat > "$BOX_DIR/proof.json" <<EOF
 {"routed":true,"ts":"$NOW_ISO","image_id":"$DEFAULT_SNAPSHOT_ID"}
 EOF
+# PRD-build-burst-canary-live-parity R8: enable now reads schema_version 2
+# canary.json (main/branch as objects, not flat strings).
 mkdir -p "$STATE_DIR/boxes/$SERVER_ID"
 cat > "$STATE_DIR/boxes/$SERVER_ID/canary.json" <<EOF
-{"head":"abcdef01234567","head_source":"green-main","ts":"$NOW_ISO","image_id":"$DEFAULT_SNAPSHOT_ID",
- "variants":{"main":"pass","branch":"pass","delta":"pass"},
+{"schema_version":2,"head":"abcdef01234567","head_source":"green-main","ts":"$NOW_ISO","image_id":"$DEFAULT_SNAPSHOT_ID",
+ "baseline":{"head":"abcdef01234567","launch_ts":0,"gate_rc":0,"receipts_n":1,"state":"built"},
+ "variants":{"main":{"verdict":"pass","cause":"","gate_rc":0,"receipts_n":1,"common_producers":3,"routed_runs":1,"worktree":"/tmp/x","launch_ts":0,"finish_ts":1},
+             "branch":{"verdict":"pass","cause":"","gate_rc":0,"receipts_n":1,"common_producers":3,"routed_runs":1,"worktree":"/tmp/y","launch_ts":0,"finish_ts":1},
+             "delta":"pass"},
  "diverged":[],
  "baseline_dir":""}
 EOF

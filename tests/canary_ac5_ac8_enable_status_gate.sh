@@ -63,9 +63,17 @@ echo "ok  journal line present"
 
 echo "== AC5 part 2: canary=diverged -> enable refuses =="
 mkdir -p "$STATE_DIR/boxes/$SERVER_ID"
+# PRD-build-burst-canary-live-parity R8: enable now reads schema_version 2
+# canary.json (main/branch as objects, not flat strings) -- this fixture
+# was written for the predecessor's flat schema and is updated in place so
+# AC5 part 2 still exercises a genuine divergence refusal, not a
+# canary-legacy refusal (R8's own, distinct, cause for a pre-schema-2 file).
 cat > "$STATE_DIR/boxes/$SERVER_ID/canary.json" <<EOF
-{"head":"deadbeef00","head_source":"green-main","ts":"$NOW_ISO","image_id":"$DEFAULT_SNAPSHOT_ID",
- "variants":{"main":"diverged","branch":"pass","delta":"pass"},
+{"schema_version":2,"head":"deadbeef00","head_source":"green-main","ts":"$NOW_ISO","image_id":"$DEFAULT_SNAPSHOT_ID",
+ "baseline":{"head":"deadbeef00","launch_ts":0,"gate_rc":0,"receipts_n":1,"state":"built"},
+ "variants":{"main":{"verdict":"diverged","cause":"","gate_rc":1,"receipts_n":1,"common_producers":1,"routed_runs":1,"worktree":"/tmp/x","launch_ts":0,"finish_ts":1},
+             "branch":{"verdict":"pass","cause":"","gate_rc":0,"receipts_n":1,"common_producers":3,"routed_runs":1,"worktree":"/tmp/y","launch_ts":0,"finish_ts":1},
+             "delta":"pass"},
  "diverged":[{"producer":"extended-receipts","local":"pass","box":"fail","route":"burst:$SERVER_ID"}],
  "baseline_dir":""}
 EOF
@@ -81,8 +89,11 @@ esac
 
 echo "== AC5 part 3: canary=pass -> enable succeeds, writes drop-in + enable.json =="
 cat > "$STATE_DIR/boxes/$SERVER_ID/canary.json" <<EOF
-{"head":"abcdef01234567","head_source":"green-main","ts":"$NOW_ISO","image_id":"$DEFAULT_SNAPSHOT_ID",
- "variants":{"main":"pass","branch":"pass","delta":"pass"},
+{"schema_version":2,"head":"abcdef01234567","head_source":"green-main","ts":"$NOW_ISO","image_id":"$DEFAULT_SNAPSHOT_ID",
+ "baseline":{"head":"abcdef01234567","launch_ts":0,"gate_rc":0,"receipts_n":1,"state":"built"},
+ "variants":{"main":{"verdict":"pass","cause":"","gate_rc":0,"receipts_n":1,"common_producers":3,"routed_runs":1,"worktree":"/tmp/x","launch_ts":0,"finish_ts":1},
+             "branch":{"verdict":"pass","cause":"","gate_rc":0,"receipts_n":1,"common_producers":3,"routed_runs":1,"worktree":"/tmp/y","launch_ts":0,"finish_ts":1},
+             "delta":"pass"},
  "diverged":[],
  "baseline_dir":""}
 EOF

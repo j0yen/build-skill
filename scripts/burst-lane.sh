@@ -3707,33 +3707,38 @@ print("allow", ts, proof.get("image_id", ""))
     return 3
   fi
 
-  # R6/AC5: enable requires a passing canary for the CURRENT box before it
-  # ever writes the drop-in. This reads canary_read_status's cached verdict
-  # rather than invoking a live cmd_canary (same cached-check family as
-  # up/bake's canary_gate_check below): AC5's own flow is "canary=missing
-  # -> enable refuses -> operator or the timer runs canary -> enable
-  # re-runs and succeeds", and the Migration section describes "canary=
-  # missing in status until the operator or the timer runs it" -- both
-  # read enable as a state CHECK, not a trigger. A live inline run here
-  # would also make every enable call pay the canary's own <=25min cold
-  # gate wall, never budgeted for enable.
-  local canary_verdict canary_age canary_head canary_ts
+  # R8: enable requires a schema_version 2 canary carrying pass on both
+  # main/branch, routed_runs>=1 on both, and a matching-head built baseline
+  # for the CURRENT box before it ever writes the drop-in. This reads
+  # canary_enable_check's cached verdict rather than invoking a live
+  # cmd_canary (same cached-check family as up/bake's canary_gate_check
+  # below): the flow is "canary missing/legacy/not-routed -> enable refuses
+  # -> operator or the timer runs a fresh canary -> enable re-runs and
+  # succeeds", and the Migration section describes "canary=missing in
+  # status until the operator or the timer runs it" -- both read enable as
+  # a state CHECK, not a trigger. A live inline run here would also make
+  # every enable call pay the canary's own <=25min cold gate wall, never
+  # budgeted for enable.
+  local canary_verdict canary_cause canary_ts="" canary_head="" canary_schema=""
   local canary_server_id; canary_server_id="$(state_read server_id)"
   if [ "${BURST_CANARY_SKIP:-0}" = "1" ]; then
     journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  canary-skip  (event=enable by=${BURST_CANARY_SKIP_BY:-${SUDO_USER:-${USER:-unknown}}})"
-    canary_verdict="pass"; canary_head=""; canary_ts="$(now_iso)"
+    canary_verdict="pass"; canary_ts="$(now_iso)"
   else
-    read -r canary_verdict canary_age canary_head canary_ts <<<"$(canary_read_status "$canary_server_id")"
-    if [ "$canary_verdict" = "missing" ]; then
-      journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  enable  refused  (cause=canary-missing)"
-      echo "enable refused (cause=canary-missing)" >&2
+    read -r canary_verdict canary_cause <<<"$(canary_enable_check "$canary_server_id")"
+    if [ "$canary_verdict" != "allow" ]; then
+      journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  enable  refused  (cause=$canary_cause)"
+      echo "enable refused (cause=$canary_cause)" >&2
       return 3
     fi
-    if [ "$canary_verdict" != "pass" ]; then
-      journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  enable  refused  (cause=canary-diverged)"
-      echo "enable refused (cause=canary-diverged)" >&2
-      return 3
-    fi
+    canary_verdict="pass"
+    canary_schema=2
+    local cf; cf="$(box_path_for "$canary_server_id" canary.json)"
+    read -r canary_head canary_ts <<<"$(python3 -c '
+import json, sys
+d = json.load(open(sys.argv[1]))
+print(d.get("head", ""), d.get("ts", ""))
+' "$cf" 2>/dev/null)"
   fi
 
   mkdir -p "$(dirname "$SYSTEMD_DROPIN")"
@@ -3750,13 +3755,15 @@ print("allow", ts, proof.get("image_id", ""))
   enable_json_tmp="$(mktemp "$STATE_DIR/.enable.XXXXXX")"
   python3 -c '
 import json, sys
-ts, canary_verdict, canary_ts, head, out_path = sys.argv[1:6]
-json.dump({"ts": ts, "canary_verdict": canary_verdict, "canary_ts": canary_ts, "head": head},
-          open(out_path, "w"), indent=2, sort_keys=True)
-' "$(now_iso)" "$canary_verdict" "$canary_ts" "$canary_head" "$enable_json_tmp"
+ts, canary_verdict, canary_ts, head, canary_schema, out_path = sys.argv[1:7]
+d = {"ts": ts, "canary_verdict": canary_verdict, "canary_ts": canary_ts, "head": head}
+if canary_schema:
+    d["canary_schema"] = int(canary_schema)
+json.dump(d, open(out_path, "w"), indent=2, sort_keys=True)
+' "$(now_iso)" "$canary_verdict" "$canary_ts" "$canary_head" "$canary_schema" "$enable_json_tmp"
   mv -f "$enable_json_tmp" "$enable_json"
 
-  journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  enable  done  (proof_ts=$cause_or_ts image_id=$image_id canary=$canary_verdict)"
+  journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  enable  done  (proof_ts=$cause_or_ts image_id=$image_id canary=$canary_verdict canary_schema=${canary_schema:-none})"
   echo "enable done: image_id=$image_id"
   return 0
 }
@@ -4046,6 +4053,16 @@ CANARY_WORKTREE_ROOT="${BURST_LANE_CANARY_WORKTREE_ROOT:-/mnt/data/jsy/tmp}"
 # payload through a file instead of a variable — same tmp+mv-adjacent
 # pattern every other cross-boundary handoff in this file already uses.
 CANARY_DIVERGED_LINES_FILE="$STATE_DIR/.canary-last-diverged-lines"
+# PRD-build-burst-canary-live-parity R5 (Open question, default until
+# answered): minimum common producers (gate-receipt-diff.sh's own
+# same+DIVERGED lines, per-commit 40-hex baseline files excluded) a
+# variant needs before "pass" is available to it at all.
+CANARY_MIN_COMMON_PRODUCERS="${CANARY_MIN_COMMON_PRODUCERS:-3}"
+# canary_run_variant_main/_branch write their per-variant R7 record here
+# (same subshell-handoff-via-file reasoning as CANARY_DIVERGED_LINES_FILE
+# just above) and _canary_core reads it out immediately after each call,
+# before the next variant overwrites it.
+CANARY_VARIANT_JSON_FILE="$STATE_DIR/.canary-last-variant"
 
 # canary_repo_slug <repo> -> stdout "owner/name" from origin's URL, or empty.
 canary_repo_slug() {
@@ -4081,14 +4098,19 @@ else:
 }
 
 # canary_read_status [server_id] -> stdout "<verdict> <age_h> <head7> <ts>":
-# verdict is pass|diverged|missing, read from that server's canary.json
-# (R5's per-box state, "boxes/<server_id>/canary.json"); "missing" means no
-# canary has ever run for this server_id/image — never treated as a pass.
-# A verdict is "diverged" both when canary.json's own diverged[] is
-# non-empty AND when any variant's own verdict is "block" (a refused/errored
-# variant is not a pass either, even with nothing in diverged[]). Shared by
-# cmd_status (R8) and the enable/up/bake gates below (R6) so there is exactly
-# one place that decides what "the box's canary state" means.
+# verdict is pass|diverged|legacy|missing, read from that server's
+# canary.json (per-box state, "boxes/<server_id>/canary.json"); "missing"
+# means no canary has ever run for this server_id/image — never treated as
+# a pass. R7/Migration: a canary.json with no `schema_version` (written
+# before this PRD) reads as "legacy", distinct from "diverged" so status
+# can show `canary=legacy@<age>h` (AC11) rather than implying a real
+# divergence was measured. For schema 2: "diverged" when canary.json's own
+# diverged[] is non-empty, OR any of the main/branch variant objects has
+# verdict block/diverged, OR the (unchanged, plain-string) delta variant is
+# "block" — a refused/errored variant is not a pass either, even with
+# nothing in diverged[]. Shared by cmd_status and the enable/up/bake gates
+# below (R8) so there is exactly one place that decides what "the box's
+# canary state" means.
 canary_read_status() {
   local server_id="${1:-$(state_read server_id)}" cf
   cf="$(box_path_for "$server_id" canary.json)"
@@ -4106,10 +4128,62 @@ try:
     age_h = round((time.time() - calendar.timegm(t)) / 3600.0, 2)
 except Exception:
     age_h = -1
+if d.get("schema_version") != 2:
+    print("legacy %s %s %s" % (age_h, head, ts or "-"))
+    raise SystemExit(0)
 diverged = d.get("diverged") or []
-variants = (d.get("variants") or {}).values()
-verdict = "diverged" if (diverged or "block" in variants) else "pass"
+variants = d.get("variants") or {}
+bad = bool(diverged)
+for key in ("main", "branch"):
+    v = variants.get(key)
+    if isinstance(v, dict) and v.get("verdict") in ("block", "diverged"):
+        bad = True
+if variants.get("delta") == "block":
+    bad = True
+verdict = "diverged" if bad else "pass"
 print("%s %s %s %s" % (verdict, age_h, head, ts or "-"))
+' "$cf"
+}
+
+# canary_enable_check [server_id] -> stdout "<verdict> <cause>" (R8):
+# verdict is allow|refuse. `enable` (and the bake/up canary gates through
+# canary_gate_check) accept ONLY a schema_version 2 canary.json with
+# variants.main.verdict=pass, variants.branch.verdict=pass, routed_runs>=1
+# on both, and baseline.state=built at the same head canary.json itself
+# names -- a legacy canary.json (no schema_version) refuses with
+# cause=canary-legacy, a routed-runs miss on either variant refuses with
+# cause=canary-not-routed, no canary.json at all refuses with
+# cause=canary-missing, any other mismatch (a real divergence/block, or a
+# baseline that does not match the canaried head) refuses with
+# cause=canary-diverged.
+canary_enable_check() {
+  local server_id="${1:-$(state_read server_id)}" cf
+  cf="$(box_path_for "$server_id" canary.json)"
+  python3 -c '
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    print("refuse canary-missing")
+    raise SystemExit(0)
+if d.get("schema_version") != 2:
+    print("refuse canary-legacy")
+    raise SystemExit(0)
+head = d.get("head", "")
+variants = d.get("variants") or {}
+baseline = d.get("baseline") or {}
+main_v = variants.get("main") if isinstance(variants.get("main"), dict) else {}
+branch_v = variants.get("branch") if isinstance(variants.get("branch"), dict) else {}
+if main_v.get("verdict") != "pass" or branch_v.get("verdict") != "pass":
+    print("refuse canary-diverged")
+    raise SystemExit(0)
+if int(main_v.get("routed_runs") or 0) < 1 or int(branch_v.get("routed_runs") or 0) < 1:
+    print("refuse canary-not-routed")
+    raise SystemExit(0)
+if baseline.get("state") != "built" or baseline.get("head") != head:
+    print("refuse canary-diverged")
+    raise SystemExit(0)
+print("allow ok")
 ' "$cf"
 }
 
@@ -4137,7 +4211,24 @@ canary_gate_check() {
     printf 'pass 0 ------- %s\n' "$(now_iso)"
     return 0
   fi
-  canary_read_status "$(state_read server_id)"
+  # R8: bake/up gate on the SAME strict acceptance canary_enable_check
+  # gives `enable` (schema 2, both variants pass, routed_runs>=1 on both,
+  # baseline built at the same head) -- not the looser pass/diverged
+  # canary_read_status alone reports. A refusal's cause (minus its
+  # "canary-" prefix: missing|legacy|not-routed|diverged) becomes this
+  # verdict so callers' existing `case "$verdict" in pass) ... *) refuse`
+  # pattern keeps working unchanged while the refusal message now names
+  # which R8 condition failed.
+  local server_id; server_id="$(state_read server_id)"
+  local ec_verdict ec_cause
+  read -r ec_verdict ec_cause <<<"$(canary_enable_check "$server_id")"
+  if [ "$ec_verdict" = "allow" ]; then
+    canary_read_status "$server_id"
+    return 0
+  fi
+  local age_h head ts
+  read -r _ age_h head ts <<<"$(canary_read_status "$server_id")"
+  printf '%s %s %s %s\n' "${ec_cause#canary-}" "$age_h" "$head" "$ts"
 }
 
 # canary_resolve_head <repo> <operator_head> -> stdout "<sha> <source>" on
@@ -4179,6 +4270,119 @@ canary_diverged_lines() {
   [ -n "$(ls -A "$run_dir" 2>/dev/null)" ] || return 0
   "$CANARY_RECEIPT_DIFF" "$baseline_dir" "$run_dir" 2>/dev/null | awk '$NF=="DIVERGED"'
   return 0
+}
+
+# canary_common_producers <baseline_dir> <run_dir> -> stdout count (R5): the
+# number of producers gate-receipt-diff.sh actually compared (its own
+# same+DIVERGED output lines), excluding per-commit baseline files (40-hex
+# producer names) -- Technical considerations: "those are not producers
+# and are excluded from that count."
+canary_common_producers() {
+  local baseline_dir="$1" run_dir="$2" n
+  [ -n "$baseline_dir" ] && [ -d "$baseline_dir" ] || { printf '0'; return 0; }
+  [ -n "$(ls -A "$run_dir" 2>/dev/null)" ] || { printf '0'; return 0; }
+  n="$("$CANARY_RECEIPT_DIFF" "$baseline_dir" "$run_dir" 2>/dev/null | awk '$1 !~ /^[0-9a-f]{40}$/' | grep -c .)"
+  printf '%s' "${n:-0}"
+}
+
+# canary_routed_runs <worktree> <launch_ts> <finish_ts> -> stdout count
+# (R4): `run  routed` journal lines whose `worktree=` field equals
+# <worktree> and whose ISO timestamp falls in [launch_ts, finish_ts].
+# Fallback: ` burst ` lines in <worktree>/target/autobuilder/route.log
+# (predecessor R13's route-log path) when the journal has none -- until
+# R13/R15's route attestation lands, this journal join IS the routing
+# evidence (Technical considerations).
+canary_routed_runs() {
+  local wt="$1" launch_ts="$2" finish_ts="$3" n
+  n="$(python3 -c '
+import calendar, re, sys, time
+journal, wt, launch_ts, finish_ts = sys.argv[1:5]
+launch_ts, finish_ts = int(launch_ts), int(finish_ts)
+pat = re.compile(r"worktree=(\S+)")
+n = 0
+try:
+    with open(journal) as fh:
+        for line in fh:
+            if "  run  routed  " not in line:
+                continue
+            m = pat.search(line)
+            if not m or m.group(1) != wt:
+                continue
+            try:
+                t = calendar.timegm(time.strptime(line.split(None, 1)[0], "%Y-%m-%dT%H:%M:%SZ"))
+            except Exception:
+                continue
+            if launch_ts <= t <= finish_ts:
+                n += 1
+except FileNotFoundError:
+    pass
+print(n)
+' "$JOURNAL" "$wt" "$launch_ts" "$finish_ts" 2>/dev/null)"
+  [ -n "$n" ] || n=0
+  if [ "$n" -eq 0 ]; then
+    local route_log="$wt/target/autobuilder/route.log"
+    [ -f "$route_log" ] && n="$(grep -c ' burst ' "$route_log" 2>/dev/null || echo 0)"
+  fi
+  printf '%s' "${n:-0}"
+}
+
+# canary_variant_verdict <receipts_n> <common_producers> <routed_runs>
+# <diverged_n> -> stdout "<verdict> <cause>" (R5): a divergence wins
+# outright (cause left empty -- the diverged producer is already named via
+# CANARY_CORE_FIRST_DIVERGED_PRODUCER/diverged[]); otherwise "pass" needs
+# routed_runs>=1 AND receipts_n>=1 AND common_producers>=
+# CANARY_MIN_COMMON_PRODUCERS, else "block" with the first-failing cause in
+# that fixed order -- gate_rc is never consulted here (R5: "gate_rc ...
+# never decides the verdict").
+canary_variant_verdict() {
+  local receipts_n="$1" common_producers="$2" routed_runs="$3" diverged_n="$4"
+  if [ "$diverged_n" -gt 0 ]; then
+    printf 'diverged '
+    return 0
+  fi
+  if [ "$routed_runs" -lt 1 ]; then
+    printf 'block not-routed'
+    return 0
+  fi
+  if [ "$receipts_n" -lt 1 ]; then
+    printf 'block no-receipts'
+    return 0
+  fi
+  if [ "$common_producers" -lt "$CANARY_MIN_COMMON_PRODUCERS" ]; then
+    printf 'block too-few-common:%s' "$common_producers"
+    return 0
+  fi
+  printf 'pass '
+}
+
+# canary_write_variant_json <out_file> <verdict> <cause> <gate_rc>
+# <receipts_n> <common_producers> <routed_runs> <worktree> <launch_ts>
+# <finish_ts> -- R7's per-variant record, tmp+mv atomic like baseline.json.
+canary_write_variant_json() {
+  local out_file="$1" verdict="$2" cause="$3" gate_rc="$4" receipts_n="$5" \
+        common_producers="$6" routed_runs="$7" worktree="$8" launch_ts="$9"
+  shift 9
+  local finish_ts="$1"
+  mkdir -p "$(dirname "$out_file")"
+  local tmp; tmp="$(mktemp "$(dirname "$out_file")/.variant.XXXXXX")"
+  python3 -c '
+import json, sys
+(verdict, cause, gate_rc, receipts_n, common_producers, routed_runs, worktree,
+ launch_ts, finish_ts, out_path) = sys.argv[1:11]
+json.dump({
+    "verdict": verdict,
+    "cause": cause,
+    "gate_rc": int(gate_rc),
+    "receipts_n": int(receipts_n),
+    "common_producers": int(common_producers),
+    "routed_runs": int(routed_runs),
+    "worktree": worktree,
+    "launch_ts": int(launch_ts),
+    "finish_ts": int(finish_ts),
+}, open(out_path, "w"), indent=2, sort_keys=True)
+' "$verdict" "$cause" "$gate_rc" "$receipts_n" "$common_producers" "$routed_runs" \
+  "$worktree" "$launch_ts" "$finish_ts" "$tmp"
+  mv -f "$tmp" "$out_file"
 }
 
 # canary_build_baseline <head_sha> <baseline_dir> <repo_path> — R2: a local
@@ -4305,21 +4509,31 @@ canary_copy_fresh_receipts() {
 # R1: repo_path is the pinned canary worktree, never CANARY_REPO directly.
 canary_run_variant_main() {
   local head_sha="$1" baseline_dir="$2" baseline_state="$3" server_id="$4" repo_path="${5:-$CANARY_REPO}"
-  local ts rc=0 verdict="pass" n_diverged=0
+  local ts rc=0 verdict="pass" cause="" n_diverged=0
   ts="$(now_epoch)"
   BURST_LANE=1 "$CANARY_GATE_LAUNCH" "$repo_path" --head "$head_sha" --scope main \
     --slug "canary-main-$ts" --wait >/dev/null 2>&1 || rc=$?
+  local finish_ts; finish_ts="$(now_epoch)"
   local run_dir="$CANARY_RUNS_ROOT/$ts-main/receipts"
   canary_copy_fresh_receipts "$repo_path/target/autobuilder/receipts" "$run_dir" "$ts" >/dev/null
-  [ "$rc" -eq 0 ] || verdict="block"
-  local diverged_lines=""
+  local receipts_n; receipts_n="$(find "$run_dir" -maxdepth 1 -name '*.json' 2>/dev/null | grep -c .)"
+  local routed_runs; routed_runs="$(canary_routed_runs "$repo_path" "$ts" "$finish_ts")"
+  local diverged_lines="" common_producers=0
   if [ "$baseline_state" = "present" ]; then
     diverged_lines="$(canary_diverged_lines "$baseline_dir" "$run_dir")"
-    [ -n "$diverged_lines" ] && verdict="diverged" && n_diverged="$(printf '%s\n' "$diverged_lines" | grep -c .)"
+    [ -n "$diverged_lines" ] && n_diverged="$(printf '%s\n' "$diverged_lines" | grep -c .)"
+    common_producers="$(canary_common_producers "$baseline_dir" "$run_dir")"
+    read -r verdict cause <<<"$(canary_variant_verdict "$receipts_n" "$common_producers" "$routed_runs" "$n_diverged")"
+  else
+    # R5's parity verdict needs a baseline to compare against; with none
+    # (--no-baseline) fall back to the gate's own exit code the way every
+    # prior R had it.
+    [ "$rc" -eq 0 ] || { verdict="block"; cause="gate-rc:$rc"; }
   fi
   printf '%s' "$diverged_lines" > "$CANARY_DIVERGED_LINES_FILE"
-  local receipts_n; receipts_n="$(find "$run_dir" -maxdepth 1 -name '*.json' 2>/dev/null | grep -c .)"
-  journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  canary  main  $verdict  (head=$head_sha receipts=$receipts_n diverged=$n_diverged route=burst:${server_id:-unknown})"
+  canary_write_variant_json "$CANARY_VARIANT_JSON_FILE" "$verdict" "$cause" "$rc" \
+    "$receipts_n" "$common_producers" "$routed_runs" "$repo_path" "$ts" "$finish_ts"
+  journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  canary  main  $verdict  (head=$head_sha receipts=$receipts_n diverged=$n_diverged common_producers=$common_producers routed_runs=$routed_runs gate_rc=$rc cause=${cause:-none} route=burst:${server_id:-unknown})"
   printf '%s\n' "$verdict"
 }
 
@@ -4329,13 +4543,15 @@ canary_run_variant_main() {
 # Technical considerations).
 canary_run_variant_branch() {
   local head_sha="$1" baseline_dir="$2" baseline_state="$3" server_id="$4"
-  local ts branch wt rc=0 verdict="pass" n_diverged=0 branch_head
+  local ts branch wt rc=0 verdict="pass" cause="" n_diverged=0 branch_head
   ts="$(now_epoch)"
   branch="canary/$ts"
   wt="$(mktemp -u "${TMPDIR:-/tmp}/burst-canary-branch.XXXXXX")"
   if ! git -C "$CANARY_REPO" worktree add -b "$branch" "$wt" "$head_sha" >/dev/null 2>&1; then
     journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  canary  branch  block  (head=$head_sha cause=worktree-add-failed)"
     printf '' > "$CANARY_DIVERGED_LINES_FILE"
+    canary_write_variant_json "$CANARY_VARIANT_JSON_FILE" "block" "worktree-add-failed" 1 \
+      0 0 0 "$wt" "$ts" "$(now_epoch)"
     printf 'block\n'
     return 0
   fi
@@ -4343,17 +4559,24 @@ canary_run_variant_branch() {
   branch_head="$(git -C "$wt" rev-parse HEAD 2>/dev/null || echo "$head_sha")"
   BURST_LANE=1 "$CANARY_GATE_LAUNCH" "$wt" --head "$branch_head" --scope branch \
     --slug "canary-branch-$ts" --wait >/dev/null 2>&1 || rc=$?
+  local finish_ts; finish_ts="$(now_epoch)"
   local run_dir="$CANARY_RUNS_ROOT/$ts-branch/receipts"
   canary_copy_fresh_receipts "$wt/target/autobuilder/receipts" "$run_dir" "$ts" >/dev/null
-  [ "$rc" -eq 0 ] || verdict="block"
-  local diverged_lines=""
+  local receipts_n; receipts_n="$(find "$run_dir" -maxdepth 1 -name '*.json' 2>/dev/null | grep -c .)"
+  local routed_runs; routed_runs="$(canary_routed_runs "$wt" "$ts" "$finish_ts")"
+  local diverged_lines="" common_producers=0
   if [ "$baseline_state" = "present" ]; then
     diverged_lines="$(canary_diverged_lines "$baseline_dir" "$run_dir")"
-    [ -n "$diverged_lines" ] && verdict="diverged" && n_diverged="$(printf '%s\n' "$diverged_lines" | grep -c .)"
+    [ -n "$diverged_lines" ] && n_diverged="$(printf '%s\n' "$diverged_lines" | grep -c .)"
+    common_producers="$(canary_common_producers "$baseline_dir" "$run_dir")"
+    read -r verdict cause <<<"$(canary_variant_verdict "$receipts_n" "$common_producers" "$routed_runs" "$n_diverged")"
+  else
+    [ "$rc" -eq 0 ] || { verdict="block"; cause="gate-rc:$rc"; }
   fi
   printf '%s' "$diverged_lines" > "$CANARY_DIVERGED_LINES_FILE"
-  local receipts_n; receipts_n="$(find "$run_dir" -maxdepth 1 -name '*.json' 2>/dev/null | grep -c .)"
-  journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  canary  branch  $verdict  (head=$branch_head receipts=$receipts_n diverged=$n_diverged route=burst:${server_id:-unknown})"
+  canary_write_variant_json "$CANARY_VARIANT_JSON_FILE" "$verdict" "$cause" "$rc" \
+    "$receipts_n" "$common_producers" "$routed_runs" "$wt" "$ts" "$finish_ts"
+  journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  canary  branch  $verdict  (head=$branch_head receipts=$receipts_n diverged=$n_diverged common_producers=$common_producers routed_runs=$routed_runs gate_rc=$rc cause=${cause:-none} route=burst:${server_id:-unknown})"
   git -C "$CANARY_REPO" worktree remove --force "$wt" >/dev/null 2>&1 || rm -rf "$wt"
   git -C "$CANARY_REPO" branch -D "$branch" >/dev/null 2>&1 || true
   printf '%s\n' "$verdict"
@@ -4379,45 +4602,72 @@ canary_run_variant_delta() {
 }
 
 # canary_write_state_json <out_file> <head> <head_source> <ts> <image_id>
-# <baseline_dir> <verdict_main> <verdict_branch> <verdict_delta>
-# <diverged_ndjson> [<lane_id> <verdict_lane>] — R5's canary.json, written
-# atomically (tmp + mv). The lane args are optional (R12, P2): omitted or
-# empty means no named-lane variant ran this canary, and "lane" is left out
-# of variants{} entirely rather than written as a hollow key, so existing
-# consumers (canary_print_report, the R16 fixture parity test) see no new
-# required key on a canary that never used --variants <lane-id>.
+# <baseline_dir> <main_variant_json> <branch_variant_json> <verdict_delta>
+# <diverged_ndjson> [<lane_id> <verdict_lane>] — R7's canary.json schema 2,
+# written atomically (tmp + mv). main_variant_json/branch_variant_json are
+# the JSON text canary_write_variant_json already produced for that
+# variant (verdict/cause/gate_rc/receipts_n/common_producers/routed_runs/
+# worktree/launch_ts/finish_ts) — this function embeds them as-is rather
+# than re-deriving anything R5 already decided. The delta variant stays a
+# plain string (R5: "Delta variant unchanged"). The lane args are optional
+# (R12, P2): omitted or empty means no named-lane variant ran this canary,
+# and "lane" is left out of variants{} entirely.
 canary_write_state_json() {
   local out_file="$1" head="$2" head_source="$3" ts="$4" image_id="$5" \
-        baseline_dir="$6" v_main="$7" v_branch="$8" v_delta="$9"
+        baseline_dir="$6" main_variant_json="$7" branch_variant_json="$8" v_delta="$9"
   shift 9
   local diverged_ndjson="$1" lane_id="${2:-}" v_lane="${3:-}"
   mkdir -p "$(dirname "$out_file")"
   local tmp; tmp="$(mktemp "$(dirname "$out_file")/.canary.XXXXXX")"
   python3 -c '
 import json, sys
-(head, head_source, ts, image_id, baseline_dir, v_main, v_branch, v_delta,
- diverged_ndjson, lane_id, v_lane, out_path) = sys.argv[1:13]
+(head, head_source, ts, image_id, baseline_dir, main_variant_json,
+ branch_variant_json, v_delta, diverged_ndjson, lane_id, v_lane,
+ baseline_json_path, out_path) = sys.argv[1:14]
+
+def load_variant(text):
+    try:
+        return json.loads(text)
+    except Exception:
+        return {}
+
 diverged = []
 for line in diverged_ndjson.splitlines():
     parts = line.split()
     if len(parts) < 5:
         continue
     diverged.append({"producer": parts[0], "local": parts[1], "box": parts[2], "route": parts[3]})
-variants = {"main": v_main, "branch": v_branch, "delta": v_delta}
+
+if baseline_json_path:
+    try:
+        baseline = json.load(open(baseline_json_path))
+    except Exception:
+        baseline = {"state": "failed"}
+else:
+    baseline = {"state": "skipped"}
+
+variants = {
+    "main": load_variant(main_variant_json),
+    "branch": load_variant(branch_variant_json),
+    "delta": v_delta,
+}
 if lane_id:
     variants["lane"] = {"id": lane_id, "verdict": v_lane}
 d = {
+    "schema_version": 2,
     "head": head,
     "head_source": head_source,
     "image_id": image_id,
     "ts": ts,
+    "baseline": baseline,
     "variants": variants,
     "diverged": diverged,
     "baseline_dir": baseline_dir,
 }
 json.dump(d, open(out_path, "w"), indent=2, sort_keys=True)
-' "$head" "$head_source" "$ts" "$image_id" "$baseline_dir" "$v_main" "$v_branch" "$v_delta" \
-  "$diverged_ndjson" "$lane_id" "$v_lane" "$tmp"
+' "$head" "$head_source" "$ts" "$image_id" "$baseline_dir" "$main_variant_json" \
+  "$branch_variant_json" "$v_delta" "$diverged_ndjson" "$lane_id" "$v_lane" \
+  "${baseline_dir:+$baseline_dir/baseline.json}" "$tmp"
   mv -f "$tmp" "$out_file"
 }
 
@@ -4581,16 +4831,23 @@ _canary_core() {
   local v_main="skipped" v_branch="skipped" v_delta="skipped"
   local lane_id="" v_lane=""
   local diverged_ndjson="" w
+  # R7: each variant writes its record to $CANARY_VARIANT_JSON_FILE (a
+  # fixed path, same subshell-handoff pattern as CANARY_DIVERGED_LINES_FILE)
+  # -- captured into these vars right after that variant's call, before the
+  # next variant's call overwrites the file.
+  local main_variant_json="{}" branch_variant_json="{}"
   for w in "${want[@]}"; do
     case "$w" in
       main)
         v_main="$(canary_run_variant_main "$head_sha" "$baseline_dir" "$baseline_state" "$server_id" "$canary_wt")"
+        main_variant_json="$(cat "$CANARY_VARIANT_JSON_FILE" 2>/dev/null || echo '{}')"
         local _dl; _dl="$(cat "$CANARY_DIVERGED_LINES_FILE" 2>/dev/null || true)"
         [ -n "$_dl" ] && diverged_ndjson="$diverged_ndjson$_dl"$'\n'
         [ "$v_main" = "pass" ] && canary_record_routed_main_pass "$head_sha"
         ;;
       branch)
         v_branch="$(canary_run_variant_branch "$head_sha" "$baseline_dir" "$baseline_state" "$server_id")"
+        branch_variant_json="$(cat "$CANARY_VARIANT_JSON_FILE" 2>/dev/null || echo '{}')"
         local _dl; _dl="$(cat "$CANARY_DIVERGED_LINES_FILE" 2>/dev/null || true)"
         [ -n "$_dl" ] && diverged_ndjson="$diverged_ndjson$_dl"$'\n'
         ;;
@@ -4610,8 +4867,8 @@ _canary_core() {
   done
 
   canary_write_state_json "$box_dir/canary.json" "$head_sha" "$head_source" "$(now_iso)" \
-    "${image_id:-unknown}" "$baseline_dir" "$v_main" "$v_branch" "$v_delta" "$diverged_ndjson" \
-    "$lane_id" "$v_lane"
+    "${image_id:-unknown}" "$baseline_dir" "$main_variant_json" "$branch_variant_json" "$v_delta" \
+    "$diverged_ndjson" "$lane_id" "$v_lane"
   cp -f "$box_dir/canary.json" "$STATE_DIR/canary.json" 2>/dev/null || true
 
   CANARY_CORE_V_MAIN="$v_main"; CANARY_CORE_V_BRANCH="$v_branch"; CANARY_CORE_V_DELTA="$v_delta"
@@ -4667,14 +4924,28 @@ canary_print_report() {
   python3 -c '
 import json, sys
 d = json.load(open(sys.argv[1]))
+print("schema_version %s" % d.get("schema_version", "legacy"))
 print("head           %s" % d.get("head", ""))
 print("head_source    %s" % d.get("head_source", ""))
 print("image_id       %s" % d.get("image_id", ""))
 print("ts             %s" % d.get("ts", ""))
+baseline = d.get("baseline") or {}
+print("baseline       state=%s head=%s launch_ts=%s gate_rc=%s receipts_n=%s" % (
+    baseline.get("state", ""), baseline.get("head", ""), baseline.get("launch_ts", ""),
+    baseline.get("gate_rc", ""), baseline.get("receipts_n", "")))
 v = d.get("variants") or {}
-print("variant main   %s" % v.get("main", ""))
-print("variant branch %s" % v.get("branch", ""))
-print("variant delta  %s" % v.get("delta", ""))
+
+def print_variant(name, val):
+    if isinstance(val, dict):
+        print("variant %-6s verdict=%s cause=%s gate_rc=%s receipts_n=%s common_producers=%s routed_runs=%s" % (
+            name, val.get("verdict", ""), val.get("cause", ""), val.get("gate_rc", ""),
+            val.get("receipts_n", ""), val.get("common_producers", ""), val.get("routed_runs", "")))
+    else:
+        print("variant %-6s %s" % (name, val))
+
+print_variant("main", v.get("main", ""))
+print_variant("branch", v.get("branch", ""))
+print_variant("delta", v.get("delta", ""))
 lane = v.get("lane")
 if lane:
     print("variant lane   id=%s verdict=%s" % (lane.get("id", ""), lane.get("verdict", "")))
