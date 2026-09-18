@@ -3309,6 +3309,7 @@ if [ "$route_intended" = "burst" ]; then
 import calendar, json, sys, time
 
 producers_file, ledger_file, gate_start_epoch = sys.argv[1:4]
+receipts_dir = sys.argv[4] if len(sys.argv) > 4 else ""
 gate_start_epoch = float(gate_start_epoch)
 
 wanted = [l.strip() for l in open(producers_file)
@@ -3337,9 +3338,24 @@ try:
 except FileNotFoundError:
     pass
 
+# 2026-09-18: a producer whose own receipt says it skipped (no benches, no
+# MSRV field, ...) never spawned cargo, so no ledger row can exist — it is
+# attested by its receipt, not unattested (false-blocked bench-delta and
+# mutation-kill on burst-lane 6f41397 and every bench-less repo).
+import os
+for p in wanted:
+    if p in seen:
+        continue
+    rp = os.path.join(receipts_dir, p + "-receipt.json") if receipts_dir else ""
+    try:
+        v = json.load(open(rp)).get("verdict", "")
+    except Exception:
+        continue
+    if str(v).lower() in ("skipped", "skip"):
+        seen.add(p)
 missing = [p for p in wanted if p not in seen]
 print(",".join(missing))
-' "$CARGO_PRODUCERS_FILE" "$CARGO_PRODUCERS_LEDGER" "$t0" 2>/dev/null || true)"
+' "$CARGO_PRODUCERS_FILE" "$CARGO_PRODUCERS_LEDGER" "$t0" "${project_abs:-}/target/autobuilder/receipts" 2>/dev/null || true)"
     producer_unattested_first="${producer_unattested_csv%%,*}"
   fi
 fi
