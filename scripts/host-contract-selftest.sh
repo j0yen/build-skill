@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # host-contract-selftest.sh — PRD-build-host-contract AC1, AC2, AC4, AC5,
-# and the journal-dedup half of AC6.
+# the journal-dedup half of AC6, and a lock-protocol regression.
 #
 # Every case isolates BUILD_STATE_DIR/BUILD_JOURNAL_ROOT under a
 # disposable tempdir, and overrides host-contract.sh's binary hooks
@@ -212,6 +212,54 @@ out2="$(BUILD_JOURNAL_ROOT="$D/journal" BUILD_STATE_DIR="$D/state" \
   "$HC" check --fast)"
 expect "AC5 missing TMPDIR -> drift(missing:TMPDIR)" \
   "grep -q '^unit-env-inheritance=drift(missing:TMPDIR)' <<<'$out2'"
+
+# ============================================================================
+# Regression — lock-protocol: `flock <file> claude ...` (the production
+# pattern) must not flag the claude child itself as a second violation.
+# fuser reports BOTH the flock wrapper and its exec'd child as holders
+# (the child inherits the lock fd across fork/exec); the child is the
+# expected holder, not a bad one. A `flock <file> <non-claude>` process
+# must still be flagged.
+# ============================================================================
+D="$T/lockproto"; mkdir -p "$D/journal" "$D/state" "$D/bin"
+# comm is derived from the executed file's own basename, not argv[0] or
+# a shebang script's name (a #!/bin/sh wrapper execs as "sh", so comm
+# would read "sh"/"dash", and a single-external-command `bash -c` also
+# self-exec-optimizes into the child, losing its own name) — copy the
+# real bash binary to a file literally named "claude" and give it a
+# two-statement body so it forks the sleep instead of exec-replacing
+# itself, keeping comm == "claude" for the process flock actually holds
+# open. `read -t` (builtin, no fork/exec) keeps it a single process —
+# a forked external `sleep` would inherit the lock fd too and add a
+# third fuser holder, unlike the real `claude` CLI's own children.
+cp "$(command -v bash)" "$D/bin/claude"
+chmod +x "$D/bin/claude"
+
+lockfile="$D/state/prd-fixture-lockproto.lock"
+: > "$lockfile"
+flock -n "$lockfile" "$D/bin/claude" -c "read -t 5" &
+flock_pid=$!
+for _ in 1 2 3 4 5 6 7 8 9 10; do fuser "$lockfile" >/dev/null 2>&1 && break; sleep 0.2; done
+out="$(BUILD_JOURNAL_ROOT="$D/journal" BUILD_STATE_DIR="$D/state" \
+  HOST_CONTRACT_SYSTEMCTL=/bin/true HOST_CONTRACT_DF=/bin/true HOST_CONTRACT_SYSTEMD_RUN=/bin/true \
+  "$HC" check --fast)"
+expect "lock-protocol: flock+live-claude-child is ok, not a second violation" \
+  "grep -q '^lock-protocol=ok' <<<'$out'"
+kill "$flock_pid" 2>/dev/null; wait "$flock_pid" 2>/dev/null
+rm -f "$lockfile"
+
+lockfile2="$D/state/prd-fixture-lockproto-bad.lock"
+: > "$lockfile2"
+flock -n "$lockfile2" sleep 5 &
+flock_pid2=$!
+for _ in 1 2 3 4 5 6 7 8 9 10; do fuser "$lockfile2" >/dev/null 2>&1 && break; sleep 0.2; done
+out2="$(BUILD_JOURNAL_ROOT="$D/journal2" BUILD_STATE_DIR="$D/state" \
+  HOST_CONTRACT_SYSTEMCTL=/bin/true HOST_CONTRACT_DF=/bin/true HOST_CONTRACT_SYSTEMD_RUN=/bin/true \
+  "$HC" check --fast)"
+expect "lock-protocol: flock wrapping a non-claude process is still flagged drift" \
+  "grep -q '^lock-protocol=drift(.*no-live-claude-child' <<<'$out2'"
+kill "$flock_pid2" 2>/dev/null; wait "$flock_pid2" 2>/dev/null
+rm -f "$lockfile2"
 
 echo "host-contract-selftest: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
