@@ -62,6 +62,7 @@ points here instead of listing scripts inline).
 - `scripts/extend-gate-cargo-route-selftest.sh` — proves extend-gate.sh itself (not
 - `scripts/extend-gate-concurrent-selftest.sh` — regression coverage for the exact
 - `scripts/extend-gate-explain-scope-class-selftest.sh` — PRD-build-diff-scoped-gate
+- `scripts/extend-gate-history-infra-class-selftest.sh` — PRD-build-diff-scoped-gate
 - `scripts/extend-gate-phase-timing-selftest.sh` — PRD-build-gate-phase-timing,
 - `scripts/extend-gate-reviewer-auth-selftest.sh` — the one entrypoint for
 - `scripts/extend-gate-scope-selftest.sh` — PRD-build-gate-before-land requirement 1

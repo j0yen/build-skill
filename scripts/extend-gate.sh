@@ -2021,12 +2021,12 @@ else
   fi
   if $rollback_deferred; then
     _tmp_rb="$(mktemp "${TMPDIR:-/tmp}/extend-gate-rollback-defer.XXXXXX")"
-    if jq '.verdict = "pass" | .scope_deferred = true' "$rollback_receipt" > "$_tmp_rb" 2>/dev/null; then
+    if jq '.verdict = "pass" | .scope_deferred = true | .class = "history-infra"' "$rollback_receipt" > "$_tmp_rb" 2>/dev/null; then
       mv "$_tmp_rb" "$rollback_receipt"
     else
       rm -f "$_tmp_rb" 2>/dev/null || true
     fi
-    note_defer "rollback-plan — scope-deferred (head-untagged) — branch HEAD carries no release tag; land re-runs this at main scope"
+    note_defer "rollback-plan — scope-deferred (head-untagged) class=history-infra — branch HEAD carries no release tag; land re-runs this at main scope"
     record_phase rollback-plan $(( $(date +%s) - _phase_t0 )) defer
   else
     # PRD-build-inherited-blocks-delta-pass AC10: name the GUILTY commits
@@ -2449,20 +2449,20 @@ elif [ "$scope" = branch ]; then
       schema: "autobuilder.ci_checks_receipt.v1",
       head_sha: $head, repo: "", run_count: 0, success_count: 0,
       failure_count: 0, pending_count: 0, runs: [],
-      verdict: "pass", scope_deferred: true, skip_reason: $reason,
+      verdict: "pass", scope_deferred: true, class: "history-infra", skip_reason: $reason,
       captured_at: (now | todateiso8601), receipt_digest: ""
     }' > "$ci_checks_receipt" 2>/dev/null
   }
   _phase_t0=$(date +%s)
   if [ "${BRANCH_GATE_PUSH:-1}" = "0" ]; then
     write_ci_defer_receipt "push-disabled: BRANCH_GATE_PUSH=0, branch was never pushed"
-    note_defer "ci-checks — scope-deferred (push-disabled) — BRANCH_GATE_PUSH=0, branch was never pushed; land re-runs this at main scope"
+    note_defer "ci-checks — scope-deferred (push-disabled) class=history-infra — BRANCH_GATE_PUSH=0, branch was never pushed; land re-runs this at main scope"
     record_phase ci-checks 0 defer
   else
     _push_ref="$(git -C "$repo" symbolic-ref --short HEAD 2>/dev/null || echo "autobuilder/$slug")"
     if ! ( cd "$repo" && git push origin "HEAD:refs/heads/$_push_ref" ) >&2; then
       write_ci_defer_receipt "push-failed: could not push $_push_ref to origin"
-      note_defer "ci-checks — scope-deferred (push-failed) — could not push $_push_ref to origin; land re-runs this at main scope"
+      note_defer "ci-checks — scope-deferred (push-failed) class=history-infra — could not push $_push_ref to origin; land re-runs this at main scope"
       record_phase ci-checks 0 defer
     else
       _ci_wait_s="${CI_CHECKS_BRANCH_WAIT:-900}"
@@ -2494,7 +2494,7 @@ elif [ "$scope" = branch ]; then
         if [ "$_ci_run_count" = "0" ]; then
           if [ -f "$ci_checks_receipt" ] && jq -e . "$ci_checks_receipt" >/dev/null 2>&1; then
             _tmp_ci="$(mktemp "${TMPDIR:-/tmp}/extend-gate-ci-defer.XXXXXX")"
-            if jq '.verdict = "pass" | .scope_deferred = true' "$ci_checks_receipt" > "$_tmp_ci" 2>/dev/null; then
+            if jq '.verdict = "pass" | .scope_deferred = true | .class = "history-infra"' "$ci_checks_receipt" > "$_tmp_ci" 2>/dev/null; then
               mv "$_tmp_ci" "$ci_checks_receipt"
             else
               rm -f "$_tmp_ci" 2>/dev/null || true
@@ -2502,7 +2502,7 @@ elif [ "$scope" = branch ]; then
           else
             write_ci_defer_receipt "no-runs-on-ref: ci-checks never wrote a receipt within ${_ci_wait_s}s (see gate output above)"
           fi
-          note_defer "ci-checks — scope-deferred (no-runs-on-ref) — no workflow runs observed for $head_now within ${_ci_wait_s}s; land re-runs this at main scope"
+          note_defer "ci-checks — scope-deferred (no-runs-on-ref) class=history-infra — no workflow runs observed for $head_now within ${_ci_wait_s}s; land re-runs this at main scope"
           record_phase ci-checks $(( $(date +%s) - _phase_t0 )) defer
         else
           note_block "ci-checks — workflow(s) on HEAD are not green, or still pending (the next tick retries)"
