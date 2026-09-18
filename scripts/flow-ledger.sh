@@ -27,6 +27,23 @@
 #       (Requirement 3, user story "five slowest slugs with where they
 #       waited"). `prds_measured` is always the count behind the medians.
 #
+#   flow-ledger.sh backfill [--since <dur>] [--prd-dir <dir>]
+#       Requirement 6 (P1): for every PRD archived within --since (default
+#       14d) -- read the same way day-ledger.sh's own shipped[] source
+#       already does, `git log --grep '^archive: .+ shipped$'` in
+#       --prd-dir -- reconstructs the `archived` event from that commit's
+#       own sha+timestamp, and (from the now-archived file's own
+#       frontmatter) `queued` from `Drafted: <date>` and `claimed` from
+#       `Lane: <host> <ts>`, every one marked `detail: source=backfill`
+#       and skipped when that slug already has a REAL event for that
+#       stage (idempotent -- a repeat run never duplicates). Known scope
+#       limit: `gate_start`/`gate_verdict` are NOT reconstructed -- no
+#       journal line before this PRD shipped reliably maps a gate run back
+#       to a PRD slug (gate journal lines are keyed by crate/repo name);
+#       a backfilled slug's gate_runs/gate_time_s read 0, honestly, rather
+#       than a guess. lead_time_h (queued->archived, the one AC7 checks)
+#       is unaffected by this gap.
+#
 # Env:
 #   FLOW_LEDGER_FILE   override the ledger path (default: see lib/flow-ledger.sh).
 #   FLOW_LEDGER_JQ     override `jq`.
@@ -227,10 +244,95 @@ cmd_report() {
   exit 0
 }
 
+cmd_backfill() {
+  local since="14d" prd_dir="${PRD_DIR:-$HOME/Documents/PRDs}"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --since) since="${2:?--since needs a value like 14d}"; shift 2 ;;
+      --prd-dir) prd_dir="${2:?--prd-dir needs a path}"; shift 2 ;;
+      *) die "backfill: unknown argument: $1" 2 ;;
+    esac
+  done
+
+  { [ -d "$prd_dir/.git" ] || git -C "$prd_dir" rev-parse --git-dir >/dev/null 2>&1; } \
+    || die "backfill: not a git repo: $prd_dir" 2
+
+  local now_ep; now_ep="$(date -u +%s)"
+  local cutoff_ep; cutoff_ep="$(since_to_epoch "$now_ep" "$since")" \
+    || die "bad --since value: $since (want <n>d|<n>h|<n>m)" 2
+  local cutoff_iso; cutoff_iso="$(date -u -d "@$cutoff_ep" +%Y-%m-%dT%H:%M:%SZ)"
+
+  local ledger; ledger="$(flow_ledger_path)"
+  local existing="[]"
+  if [ -r "$ledger" ]; then
+    existing="$("$JQ" -c '.' "$ledger" 2>/dev/null | "$JQ" -s '.' 2>/dev/null)"
+    [ -n "$existing" ] || existing="[]"
+  fi
+  # Idempotent (Requirement 6): a slug that already has a REAL event for a
+  # stage is left alone -- backfill only fills gaps, never overwrites, and
+  # a repeat run over the same window is a no-op.
+  has_stage() {  # $1=slug $2=stage
+    printf '%s' "$existing" | "$JQ" -e --arg s "$1" --arg st "$2" \
+      'any(.[]; .slug == $s and .stage == $st)' >/dev/null 2>&1
+  }
+
+  local archived_n=0 queued_n=0 claimed_n=0
+  local glog
+  glog="$(git -C "$prd_dir" log --since="$cutoff_iso" --date=iso-strict --pretty='%H|%aI|%s' \
+    -E --grep '^archive: .+ shipped$' 2>/dev/null || true)"
+  while IFS='|' read -r sha aidate subj; do
+    [ -n "$subj" ] || continue
+    local slug; slug="$(printf '%s' "$subj" | sed -n 's/^archive: \(.*\) shipped$/\1/p')"
+    [ -n "$slug" ] || continue
+    local ts; ts="$(date -u -d "$aidate" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)"
+    [ -n "$ts" ] || continue
+
+    if ! has_stage "$slug" "archived"; then
+      flow_ledger_append "$slug" "archived" --sha "$sha" --detail "source=backfill" --ts "$ts"
+      archived_n=$((archived_n + 1))
+    fi
+
+    local f="$prd_dir/built-prds/PRD-$slug.md"
+    [ -f "$f" ] || continue
+
+    if ! has_stage "$slug" "queued"; then
+      local drafted; drafted="$(grep -m1 -E '^-? *Drafted: *[0-9]{4}-[0-9]{2}-[0-9]{2}' "$f" 2>/dev/null \
+        | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}')"
+      if [ -n "$drafted" ]; then
+        local qts; qts="$(date -u -d "${drafted}T00:00:00Z" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)"
+        if [ -n "$qts" ]; then
+          flow_ledger_append "$slug" "queued" --detail "source=backfill" --ts "$qts"
+          queued_n=$((queued_n + 1))
+        fi
+      fi
+    fi
+
+    if ! has_stage "$slug" "claimed"; then
+      local lane_line; lane_line="$(grep -m1 -E '^-? *Lane: *[^ ]+ +[0-9TZ:.-]+' "$f" 2>/dev/null)"
+      if [ -n "$lane_line" ]; then
+        local lane_host; lane_host="$(printf '%s' "$lane_line" | sed -E 's/^-? *Lane: *([^ ]+).*/\1/')"
+        local lane_ts_raw; lane_ts_raw="$(printf '%s' "$lane_line" | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z')"
+        if [ -n "$lane_ts_raw" ]; then
+          local cts; cts="$(date -u -d "$lane_ts_raw" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)"
+          if [ -n "$cts" ]; then
+            flow_ledger_append "$slug" "claimed" --lane "$lane_host" --detail "source=backfill" --ts "$cts"
+            claimed_n=$((claimed_n + 1))
+          fi
+        fi
+      fi
+    fi
+  done <<< "$glog"
+
+  printf 'flow-ledger backfill: archived=%d queued=%d claimed=%d (since=%s)\n' \
+    "$archived_n" "$queued_n" "$claimed_n" "$since"
+  exit 0
+}
+
 [ $# -ge 1 ] || usage
 sub="$1"; shift
 case "$sub" in
   append) cmd_append "$@" ;;
   report) cmd_report "$@" ;;
+  backfill) cmd_backfill "$@" ;;
   *) usage ;;
 esac
