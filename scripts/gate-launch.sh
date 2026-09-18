@@ -260,10 +260,21 @@ fi
 
 started_ts="$(now_iso)"
 
+# PRD-build-burst-canary-live-parity R6 fix: systemd-run does NOT inherit
+# this process's own environment, only what --setenv names explicitly (the
+# PATH/EXTEND_GATE_HOST_CONTRACT_CHECK lines below already prove that out).
+# EXTEND_GATE_SKIP_PRODUCERS is set by burst-lane.sh's canary callers as a
+# plain env-var prefix on this script's own invocation, so without an
+# explicit --setenv here it never reaches the unit and extend-gate.sh sees
+# it unset -- silently running ci-checks/reviewer-agent/session-trace for
+# real instead of skipping them (the branch variant then pays the full
+# CI_CHECKS_BRANCH_WAIT, exactly the defect R6 exists to prevent).
+sr_setenv_args=(--setenv="PATH=$launch_path" --setenv="EXTEND_GATE_HOST_CONTRACT_CHECK=1")
+[ -n "${EXTEND_GATE_SKIP_PRODUCERS:-}" ] && sr_setenv_args+=(--setenv="EXTEND_GATE_SKIP_PRODUCERS=$EXTEND_GATE_SKIP_PRODUCERS")
+
 "$SYSTEMD_RUN" --user --unit "$unit" --collect \
   -p WorkingDirectory="$repo" \
-  --setenv="PATH=$launch_path" \
-  --setenv="EXTEND_GATE_HOST_CONTRACT_CHECK=1" \
+  "${sr_setenv_args[@]}" \
   bash -c "$inner" >&2
 sr_rc=$?
 [ "$sr_rc" -eq 0 ] || die 2 "systemd-run failed to launch $unit (rc=$sr_rc)"
