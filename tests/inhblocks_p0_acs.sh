@@ -178,4 +178,74 @@ expect "AC9: prints inherited-debt line for crate9"             "grep -qE '^inhe
 expect "AC9: oldest is at least 3 days"                          "n=\$(grep -oE 'oldest=[0-9]+d' <<<\"\$out9\" | grep -oE '[0-9]+'); [ \"\$n\" -ge 3 ]"
 expect "AC9: journal carries the same inherited-debt line"       "grep -q 'inherited-debt: crate=crate9 open=1' \"$T9/journal9.md\""
 
+# --- requirement 2, main-scope clause: a SQUASH landing's attribution ---
+# ------- range comes from state/landings/<repo>/<slug>.json, not the ----
+# ------- newest version tag --------------------------------------------
+# No AC of this PRD names this clause directly (ACs 1-9 cover requirement
+# 2 only via AC3's unknown-inputs half), but requirement 2 states it, and
+# gate-then-land.sh lands via `--squash` -> a ONE-parent commit, which the
+# merge-parent rule above it cannot catch. Fixture: a repo tagged v0.1.0
+# followed by THREE single-parent "landings"; the attribution range for
+# the last one must cover only its own file, not the two before it.
+#
+# The block under test is EXTRACTED FROM THE SHIPPED extend-gate.sh by its
+# own BEGIN/END marker (the convention tests/canary_ac15_route_block.sh
+# already uses), so this proves the code that actually runs rather than a
+# transcription of it.
+TR2="$(mktemp -d "${TMPDIR:-/tmp}/inhblocks-r2.XXXXXX")"
+trap 'rm -rf "$T" "$T7" "$T9" "$TR2"' EXIT
+(
+  cd "$TR2" && git init -q repo && cd repo
+  git config user.email t@t && git config user.name t
+  echo base > base.txt && git add -A && git commit -qm base
+  git tag v0.1.0
+  for f in landed_one landed_two landed_three; do
+    echo x > "$f.txt" && git add -A && git commit -qm "$f"
+  done
+) >/dev/null 2>&1
+M="$(git -C "$TR2/repo" rev-parse HEAD)"
+mkdir -p "$TR2/state/landings/repo"
+printf '{"merge_sha": "%s"}\n' "$M" > "$TR2/state/landings/repo/myslug.json"
+
+# Extract the shipped block and run it with exactly the inputs it declares.
+r2_block="$(sed -n '/BEGIN inhblocks-r2-landing-range/,/END inhblocks-r2-landing-range/p' "$HERE/../scripts/extend-gate.sh")"
+expect "R2: landing-range block is present in extend-gate.sh" \
+  "[ -n \"\$r2_block\" ]"
+
+r2_run() { # $1 = pinned_landing (true|false); echoes "<base>|<source>"
+  local pinned_landing="$1"
+  local STATE_DIR="$TR2/state" repo="$TR2/repo" slug="myslug"
+  # base_ref stand-in: exactly what resolve_base() would return here —
+  # the newest reachable version tag.
+  local attr_diff_base; attr_diff_base="$(git -C "$repo" describe --tags --abbrev=0 2>/dev/null)"
+  local attribution_range_source=""
+  repo_slug_for_ci() { basename "$1"; }
+  eval "$r2_block"
+  printf '%s|%s\n' "$attr_diff_base" "$attribution_range_source"
+}
+
+r2_pinned="$(r2_run true)"
+r2_plain="$(r2_run false)"
+
+expect "R2: pinned landing pins the range to the landing record's merge_sha" \
+  "[ \"\${r2_pinned%%|*}\" = \"$M^1\" ]"
+expect "R2: pinned landing reports attribution_range=landing-record" \
+  "[ \"\${r2_pinned##*|}\" = landing-record ]"
+# The whole point: the pinned range must see ONLY this landing's file.
+r2_files_pinned="$(git -C "$TR2/repo" diff --name-only "${r2_pinned%%|*}" "$M")"
+expect "R2: pinned range covers only the landing's own file" \
+  "[ \"\$r2_files_pinned\" = landed_three.txt ]"
+# ...whereas the un-pinned fallback drags in the two earlier landings,
+# which is exactly the over-wide diff that mis-scores inherited as in-scope.
+r2_files_plain="$(git -C "$TR2/repo" diff --name-only "${r2_plain%%|*}" "$M" | sort | tr '\n' ' ')"
+expect "R2: un-pinned fallback is the over-wide tag range (regression guard)" \
+  "[ \"\$r2_files_plain\" = 'landed_one.txt landed_three.txt landed_two.txt ' ]"
+expect "R2: a non-landing run is untouched (no attribution_range token)" \
+  "[ -z \"\${r2_plain##*|}\" ]"
+# Fail-safe: an unusable record must leave the range exactly as found.
+printf '{"merge_sha": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"}\n' > "$TR2/state/landings/repo/myslug.json"
+r2_bad="$(r2_run true)"
+expect "R2: unresolvable merge_sha falls back, never crashes the gate" \
+  "[ \"\${r2_bad%%|*}\" = v0.1.0 ] && [ -z \"\${r2_bad##*|}\" ]"
+
 exit $fail

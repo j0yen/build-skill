@@ -2566,6 +2566,12 @@ attribution_json=""
 attribution_inherited=0
 attribution_in_scope=0
 attribution_unknown_inputs=0
+# Which rule chose attr_diff_base below. Only ever set to a non-empty value
+# by the --pinned-landing branch (requirement 2's main-scope clause); the
+# empty default means "the pre-existing base_ref/merge-base/merge-parent
+# rules picked the range", which is journaled as nothing at all so every
+# non-landing gate line stays byte-identical to before this PRD.
+attribution_range_source=""
 if [ "${#blocking_notes[@]}" -gt 0 ] && [ -x "$GATE_ATTRIBUTION" ]; then
   attr_diff_base="$base_ref"
   if [ "$scope" = branch ] && [ -n "${main_sha_at_gate_start:-}" ]; then
@@ -2575,6 +2581,53 @@ if [ "${#blocking_notes[@]}" -gt 0 ] && [ -x "$GATE_ATTRIBUTION" ]; then
   if [ "${parent_count:-0}" -eq 2 ]; then
     attr_diff_base="${head_now}^1"
   fi
+  # PRD-build-inherited-blocks-delta-pass requirement 2, the main-scope
+  # clause: "for main scope after a landing it is the landing's OWN merge
+  # range (state/landings/<repo>/<slug>.json)". The two-parent case above
+  # already lands that range for a genuine merge commit (M^1..M), but
+  # gate-then-land.sh also lands via `--squash`, and a squash/fast-forward
+  # landing is a ONE-parent commit: it misses the branch above and falls
+  # all the way back to $base_ref, which resolve_base() sets to the newest
+  # reachable VERSION TAG — a range spanning every landing since that tag,
+  # not this one. A too-wide range is the dangerous direction for THIS
+  # PRD specifically: every path any other landing touched enters
+  # diff_files, so blocks this landing genuinely inherited get scored
+  # in-scope, under-reporting the inherited set that requirement 4
+  # (gate-debt drafting) and requirement 7 (the weekly inherited-debt
+  # line) are both computed from. Requirement 6 keeps main-scope VERDICTS
+  # off attribution, so this only ever moves the journal's
+  # inherited=/in-scope= tokens and the debt accounting downstream of
+  # them — never a pass/block decision.
+  #
+  # So under --pinned-landing, pin the range to the landing record the PRD
+  # names. `merge_sha` is the field landing-verdict-resolve.sh reads first;
+  # `head_sha` is the pre-merge fallback every record has carried since
+  # branch-protection.sh started writing them. Resolution is deliberately
+  # local-only (no gh, no fetch — a gate must not grow a network
+  # dependency here); anything unresolvable leaves attr_diff_base exactly
+  # as the lines above left it, so this is strictly a narrowing fix.
+  # BEGIN inhblocks-r2-landing-range (tests/inhblocks_p0_acs.sh extracts
+  # this exact block by marker and evals it — keep it self-contained: it
+  # reads only pinned_landing/STATE_DIR/repo/slug and writes only
+  # attr_diff_base/attribution_range_source, all already defined above.)
+  if $pinned_landing; then
+    _attr_landing_rec="$STATE_DIR/landings/$(repo_slug_for_ci "$repo")/${slug}.json"
+    if [ -r "$_attr_landing_rec" ]; then
+      _attr_landing_sha="$(python3 -c 'import json,sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    raise SystemExit(0)
+print(d.get("merge_sha") or d.get("head_sha") or "")' "$_attr_landing_rec" 2>/dev/null)"
+      if [ -n "${_attr_landing_sha:-}" ] \
+        && git -C "$repo" rev-parse --verify --quiet "${_attr_landing_sha}^{commit}" >/dev/null 2>&1 \
+        && git -C "$repo" rev-parse --verify --quiet "${_attr_landing_sha}^1^{commit}" >/dev/null 2>&1; then
+        attr_diff_base="${_attr_landing_sha}^1"
+        attribution_range_source="landing-record"
+      fi
+    fi
+  fi
+  # END inhblocks-r2-landing-range
   attr_notes_file="$(mktemp "${TMPDIR:-/tmp}/extend-gate-attr-notes.XXXXXX")"
   for n in "${blocking_notes[@]}"; do
     # note_block strings are always "<receipt> — <detail>" (em dash,
@@ -2693,6 +2746,13 @@ fi
 # reads as an ordinary in-scope finding in the journal.
 if [ "${attribution_unknown_inputs:-0}" -gt 0 ]; then
   journal_suffix="$journal_suffix attribution=unknown-inputs"
+fi
+# requirement 2 (main-scope clause): when the landing record pinned the
+# attribution range, say so on the line, so a main-scope inherited=/in-scope=
+# pair can be told apart from one computed against the wider base_ref
+# fallback. Empty for every other run -> no new token, no churn.
+if [ -n "${attribution_range_source:-}" ]; then
+  journal_suffix="$journal_suffix attribution_range=$attribution_range_source"
 fi
 # requirement 4 (AC5): `deferred=<names>` — appended whenever this run
 # scope-deferred at least one receipt, independent of both suffixes above.
