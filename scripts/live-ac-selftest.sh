@@ -193,6 +193,56 @@ ck "AC4: verified-completed.sh reports a deferred (Live AC as live-ac-deferred, 
   '[ "$cls4d" = "live-ac-deferred" ]' "got: $cls4d"
 rm -rf "$T4"
 
+# ---- Regression (PRD-build-inherited-blocks-delta-pass, found 2026-09-18
+# proving that PRD's own AC6): a backtick-quoted evidence spec that itself
+# contains a paren group -- `journal:gate ... (pass|delta-pass|block) ...`
+# -- was truncated at the FIRST ")" by the tag capture in
+# verified-completed.sh, leaving one unterminated backtick, no quoted
+# token to extract, and an empty spec that surfaced as the misleading
+# "(no evidence: clause on the AC line)" for a clause that was in fact
+# present and well-formed. Seven queued PRDs carry that shape. Assert both
+# halves: the spec parses whole (unproven names the REAL regex, not the
+# no-clause reason), and it still pairs once its evidence lands. ----
+TP="$(mktemp -d "${TMPDIR:-/tmp}/live-ac-selftest-paren.XXXXXX")"
+mkdir -p "$TP/repo/tests" "$TP/queue" "$TP/journal"
+cat > "$TP/loop-tooling-repos.txt" <<EOF
+$TP/repo
+EOF
+fp="$TP/queue/PRD-fixture-paren.md"
+cat > "$fp" <<EOF
+# PRD: fixture-paren
+
+- Status: queued
+- build_target: shell
+- build_into: $TP/repo
+- test_prefix: liveac
+- Drafted: 2026-09-18
+- Grounding: failure-derived
+- Vision: x.md
+
+## Acceptance criteria
+
+1. P0 — Given a real loop, When it runs, Then it proves this. (Live; evidence: \`journal:gate  PARENFIX-[a-z0-9-]+  (pass|delta-pass|block) .*inherited=[0-9]+\`)
+EOF
+run_vcp() {
+  LOOP_TOOLING_REPOS_FILE="$TP/loop-tooling-repos.txt" VC_JOURNAL_DIR="$TP/journal" \
+    "$VC" "$fp" 2>&1
+}
+outp_before="$(run_vcp)"
+ck "paren-spec: the reason names the whole regex, paren group included" \
+  '[[ "$outp_before" == *"evidence not found: journal:gate  PARENFIX-[a-z0-9-]+  (pass|delta-pass|block)"* ]]' \
+  "out: $outp_before"
+ck "paren-spec: the old no-clause misdiagnosis is gone" \
+  '[[ "$outp_before" != *"no evidence: clause on the AC line"* ]]' "out: $outp_before"
+
+echo "2026-09-18T00:00:00Z  gate  PARENFIX-fixture  delta-pass  (scope=branch) inherited=2 in-scope=0" \
+  > "$TP/journal/2026-09-18.md"
+clsp_after="$(LOOP_TOOLING_REPOS_FILE="$TP/loop-tooling-repos.txt" VC_JOURNAL_DIR="$TP/journal" \
+  "$VC" "$fp" --derive --format table 2>/dev/null | awk -F'\t' '$1==1{print $4}')"
+ck "paren-spec: pairs once a journal line matching the whole regex exists" \
+  '[ "$clsp_after" = "PAIRED" ]' "got: $clsp_after"
+rm -rf "$TP"
+
 # ---- AC5: archive-live-ac-refusal.sh -- a `(Live` AC unproven refuses
 # (exit 1), prints live-ac-unproven:<N>, and journals it; once the named
 # evidence appears it goes silent (exit 0, nothing to refuse on live-ac-*

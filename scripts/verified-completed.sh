@@ -684,7 +684,34 @@ if is_loop_tooling_build_into "$this_build_into"; then
       # the word-boundary check prd-lint.sh does with a real regex engine.
       if (stripped !~ /\(Live[^A-Za-z]/) next
       if (match(orig, /\(Live[^)]*\)/)) {
+        live_start = RSTART
         tag = substr(orig, RSTART, RLENGTH)
+        # Bugfix (PRD-build-inherited-blocks-delta-pass, found 2026-09-18
+        # proving this PRD own AC6): the capture above stops at the FIRST
+        # ")", so a backtick-quoted evidence spec that itself contains a
+        # paren group -- `journal:gate ... (pass|delta-pass|block) ...` --
+        # was cut mid-spec. That left ONE unterminated backtick after
+        # "evidence:", no backtick-quoted token for the loop below to
+        # find, and an empty evidence string, reported as the misleading
+        # "(no evidence: clause on the AC line)" when the clause was in
+        # fact present and well-formed. An odd backtick count after
+        # "evidence:" means the spec is still open, so re-capture from
+        # "(Live" through the LAST backtick on the line (plus a trailing
+        # ")" when one follows it) instead of the first paren.
+        if (match(tag, /evidence:/)) {
+          after = substr(tag, RSTART + RLENGTH)
+          if (gsub(/`/, "`", after) % 2 == 1) {
+            last_tick = 0
+            for (i = length(orig); i > live_start; i--) {
+              if (substr(orig, i, 1) == "`") { last_tick = i; break }
+            }
+            if (last_tick > live_start) {
+              tag_end = last_tick
+              if (substr(orig, last_tick + 1, 1) == ")") tag_end = last_tick + 1
+              tag = substr(orig, live_start, tag_end - live_start + 1)
+            }
+          }
+        }
         evidence = ""
         # Bugfix (PRD-build-live-ac-no-defer, found live 2026-09-17 by a
         # sibling PRD dispatch): the old capture ran to the tag closing
