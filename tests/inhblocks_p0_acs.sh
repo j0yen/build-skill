@@ -193,7 +193,7 @@ expect "AC9: journal carries the same inherited-debt line"       "grep -q 'inher
 # already uses), so this proves the code that actually runs rather than a
 # transcription of it.
 TR2="$(mktemp -d "${TMPDIR:-/tmp}/inhblocks-r2.XXXXXX")"
-trap 'rm -rf "$T" "$T7" "$T9" "$TR2"' EXIT
+trap 'rm -rf "$T" "$T7" "$T9" "$TR2" "${T10:-}"' EXIT
 (
   cd "$TR2" && git init -q repo && cd repo
   git config user.email t@t && git config user.name t
@@ -247,5 +247,124 @@ printf '{"merge_sha": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"}\n' > "$TR2/sta
 r2_bad="$(r2_run true)"
 expect "R2: unresolvable merge_sha falls back, never crashes the gate" \
   "[ \"\${r2_bad%%|*}\" = v0.1.0 ] && [ -z \"\${r2_bad##*|}\" ]"
+
+# --- AC10: rollback-plan attributed by GUILTY-COMMIT RANGE -------------
+# 2026-09-18 live finding (burst-lane-gate-debt-2b2982e): `rollback-plan`
+# is pathless and has no producer-input map, so AC3's fail-closed
+# unknown-inputs rule scored it in-scope on every branch — including when
+# the non-revert-clean commit it names landed on main before the branch
+# even forked (guilty commit 31f733d). Its inputs are commits, not files:
+# a guilty sha that is an ancestor of the branch base is INHERITED; one
+# inside base..head is IN-SCOPE.
+#
+# Fixture lineage:  c_pre  ->  c_base (the branch base)  ->  c_head
+# so c_pre is an ancestor of the base and c_head is inside base..head.
+T10="$(mktemp -d "${TMPDIR:-/tmp}/inhblocks-ac10.XXXXXX")"
+(
+  cd "$T10" && git init -q repo && cd repo
+  git config user.email t@t && git config user.name t
+  echo pre > pre.txt   && git add -A && git commit -qm pre
+  echo base > base.txt && git add -A && git commit -qm base
+  echo head > head.txt && git add -A && git commit -qm head
+) >/dev/null 2>&1
+C_PRE="$(git -C "$T10/repo" rev-parse HEAD~2)"
+C_BASE="$(git -C "$T10/repo" rev-parse HEAD~1)"
+C_HEAD="$(git -C "$T10/repo" rev-parse HEAD)"
+
+# $1 = the commits= token value (empty -> no token at all); echoes the scope.
+ac10_scope() {
+  local token="$1" note="rollback-plan"
+  local n="$T10/notes.tsv"
+  if [ -n "$token" ]; then
+    printf 'rollback-plan\tcommits since v0.1.0 are not all revert-clean commits=%s\n' "$token" > "$n"
+  else
+    printf 'rollback-plan\tcommits since v0.1.0 are not all revert-clean\n' > "$n"
+  fi
+  "$GATE_ATTRIBUTION" compute "$T10/repo" "$C_BASE" "$C_HEAD" "$n" 2>/dev/null \
+    | python3 -c 'import json,sys; b=json.load(sys.stdin)["blocks"][0]; print(b["scope"], b.get("attribution",""), sep="|")'
+}
+
+ac10_pre="$(ac10_scope "$C_PRE")"
+expect "AC10: guilty commit that pre-dates the branch base is inherited" \
+  "[ \"\${ac10_pre%%|*}\" = inherited ]"
+expect "AC10: inherited-by-range block is tagged attribution=commit-range" \
+  "[ \"\${ac10_pre##*|}\" = commit-range ]"
+
+ac10_head="$(ac10_scope "$C_HEAD")"
+expect "AC10: guilty commit inside base..head is in-scope" \
+  "[ \"\${ac10_head%%|*}\" = in-scope ]"
+
+# ANY in-range sha makes the whole finding in-scope — the branch caused
+# part of it, so it owns it.
+ac10_mixed="$(ac10_scope "$C_PRE,$C_HEAD")"
+expect "AC10: a mixed set with one in-range sha is in-scope" \
+  "[ \"\${ac10_mixed%%|*}\" = in-scope ]"
+
+# Fail-closed: a sha this repo cannot resolve must never become free debt.
+ac10_bogus="$(ac10_scope deadbeefdeadbeefdeadbeefdeadbeefdeadbeef)"
+expect "AC10: an unresolvable guilty sha is in-scope (fail-closed)" \
+  "[ \"\${ac10_bogus%%|*}\" = in-scope ]"
+ac10_empty_tok="$(ac10_scope ,)"
+expect "AC10: commits= naming nothing is in-scope (fail-closed)" \
+  "[ \"\${ac10_empty_tok%%|*}\" = in-scope ]"
+
+# Regression guard: with NO commits= token the pre-existing AC3 rule still
+# owns the note (pathless + unmapped producer -> in-scope, unknown-inputs).
+ac10_none="$(ac10_scope "")"
+expect "AC10: no commits= token keeps the AC3 unknown-inputs path intact" \
+  "[ \"\$ac10_none\" = 'in-scope|unknown-inputs' ]"
+
+# Summary counter/token.
+printf 'rollback-plan\tnot revert-clean commits=%s\n' "$C_PRE" > "$T10/notes.tsv"
+ac10_json="$("$GATE_ATTRIBUTION" compute "$T10/repo" "$C_BASE" "$C_HEAD" "$T10/notes.tsv" 2>"$T10/stderr")"
+expect "AC10: commit_range counter is 1" \
+  "echo \"\$ac10_json\" | python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin)[\"commit_range\"]==1 else 1)'"
+expect "AC10: stderr summary carries attribution=commit-range" \
+  "grep -q 'attribution=commit-range' \"$T10/stderr\""
+expect "AC10: the inherited/in-scope pair reflects the range verdict" \
+  "grep -q 'inherited=1 in-scope=0' \"$T10/stderr\""
+
+# --- AC10 (producer half): the SHIPPED extend-gate.sh block that puts the
+# guilty shas into the note. Extracted by marker, same convention as R2.
+ac10_block="$(sed -n '/BEGIN inhblocks-r10-rollback-commits/,/END inhblocks-r10-rollback-commits/p' "$HERE/../scripts/extend-gate.sh")"
+expect "AC10: rollback-commits block is present in extend-gate.sh" \
+  "[ -n \"\$ac10_block\" ]"
+
+ac10_csv() { # $1 = receipt path (may not exist); echoes _rb_guilty_csv
+  local rollback_receipt="$1" _rb_guilty_csv=""
+  eval "$ac10_block"
+  printf '%s\n' "$_rb_guilty_csv"
+}
+
+cat > "$T10/rb-mixed.json" <<EOF
+{"schema":"autobuilder.rollback_plan_receipt.v2","commits":[
+  {"sha":"$C_PRE","revertable":false},
+  {"sha":"$C_BASE","revertable":true},
+  {"sha":"$C_HEAD","revertable":false}]}
+EOF
+expect "AC10: only NON-revertable commits are named as guilty" \
+  "[ \"\$(ac10_csv "$T10/rb-mixed.json")\" = \"$C_PRE,$C_HEAD\" ]"
+
+cat > "$T10/rb-clean.json" <<EOF
+{"schema":"autobuilder.rollback_plan_receipt.v2","commits":[
+  {"sha":"$C_PRE","revertable":true}]}
+EOF
+expect "AC10: an all-revertable receipt names no guilty commit" \
+  "[ -z \"\$(ac10_csv "$T10/rb-clean.json")\" ]"
+
+printf 'not json at all\n' > "$T10/rb-broken.json"
+expect "AC10: an unparseable receipt emits no token, never crashes" \
+  "[ -z \"\$(ac10_csv "$T10/rb-broken.json")\" ]"
+expect "AC10: a missing receipt emits no token" \
+  "[ -z \"\$(ac10_csv "$T10/does-not-exist.json")\" ]"
+
+# End-to-end: receipt -> note -> attribution. A crate whose only block is a
+# pre-branch non-revert-clean commit must come out inherited=1 in-scope=0,
+# which is exactly what lets gate-delta.sh call it delta-pass (AC1).
+ac10_e2e_csv="$(ac10_csv "$T10/rb-mixed.json")"
+printf 'rollback-plan\tnot all revert-clean commits=%s\n' "${ac10_e2e_csv%%,*}" > "$T10/notes.tsv"
+"$GATE_ATTRIBUTION" compute "$T10/repo" "$C_BASE" "$C_HEAD" "$T10/notes.tsv" >"$T10/e2e.json" 2>&1
+expect "AC10: receipt -> note -> attribution yields inherited=1 in-scope=0" \
+  "grep -q 'inherited=1 in-scope=0' \"$T10/e2e.json\""
 
 exit $fail

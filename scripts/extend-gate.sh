@@ -1720,7 +1720,38 @@ else
     note_defer "rollback-plan — scope-deferred (head-untagged) — branch HEAD carries no release tag; land re-runs this at main scope"
     record_phase rollback-plan $(( $(date +%s) - _phase_t0 )) defer
   else
-    note_block "rollback-plan — commits since $base_ref are not all revert-clean (see target/autobuilder/rollback.md); fix forward, or a human rewrites history and says so — this script never edits history to force a pass"
+    # PRD-build-inherited-blocks-delta-pass AC10: name the GUILTY commits
+    # in the note, so gate-attribution.sh can attribute this pathless
+    # finding by commit range instead of falling into its unknown-inputs
+    # fail-closed rule. rollback-plan has no producer-input map and never
+    # will have a sensible one — its inputs are not files, they are the
+    # commits it could not revert cleanly. Before this, a non-revert-clean
+    # commit that landed on main long before the branch forked was scored
+    # in-scope on EVERY branch of the crate (2026-09-18 live finding,
+    # burst-lane-gate-debt-2b2982e: guilty commit 31f733d was pre-branch
+    # and still blocked). An unreadable receipt, or one that lists no
+    # non-revertable commit, emits no token at all — the note stays exactly
+    # as it was and the pre-existing fail-closed path still applies.
+    # BEGIN inhblocks-r10-rollback-commits (tests/inhblocks_p0_acs.sh
+    # extracts this exact block by marker and evals it — keep it
+    # self-contained: it reads only $rollback_receipt and writes only
+    # _rb_guilty_csv.)
+    _rb_guilty_csv=""
+    if [ -f "$rollback_receipt" ]; then
+      _rb_guilty_csv="$(python3 -c 'import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    raise SystemExit(0)
+print(",".join(
+    c["sha"] for c in (d.get("commits") or [])
+    if isinstance(c, dict) and c.get("revertable") is False and c.get("sha")
+))' "$rollback_receipt" 2>/dev/null || true)"
+    fi
+    # END inhblocks-r10-rollback-commits
+    _rb_note="rollback-plan — commits since $base_ref are not all revert-clean (see target/autobuilder/rollback.md); fix forward, or a human rewrites history and says so — this script never edits history to force a pass"
+    [ -n "$_rb_guilty_csv" ] && _rb_note="$_rb_note commits=$_rb_guilty_csv"
+    note_block "$_rb_note"
     record_phase rollback-plan $(( $(date +%s) - _phase_t0 )) fail
   fi
 fi

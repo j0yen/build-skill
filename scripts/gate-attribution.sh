@@ -36,6 +36,26 @@
 #       touches the producer's inputs").
 #
 #     Scope rule (requirement 1, AC1):
+#       - a finding with a `commits=<sha>[,<sha>...]` token is attributed by
+#         COMMIT RANGE, not by path (PRD-build-inherited-blocks-delta-pass
+#         AC10): those shas ARE the finding's inputs. The finding is
+#         `inherited` when EVERY named sha is an ancestor of <diff_base>
+#         (`git merge-base --is-ancestor <sha> <diff_base>` — it landed on
+#         main before this branch forked, so this branch did not cause it);
+#         `in-scope` when ANY named sha is inside <diff_base>..<diff_head>,
+#         or is unresolvable in <repo>, or the token names nothing at all
+#         (fail-closed, same spirit as the unknown-inputs rule below).
+#         This token is checked FIRST and wins over path/test.
+#         The block carries `"attribution":"commit-range"` and the stderr
+#         summary gains ` attribution=commit-range`.
+#         Motivating case (2026-09-18 live finding, burst-lane-gate-debt-
+#         2b2982e): `rollback-plan` is pathless and has no producer-input
+#         map, so the fail-closed rule below called it in-scope on every
+#         branch — even when the non-revert-clean commit it names landed on
+#         main long before the branch existed. extend-gate.sh now puts the
+#         guilty (non-revertable) shas from the rollback-plan receipt into
+#         the note as this token, which makes that block correctly
+#         inherited.
 #       - a finding WITH a path/test token is `in-scope` if ANY of its
 #         listed paths appears in `git -C <repo> diff --name-only
 #         <diff_base>..<diff_head>`, else `inherited`.
@@ -55,8 +75,11 @@
 #
 #     Prints ONE line of JSON to stdout:
 #       {"blocks":[{"receipt":"...","finding":"...","path":"...",
-#                   "scope":"in-scope"|"inherited"[,"attribution":"unknown-inputs"]}, ...],
-#        "in_scope":<N>, "inherited":<M>, "unknown_inputs":<K>}
+#                   "scope":"in-scope"|"inherited"
+#                   [,"attribution":"unknown-inputs"|"commit-range"]
+#                   [,"commits":"<sha>,<sha>"]}, ...],
+#        "in_scope":<N>, "inherited":<M>, "unknown_inputs":<K>,
+#        "commit_range":<R>}
 #     and a human summary to stderr: "gate-attribution: inherited=M in-scope=N"
 #     (the exact token order extend-gate.sh's journal gate line reuses,
 #     AC1: "the journal gate line reads inherited=1 in-scope=1"), with an
@@ -98,10 +121,11 @@ cmd_compute() {
   diff_file="$(mktemp "${TMPDIR:-/tmp}/gate-attribution-diff.XXXXXX")"
   git -C "$repo" diff --name-only "${base}..${head}" > "$diff_file" 2>/dev/null || true
 
-  python3 - "$notes_file" "$producer_inputs" "$diff_file" <<'PY'
-import json, re, sys
+  python3 - "$notes_file" "$producer_inputs" "$diff_file" "$repo" "$base" <<'PY'
+import json, re, subprocess, sys
 
 notes_file, producer_inputs_spec, diff_file = sys.argv[1], sys.argv[2], sys.argv[3]
+repo, diff_base = sys.argv[4], sys.argv[5]
 with open(diff_file) as fh:
     diff_files = set(l.strip() for l in fh if l.strip())
 
@@ -123,11 +147,39 @@ if producer_inputs_spec:
 
 path_re = re.compile(r'\bpath=(\S+)')
 test_re = re.compile(r'\btest=(\S+)')
+commits_re = re.compile(r'\bcommits=(\S+)')
+
+# AC10: a guilty commit that is an ancestor of the branch base landed
+# before this branch forked -> the branch did not cause it -> inherited.
+# Anything else (inside diff_base..diff_head, or a sha this repo cannot
+# resolve at all) is in-scope, fail-closed. Cached: a rollback-plan note
+# can name the same sha on several findings, and each check is two forks.
+_ancestor_cache = {}
+
+
+def landed_before_base(sha):
+    if sha in _ancestor_cache:
+        return _ancestor_cache[sha]
+    verdict = False
+    try:
+        resolved = subprocess.run(
+            ["git", "-C", repo, "rev-parse", "--verify", "--quiet", sha + "^{commit}"],
+            capture_output=True, text=True)
+        if resolved.returncode == 0:
+            anc = subprocess.run(
+                ["git", "-C", repo, "merge-base", "--is-ancestor", sha, diff_base],
+                capture_output=True, text=True)
+            verdict = anc.returncode == 0
+    except Exception:
+        verdict = False
+    _ancestor_cache[sha] = verdict
+    return verdict
 
 blocks = []
 in_scope = 0
 inherited = 0
 unknown_inputs = 0
+commit_range = 0
 
 with open(notes_file) as fh:
     for line in fh:
@@ -138,9 +190,21 @@ with open(notes_file) as fh:
         receipt = parts[0]
         note = parts[1] if len(parts) > 1 else ""
 
+        cm = commits_re.search(note)
         m = path_re.search(note) or test_re.search(note)
         unknown = False
-        if m:
+        by_commit_range = False
+        commits_field = ""
+        if cm:
+            # AC10: attribute by commit range. These shas ARE the inputs;
+            # checked before path/test because a receipt that names its
+            # guilty commits has told us exactly what caused it.
+            shas = [c for c in cm.group(1).split(",") if c]
+            scope = "inherited" if shas and all(landed_before_base(c) for c in shas) else "in-scope"
+            path_field = ""
+            commits_field = ",".join(shas)
+            by_commit_range = True
+        elif m:
             paths = [p for p in m.group(1).split(",") if p]
             scope = "in-scope" if any(p in diff_files for p in paths) else "inherited"
             path_field = ",".join(paths)
@@ -165,16 +229,23 @@ with open(notes_file) as fh:
         if unknown:
             block["attribution"] = "unknown-inputs"
             unknown_inputs += 1
+        if by_commit_range:
+            block["attribution"] = "commit-range"
+            block["commits"] = commits_field
+            commit_range += 1
         blocks.append(block)
         if scope == "in-scope":
             in_scope += 1
         else:
             inherited += 1
 
-print(json.dumps({"blocks": blocks, "in_scope": in_scope, "inherited": inherited, "unknown_inputs": unknown_inputs}))
+print(json.dumps({"blocks": blocks, "in_scope": in_scope, "inherited": inherited,
+                  "unknown_inputs": unknown_inputs, "commit_range": commit_range}))
 summary = f"gate-attribution: inherited={inherited} in-scope={in_scope}"
 if unknown_inputs:
     summary += " attribution=unknown-inputs"
+if commit_range:
+    summary += " attribution=commit-range"
 print(summary, file=sys.stderr)
 PY
   local py_rc=$?
