@@ -102,7 +102,7 @@ points here instead of listing scripts inline).
 - `scripts/handwritten-fixture-lint.sh` — scripts/handwritten-fixture-lint.sh — PRD-build-burst-gate-canary-
 - `scripts/host-contract-selftest.sh` — PRD-build-host-contract AC1, AC2, AC4, AC5,
 - `scripts/host-contract.sh` — probe + self-heal for docs/host-contract.md
-- `scripts/host-contract-tick-selftest.sh` — PRD-build-host-contract AC3 and the
+- `scripts/host-contract-tick-selftest.sh` — PRD-build-host-contract AC3 and AC6.
 - `scripts/inhblocks-selftest.sh` — PRD-build-inherited-blocks-delta-pass whole-suite
 - `scripts/install-hcloud-selftest.sh` — offline proof for install-hcloud.sh
 - `scripts/install-hcloud.sh` — pinned-version, sha256-checked install of the Hetzner
@@ -122,7 +122,6 @@ points here instead of listing scripts inline).
 - `scripts/lane-claim.sh` — push-wins claim protocol for multi-lane /build (PRD-build-second-lane-carbon).
 - `scripts/lane-defer.sh` — ExecCondition for claude-build.service on secondary lanes.
 - `scripts/lane-has-work.sh` — ExecCondition for claude-build.service on secondary
-- `scripts/lane-health.sh` — the one tick health line (PRD-build-host-contract
 - `scripts/lane-predicate-selftest.sh` — exercises lane-predicate.sh's select/reachable
 - `scripts/lane-predicate.sh` — Phase 2 lane-aware selection predicate (PRD-build-
 - `scripts/lane-status-selftest.sh` — exercises lane-status.sh's tick-summary (journal

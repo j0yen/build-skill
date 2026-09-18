@@ -235,3 +235,20 @@ pre-branch commit or file just to satisfy the reviewer's restated
 finding; that finding is not this branch's to own. Only a `new_blocks=`
 entry naming an in-scope reviewer reason is this branch's own to fix. See
 history.md#reviewer-restated-inherited.
+
+## 15. Host contract
+
+`docs/host-contract.md` names every ambient RedBaron default the loop
+depends on; `scripts/host-contract.sh check` probes it. If you hit a
+host fault mid-dispatch — `mktemp`/`ENOSPC`, an auth source coming back
+empty, an expected env var absent, a PATH shim in the wrong order, a
+lock holder that is not a live `flock`+`claude` pair — do not patch the
+caller that happened to trip over it: run `scripts/host-contract.sh
+check` yourself, report `host-drift:<key>` (the key from that output,
+not a guess), and stop with `needs-user`. A `self-heal`-owned key
+(`scripts/host-contract.sh apply <key>` fixes it) is fine to apply
+yourself; an `operator`-owned key is not — `apply` on one only ever
+prints the command, never mutates, and neither should you by hand. A
+gate journal line already carrying `infra=host-drift:<key>` (its outcome
+is `incomplete`, never `block`) means the gate itself already made this
+call — cite it, do not re-diagnose. See history.md#host-contract.

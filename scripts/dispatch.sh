@@ -418,7 +418,12 @@ run_parent_steps() {
   [ -x "$MANIFEST_SET" ] && "$MANIFEST_SET" --replay-orphans >/dev/null 2>&1
   [ -x "$VERDICT_RECEIPTS" ] && "$VERDICT_RECEIPTS" postflight "$journal" >/dev/null 2>&1
   [ -x "$GATE_DEBT" ] && "$GATE_DEBT" release-check --prd-dir "$PRD_DIR" --journal "$journal" >/dev/null 2>&1
-  [ -x "$LANE_STATUS" ] && "$LANE_STATUS" tick-summary "$LANE" "$dispatched" "$skipped" "$journal" >/dev/null 2>&1
+  # PRD-build-host-contract requirement 3: opts the real tick-summary call
+  # into lane-status.sh's own host-contract.sh check (default off there —
+  # see its header), so the standing lane-health line carries host=ok or
+  # host=drift:<csv> without lane-status-selftest.sh's/cargo-budget-
+  # selftest.sh's existing exact-string assertions needing a fixture.
+  [ -x "$LANE_STATUS" ] && LANE_STATUS_HOST_CONTRACT_CHECK=1 "$LANE_STATUS" tick-summary "$LANE" "$dispatched" "$skipped" "$journal" >/dev/null 2>&1
   [ -x "$SERIALIZATION_DIGEST" ] && "$SERIALIZATION_DIGEST" "$journal" >/dev/null 2>&1
   [ -x "$LAND_CONFLICTS_DIGEST" ] && "$LAND_CONFLICTS_DIGEST" >/dev/null 2>&1
   write_dispatch_summary "$tick" "$admitted" "$dispatched" "$skipped" \

@@ -28,6 +28,18 @@
 #                 non-network sanity probe) — a sandboxed shell cannot
 #                 brand a healthy host unreachable off a single probe.
 #
+# host-drift (PRD-build-host-contract requirement 5): NOT a reserved word
+# scan_line() enforces receipts for — `infra=host-drift:<key>` is one of
+# extend-gate.sh's `infra=` notes (same family as `infra=reviewer-agent:
+# auth-missing`), which this script never parsed a kind-allowlist for in
+# the first place, so it needs no code change to "accept" it: a gate that
+# ends `verdict: incomplete infra=host-drift:<key>` (docs/host-contract.md
+# names the key; `host-contract.sh check`'s own output IS the receipt —
+# see verdict-receipts.sh record's <kind> argument, unvalidated, any
+# caller-chosen string) is never scanned as a block, because it never
+# said `block`. Documented here so the next reader does not go looking
+# for enforcement code that was never needed.
+#
 # Operator-authorization deferral check (PRD-build-operator-authorization-
 # contract): not a reserved WORD but the same "a claim is only as good as
 # what it names, not what it asserts" shape. A journal/PRD line naming a

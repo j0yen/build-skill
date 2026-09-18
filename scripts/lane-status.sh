@@ -40,6 +40,15 @@ DECISIONS="${DECISIONS:-$HERE/decisions.sh}"
 SKILL_DIR="${BUILD_SKILL_DIR:-$(cd "$HERE/.." && pwd)}"
 STATE_DIR="${BUILD_STATE_DIR:-$SKILL_DIR/state}"
 GATE_STATUS="${GATE_STATUS:-$HERE/gate-status.sh}"
+# PRD-build-host-contract requirement 3: HOST_CONTRACT_SH is the same
+# override name extend-gate.sh and select-tick.sh use for a fixture
+# double. LANE_STATUS_HOST_CONTRACT_CHECK=1 (default OFF, same reasoning
+# as extend-gate.sh's EXTEND_GATE_HOST_CONTRACT_CHECK -- see that
+# script's header) is set by dispatch.sh, the one real caller of
+# `tick-summary`, so lane-status-selftest.sh/cargo-budget-selftest.sh's
+# existing exact-string assertions on the plain tick-summary line stay
+# byte-identical without needing a fixture double of their own.
+HOST_CONTRACT_SH="${HOST_CONTRACT_SH:-$HERE/host-contract.sh}"
 # PRD-build-flow-ledger P1 requirement 7 / AC8: the last-24h flow medians line.
 FLOW_LEDGER="${FLOW_LEDGER:-$HERE/flow-ledger.sh}"
 # PRD-build-prd-superseded-by P1 requirement 8 / AC12: superseded chain count.
@@ -50,6 +59,26 @@ die() { echo "lane-status: $*" >&2; exit "${2:-4}"; }
 usage() { echo "usage: lane-status.sh {tick-summary|report|digest} ..." >&2; exit 4; }
 
 now_iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+# host_status_field — PRD-build-host-contract requirement 3: "host=ok" or
+# "host=drift:<csv>", or empty (nothing appended) when the check is
+# disabled or not applicable. Prints without a leading space; the caller
+# adds one only when non-empty, so a disabled check leaves the tick line
+# byte-identical to before this PRD.
+host_status_field() {
+  [ "${LANE_STATUS_HOST_CONTRACT_CHECK:-0}" = "1" ] || return 0
+  [ "$(hostname)" = "redbaron" ] || return 0
+  [ -x "$HOST_CONTRACT_SH" ] || return 0
+  local hc_out hc_rc
+  hc_out="$("$HOST_CONTRACT_SH" check 2>/dev/null)"
+  hc_rc=$?
+  if [ "$hc_rc" -eq 0 ]; then
+    printf 'host=ok'
+  else
+    local csv; csv="$(printf '%s\n' "$hc_out" | grep '=drift(' | sed -E 's/=drift.*$//' | paste -sd, -)"
+    printf 'host=drift:%s' "$csv"
+  fi
+}
 
 read_lane_line() {
   local f="$1"
@@ -287,8 +316,10 @@ cmd_tick_summary() {
   mkdir -p "$(dirname "$journal")" 2>/dev/null || true
   local stash_n stash_oldest_h
   read -r stash_n stash_oldest_h < <(stash_stats "$prd_dir")
-  printf '%s  lane-health  tick  claimed=%s skipped=%s  (lane=%s)  stashes=%s oldest=%sh\n' \
-    "$(now_iso)" "$claimed" "$skipped" "$lane" "$stash_n" "$stash_oldest_h" >> "$journal"
+  local host_field; host_field="$(host_status_field)"
+  printf '%s  lane-health  tick  claimed=%s skipped=%s  (lane=%s)  stashes=%s oldest=%sh%s\n' \
+    "$(now_iso)" "$claimed" "$skipped" "$lane" "$stash_n" "$stash_oldest_h" \
+    "${host_field:+ $host_field}" >> "$journal"
   journal_stale_stashes "$prd_dir" "$journal"
   if [ -x "$CARGO_BUDGET" ]; then
     local cb_line; cb_line="$("$CARGO_BUDGET" summary 2>/dev/null || true)"
@@ -360,6 +391,34 @@ cmd_report() {
     done < <(grep '  lane-health  tick  ' "$f" | tac)
   done
   if [ ${#seen[@]} -eq 0 ]; then echo "(no lane-health lines found in the scanned window)"; fi
+
+  echo
+  echo "== host contract: drifted keys (PRD-build-host-contract requirement 7) =="
+  if [ "$(hostname)" = "redbaron" ] && [ -x "$HOST_CONTRACT_SH" ]; then
+    local hc_out hc_rc hc_line hc_key hc_owner hc_cmd
+    hc_out="$("$HOST_CONTRACT_SH" check --fast 2>/dev/null)"
+    hc_rc=$?
+    if [ "$hc_rc" -eq 0 ]; then
+      echo "(none -- host-contract.sh check --fast reports all-ok)"
+    else
+      while IFS= read -r hc_line; do
+        case "$hc_line" in
+          *=drift\(*)
+            hc_key="${hc_line%%=drift(*}"
+            hc_owner="$(sed -E 's/.*owner=([a-z-]+).*/\1/' <<<"$hc_line")"
+            if [ "$hc_owner" = operator ]; then
+              hc_cmd="$("$HOST_CONTRACT_SH" apply "$hc_key" 2>/dev/null | tail -n1 | sed -E 's/^ +//')"
+            else
+              hc_cmd="self-heal: host-contract.sh apply $hc_key"
+            fi
+            echo "$hc_line -> $hc_cmd"
+            ;;
+        esac
+      done <<<"$hc_out"
+    fi
+  else
+    echo "(skipped -- not redbaron, or host-contract.sh not found)"
+  fi
 
   echo
   echo "== live and stale claims (build-queue/*.md) =="

@@ -1,18 +1,22 @@
 #!/usr/bin/env bash
-# host-contract-tick-selftest.sh — PRD-build-host-contract AC3 and the
-# lane-health half of AC6.
+# host-contract-tick-selftest.sh — PRD-build-host-contract AC3 and AC6.
 #
 #   AC3 — a critical host-contract drift on lane=redbaron: select-tick.sh
 #     admits nothing, journals `dispatch  host-drift  <keys>`, and an
 #     already-running fixture process is untouched (select-tick.sh never
 #     manages running units, so this is really "still true after", not
 #     something select-tick.sh has to actively preserve).
-#   AC6 (lane-health half) — lane-health.sh's own tick line ends `host=ok`
-#     when host-contract.sh check is all-ok, `host=drift:<csv>` otherwise,
-#     and its exit code mirrors host-contract.sh check's own.
+#   AC6 — lane-status.sh's own standing `lane-health  tick` journal line
+#     (the "tick health line" the PRD's engineering-target list actually
+#     means -- there is no separate lane-health.sh script; "lane-health"
+#     is the label lane-status.sh's cmd_tick_summary already wrote to the
+#     journal before this PRD, per scripts/lane-status.sh's own header)
+#     ends ` host=ok` when host-contract.sh check is all-ok, `
+#     host=drift:<csv>` otherwise, gated on LANE_STATUS_HOST_CONTRACT_
+#     CHECK=1 (dispatch.sh, the real caller, sets it — see that script).
 #
-# Both scripts are pointed at a small deterministic fixture double of
-# host-contract.sh (via $HOST_CONTRACT_SH) rather than the real one --
+# All three scripts are pointed at a small deterministic fixture double
+# of host-contract.sh (via $HOST_CONTRACT_SH) rather than the real one --
 # the real script probes the actual host (systemctl/df/fuser/systemd-run)
 # which would make this selftest's pass/fail depend on RedBaron's live
 # state at run time.
@@ -22,9 +26,9 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 ST="$HERE/select-tick.sh"
-LH="$HERE/lane-health.sh"
+LS="$HERE/lane-status.sh"
 [ -x "$ST" ] || { echo "selftest: $ST not executable" >&2; exit 2; }
-[ -x "$LH" ] || { echo "selftest: $LH not executable" >&2; exit 2; }
+[ -x "$LS" ] || { echo "selftest: $LS not executable" >&2; exit 2; }
 command -v jq >/dev/null 2>&1 || { echo "selftest: jq not on \$PATH, cannot run" >&2; exit 2; }
 
 # shellcheck source=lib/isolation.sh
@@ -59,26 +63,37 @@ FAKEHC
 chmod +x "$FAKE_HC"
 
 # ============================================================================
-# lane-health.sh — ok case.
+# AC6 — lane-status.sh tick-summary, flag on, ok case: the standing
+# `lane-health  tick` line ends ` host=ok`.
 # ============================================================================
-D="$T/lh-ok"; mkdir -p "$D/journal"
-out="$(BUILD_JOURNAL_ROOT="$D/journal" HOST_CONTRACT_SH="$FAKE_HC" FAKE_HC_MODE=ok "$LH" --lane testlane)"
-rc=$?
-expect "lane-health ok exit 0" "[ $rc -eq 0 ]"
-expect "lane-health ok line ends host=ok" "grep -qE '  lane-health  testlane  host=ok$' <<<'$out'"
-jf="$D/journal/$(date -u +%F).md"
-expect "lane-health ok journaled" "grep -qE '  lane-health  testlane  host=ok$' '$jf'"
+D="$T/ls-ok"; mkdir -p "$D/journal"
+JF="$D/journal/$(date -u +%F).md"
+LANE_STATUS_HOST_CONTRACT_CHECK=1 HOST_CONTRACT_SH="$FAKE_HC" FAKE_HC_MODE=ok \
+  "$LS" tick-summary testlane 3 1 "$JF" >/dev/null
+expect "AC6 ok: tick line ends host=ok" \
+  "grep -qE '  lane-health  tick  claimed=3 skipped=1  \(lane=testlane\).* host=ok\$' '$JF'"
 
 # ============================================================================
-# lane-health.sh — drift case: csv carries every drifted key (both
-# severities), exit code mirrors host-contract.sh check's own (2).
+# AC6 — flag on, drift case: csv carries every drifted key (both
+# severities).
 # ============================================================================
-D="$T/lh-drift"; mkdir -p "$D/journal"
-out="$(BUILD_JOURNAL_ROOT="$D/journal" HOST_CONTRACT_SH="$FAKE_HC" FAKE_HC_MODE=drift "$LH" --lane testlane)"
-rc=$?
-expect "lane-health drift exit 2" "[ $rc -eq 2 ]"
-expect "lane-health drift line carries all 3 keys" \
-  "grep -qE '  lane-health  testlane  host=drift:manager-env:TMPDIR,tmp-usage:/tmp,path:autobuilder$' <<<'$out'"
+D="$T/ls-drift"; mkdir -p "$D/journal"
+JF2="$D/journal/$(date -u +%F).md"
+LANE_STATUS_HOST_CONTRACT_CHECK=1 HOST_CONTRACT_SH="$FAKE_HC" FAKE_HC_MODE=drift \
+  "$LS" tick-summary testlane 3 1 "$JF2" >/dev/null
+expect "AC6 drift: tick line carries all 3 keys" \
+  "grep -qE ' host=drift:manager-env:TMPDIR,tmp-usage:/tmp,path:autobuilder\$' '$JF2'"
+
+# ============================================================================
+# AC6 — flag unset (dispatch-selftest.sh's/lane-status-selftest.sh's own
+# shape): the fixture double is never consulted, line is byte-identical
+# to the pre-PRD shape (no trailing host= field at all).
+# ============================================================================
+D="$T/ls-off"; mkdir -p "$D/journal"
+JF3="$D/journal/$(date -u +%F).md"
+HOST_CONTRACT_SH="$FAKE_HC" FAKE_HC_MODE=drift "$LS" tick-summary testlane 3 1 "$JF3" >/dev/null
+expect "AC6 (flag off): tick line carries no host= field" \
+  "grep -qE '  lane-health  tick  claimed=3 skipped=1  \(lane=testlane\)  stashes=[0-9]+ oldest=[0-9]+h\$' '$JF3'"
 
 # ============================================================================
 # AC3 — select-tick.sh, lane=redbaron, critical drift: admits nothing,

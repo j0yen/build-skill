@@ -471,3 +471,59 @@ before any producer, journal carries `infra=host-drift:<keys>`, no
 `block`; flag unset (the shape every other selftest already runs under)
 -> the same fixture double is never even consulted, gate proceeds
 normally to the reviewer-auth-probe point next.
+
+## host-contract-lane-status-correction — 2026-09-18, PRD-build-host-contract
+
+Step 4 opened by deleting `scripts/lane-health.sh`, which step 2 had
+invented from a literal reading of this PRD's own engineering-target
+list ("`scripts/lane-health.sh` (tick health line)"). There never was a
+separate lane-health.sh script — "lane-health" is the label
+`scripts/lane-status.sh`'s pre-existing `cmd_tick_summary()` already
+writes to the journal (`<ts>  lane-health  tick  claimed=<n> skipped=<n>
+(lane=<lane>) ...`), called once per real tick from `dispatch.sh:421` —
+and `lane-status.sh report`'s own header already greps for exactly that
+shape (`grep '  lane-health  tick  '`, `scripts/lane-status.sh:391` pre-
+this-PRD). Requirement 3's "appends host=ok|drift:<csv> to its tick
+line" reads correctly once "its tick line" is recognized as THIS line,
+not a new one. Caught reading `cmd_report`'s existing grep pattern while
+building requirement 7 (below), not by any test failure — nothing yet
+depended on the wrong file, so nothing failed loud; this is exactly the
+kind of drift a review pass exists to catch before a downstream PRD
+starts depending on the wrong name.
+
+Fix: `cmd_tick_summary` gained a `host_status_field()` call appended to
+its own first printf, producing ` host=ok`/` host=drift:<csv>` only when
+`LANE_STATUS_HOST_CONTRACT_CHECK=1` (default off, same opt-in shape as
+`EXTEND_GATE_HOST_CONTRACT_CHECK` — see host-contract-gate-integration
+above) and `hostname=redbaron`; empty otherwise, so a disabled check
+leaves the line byte-identical to its pre-PRD shape (verified: `git
+stash` this file back to HEAD, `lane-status-selftest.sh` and
+`cargo-budget-selftest.sh`'s own exact-string assertion on that line
+pass identically either way). `dispatch.sh` — the one real caller — sets
+the flag. `scripts/host-contract-tick-selftest.sh`'s "lane-health.sh"
+cases were rewritten against `lane-status.sh tick-summary` directly
+(flag-on ok, flag-on drift, flag-off no-field), plus a manual `dispatch-
+selftest.sh` re-run confirmed the live systemd-unit dispatch path is
+unaffected.
+
+Requirement 7 (P1): `lane-status.sh report` gained a `== host contract:
+drifted keys ==` section — always on (a manual operator command, not a
+hot tick path, so no opt-in flag), `host-contract.sh check --fast` (no
+auth-probe spend on every `report` call), one line per drifted key with
+its operator command (`self-heal: host-contract.sh apply <key>` for a
+self-heal-owned key, the exact `apply`-printed command for an
+operator-owned one).
+
+Requirement 5's second clause (verdict-receipts.sh "accepts host-drift
+as an infra kind"): confirmed by direct reading that `scan_line()` has
+no infra-kind allowlist at all today — it only checks the five reserved
+words (bisected/reproducible/flaky-infra/unreachable/deferred), none of
+which `infra=host-drift:<key>` or `outcome=incomplete` ever trip. Nothing
+to change in code; a header comment now says so explicitly, next to the
+reserved-words list, so a future reader does not go looking for
+enforcement that was never needed.
+
+Directive 15 ("Host contract") added to `docs/branch-contract.md`
+(requirement 6, P1): a branch agent that hits a host fault mid-dispatch
+runs `host-contract.sh check` itself, reports `host-drift:<key>`, and
+stops `needs-user` — never patches the caller that tripped over it.
