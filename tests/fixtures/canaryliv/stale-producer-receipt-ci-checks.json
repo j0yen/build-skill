@@ -1,0 +1,17 @@
+{
+  "_comment": "Recorded from the 2026-09-18 04:36Z burst canary run (box 166412876, head=f59b60b3) -- PRD-build-burst-canary-live-parity R10, grounding for R2/R5 (gate exit code recorded but never decisive). This IS a real producer receipt (ci-checks, not a per-commit baseline file), but captured_at 2026-09-17T15:30:28Z predates the 04:36Z launch by over 12 hours and route:local -- the run's own ci-checks producer never executed (the gate died wait-lost in ~1s), so this stale block verdict from an unrelated earlier gate is what the old `[ rc -eq 0 ] || verdict=block` rule counted. Real values unmodified; only this _comment key was added.",
+  "schema": "autobuilder.ci_checks_receipt.v1",
+  "head_sha": "ed102dc4e0ba87e350c47fbb3eeecceb21f04239",
+  "repo": "",
+  "run_count": 0,
+  "success_count": 0,
+  "failure_count": 0,
+  "pending_count": 0,
+  "runs": [],
+  "verdict": "block",
+  "scope_deferred": false,
+  "skip_reason": "no-landing-record",
+  "captured_at": "2026-09-17T15:30:28Z",
+  "receipt_digest": "",
+  "route": "local"
+}

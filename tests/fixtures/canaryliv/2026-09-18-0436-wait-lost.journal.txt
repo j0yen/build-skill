@@ -1,0 +1,41 @@
+# recorded-from: 2026-09-18T04:36Z burst canary run on box 166412876, head=f59b60b3
+# (PRD-build-burst-canary-live-parity R10) -- ~/brain/journal/build/2026-09-18.md
+# and ~/brain/journal/build/burst-lane.log, verbatim, unredacted (no secrets in
+# these lines). This is the run the PRD's TL;DR/Problem-statement cites as
+# costing 21 minutes / EUR 0.18 and producing zero evidence: a baseline that
+# died wait-lost in 1s, a synthetic-slug verdict that can never pass, and 83
+# route=local receipts the aggregator called "present".
+#
+# ---- ~/brain/journal/build/2026-09-18.md (canary-baseline-1789706161 wait-lost) ----
+2026-09-18T04:36:02Z  canary-baseline-1789706161  gate  launched (unit=gate-canary-baseline-1789706161-f59b60b.service head=f59b60b35f0382506e3ee0e776be92724bee4841 scope=main)
+2026-09-18T04:36:02Z  gate  patience  (crate=mcphost depth=0 wall_est=600 patience=90)
+2026-09-18T04:36:03Z  canary-baseline-1789706161  gate  wait-lost (unit=gate-canary-baseline-1789706161-f59b60b.service)
+2026-09-18T04:36:03Z  canary-main-1789706163  gate  launched (unit=gate-canary-main-1789706163-f59b60b.service head=f59b60b35f0382506e3ee0e776be92724bee4841 scope=main)
+2026-09-18T04:36:03Z  gate  patience  (crate=mcphost depth=0 wall_est=600 patience=90)
+2026-09-18T04:36:04Z  canary-main-1789706163  gate  wait-lost (unit=gate-canary-main-1789706163-f59b60b.service)
+2026-09-18T04:36:08Z  canary-branch-1789706168  gate  launched (unit=gate-canary-branch-1789706168-2a52d0f.service head=2a52d0f805fee550d1cc92fe648836c9a3891a1c scope=branch)
+2026-09-18T04:36:09Z  gate  patience  (crate=burst-canary-branch.d6EpJb depth=0 wall_est=600 patience=90)
+2026-09-18T04:36:43Z  operator  canary-launch  (unit=burst-canary-0436 head=f59b60b variants=main,branch,delta box=166412876 log=state/burst-lane/canary-operator-0918T0436.log; Joe 2026-09-18 ~12:05 AM EDT "your goal is to get burst up on casper")
+#
+# ---- ~/brain/journal/build/burst-lane.log (the full 04:36Z canary run) ----
+2026-09-18T04:34:44Z  burst-lane  up  canary-diverged  (verdict=missing server_id=166412876)
+2026-09-18T04:34:55Z  burst-lane  verify  ok  (rsync+cargo+uv+python3+sandbox all real)
+2026-09-18T04:34:55Z  burst-lane  parity  scheduled  (repo=mcphost session=166412876)
+2026-09-18T04:34:55Z  burst-lane.sh  probe  failed  (name=parity rc=127 err="setsid: failed to execute cmd_parity: No such file or directory" log=/home/jsy/.claude/skills/build/state/burst-lane/logs/probe/parity.1789706095.log)
+2026-09-18T04:34:55Z  burst-lane.sh  probe  bg-exit  (name=parity rc=127)
+2026-09-18T04:36:01Z  burst-lane  canary  baseline  building  (head=f59b60b35f0382506e3ee0e776be92724bee4841)
+2026-09-18T04:36:03Z  burst-lane  canary  baseline  built  (head=f59b60b35f0382506e3ee0e776be92724bee4841 rc=1)
+2026-09-18T04:36:08Z  burst-lane  canary  main  block  (head=f59b60b35f0382506e3ee0e776be92724bee4841 receipts=83 diverged=0 route=burst:166412876)
+2026-09-18T04:36:43Z  burst-lane  canary  refused  (cause=inflight)
+2026-09-18T04:36:46Z  burst-lane  run  routed  (server_id=166412876 worktree=/mnt/data/jsy/tmp/burst-canary-branch.d6EpJb runs_served=1 exit=0 dirty=1 kind=target bytes_saved=0 slug=gate-burst-canary-branch.d6EpJb wall_s=5.296 concurrent=1/6 warm=false phase=n/a)
+2026-09-18T04:36:55Z  burst-lane  pull  cold  (worktree=/mnt/data/jsy/tmp/burst-canary-branch.d6EpJb session_id=166412876 remote_path=/home/build/build/burst-canary-branch.d6EpJb-cb93ee16 trigger=local-read cause=remote-target-missing — nothing was built on the box for this marker)
+2026-09-18T04:37:29Z  burst-lane  run-slot-cap  deprecated-knob  (old=BURST_CORES_PER_BRANCH new=BURST_CORES_PER_RUN)
+2026-09-18T04:37:29Z  burst-lane  run-slot-cap  deprecated-knob  (old=BURST_GB_PER_BRANCH new=BURST_GB_PER_RUN)
+2026-09-18T04:37:29Z  burst-lane  run-slot-cap  deprecated-knob  (old=BURST_GB_DISK_PER_BRANCH new=BURST_GB_DISK_PER_RUN)
+2026-09-18T04:37:29Z  burst-lane  sub-cap  computed  (burst: sub-cap=4 (avail_gb=59 nproc=16 free_disk_gb=376) local=0)
+2026-09-18T04:37:51Z  burst-lane  run  routed  (server_id=166412876 worktree=/mnt/data/jsy/tmp/burst-canary-branch.d6EpJb runs_served=2 exit=0 dirty=1 kind=target bytes_saved=0 slug=gate-burst-canary-branch.d6EpJb wall_s=27.191 concurrent=1/6 warm=false phase=n/a)
+2026-09-18T04:41:10Z  burst-lane  run  routed  (server_id=166412876 worktree=/mnt/data/jsy/tmp/burst-canary-branch.d6EpJb runs_served=3 exit=0 dirty=1 kind=target bytes_saved=0 slug=gate-burst-canary-branch.d6EpJb wall_s=165.763 concurrent=1/6 warm=true phase=n/a)
+2026-09-18T04:41:47Z  burst-lane  run  routed  (server_id=166412876 worktree=/mnt/data/jsy/tmp/burst-canary-branch.d6EpJb runs_served=4 exit=0 dirty=1 kind=target bytes_saved=0 slug=gate-burst-canary-branch.d6EpJb wall_s=3.254 concurrent=1/6 warm=true phase=n/a)
+2026-09-18T04:57:35Z  burst-lane  canary  branch  block  (head=2a52d0f805fee550d1cc92fe648836c9a3891a1c receipts=7 diverged=0 route=burst:166412876)
+2026-09-18T04:57:35Z  burst-lane  canary  delta  pass  (head=f59b60b35f0382506e3ee0e776be92724bee4841 baseline=present route=burst:166412876)
+2026-09-18T04:57:35Z  burst-lane  canary  cost  (eur=0.1827 minutes=21)

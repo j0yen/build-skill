@@ -1,0 +1,20 @@
+{
+  "_comment": "Recorded from the 2026-09-18 04:36Z burst canary run (box 166412876, head=f59b60b3) -- PRD-build-burst-canary-live-parity R10, grounding for R2/R3's fail-closed baseline. This is one of the 57 per-commit `baseline` receipts (40-hex filename = the commit sha it was captured against, NOT a producer name) that canary_build_baseline copied into state/burst-lane/canary-baseline/<head>/receipts/ and counted as \"present\" -- captured_at is 2026-09-10T03:01:06Z, eight days before the 04:36Z launch it was credited to, and route:local (it never touched the burst box). Byte-identical to the copy this same run wrote into state/burst-lane/canary-runs/1789706163-main/receipts/ (gate-receipt-diff.sh printed `same` for it and 82 others, mistaken for agreement instead of one stale file copied twice). Real values unmodified; only this _comment key was added.",
+  "ac_passing_count": 19,
+  "ac_total_count": 19,
+  "audit": {
+    "advisory_count": 2,
+    "blocking_count": 0
+  },
+  "captured_at": "2026-09-10T03:01:06Z",
+  "clippy_warning_count": 0,
+  "head_sha": "0537cac312e4ab8753880a1f3c0292cd739628a7",
+  "iteration": 0,
+  "metric_name": "acceptance_tests_passing_count",
+  "metric_value": 19.0,
+  "previous_metric_value": 19.0,
+  "receipt_digest": "sha256:422beec2e5e2952eb3d8f7953ecee9dc4e8716651f563ac62e6120e7ffc0810a",
+  "schema": "autobuilder.iteration_receipt.v1",
+  "verdict": "baseline",
+  "route": "local"
+}
