@@ -28,4 +28,4 @@ bench-delta
 msrv-verify
 hermetic-build
 determinism
-semver-check
+# semver-check — removed 2026-09-18 (operator): git-show + syn only, never spawns cargo (extended-gates lib.rs no-shell-out); it can never attest and always false-blocked R15
