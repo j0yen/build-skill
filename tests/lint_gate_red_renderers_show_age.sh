@@ -14,25 +14,34 @@
 #
 # Scans scripts/*.sh and scripts/lib/*.sh (excluding *selftest*, *.bak-*
 # files, and lib/gate-red-age.sh itself -- the helper's own home) for any
-# non-comment line containing the literal substring `gate-red.summary` or
-# `gate-red.json`. Each such line is a SITE.
+# non-comment line containing the literal substring `gate-red.summary`,
+# `gate-red.json`, or (PRD-buildloop-tick-outcome-liveness AC14)
+# `tick-outcome.json` -- the record `tick-run.sh` writes every tick and
+# `loop-liveness.sh`/`handoff-header.sh`/`gates-banner.sh` render a
+# "when did the loop last succeed" line from, the same staleness-hiding
+# bug class gate-red.summary/.json already had: a renderer that prints
+# `last_ok=...` without an age is exactly how a dead loop reads alive.
+# Each such line is a SITE.
 #
 # A site passes if:
 #   (a) its FILE, anywhere, both sources lib/gate-red-age.sh (a `source`/
 #       `.` line naming gate-red-age.sh) AND calls gate_red_age_note or
 #       gate_red_age_s -- once a file has adopted the helper, every
-#       gate-red.summary/.json reference in it is presumed downstream of
-#       that adoption (gates-banner.sh, handoff-header.sh, gate-red-
-#       tick.sh all reference the filename several times each -- in a
-#       cache-path default, a remote ssh command string, a doc comment --
-#       and re-marking every one individually would be noise, not signal);
+#       gate-red.summary/.json/tick-outcome.json reference in it is
+#       presumed downstream of that adoption (gates-banner.sh,
+#       handoff-header.sh, gate-red-tick.sh, loop-liveness.sh all
+#       reference the filename several times each -- in a cache-path
+#       default, a remote ssh command string, a doc comment -- and
+#       re-marking every one individually would be noise, not signal);
 #   (b) OR the line itself carries the trailing marker
 #       `# lint:gate-red-not-rendered` with a reason -- for a producer or
 #       a machine consumer that intentionally never renders the state as
 #       a human-facing "current" line (gate-red-summary.sh itself,
-#       manifest-invariants.sh's retraction-consistency check, day-
-#       ledger.sh's machine ledger record, gate-status.sh's --red JSON
-#       passthrough).
+#       manifest-invariants.sh's retraction-consistency check (both the
+#       gate-red-archived class and, since AC14, the loop-tick-stale
+#       class), day-ledger.sh's machine ledger record, gate-status.sh's
+#       --red JSON passthrough, tick-run.sh's own tick-outcome.json
+#       write -- a writer, not a renderer).
 #
 # --extra <path> [<path> ...]: scan additional files (outside scripts/)
 # with the same two rules, plus a third: the marker
@@ -74,7 +83,7 @@ args = [a for a in sys.argv[1:] if a]
 root = args[0] if args else "."
 extra = args[1:]
 
-REF_RE = re.compile(r'gate-red\.summary|gate-red\.json')
+REF_RE = re.compile(r'gate-red\.summary|gate-red\.json|tick-outcome\.json')
 SOURCE_RE = re.compile(r'gate-red-age\.sh')
 CALL_RE = re.compile(r'\bgate_red_age_(?:note|s)\b')
 MARKER_NOT_RENDERED = "# lint:gate-red-not-rendered"

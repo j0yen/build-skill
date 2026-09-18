@@ -84,7 +84,7 @@ RECONCILE_PY="${TICK_RECONCILE_PY:-$SKILL_DIR/scripts/tick-reconcile.py}"
 SELECT_TICK_STATE_DIR="${SELECT_TICK_STATE_DIR:-$STATE_DIR/select-tick}"
 # PRD-buildloop-tick-outcome-liveness R1: the one outcome record a tick
 # ever writes, whatever happened to its child.
-TICK_OUTCOME_FILE="${TICK_OUTCOME_FILE:-$STATE_DIR/tick-outcome.json}"
+TICK_OUTCOME_FILE="${TICK_OUTCOME_FILE:-$STATE_DIR/tick-outcome.json}"  # lint:gate-red-not-rendered -- writer, not a renderer; loop-liveness.sh/handoff-header.sh/gates-banner.sh render age from the record this writes
 # PRD-buildloop-tick-outcome-liveness R8: append-only history of every
 # record write_tick_outcome makes, one compact line per tick, rotated at
 # 30 days -- day-ledger.sh's own source for ticks_failed/causes/

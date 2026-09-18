@@ -66,7 +66,7 @@ REQUEUE_PRD="${REQUEUE_PRD:-$HERE/requeue-prd.sh}"
 LANE_CLAIM="${LANE_CLAIM:-$HERE/lane-claim.sh}"
 GATE_RED_JSON="${GATE_RED_JSON:-$STATE_DIR/gate-red.json}"  # lint:gate-red-not-rendered -- consumed only for retraction-consistency (red_slugs vs manifest status); never renders gate-red counts/summary as current state
 # PRD-buildloop-tick-outcome-liveness R7: tick-run.sh's own R1 artifact.
-TICK_OUTCOME_FILE="${TICK_OUTCOME_FILE:-$STATE_DIR/tick-outcome.json}"
+TICK_OUTCOME_FILE="${TICK_OUTCOME_FILE:-$STATE_DIR/tick-outcome.json}"  # lint:gate-red-not-rendered -- consumed only for the loop-tick-stale alarm check below; never renders last_ok as current state
 LOOP_TICK_STALE_TIMER="${LOOP_TICK_STALE_TIMER:-claude-build.timer}"
 LOOP_TICK_STALE_MULTIPLE="${LOOP_TICK_STALE_MULTIPLE:-3}"
 LOOP_TICK_STALE_DEFAULT_INTERVAL_S="${LOOP_TICK_STALE_DEFAULT_INTERVAL_S:-300}"
@@ -514,7 +514,7 @@ except (OSError, ValueError, KeyError):
     stale = True  # armed timer + no readable record at all is also stale
 if stale:
     print(json.dumps([{"slug": "build-loop", "class": "loop-tick-stale",
-                        "message": "tick-outcome.json age=" + (str(age) + "s" if age is not None else "unknown")
+                        "message": "tick-outcome.json age=" + (str(age) + "s" if age is not None else "unknown")  # lint:gate-red-not-rendered -- alarm message text, not a "current state" renderer
                                    + " exceeds " + str(stale_after) + "s (timer=" + sys.argv[3] + " active)"}]))
 else:
     print("[]")

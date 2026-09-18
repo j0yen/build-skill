@@ -3557,6 +3557,32 @@ streak=<n> last_ok=<ts>`), skipping it entirely when `cause` is
 double-paged). The first `ok` tick after a delivered alarm resolves it
 (`alert-deliver.sh resolve loop-tick-failed build-loop`).
 
+**Drill: proving the auth-expired path against the real binary
+(PRD-buildloop-tick-outcome-liveness AC16).** A fixture coordinator that
+prints a canned `Failed to authenticate` line and exits 1 proves
+`lib/tick-cause.sh`'s regex today; it can't prove the real `claude`
+binary's real failure text still matches it. On the build host (RedBaron
+— see `LOOP_ARM_BUILD_HOST`), run `scripts/loop-arm-drill.sh` — one
+command, operator-run, never called from a tick. It points the real
+`claude` binary's `HOME` and `CLAUDE_CODE_OAUTH_TOKEN` at a throwaway
+directory (this host's real `~/.claude` credentials are never read,
+written, or touched) and gives it a plain, non-slash-command prompt (an
+unrecognized `/build` is resolved locally by the CLI before any auth
+check runs, which would misclassify as `other`), runs three ticks this
+way against real production state, and asserts each one lands
+`cause=auth-expired` and the third delivers `ALARM loop-tick-failed
+… streak=3` to today's journal. It forces `NOTIFY_CMD=true` for the
+whole run (a drill is a practice run, not a real incident — the shipped
+default `NOTIFY_CMD` would otherwise file a real GitHub issue for it);
+the ALARM journal line and `alerts.banner` entry land regardless, since
+both are unconditional in `alert-deliver.sh`. The next real (unmodified)
+tick — already due within one `claude-build.timer` cycle — resolves the
+alarm on its own; `loop-arm-drill.sh --resolve-now` runs that one real
+tick immediately instead of waiting on the timer. Run once per drill
+need, not on a schedule — restoring afterward is automatic by
+construction (nothing durable was pointed at throwaway state except the
+child's own `HOME`, which is discarded after each of the three ticks).
+
 ## Local tool integration
 
 The tick has a small standard kit it reaches for. Prefer these over

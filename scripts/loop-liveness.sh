@@ -65,6 +65,12 @@ HOST="${LOOP_LIVENESS_HOST:-$(hostname -s 2>/dev/null || hostname 2>/dev/null ||
 # own state/ dir, a different tree entirely.
 TICK_OUTCOME_FILE="${TICK_OUTCOME_FILE:-${BUILD_STATE_DIR:-$SKILL_DIR/state}/tick-outcome.json}"
 JQ="${JQ:-$(command -v jq 2>/dev/null || echo /usr/bin/jq)}"
+# PRD-buildloop-tick-outcome-liveness AC14: reuse the shared age helper
+# (lib/gate-red-age.sh's gate_red_age_s) for last_ok_age below instead of
+# hand-rolling the same epoch math a second time -- same helper
+# lib/loop-line.sh already uses for handoff-header.sh/gates-banner.sh.
+# shellcheck source=lib/gate-red-age.sh
+source "$HERE/lib/gate-red-age.sh"
 
 mode="plain"
 while [ $# -gt 0 ]; do
@@ -106,11 +112,20 @@ tick_outcome_line() {
   fi
   case "$streak_failed" in ''|*[!0-9]*) streak_failed=0 ;; esac
 
+  # AC14: last_ok_ts is the last SUCCESS time, not tick-outcome.json's own
+  # .ts (the tick's write time) -- gate_red_age_s can't be pointed at the
+  # real file directly, so feed it a synthetic one-line {"ts": ...} temp
+  # file, same technique lib/loop-line.sh uses for the same reason.
   local age="unknown"
-  if [ -n "$last_ok_ts" ]; then
-    local epoch
-    epoch="$(date -u -d "$last_ok_ts" +%s 2>/dev/null)"
-    [ -n "$epoch" ] && age=$(( $(date -u +%s) - epoch ))
+  if [ -n "$last_ok_ts" ] && [ -x "$JQ" ]; then
+    local synth
+    synth="$(mktemp --suffix=.json 2>/dev/null)" && {
+      "$JQ" -nc --arg ts "$last_ok_ts" '{ts:$ts}' > "$synth" 2>/dev/null
+      local s
+      s="$(gate_red_age_s "$synth")"
+      [ "$s" -ge 0 ] 2>/dev/null && age="$s"
+      rm -f "$synth" 2>/dev/null
+    }
   fi
 
   if [ "$streak_failed" -ge 2 ]; then
