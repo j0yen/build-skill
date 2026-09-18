@@ -70,8 +70,30 @@ expect "case C: exit 1"                              "1" "$rc_c"
 expect "case C: stdout empty"                        "" "$out_c"
 expect "case C: stderr names AC4"                    "AC4: not paired (and not declared deferred)" "$err_c"
 
+# ---- PRD-build-prd-superseded-by AC8: Transferred: block + Receipts:
+# transferred=<n> on a predecessor with Superseded-by:/transferred_acs: --
+FIXTURE_SBY_PRED="$HERE/fixtures/PRD-fixture-trailer-sby-pred.md"
+[ -r "$FIXTURE_SBY_PRED" ] || { echo "archive-trailer: $FIXTURE_SBY_PRED missing" >&2; exit 2; }
+out_sby="$("$GEN" "$FIXTURE_SBY_PRED" --paired 1='tests/direct.rs::case' 2>/dev/null)"
+rc_sby=$?
+expect "AC8: exit 0"                                 "0" "$rc_sby"
+if ! printf '%s\n' "$out_sby" | grep -qF 'Transferred: 1 ACs → PRD-fixture-trailer-sby-succ [2→5]'; then
+  echo "FAIL AC8: Transferred line" >&2
+  printf '%s\n' "$out_sby" >&2
+  fail=1
+else
+  echo "ok  AC8: Transferred line"
+fi
+if ! printf '%s\n' "$out_sby" | grep -qF 'Receipts: transferred=1'; then
+  echo "FAIL AC8: Receipts transferred=1" >&2
+  printf '%s\n' "$out_sby" >&2
+  fail=1
+else
+  echo "ok  AC8: Receipts transferred=1"
+fi
+
 if [ "$fail" -ne 0 ]; then
   echo "FAIL: one or more assertions failed" >&2
   exit 1
 fi
-echo "ok  archive-trailer: all 14 assertions green"
+echo "ok  archive-trailer: all 14 assertions green + AC8 superseded-by"

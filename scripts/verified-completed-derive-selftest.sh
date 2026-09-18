@@ -426,6 +426,71 @@ ck "AC12 real-box AC beats an unrelated sibling's same-numbered bare file (PAIRE
 ck "AC12 AC1 (plain declared-prefix, no file, not real-box) still MISSING (rule unaffected for non-tagged ACs)" \
   'printf "%s\n" "$out" | awk -F"\t" "\$1==1{print \$4}" | grep -qx MISSING'
 
+# ---- PRD-build-prd-superseded-by AC6/AC7: TRANSFERRED classification and
+# absorbed-ac-cannot-defer -- --no-derive/--paired mode, since these two
+# checks are about the classification bucket itself, not real-test
+# derivation. Predecessor pred-x transfers its AC2 to succ-y's AC5 (map on
+# the successor per Technical considerations); succ-y separately declares
+# AC5 in its own deferred_acs to prove the archive-time refusal. -----------
+cat > "$T/prds/PRD-sby-pred-x.md" <<'EOF'
+# PRD: sby-pred-x fixture
+Status: Draft v0.1
+build_target: shell
+Superseded-by: PRD-sby-succ-y.md
+transferred_acs: [2]
+
+## Acceptance criteria
+
+1. P0 — Given a, When b, Then c.
+2. P0 — Given a, When b, Then c.
+EOF
+cat > "$T/prds/PRD-sby-succ-y.md" <<'EOF'
+# PRD: sby-succ-y fixture
+Status: Draft v0.1
+build_target: shell
+Absorbs: PRD-sby-pred-x.md [2:5]
+deferred_acs: [5]
+mock_justifications: AC5 fixture only.
+
+## Acceptance criteria
+
+1. P0 — Given a, When b, Then c.
+2. P0 — Given a, When b, Then c.
+3. P0 — Given a, When b, Then c.
+4. P0 — Given a, When b, Then c.
+5. P0 — Given a, When b, Then c.
+EOF
+cat > "$T/prds/PRD-sby-succ-y-clean.md" <<'EOF'
+# PRD: sby-succ-y-clean fixture (no deferral -- clean archive path)
+Status: Draft v0.1
+build_target: shell
+Absorbs: PRD-sby-pred-x.md [2:5]
+
+## Acceptance criteria
+
+1. P0 — Given a, When b, Then c.
+2. P0 — Given a, When b, Then c.
+3. P0 — Given a, When b, Then c.
+4. P0 — Given a, When b, Then c.
+5. P0 — Given a, When b, Then c.
+EOF
+
+out="$("$VC" "$T/prds/PRD-sby-pred-x.md" --no-derive --paired 1 --format table 2>/dev/null)"; rc=$?
+ck "AC6 predecessor exit 0 (transferred AC never blocks archive)" '[ "$rc" -eq 0 ]'
+ck "AC6 AC2 classification TRANSFERRED" \
+  'printf "%s\n" "$out" | awk -F"\t" "\$1==2{print \$4}" | grep -qx TRANSFERRED'
+out_text="$("$VC" "$T/prds/PRD-sby-pred-x.md" --no-derive --paired 1 2>/dev/null)"
+ck "AC6 plain-text prints TRANSFERRED -> PRD-sby-succ-y.md#5" \
+  'printf "%s\n" "$out_text" | grep -qF "AC2: TRANSFERRED"'
+
+out="$("$VC" "$T/prds/PRD-sby-succ-y.md" --no-derive --paired 1,2,3,4 --format table 2>/dev/null)"; rc=$?
+ck "AC7 successor with absorbed AC deferred: exit 1" '[ "$rc" -eq 1 ]'
+ck "AC7 AC5 classification absorbed-ac-cannot-defer" \
+  'printf "%s\n" "$out" | awk -F"\t" "\$1==5{print \$4}" | grep -qx absorbed-ac-cannot-defer'
+
+out="$("$VC" "$T/prds/PRD-sby-succ-y-clean.md" --no-derive --paired 1,2,3,4,5 --format table 2>/dev/null)"; rc=$?
+ck "AC7 successor with absorbed AC PAIRED (not deferred): exit 0" '[ "$rc" -eq 0 ]'
+
 echo "----"
 echo "verified-completed-derive-selftest: pass=$PASS fail=$FAIL"
 [ "$FAIL" -eq 0 ]

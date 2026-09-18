@@ -591,6 +591,60 @@ while IFS= read -r n; do
   esac
 done < <("$JQ" -r '.[]?' <<<"$deferred")
 
+# PRD-build-prd-superseded-by requirement 4: a `Superseded-by:`+
+# `transferred_acs:` AC is a third classification, TRANSFERRED, never
+# PAIRED (no test proves it here) and never DEFERRED (the no-defer-live
+# rule and deferred_ac_reasons validation stay untouched -- Technical
+# considerations). The successor AC number it prints comes from the
+# SUCCESSOR's own `Absorbs:` map (Technical considerations: the map lives
+# there since its AC numbers are the ones still free to change before
+# dispatch), so it's cross-read the same way prd-lint.sh's superseded-by
+# checks do -- an unmapped transferred AC (lint should have already caught
+# it) falls through to the ordinary MISSING/DEFERRED handling below rather
+# than being silently accepted.
+declare -A is_transferred=() transferred_target=()
+superseded_by="$("$JQ" -r --arg s "$slug" '.[] | select(.slug==$s) | .superseded_by // empty' <<<"$json")"
+transferred_raw="$("$JQ" -c --arg s "$slug" '.[] | select(.slug==$s) | .transferred_acs // []' <<<"$json")"
+[ -n "$transferred_raw" ] || transferred_raw="[]"
+if [ -n "$superseded_by" ] && [ "$transferred_raw" != "[]" ]; then
+  succ_dir=""
+  for d in "$prd_dir" "$prd_dir/../build-queue" "$prd_dir/../built-prds"; do
+    [ -f "$d/$superseded_by" ] && { succ_dir="$(cd "$d" && pwd)"; break; }
+  done
+  if [ -n "$succ_dir" ]; then
+    succ_json="$(PRD_DIR="$succ_dir" "$SCAN" 2>/dev/null)"
+    succ_slug="${superseded_by#PRD-}"; succ_slug="${succ_slug%.md}"
+    absorbs_map="$("$JQ" -c --arg s "$succ_slug" '.[] | select(.slug==$s) | .absorbs.map // []' <<<"$succ_json" 2>/dev/null)"
+    [ -n "$absorbs_map" ] || absorbs_map="[]"
+    while IFS=$'\t' read -r p s; do
+      [ -n "$p" ] || continue
+      transferred_target[$p]="${superseded_by}#${s}"
+    done < <("$JQ" -r '.[]? | "\(.[0])\t\(.[1])"' <<<"$absorbs_map" 2>/dev/null)
+  fi
+  while IFS= read -r n; do
+    case "$n" in
+      ''|*[!0-9]*) continue ;;
+      *) [ -n "${transferred_target[$n]:-}" ] && is_transferred[$n]=1 ;;
+    esac
+  done < <("$JQ" -r '.[]?' <<<"$transferred_raw")
+fi
+
+# PRD-build-prd-superseded-by requirement 7: on a SUCCESSOR (this file
+# carries its own `Absorbs:` line), every AC number the map targets is
+# required -- deferring one is refused with absorbed-ac-cannot-defer,
+# same diagnostic id prd-lint.sh's lint-time check uses, here as the
+# archive-time belt to that lint-time suspenders.
+declare -A absorbed_cannot_defer=()
+absorbs_own="$("$JQ" -c --arg s "$slug" '.[] | select(.slug==$s) | .absorbs // null' <<<"$json")"
+if [ "$absorbs_own" != "null" ] && [ -n "$absorbs_own" ]; then
+  while IFS= read -r s; do
+    case "$s" in
+      ''|*[!0-9]*) continue ;;
+      *) [ -n "${is_deferred[$s]:-}" ] && absorbed_cannot_defer[$s]=1 ;;
+    esac
+  done < <("$JQ" -r '.map[]?[1]' <<<"$absorbs_own" 2>/dev/null)
+fi
+
 # `(Live` tagging (PRD-build-live-ac-no-defer R4): which written AC numbers
 # carry the "(Live" marker AND belong to a loop-tooling PRD (build_into
 # under scripts/loop-tooling-repos.txt) — keyed by the literal AC number on
@@ -1502,6 +1556,8 @@ failing=()
 collisions=()
 live_deferred=()
 live_unproven=()
+transferred=()
+absorbed_defer_conflicts=()
 results=()
 for ((i=1; i<=num_acs; i++)); do
   if [ -n "${is_paired[$i]:-}" ]; then
@@ -1511,6 +1567,12 @@ for ((i=1; i<=num_acs; i++)); do
     else
       cls=PAIRED
     fi
+  elif [ -n "${absorbed_cannot_defer[$i]:-}" ]; then
+    cls=absorbed-ac-cannot-defer
+    absorbed_defer_conflicts+=("$i")
+  elif [ -n "${is_transferred[$i]:-}" ]; then
+    cls=TRANSFERRED
+    transferred+=("$i")
   elif [ -n "${live_ac_deferred[$i]:-}" ]; then
     # PRD-build-live-ac-no-defer R4: a deferred `(Live` AC on a loop-tooling
     # PRD is its own classification, never the ordinary DEFERRED bucket
@@ -1604,6 +1666,12 @@ elif [ "$doctor" = true ]; then
       MISSING)
         printf 'AC%s: %-8s — %s\n' "$n" "$cls" "(not paired, not deferred)"
         ;;
+      TRANSFERRED)
+        printf 'AC%s: %-8s — %s\n' "$n" "$cls" "${transferred_target[$n]:-?}"
+        ;;
+      absorbed-ac-cannot-defer)
+        printf 'AC%s: %-8s — mapped by this PRD'\''s own Absorbs: but also in deferred_acs\n' "$n" "$cls"
+        ;;
     esac
   done
 else
@@ -1611,6 +1679,9 @@ else
     n="${line%% *}"; cls="${line#* }"
     if [ "$cls" = "ac-number-collision" ]; then
       echo "AC$n: $cls (matched ${collision_path[$n]:-?}, which belongs to PRD ${collision_owner_slug[$n]:-?})"
+    elif [ "$cls" = "TRANSFERRED" ]; then
+      # PRD-build-prd-superseded-by AC6: literal `TRANSFERRED → PRD-<succ>#<s>`.
+      echo "AC$n: TRANSFERRED → ${transferred_target[$n]:-?}"
     else
       echo "AC$n: $cls"
     fi
@@ -1618,7 +1689,8 @@ else
 fi
 
 if [ "${#missing[@]}" -gt 0 ] || [ "${#failing[@]}" -gt 0 ] || [ "${#collisions[@]}" -gt 0 ] \
-   || [ "${#live_deferred[@]}" -gt 0 ] || [ "${#live_unproven[@]}" -gt 0 ]; then
+   || [ "${#live_deferred[@]}" -gt 0 ] || [ "${#live_unproven[@]}" -gt 0 ] \
+   || [ "${#absorbed_defer_conflicts[@]}" -gt 0 ]; then
   for n in "${missing[@]}"; do
     echo "AC$n: not paired (and not declared deferred)" >&2
   done
@@ -1633,6 +1705,9 @@ if [ "${#missing[@]}" -gt 0 ] || [ "${#failing[@]}" -gt 0 ] || [ "${#collisions[
   done
   for n in "${live_unproven[@]}"; do
     echo "AC$n: live-ac-unproven (evidence not found: ${ac_live_evidence[$n]:-(no evidence: clause on the AC line)})" >&2
+  done
+  for n in "${absorbed_defer_conflicts[@]}"; do
+    echo "AC$n: absorbed-ac-cannot-defer (an Absorbs: map target can never appear in deferred_acs)" >&2
   done
   exit 1
 fi

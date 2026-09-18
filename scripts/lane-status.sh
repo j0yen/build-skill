@@ -33,6 +33,9 @@ STATE_DIR="${BUILD_STATE_DIR:-$SKILL_DIR/state}"
 GATE_STATUS="${GATE_STATUS:-$HERE/gate-status.sh}"
 # PRD-build-flow-ledger P1 requirement 7 / AC8: the last-24h flow medians line.
 FLOW_LEDGER="${FLOW_LEDGER:-$HERE/flow-ledger.sh}"
+# PRD-build-prd-superseded-by P1 requirement 8 / AC12: superseded chain count.
+SCAN_PRDS="${SCAN_PRDS:-$HERE/scan-prds.sh}"
+JQ="${JQ:-$(command -v jq || echo /usr/sbin/jq)}"
 
 die() { echo "lane-status: $*" >&2; exit "${2:-4}"; }
 usage() { echo "usage: lane-status.sh {tick-summary|report} ..." >&2; exit 4; }
@@ -424,6 +427,17 @@ else:
     echo "${burst_line:-burst gate parity: unavailable (gate-status --parity failed)}"
   else
     echo "(gate-status.sh not found at $GATE_STATUS)"
+  fi
+
+  echo
+  echo "== superseded chains (PRD-build-prd-superseded-by) =="
+  if [ -x "$SCAN_PRDS" ] && [ -x "$JQ" ]; then
+    local sup_n
+    sup_n="$(PRD_DIR="$prd_dir" "$SCAN_PRDS" 2>/dev/null | "$JQ" -r '[.[] | select(.superseded_by != null)] | length' 2>/dev/null)"
+    [ -n "$sup_n" ] || sup_n=0
+    echo "superseded=$sup_n"
+  else
+    echo "(scan-prds.sh or jq not found)"
   fi
 
   echo

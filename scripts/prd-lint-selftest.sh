@@ -11,9 +11,10 @@ LINT="$HERE/prd-lint.sh"
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
-mkdir -p "$tmp/build-queue" "$tmp/built-prds" "$tmp/visions"
+mkdir -p "$tmp/build-queue" "$tmp/built-prds" "$tmp/parked" "$tmp/visions"
 q="$tmp/build-queue"
 b="$tmp/built-prds"
+p="$tmp/parked"
 v="$tmp/visions"
 
 echo "plain vision, no loop contract." > "$v/plain.md"
@@ -733,6 +734,201 @@ expect_fail "$q/PRD-ac-inflation-bold.md" ac-heading-inflation "ac-heading-infla
 
 expect_clean_no_id "$q/PRD-status-ok.md" failures ac-heading-inflation "ac-heading-inflation/pass"
 
+# ============================================================ Superseded-by / transferred_acs / Absorbs (PRD-build-prd-superseded-by AC2-5, AC10)
+
+# -- AC2: superseded-by-target-missing --------------------------------------
+cat > "$q/PRD-sup-missing.md" <<'EOF'
+- Status: queued
+- build_target: shell
+- Vision: visions/plain.md
+- Superseded-by: PRD-nowhere.md
+- transferred_acs: [1]
+
+## Acceptance criteria
+
+1. P0 — Given a, When b, Then c.
+EOF
+expect_fail "$q/PRD-sup-missing.md" superseded-by-target-missing "superseded-by-target-missing/fail"
+
+# -- superseded-by-target-parked --------------------------------------------
+cat > "$p/PRD-sup-parked-target.md" <<'EOF'
+- Status: parked
+- build_target: shell
+- Vision: visions/plain.md
+
+## Acceptance criteria
+
+1. P0 — Given a, When b, Then c.
+2. P0 — Given d, When e, Then f.
+EOF
+cat > "$q/PRD-sup-parked.md" <<'EOF'
+- Status: queued
+- build_target: shell
+- Vision: visions/plain.md
+- Superseded-by: PRD-sup-parked-target.md
+- transferred_acs: [1]
+
+## Acceptance criteria
+
+1. P0 — Given a, When b, Then c.
+EOF
+expect_fail "$q/PRD-sup-parked.md" superseded-by-target-parked "superseded-by-target-parked/fail"
+
+# -- superseded-by-cycle -----------------------------------------------------
+cat > "$q/PRD-sup-cycle-a.md" <<'EOF'
+- Status: queued
+- build_target: shell
+- Vision: visions/plain.md
+- Superseded-by: PRD-sup-cycle-b.md
+- transferred_acs: [1]
+
+## Acceptance criteria
+
+1. P0 — Given a, When b, Then c.
+EOF
+cat > "$q/PRD-sup-cycle-b.md" <<'EOF'
+- Status: queued
+- build_target: shell
+- Vision: visions/plain.md
+- Superseded-by: PRD-sup-cycle-a.md
+- transferred_acs: [1]
+
+## Acceptance criteria
+
+1. P0 — Given a, When b, Then c.
+EOF
+expect_fail "$q/PRD-sup-cycle-a.md" superseded-by-cycle "superseded-by-cycle/fail"
+
+# -- AC3: transferred-ac-unmapped --------------------------------------------
+cat > "$q/PRD-abs-succ-partial.md" <<'EOF'
+- Status: queued
+- build_target: shell
+- Vision: visions/plain.md
+- Absorbs: PRD-sup-unmapped.md [9:15]
+
+## Acceptance criteria
+
+1. P0 — Given a, When b, Then c.
+15. P0 — Given a, When b, Then c.
+EOF
+cat > "$q/PRD-sup-unmapped.md" <<'EOF'
+- Status: queued
+- build_target: shell
+- Vision: visions/plain.md
+- Superseded-by: PRD-abs-succ-partial.md
+- transferred_acs: [9, 10]
+
+## Acceptance criteria
+
+1. P0 — Given a, When b, Then c.
+EOF
+expect_fail "$q/PRD-sup-unmapped.md" transferred-ac-unmapped "transferred-ac-unmapped/fail"
+
+# -- AC1 clean pairing (also proves the pass side of AC3/AC9): every
+# transferred AC mapped, none unmapped -------------------------------------
+cat > "$q/PRD-abs-succ-clean.md" <<'EOF'
+- Status: queued
+- build_target: shell
+- Vision: visions/plain.md
+- Absorbs: PRD-sup-clean.md [9:15, 10:16]
+
+## Acceptance criteria
+
+1. P0 — Given a, When b, Then c.
+15. P0 — Given a, When b, Then c.
+16. P0 — Given a, When b, Then c.
+EOF
+cat > "$q/PRD-sup-clean.md" <<'EOF'
+- Status: queued
+- build_target: shell
+- Vision: visions/plain.md
+- Superseded-by: PRD-abs-succ-clean.md
+- transferred_acs: [9, 10]
+
+## Acceptance criteria
+
+1. P0 — Given a, When b, Then c.
+EOF
+expect_clean_no_id "$q/PRD-sup-clean.md" failures transferred-ac-unmapped "transferred-ac-unmapped/pass"
+expect_clean_no_id "$q/PRD-abs-succ-clean.md" failures absorbs-ac-missing "absorbs-ac-missing/pass"
+
+# -- AC4: transferred-live-ac-not-live ---------------------------------------
+cat > "$q/PRD-abs-succ-notlive.md" <<'EOF'
+- Status: queued
+- build_target: shell
+- Vision: visions/plain.md
+- Absorbs: PRD-sup-live.md [9:15]
+
+## Acceptance criteria
+
+1. P0 — Given a, When b, Then c.
+15. P0 — Given a, When b, Then c.
+EOF
+cat > "$q/PRD-sup-live.md" <<'EOF'
+- Status: queued
+- build_target: shell
+- Vision: visions/plain.md
+- Superseded-by: PRD-abs-succ-notlive.md
+- transferred_acs: [9]
+
+## Acceptance criteria
+
+1. P0 — Given a, When b, Then c.
+9. P0 — Given a, When b, Then c. (Live; evidence: fixture)
+EOF
+expect_fail "$q/PRD-sup-live.md" transferred-live-ac-not-live "transferred-live-ac-not-live/fail"
+
+# -- AC5: absorbs-ac-missing --------------------------------------------------
+cat > "$q/PRD-abs-missing.md" <<'EOF'
+- Status: queued
+- build_target: shell
+- Vision: visions/plain.md
+- Absorbs: PRD-sup-for-abs-missing.md [9:15]
+
+## Acceptance criteria
+
+1. P0 — Given a, When b, Then c.
+EOF
+cat > "$q/PRD-sup-for-abs-missing.md" <<'EOF'
+- Status: queued
+- build_target: shell
+- Vision: visions/plain.md
+- transferred_acs: [9]
+
+## Acceptance criteria
+
+1. P0 — Given a, When b, Then c.
+9. P0 — Given a, When b, Then c.
+EOF
+expect_fail "$q/PRD-abs-missing.md" absorbs-ac-missing "absorbs-ac-missing/fail"
+
+# -- AC10: absorbed-ac-cannot-defer -------------------------------------------
+cat > "$q/PRD-abs-defer-conflict.md" <<'EOF'
+- Status: queued
+- build_target: shell
+- Vision: visions/plain.md
+- Absorbs: PRD-sup-for-defer-conflict.md [9:15]
+- deferred_acs: [15]
+- mock_justifications: AC15 justified for fixture purposes only.
+
+## Acceptance criteria
+
+1. P0 — Given a, When b, Then c.
+15. P0 — Given a, When b, Then c.
+EOF
+cat > "$q/PRD-sup-for-defer-conflict.md" <<'EOF'
+- Status: queued
+- build_target: shell
+- Vision: visions/plain.md
+- transferred_acs: [9]
+
+## Acceptance criteria
+
+1. P0 — Given a, When b, Then c.
+9. P0 — Given a, When b, Then c.
+EOF
+expect_fail "$q/PRD-abs-defer-conflict.md" absorbed-ac-cannot-defer "absorbed-ac-cannot-defer/fail"
+
 # ============================================================ directory arg / --quiet / --format pass-fail (PRD-prd-contract-lint AC1, AC7)
 dirtest="$tmp/dirtest"
 mkdir -p "$dirtest/visions"
@@ -807,7 +1003,7 @@ SCAN_PRDS="$HERE/scan-prds.sh"
 # with prd-lint.sh's own fm.get("...")/"..." in fm checks, same
 # duplicate-and-comment convention prd-lint.sh itself uses for
 # RUST_SUBSTRATE_TARGETS mirroring substrate-probe.sh.
-KNOWN_LINT_KEYS="status build_target build_into deferred_acs mock_justifications deferred_ac_reasons depends_on vision loop operator_authorization grounding"
+KNOWN_LINT_KEYS="status build_target build_into deferred_acs mock_justifications deferred_ac_reasons depends_on vision loop operator_authorization grounding superseded_by transferred_acs absorbs"
 
 # scan-prds.sh-only fields with no lint shape to check -- one reason each.
 declare -A PARITY_ALLOWLIST=(
@@ -825,6 +1021,8 @@ declare -A PARITY_ALLOWLIST=(
   [mtime]="file stat metadata, not frontmatter"
   [substrate]="computed diagnostic (substrate-probe.sh's own algorithm), not frontmatter"
   [gate_stale]="computed diagnostic, not frontmatter"
+  [transferred_acs_unparsed]="a derived flag from parsing transferred_acs, not itself a frontmatter key"
+  [absorbs_unparsed]="a derived flag from parsing Absorbs, not itself a frontmatter key"
 )
 
 scan_keys="$(python3 -c '
