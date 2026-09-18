@@ -25,7 +25,7 @@
   "definitions": {
     "admitted_entry": {
       "type": "object",
-      "required": ["slug", "path", "build_target", "build_priority", "build_into", "continuation", "shared_target", "model", "pinned"],
+      "required": ["slug", "path", "build_target", "build_priority", "build_into", "continuation", "shared_target", "model", "pinned", "operator_authorization"],
       "additionalProperties": false,
       "properties": {
         "slug": { "type": "string" },
@@ -36,7 +36,17 @@
         "continuation": { "type": "boolean" },
         "shared_target": { "type": "boolean" },
         "model": { "type": "string", "enum": ["sonnet", "opus"] },
-        "pinned": { "type": "boolean" }
+        "pinned": { "type": "boolean" },
+        "operator_authorization": {
+          "description": "PRD-build-programmatic-dispatch: forwarded verbatim from scan-prds.sh so dispatch.sh's renderer can inject the operator-authorization directive without re-parsing the PRD.",
+          "type": ["object", "null"],
+          "properties": {
+            "who": { "type": "string" },
+            "ts": { "type": "string" },
+            "words": { "type": "string" },
+            "scope": { "type": "string" }
+          }
+        }
       }
     },
     "skipped_entry": {

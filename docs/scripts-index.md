@@ -52,7 +52,10 @@ points here instead of listing scripts inline).
 - `scripts/decisions-banner.sh` — SessionStart hook: print open operator decisions
 - `scripts/decisions-selftest.sh` — offline assertions for PRD-build-open-decision-
 - `scripts/decisions.sh` — operator decision escalation ledger
+- `scripts/depends-gate-superseded-selftest.sh` — PRD-build-prd-superseded-by AC9.
 - `scripts/dispatch-distrust-selftest.sh` — regression-proofs the coordinator-message
+- `scripts/dispatch-selftest.sh` — exercises dispatch.sh (PRD-build-programmatic-
+- `scripts/dispatch.sh` — the tick is a program; a model is spent only inside a
 - `scripts/dream-governor-selftest.sh` — acceptance harness for dream-governor.sh
 - `scripts/dream-governor.sh` — fires /dream when the queue thins and the budget
 - `scripts/extend-gate-branch-scope-realfixture-selftest.sh` — PRD-build-branch-gate-
@@ -94,6 +97,7 @@ points here instead of listing scripts inline).
 - `scripts/gate-wedge.sh` — per-step wall-clock budget + progress-aware wedge probe for
 - `scripts/handoff-header.sh` — R8 of PRD-build-gate-red-alarm-invariant.
 - `scripts/handwritten-fixture-lint.sh` — scripts/handwritten-fixture-lint.sh — PRD-build-burst-gate-canary-
+- `scripts/inhblocks-selftest.sh` — PRD-build-inherited-blocks-delta-pass whole-suite
 - `scripts/install-hcloud-selftest.sh` — offline proof for install-hcloud.sh
 - `scripts/install-hcloud.sh` — pinned-version, sha256-checked install of the Hetzner
 - `scripts/install-repo-hooks.sh` — point a build_into repo's core.hooksPath at the

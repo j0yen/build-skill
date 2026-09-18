@@ -21,8 +21,13 @@
 # the first and genuinely fails to acquire the same flock.
 #
 # Usage:
-#   tick-run.sh                    run the default coordinator
-#                                   (claude -p "/build${BUILD_TICK_ARGS:+ $BUILD_TICK_ARGS}")
+#   tick-run.sh                    run the default coordinator: dispatch.sh
+#                                   (PRD-build-programmatic-dispatch — Phase
+#                                   0-2 as a script, one `claude -p` per
+#                                   admitted PRD, no coordinator model in
+#                                   between). BUILD_COORDINATOR=model
+#                                   restores the old coordinator, `claude -p
+#                                   "/build${BUILD_TICK_ARGS:+ $BUILD_TICK_ARGS}"`.
 #   tick-run.sh -- <cmd...>        run <cmd...> as the coordinator instead
 #                                   (selftests use this to substitute a fixture)
 #   tick-run.sh --status           print the current holder (pid/age/cmdline)
@@ -50,7 +55,13 @@
 #   TICK_RUN_JOURNAL  daily journal (default ~/brain/journal/build/<date>.md)
 #   TICK_RUN_BOOT_ID_FILE  boot id source (default /proc/sys/kernel/random/boot_id;
 #                     tests override this to a fixture file)
-#   CLAUDE_BIN        coordinator binary (default ~/.local/bin/claude)
+#   CLAUDE_BIN        coordinator binary (default ~/.local/bin/claude) --
+#                     also the binary dispatch.sh execs per branch.
+#   BUILD_COORDINATOR default coordinator selector: unset/anything but
+#                     `model` -> dispatch.sh (default); `model` -> the old
+#                     `claude -p /build` coordinator, for one release
+#                     (PRD-build-programmatic-dispatch requirement 5).
+#   DISPATCH_SH       dispatch.sh path (default <skill-dir>/scripts/dispatch.sh)
 #   BUILD_TICK_ARGS   forwarded into the default coordinator's /build arg,
 #                     UNLESS it starts with "run <slugs>" (space- or
 #                     comma-separated) -- PRD-build-select-tick-run-pin:
@@ -101,6 +112,12 @@ source "$SKILL_DIR/scripts/lib/journal.sh"
 source "$SKILL_DIR/scripts/lib/tick-cause.sh"
 JOURNAL="${TICK_RUN_JOURNAL:-$(journal_root)/$(date -u +%F).md}"
 CLAUDE_BIN="${CLAUDE_BIN:-$HOME/.local/bin/claude}"
+# PRD-build-programmatic-dispatch requirement 5: dispatch.sh (Phase 0-2 as
+# a script, one Agent-call-shaped `claude -p` per admitted PRD, no
+# coordinator model in between) is the default coordinator now.
+# BUILD_COORDINATOR=model restores the old `claude -p /build` coordinator
+# for one release (Migration / compatibility).
+DISPATCH_SH="${DISPATCH_SH:-$SKILL_DIR/scripts/dispatch.sh}"
 BOOT_ID_FILE="${TICK_RUN_BOOT_ID_FILE:-/proc/sys/kernel/random/boot_id}"
 JQ="${JQ:-$(command -v jq 2>/dev/null || echo /usr/bin/jq)}"
 LANE="${TICK_RUN_LANE:-$(hostname)}"
@@ -185,7 +202,26 @@ cmd_status() {
     echo "tick-lock-held (holder file missing/unreadable)"
   fi
   print_last_reconcile
+  print_last_dispatch
   return 0
+}
+
+# PRD-build-programmatic-dispatch AC6: dispatch.sh writes its own richer
+# per-tick record to state/dispatch/last-tick.json (see that script's own
+# "Design note on tick-outcome.json" -- a second writer to THIS script's
+# own tick-outcome.json would race the write_tick_outcome() call below,
+# since that one fires strictly after the coordinator process exits).
+# Silent no-op under BUILD_COORDINATOR=model (no such file ever written).
+print_last_dispatch() {
+  local f="$STATE_DIR/dispatch/last-tick.json"
+  [ -r "$f" ] || return 0
+  [ -x "$JQ" ] || return 0
+  local admitted dispatched ts
+  admitted="$("$JQ" -r '.admitted // empty' "$f" 2>/dev/null)"
+  dispatched="$("$JQ" -r '.dispatched // empty' "$f" 2>/dev/null)"
+  ts="$("$JQ" -r '.ts // empty' "$f" 2>/dev/null)"
+  [ -n "$admitted" ] && [ -n "$dispatched" ] || return 0
+  echo "admitted=$admitted dispatched=$dispatched (dispatch ts=$ts)"
 }
 
 # print_last_reconcile — requirement 7 (P1): the last tick's
@@ -534,7 +570,22 @@ main() {
     if [ -n "$pin_arg" ]; then
       export SELECT_TICK_PIN="$pin_arg"
     fi
-    coord_cmd=("$CLAUDE_BIN" -p "/build${build_args:+ $build_args}" --model sonnet --dangerously-skip-permissions --output-format text)
+    # PRD-build-programmatic-dispatch requirement 5: dispatch.sh is the
+    # default -- it reads SELECT_TICK_PIN itself (via select-tick.sh's own
+    # default), so nothing else changes about the pin-derivation above.
+    # BUILD_COORDINATOR=model is the one-release escape hatch back to the
+    # old model-coordinator path; any other BUILD_TICK_ARGS text (the
+    # legacy "status" passthrough) only ever applied to that /build-arg
+    # form, so it is not threaded into dispatch.sh, which has its own
+    # --status equivalent (this script's own --status, unaffected either
+    # way).
+    if [ "${BUILD_COORDINATOR:-dispatch}" = "model" ]; then
+      coord_cmd=("$CLAUDE_BIN" -p "/build${build_args:+ $build_args}" --model sonnet --dangerously-skip-permissions --output-format text)
+    else
+      local -a dispatch_args=()
+      [ -n "$pin_arg" ] && dispatch_args=(--pin "$pin_arg")
+      coord_cmd=("$DISPATCH_SH" "${dispatch_args[@]}")
+    fi
   fi
 
   mkdir -p "$STATE_DIR"

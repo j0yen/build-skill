@@ -20,7 +20,8 @@
 #
 # --format json (default): one JSON object on stdout (jq -S, stable order):
 #   {"admitted":[{slug,path,build_target,build_into,build_priority,
-#                 continuation,shared_target,model,pinned}],
+#                 continuation,shared_target,model,pinned,
+#                 operator_authorization}],
 #    "skipped":[{slug,reason,detail,pinned}],
 #    "pinned":[<slug>...],
 #    "counts":{pool,admitted,skipped,cap,distinct_targets,burst_session,sub_cap}}
@@ -483,6 +484,13 @@ while [ "$i" -lt "$n" ]; do
   continuation="$(printf '%s' "$cand" | "$JQ" -r '.continuation')"
   last_error="$(printf '%s' "$cand" | "$JQ" -r '.last_error // ""')"
   ticks_invested="$(printf '%s' "$cand" | "$JQ" -r '.ticks_invested // 0')"
+  # PRD-build-programmatic-dispatch: forwarded into admitted[] so
+  # dispatch.sh's renderer (branch-contract.md directive 4) can inject the
+  # authorization directive verbatim without re-reading the PRD file
+  # itself -- scan-prds.sh already parses this per-PRD (-c, not -r: same
+  # reason as build_target/build_priority/build_into above, this feeds
+  # --argjson below).
+  operator_authorization="$(printf '%s' "$cand" | "$JQ" -c '.operator_authorization // null')"
 
   # BUILD_MAX_BRANCHES overridden to the CLAMPED $limit for this one call
   # only (requirement 5) -- select-guard.sh reads BUILD_MAX_BRANCHES
@@ -545,7 +553,8 @@ while [ "$i" -lt "$n" ]; do
       --argjson build_into "$build_into" \
       --argjson continuation "$continuation" \
       --arg model "$model" \
-      '{slug:$slug, path:$path, build_target:$build_target, build_priority:$build_priority, build_into:$build_into, continuation:$continuation, model:$model}')"
+      --argjson operator_authorization "$operator_authorization" \
+      '{slug:$slug, path:$path, build_target:$build_target, build_priority:$build_priority, build_into:$build_into, continuation:$continuation, model:$model, operator_authorization:$operator_authorization}')"
     admitted_entries+=("$entry")
     branch_count=$((branch_count + 1))
     if [ "$continuation" != "true" ] && [ "$build_into" != "null" ]; then
