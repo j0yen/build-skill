@@ -48,6 +48,13 @@ _ISOLATION_REAL_HOME="${BUILD_TEST_REAL_HOME:-$HOME}"
 ISOLATION_LIVE_STATE_ROOT="$_ISOLATION_REAL_HOME/.claude/skills/build/state"
 ISOLATION_LIVE_JOURNAL_ROOT="$_ISOLATION_REAL_HOME/brain/journal"
 ISOLATION_LIVE_JOURNAL_FILE="${BURST_ISOLATION_LIVE_JOURNAL:-$_ISOLATION_REAL_HOME/brain/journal/build/burst-lane.log}"
+# 2026-09-18 incident (docket in PRD-build-burst-canary-live-parity): the
+# operator's real ~/.config/wm-burst/.env got rewritten twice by test runs
+# that set BURST_LANE_TEST=1 directly (never routed through isolation.sh's
+# full HOME override) and forgot to override BURST_LANE_ENV_FILE. Single
+# live FILE, not a root prefix — same override-for-selftest-coverage
+# convention as ISOLATION_LIVE_JOURNAL_FILE above.
+ISOLATION_LIVE_ENV_FILE="${BURST_ISOLATION_LIVE_ENV_FILE:-$_ISOLATION_REAL_HOME/.config/wm-burst/.env}"
 
 # PRD-build-test-isolation-by-default requirement 4: the sentinel arms
 # unconditionally under BUILD_TEST=1 (scripts/lib/isolation.sh's
@@ -91,6 +98,8 @@ isolation_guard_path() {
     "$ISOLATION_LIVE_STATE_ROOT"|"$ISOLATION_LIVE_STATE_ROOT"/*)
       isolation_refuse "$caller" "$path" ;;
     "$ISOLATION_LIVE_JOURNAL_ROOT"|"$ISOLATION_LIVE_JOURNAL_ROOT"/*)
+      isolation_refuse "$caller" "$path" ;;
+    "$ISOLATION_LIVE_ENV_FILE")
       isolation_refuse "$caller" "$path" ;;
   esac
   return 0
