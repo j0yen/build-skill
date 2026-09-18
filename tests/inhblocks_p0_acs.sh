@@ -324,6 +324,29 @@ expect "AC10: stderr summary carries attribution=commit-range" \
 expect "AC10: the inherited/in-scope pair reflects the range verdict" \
   "grep -q 'inherited=1 in-scope=0' \"$T10/stderr\""
 
+# Journal token (2026-09-18 live gap, burst-lane-gate-debt-2b2982e gates
+# 13:29:32Z and 13:37:22Z): gate-attribution.sh emitted the stderr token
+# above on both runs, but extend-gate.sh read only the unknown_inputs and
+# baseline_witness counters, so neither journal gate line carried an
+# `attribution=` token and the commit-range rule was invisible to the
+# operator who had to audit the verdict.
+expect "AC10: extend-gate.sh reads the commit_range counter" \
+  "grep -q 'attribution_commit_range=' \"$HERE/../scripts/extend-gate.sh\""
+expect "AC10: extend-gate.sh journals attribution=commit-range" \
+  "grep -q 'journal_suffix attribution=commit-range' \"$HERE/../scripts/extend-gate.sh\""
+# Key agreement: a grep test alone passes on a typo'd counter name. Assert
+# that EVERY key extend-gate.sh pulls out of the attribution JSON is a key
+# gate-attribution.sh actually emits -- the defect above was a missing
+# reader, the next one of its shape is a misspelled one.
+ac10_keys_ok=1
+for _k in $(grep -oE '\.get\("[a-z_]+", *0\)' "$HERE/../scripts/extend-gate.sh" \
+            | sed -E 's/.*\.get\("([a-z_]+)".*/\1/' | sort -u); do
+  echo "$ac10_json" | python3 -c 'import json,sys; sys.exit(0 if sys.argv[1] in json.load(sys.stdin) else 1)' "$_k" \
+    || { ac10_keys_ok=0; echo "  unknown attribution key read by extend-gate.sh: $_k" >&2; }
+done
+expect "AC10: every attribution counter extend-gate reads is one attribution emits" \
+  "[ \"$ac10_keys_ok\" = 1 ]"
+
 # --- AC10 (producer half): the SHIPPED extend-gate.sh block that puts the
 # guilty shas into the note. Extracted by marker, same convention as R2.
 ac10_block="$(sed -n '/BEGIN inhblocks-r10-rollback-commits/,/END inhblocks-r10-rollback-commits/p' "$HERE/../scripts/extend-gate.sh")"
