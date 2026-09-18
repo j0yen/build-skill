@@ -78,4 +78,48 @@ echo "$out2" | grep -qE '^flow: prds_measured=1 lead_time_p50=[0-9.]+h p90=[0-9.
   || { echo "FAIL: no flow medians line:"; echo "$out2"; exit 1; }
 echo ok
 
+echo "== AC12 (PRD-build-prd-superseded-by): report prints superseded=<n> =="
+cat > "$ROOT/clone/build-queue/PRD-sby-chain-a-pred.md" <<'EOF'
+- Status: queued
+- build_target: shell
+- Superseded-by: PRD-sby-chain-a-succ.md
+- transferred_acs: [1]
+
+## Acceptance criteria
+
+1. P0 — Given a, When b, Then c.
+EOF
+cat > "$ROOT/clone/build-queue/PRD-sby-chain-a-succ.md" <<'EOF'
+- Status: queued
+- build_target: shell
+- Absorbs: PRD-sby-chain-a-pred.md [1:1]
+
+## Acceptance criteria
+
+1. P0 — Given a, When b, Then c.
+EOF
+cat > "$ROOT/clone/build-queue/PRD-sby-chain-b-pred.md" <<'EOF'
+- Status: queued
+- build_target: shell
+- Superseded-by: PRD-sby-chain-b-succ.md
+- transferred_acs: [1]
+
+## Acceptance criteria
+
+1. P0 — Given a, When b, Then c.
+EOF
+cat > "$ROOT/clone/build-queue/PRD-sby-chain-b-succ.md" <<'EOF'
+- Status: queued
+- build_target: shell
+- Absorbs: PRD-sby-chain-b-pred.md [1:1]
+
+## Acceptance criteria
+
+1. P0 — Given a, When b, Then c.
+EOF
+out3=$("$LS" report --prd-dir "$ROOT/clone" --journal-dir "$JOURNAL_DIR" --days 1)
+echo "$out3" | grep -qx 'superseded=2' \
+  || { echo "FAIL: no superseded=2 line:"; echo "$out3"; exit 1; }
+echo ok
+
 echo "ALL PASS"
