@@ -230,4 +230,68 @@ nc_hits="$(jq -c 'select(.slug=="nc-smoke" and .stage=="needs_classification")' 
 rm -rf "$NC_ROOT"
 echo ok
 
+# =======================================================================
+# AC7 (P1) — given PRDs archived within a --since window, backfill gives
+# every one an `archived` event marked source=backfill, and the report's
+# lead_time p50 is within 10% of the 2026-09-18 hand analysis (6h).
+# lead_time = queued(Drafted: date, midnight UTC) -> archived(the "archive:
+# <slug> shipped" commit's own author date) -- 5 fixture PRDs at 4h, 5h,
+# 6h, 7h, 8h apart (median = 6h exactly) proves both the reconstruction
+# and the report math, without needing a journal fixture at all (gate_*
+# reconstruction is out of scope -- see flow-ledger.sh's own backfill
+# docstring -- and lead_time never touches gate events).
+# =======================================================================
+echo "== AC7: backfill -- archived event + lead_time p50 within 10% of 6h =="
+BF_ROOT=$(mktemp -d /tmp/flow-ledger-ac7.XXXXXX)
+BF_PRDS="$BF_ROOT/prds"
+mkdir -p "$BF_PRDS/built-prds"
+git init -q "$BF_PRDS"
+BF_LEDGER="$BF_ROOT/flow-ledger.jsonl"
+BF_JOURNAL="$BF_ROOT/journal"
+# flow-ledger.sh's --since is relative to the REAL clock (same convention
+# report --since already uses), so the fixture's own archive-commit dates
+# are pinned a few days back from wall-clock now, well inside a 14d window.
+REAL_NOW_EP="$(date -u +%s)"
+BF_DATE="$(date -u -d "@$((REAL_NOW_EP - 5 * 86400))" +%F)"
+i=0
+for h in 4 5 6 7 8; do
+  slug="ac7-slug-$i"
+  cat > "$BF_PRDS/built-prds/PRD-$slug.md" <<EOF
+# PRD: $slug
+
+- Status: built
+- Drafted: $BF_DATE
+- Lane: redbaron ${BF_DATE}T00:30:00Z
+EOF
+  git -C "$BF_PRDS" add -A
+  git -C "$BF_PRDS" -c user.name=t -c user.email=t@t commit -q -m "wip $slug"
+  GIT_AUTHOR_DATE="${BF_DATE}T$(printf '%02d' "$h"):00:00Z" GIT_COMMITTER_DATE="${BF_DATE}T$(printf '%02d' "$h"):00:00Z" \
+    git -C "$BF_PRDS" -c user.name=t -c user.email=t@t commit -q --allow-empty -m "archive: $slug shipped"
+  i=$((i + 1))
+done
+rm -f "$BF_LEDGER"
+bf_out="$(FLOW_LEDGER_FILE="$BF_LEDGER" BUILD_JOURNAL_ROOT="$BF_JOURNAL" \
+  "$FL" backfill --since 14d --prd-dir "$BF_PRDS" 2>&1)"
+echo "$bf_out" | grep -qE 'archived=5 ' || fail "AC7 backfill summary: $bf_out"
+for i in 0 1 2 3 4; do
+  hits="$(jq -c --arg s "ac7-slug-$i" 'select(.slug==$s and .stage=="archived" and (.detail|contains("source=backfill")))' "$BF_LEDGER" 2>/dev/null | wc -l)"
+  [ "$hits" = 1 ] || fail "AC7: ac7-slug-$i missing a source=backfill archived event"
+done
+rep="$(FLOW_LEDGER_FILE="$BF_LEDGER" "$FL" report --format json)"
+p50="$(printf '%s' "$rep" | jq -r '.lead_time_p50_h')"
+python3 -c "
+p50 = float('$p50')
+want = 6.0
+tol = want * 0.10
+assert abs(p50 - want) <= tol, f'p50={p50} not within 10% of {want}'
+" || fail "AC7 lead_time p50: got $p50, want ~6h (+/-10%)"
+measured="$(printf '%s' "$rep" | jq -r '.prds_measured')"
+[ "$measured" = "5" ] || fail "AC7 prds_measured: got $measured, want 5"
+# idempotent: a second backfill run over the same window adds nothing new
+bf_out2="$(FLOW_LEDGER_FILE="$BF_LEDGER" BUILD_JOURNAL_ROOT="$BF_JOURNAL" \
+  "$FL" backfill --since 14d --prd-dir "$BF_PRDS" 2>&1)"
+echo "$bf_out2" | grep -qE 'archived=0 ' || fail "AC7 idempotency: second run: $bf_out2"
+rm -rf "$BF_ROOT"
+echo ok
+
 echo "flow-ledger-selftest: PASS"

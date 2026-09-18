@@ -20,11 +20,14 @@
 # landed, archived, blocked, unblocked, needs_classification.
 #
 # API:
-#   flow_ledger_append <slug> <stage> [--lane <lane>] [--sha <sha>] [--detail <text>]
+#   flow_ledger_append <slug> <stage> [--lane <lane>] [--sha <sha>] [--detail <text>] [--ts <iso8601>]
 #     Appends one JSON line under `flock` (Technical considerations).
 #     NEVER fails the caller (Requirement 2) — a write failure (unwritable
 #     ledger, missing jq, lock timeout) is swallowed and journaled once via
 #     lib/journal.sh's journal_line, and the function still returns 0.
+#     --ts (requirement 6, backfill.sh's own use): override the recorded
+#     timestamp instead of "now" -- every OTHER call site omits it and gets
+#     "now", unchanged.
 #
 # Env:
 #   FLOW_LEDGER_FILE   override the ledger path entirely (selftests).
@@ -46,19 +49,20 @@ flow_ledger_append() {
   local slug="${1:-}" stage="${2:-}"
   [ -n "$slug" ] && [ -n "$stage" ] || { echo "flow_ledger_append: slug and stage required" >&2; return 0; }
   shift 2 2>/dev/null || shift $#
-  local lane="" sha="" detail=""
+  local lane="" sha="" detail="" ts_override=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --lane) lane="${2:-}"; shift 2 ;;
       --sha) sha="${2:-}"; shift 2 ;;
       --detail) detail="${2:-}"; shift 2 ;;
+      --ts) ts_override="${2:-}"; shift 2 ;;
       *) shift ;;
     esac
   done
   [ -n "$lane" ] || lane="$(hostname 2>/dev/null || echo unknown)"
 
   local jq_bin="${FLOW_LEDGER_JQ:-jq}"
-  local ts; ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  local ts="${ts_override:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
   local ledger; ledger="$(flow_ledger_path)"
   local timeout="${FLOW_LEDGER_LOCK_TIMEOUT:-2}"
 
