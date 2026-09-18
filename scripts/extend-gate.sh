@@ -2346,8 +2346,38 @@ fi
 # exactly as it wrote it for every case except a real block (below,
 # unchanged — PRD-build-reviewer-receipt-primary R6, preserved per this
 # PRD's AC2).
+# PRD-build-gate-finalize-verdict-split requirement 5 (P0, AC5): gate-
+# delta.sh's baseline match is a plain name lookup on this ONE
+# "reviewer-agent:<reason>" line, so a multi-reason block's scope depends
+# entirely on WHICH reason becomes that line's name. The 11:25Z operator
+# note's coarse rule — inherited only when EVERY reason is already
+# baselined, otherwise in-scope — means the representative reason must be
+# an unbaselined one whenever any exists; always taking the first CSV
+# reason (as before this fix) silently hid a real in-scope reason behind
+# an inherited one that happened to sort first, which was a false
+# delta-pass (reproduced: reasons=[baselined,new] delta-passed). Reads the
+# same committed-HEAD baseline gate-delta.sh itself reads (`git show
+# HEAD:agent/gate-baseline.json`) — an uncommitted working-tree copy never
+# counts here either, same fail-closed convention as gate-delta.sh's own.
+_reviewer_pick_representative_reason() {
+  local repo="$1" reasons_csv="$2"
+  local baseline_json="" baselined_reasons=""
+  baseline_json="$(git -C "$repo" show HEAD:agent/gate-baseline.json 2>/dev/null)"
+  if [ -n "$baseline_json" ] && printf '%s' "$baseline_json" | jq -e . >/dev/null 2>&1; then
+    baselined_reasons="$(printf '%s' "$baseline_json" | jq -r '.receipts[]?.name // empty' | sed -n 's/^reviewer-agent://p')"
+  fi
+  local reason
+  local IFS=','
+  for reason in $reasons_csv; do
+    if ! grep -qxF "$reason" <<<"$baselined_reasons"; then
+      printf '%s' "$reason"
+      return 0
+    fi
+  done
+  printf '%s' "${reasons_csv%%,*}"
+}
 if [ "$_reviewer_verdict" = block ] && [ -n "$_reviewer_block_reasons_csv" ]; then
-  _reviewer_first_reason="${_reviewer_block_reasons_csv%%,*}"
+  _reviewer_first_reason="$(_reviewer_pick_representative_reason "$repo" "$_reviewer_block_reasons_csv")"
   gate_out="$(printf '%s\n' "$gate_out" | sed "s/✗ reviewer-agent —/✗ reviewer-agent:${_reviewer_first_reason} —/")"
 fi
 printf '%s\n' "$gate_out"
