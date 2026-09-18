@@ -85,6 +85,13 @@ SELECT_TICK_STATE_DIR="${SELECT_TICK_STATE_DIR:-$STATE_DIR/select-tick}"
 # PRD-buildloop-tick-outcome-liveness R1: the one outcome record a tick
 # ever writes, whatever happened to its child.
 TICK_OUTCOME_FILE="${TICK_OUTCOME_FILE:-$STATE_DIR/tick-outcome.json}"
+# PRD-buildloop-tick-outcome-liveness R8: append-only history of every
+# record write_tick_outcome makes, one compact line per tick, rotated at
+# 30 days -- day-ledger.sh's own source for ticks_failed/causes/
+# longest_failed_streak (tick-outcome.json above is only ever the LATEST
+# record; day-ledger.sh needs the whole day's sequence).
+TICK_OUTCOMES_JSONL="${TICK_OUTCOMES_JSONL:-$STATE_DIR/tick-outcomes.jsonl}"
+TICK_OUTCOMES_ROTATE_DAYS="${TICK_OUTCOMES_ROTATE_DAYS:-30}"
 # Alarm hourly gate (requirement 4): never more than one alarm per hour per
 # lane. State is separate from select-tick.sh's own admitted/skipped
 # persistence so a read of one never races a write of the other.
@@ -255,6 +262,38 @@ write_tick_outcome() {
       "$ts" "$n" "$rc" "$outcome" "$cause" "$esc_evidence" "$streak_failed" "$last_ok_ts" "$LANE")"
   fi
   atomic_write_json "$TICK_OUTCOME_FILE" "$json"
+  append_tick_outcomes_jsonl "$json"
+}
+
+# append_tick_outcomes_jsonl <json> — R8: one compact line per tick,
+# appended to $TICK_OUTCOMES_JSONL, then rotated (drop lines whose `.ts`
+# is older than $TICK_OUTCOMES_ROTATE_DAYS days) via temp+rename so a
+# concurrent reader (day-ledger.sh) never observes a half-rewritten file.
+# Best-effort throughout (jq missing, or a JSON build failure above,
+# means this silently does nothing) -- the append-only history is a
+# reporting aid, never load-bearing for the record write_tick_outcome
+# itself already committed.
+append_tick_outcomes_jsonl() {
+  local json="$1"
+  [ -x "$JQ" ] || return 0
+  local line
+  line="$(printf '%s' "$json" | "$JQ" -c '.' 2>/dev/null)" || return 0
+  [ -n "$line" ] || return 0
+  mkdir -p "$(dirname "$TICK_OUTCOMES_JSONL")" 2>/dev/null || true
+  printf '%s\n' "$line" >> "$TICK_OUTCOMES_JSONL" 2>/dev/null || return 0
+
+  local days="$TICK_OUTCOMES_ROTATE_DAYS"
+  case "$days" in ''|*[!0-9]*) days=30 ;; esac
+  local cutoff=$(( $(now_epoch) - days * 86400 ))
+  local tmp
+  tmp="$(mktemp "$(dirname "$TICK_OUTCOMES_JSONL")/.tmp.XXXXXX" 2>/dev/null)" || return 0
+  if "$JQ" -c --argjson cutoff "$cutoff" \
+       'select((.ts // "") as $t | $t != "" and (($t | fromdateiso8601) >= $cutoff))' \
+       "$TICK_OUTCOMES_JSONL" > "$tmp" 2>/dev/null; then
+    mv -f "$tmp" "$TICK_OUTCOMES_JSONL" 2>/dev/null || rm -f "$tmp"
+  else
+    rm -f "$tmp"
+  fi
 }
 
 # maybe_deliver_loop_tick_failed <cause> <streak_failed> <last_ok_ts>

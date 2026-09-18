@@ -47,6 +47,10 @@
 #   DAY_LEDGER_BURST_LANE_STATE_DIR override burst-lane's own state dir
 #                                for that one status call (default: production)
 #   DAY_LEDGER_MANIFEST_FILE    override state/manifest.json path
+#   DAY_LEDGER_TICK_OUTCOMES_FILE override state/tick-outcomes.jsonl path
+#                                (PRD-buildloop-tick-outcome-liveness R8 --
+#                                source for ticks_failed/causes/
+#                                longest_failed_streak)
 #   DAY_LEDGER_PROD_SKILL_DIR   override the assumed production
 #                                ~/.claude/skills/build root all the
 #                                state-file defaults above are anchored to
@@ -179,6 +183,46 @@ ticks_sha=""
 }
 dispatched_prds_json="$(printf '%s\n' "${!dispatched_set[@]}" | sort -u | "$JQ" -R . | "$JQ" -s '.')"
 [ -n "$dispatched_prds_json" ] || dispatched_prds_json="[]"
+
+# =======================================================================
+# source: tick outcomes (PRD-buildloop-tick-outcome-liveness R8) --
+# state/tick-outcomes.jsonl, tick-run.sh's own append-only history (one
+# compact line per tick). ticks_failed/causes are this day's failed
+# records only; longest_failed_streak reuses each record's OWN
+# streak_failed (the running consecutive-failure count AT that tick,
+# which tick-run.sh already computes) rather than re-deriving a run
+# length from scratch -- the day's max streak_failed among its failed
+# records IS the longest streak that touched this day.
+# =======================================================================
+ticks_failed=0
+causes_json="{}"
+longest_failed_streak=0
+tick_outcomes_sha=""
+{
+  tof="${DAY_LEDGER_TICK_OUTCOMES_FILE:-$PROD_SKILL_DIR/state/tick-outcomes.jsonl}"
+  if [ -r "$tof" ]; then
+    tick_outcomes_sha="$(sha256sum "$tof" 2>/dev/null | cut -d' ' -f1)"
+    day_result="$("$JQ" -s -c --argjson s "$day_start_epoch" --argjson e "$day_end_epoch" '
+      map(select((.ts // "") as $t | $t != "" and (($t | fromdateiso8601) >= $s and ($t | fromdateiso8601) < $e))) as $day |
+      {
+        ticks_failed: ([$day[] | select(.outcome=="failed")] | length),
+        causes: ([$day[] | select(.outcome=="failed") | (.cause // "unknown")] | group_by(.) | map({key: .[0], value: length}) | from_entries),
+        longest_failed_streak: (([$day[] | select(.outcome=="failed") | (.streak_failed // 0)]) as $s2 | if ($s2|length) > 0 then ($s2|max) else 0 end)
+      }' "$tof" 2>/dev/null)"
+    if [ -z "$day_result" ]; then
+      add_note "source-missing: tick-outcomes"
+    else
+      ticks_failed="$(printf '%s' "$day_result" | "$JQ" -r '.ticks_failed' 2>/dev/null)"
+      causes_json="$(printf '%s' "$day_result" | "$JQ" -c '.causes' 2>/dev/null)"
+      longest_failed_streak="$(printf '%s' "$day_result" | "$JQ" -r '.longest_failed_streak' 2>/dev/null)"
+      [ -n "$ticks_failed" ] || ticks_failed=0
+      [ -n "$causes_json" ] || causes_json="{}"
+      [ -n "$longest_failed_streak" ] || longest_failed_streak=0
+    fi
+  else
+    add_note "source-missing: tick-outcomes"
+  fi
+}
 
 # =======================================================================
 # source: gates (reuse gates-banner.sh's own summary line, not re-derived)
@@ -422,7 +466,8 @@ sources_sha256_json="$("$JQ" -n \
   --arg landings "${landings_sha:-$(sha_of "")}" \
   --arg decisions "${decisions_sha:-$(sha_of "")}" \
   --arg burst "${burst_sha:-$(sha_of "")}" \
-  '{ticks:$ticks, gates:$gates, shipped:$shipped, landings:$landings, decisions:$decisions, burst:$burst}')"
+  --arg tick_outcomes "${tick_outcomes_sha:-$(sha_of "")}" \
+  '{ticks:$ticks, gates:$gates, shipped:$shipped, landings:$landings, decisions:$decisions, burst:$burst, tick_outcomes:$tick_outcomes}')"
 
 produced_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
@@ -448,9 +493,13 @@ doc="$("$JQ" -n \
   --arg produced_by "day-ledger.sh" \
   --arg produced_at "$produced_at" \
   --argjson sources_sha256 "$sources_sha256_json" \
+  --argjson ticks_failed "${ticks_failed:-0}" \
+  --argjson causes "$causes_json" \
+  --argjson longest_failed_streak "${longest_failed_streak:-0}" \
   '{
     schema: $schema, date: $date, tz: $tz, host: $host,
     ticks: {started: $ticks_started, dispatched_prds: $dispatched_prds},
+    ticks_failed: $ticks_failed, causes: $causes, longest_failed_streak: $longest_failed_streak,
     gates: {green: $gates_green, red: $gates_red, red_slugs: $gates_red_slugs, oldest_red_ts: $gates_oldest_red},
     shipped: $shipped, landings: $landings,
     decisions: {opened: $decisions_opened, closed: $decisions_closed},
