@@ -65,6 +65,11 @@ PRD_LINT="${PRD_LINT:-$HERE/prd-lint.sh}"
 REQUEUE_PRD="${REQUEUE_PRD:-$HERE/requeue-prd.sh}"
 LANE_CLAIM="${LANE_CLAIM:-$HERE/lane-claim.sh}"
 GATE_RED_JSON="${GATE_RED_JSON:-$STATE_DIR/gate-red.json}"  # lint:gate-red-not-rendered -- consumed only for retraction-consistency (red_slugs vs manifest status); never renders gate-red counts/summary as current state
+# PRD-buildloop-tick-outcome-liveness R7: tick-run.sh's own R1 artifact.
+TICK_OUTCOME_FILE="${TICK_OUTCOME_FILE:-$STATE_DIR/tick-outcome.json}"
+LOOP_TICK_STALE_TIMER="${LOOP_TICK_STALE_TIMER:-claude-build.timer}"
+LOOP_TICK_STALE_MULTIPLE="${LOOP_TICK_STALE_MULTIPLE:-3}"
+LOOP_TICK_STALE_DEFAULT_INTERVAL_S="${LOOP_TICK_STALE_DEFAULT_INTERVAL_S:-300}"
 SHIPPED_NOT_ARCHIVED_MINUTES="${SHIPPED_NOT_ARCHIVED_MINUTES:-20}"
 STALE_ACTIVITY_HOURS="${STALE_ACTIVITY_HOURS:-24}"
 LOCK_WAIT_SECS="${LOCK_WAIT_SECS:-60}"
@@ -472,6 +477,53 @@ print(json.dumps(out))
 alarms = json.loads(sys.argv[1])
 alarms.extend(json.loads(sys.argv[2]))
 print(json.dumps(alarms))' "$alarms_json" "$red_archived_json")"
+fi
+
+# PRD-buildloop-tick-outcome-liveness R7: an armed-but-not-ticking loop --
+# the timer is active (per systemctl, so it WILL fire again) but
+# tick-outcome.json hasn't been refreshed in 3 declared intervals, meaning
+# either every recent tick died before reaching tick-run.sh's own
+# write_tick_outcome (a crash this PRD's own R1 write-on-every-exit-path
+# is meant to make impossible, so this is a backstop, not the primary
+# signal) or the timer itself stopped firing for a reason systemctl
+# doesn't call "inactive" (a stuck/hung unit). Never alarms with the timer
+# inactive (AC12) -- an intentionally-disabled loop isn't "not ticking",
+# it's "not supposed to tick".
+timer_state="$(systemctl --user is-active "$LOOP_TICK_STALE_TIMER" 2>/dev/null || true)"
+if [ "$timer_state" = "active" ]; then
+  # OnUnitActiveSec is not a plain scalar DBus property on a real timer
+  # (systemd nests it inside the TimersMonotonic array) -- best-effort read
+  # via --value, default 300s otherwise. Real production timers today are
+  # not necessarily 300s (documented drift, not this PRD's concern); the
+  # default only matters when the property can't be read at all.
+  interval_s="$(systemctl --user show "$LOOP_TICK_STALE_TIMER" --property=OnUnitActiveSec --value 2>/dev/null)"
+  case "$interval_s" in ''|*[!0-9]*) interval_s="$LOOP_TICK_STALE_DEFAULT_INTERVAL_S" ;; esac
+  stale_after_s=$(( interval_s * LOOP_TICK_STALE_MULTIPLE ))
+
+  loop_tick_stale_json="$(python3 -c '
+import calendar, json, sys, time
+path, stale_after = sys.argv[1], int(sys.argv[2])
+try:
+    rec = json.load(open(path))
+    ts = rec.get("ts", "")
+    epoch = calendar.timegm(time.strptime(ts.rstrip("Z"), "%Y-%m-%dT%H:%M:%S"))
+    age = int(time.time()) - epoch
+    stale = age > stale_after
+except (OSError, ValueError, KeyError):
+    age = None
+    stale = True  # armed timer + no readable record at all is also stale
+if stale:
+    print(json.dumps([{"slug": "build-loop", "class": "loop-tick-stale",
+                        "message": "tick-outcome.json age=" + (str(age) + "s" if age is not None else "unknown")
+                                   + " exceeds " + str(stale_after) + "s (timer=" + sys.argv[3] + " active)"}]))
+else:
+    print("[]")
+' "$TICK_OUTCOME_FILE" "$stale_after_s" "$LOOP_TICK_STALE_TIMER" 2>/dev/null)"
+  [ -n "$loop_tick_stale_json" ] || loop_tick_stale_json="[]"
+  alarms_json="$(python3 -c 'import json,sys
+alarms = json.loads(sys.argv[1])
+alarms.extend(json.loads(sys.argv[2]))
+print(json.dumps(alarms))' "$alarms_json" "$loop_tick_stale_json")"
 fi
 
 heals_count="$(python3 -c 'import json,sys; print(len(json.loads(sys.argv[1])))' "$final_heals")"
