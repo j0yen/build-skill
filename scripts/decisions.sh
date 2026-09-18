@@ -28,7 +28,17 @@
 #       Prints open rows sorted by opened_ts, oldest first, each showing
 #       age_h and OVERDUE when past due. --json is the machine form (the
 #       decisions-rows.py output, unfiltered by status besides "open").
-#       --repo filters to one repo's open rows (P2 requirement 8).
+#       --repo filters to one repo's open rows (P2 requirement 8). In text
+#       mode only, --repo also appends an `Evidence:` block naming any
+#       superseded chain (PRD-build-prd-superseded-by requirement 8) whose
+#       `build_into` is this repo -- `<pred-slug> -> <succ-file>
+#       (transferred=<n>)` per chain, derived fresh from scan-prds.sh, so
+#       a fix PRD seeded by repo-health-seed-prd.sh (which inlines this
+#       command's own text output verbatim under its own `## Evidence`
+#       heading) shows a superseded predecessor right next to the open
+#       decisions blocking it, no second lookup. Omitted when no chain
+#       matches the repo; --json is unchanged (decisions rows only) since
+#       existing JSON consumers already treat it as decisions-only.
 #
 #   decisions.sh close <id> "<answer>"
 #       Appends a closed row (status/closed_ts/answer), then for every
@@ -77,6 +87,7 @@ MANIFEST_SET="${MANIFEST_SET:-$HERE/manifest-set.sh}"
 MANIFEST="${BUILD_MANIFEST:-$STATE_DIR/manifest.json}"
 ALERT_DELIVER="${ALERT_DELIVER:-$HERE/alert-deliver.sh}"
 VISION_EXTRACT="${VISION_EXTRACT:-$HERE/decisions-vision-extract.py}"
+PRD_DIR="${PRD_DIR:-$HOME/Documents/PRDs}"
 
 # shellcheck source=lib/journal.sh
 source "$HERE/lib/journal.sh"
@@ -216,6 +227,59 @@ for r in rows:
     question = r.get("question")
     print(f"{rid}  age_h={age_h}{flag}  owner={owner} repo={repo} blocks={len(blocks)}  {question}")
 ' "$rows"
+
+  # PRD-build-prd-superseded-by requirement 8: fold this repo's superseded
+  # chains into the same text output repo-health-seed-prd.sh inlines
+  # verbatim under a fix PRD's `## Evidence` heading (see cmd_list's own
+  # header comment above). Text mode + --repo only; no chain found is a
+  # silent no-op (no empty `Evidence:` header on an unrelated repo).
+  #
+  # Deliberately NOT scan-prds.sh: that pipeline runs prd-lint.sh over
+  # every build-queue/ PRD first (measured ~74s against this host's real
+  # corpus) and this call sits on repo-health-seed-prd.sh's hot path --
+  # every fix-PRD seed already shells out to `list --repo` once. A direct
+  # first-80-lines grep of build_into/Superseded-by/transferred_acs stays
+  # well under the PRD's own "under 1s" non-functional budget.
+  if [ -n "$repo" ]; then
+    local chains
+    chains="$(python3 - "$PRD_DIR" "$repo" <<'PY'
+import glob, os, re, sys
+prd_dir, repo = sys.argv[1], sys.argv[2]
+build_into_re = re.compile(r'^-\s*build_into:\s*(\S+)')
+superseded_re = re.compile(r'^-\s*Superseded-by:\s*(\S+)')
+transferred_re = re.compile(r'^-\s*transferred_acs:\s*\[([^\]]*)\]')
+for d in ("build-queue", "built-prds"):
+    for path in sorted(glob.glob(os.path.join(prd_dir, d, "PRD-*.md"))):
+        build_into = succ = None
+        n = 0
+        try:
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                head = [next(fh, "") for _ in range(80)]
+        except OSError:
+            continue
+        for ln in head:
+            m = build_into_re.match(ln)
+            if m:
+                build_into = m.group(1)
+            m = superseded_re.match(ln)
+            if m:
+                succ = m.group(1)
+            m = transferred_re.match(ln)
+            if m:
+                n = len([x for x in m.group(1).split(",") if x.strip()])
+        if not build_into or not succ:
+            continue
+        if build_into.rstrip("/").rsplit("/", 1)[-1] != repo:
+            continue
+        slug = os.path.basename(path)[len("PRD-"):-len(".md")]
+        print(f"{slug} -> {succ} (transferred={n})")
+PY
+)"
+    if [ -n "$chains" ]; then
+      printf '\nEvidence:\n'
+      printf '%s\n' "$chains" | sed 's/^/  /'
+    fi
+  fi
 }
 
 cmd_close() {

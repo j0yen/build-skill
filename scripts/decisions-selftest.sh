@@ -200,6 +200,71 @@ ac8() {
   rm -rf "$sbx"
 }
 
+# superseded_evidence — PRD-build-prd-superseded-by requirement 8: `list
+# --repo` folds superseded chains for that repo into an `Evidence:` block
+# (the same text repo-health-seed-prd.sh inlines under a fix PRD's own
+# `## Evidence` heading). Isolated PRD_DIR fixture, never the real corpus.
+superseded_evidence() {
+  local sbx; sbx="$(new_sandbox)"
+  eval "$(sbx_env "$sbx")"
+  mkdir -p "$sbx/prds/build-queue"
+  cat > "$sbx/prds/build-queue/PRD-sbytest-pred.md" <<'EOF'
+- Status: blocked
+- build_target: shell
+- build_into: /home/x/wintermute/sbytest-repo
+- Superseded-by: PRD-sbytest-succ.md
+- transferred_acs: [1, 2]
+
+## Acceptance criteria
+
+1. P0 — Given a, When b, Then c.
+EOF
+  cat > "$sbx/prds/build-queue/PRD-sbytest-succ.md" <<'EOF'
+- Status: queued
+- build_target: shell
+- build_into: /home/x/wintermute/sbytest-repo
+- Absorbs: PRD-sbytest-pred.md [1:5, 2:6]
+
+## Acceptance criteria
+
+5. P0 — Given a, When b, Then c.
+6. P0 — Given a, When b, Then c.
+EOF
+  cat > "$sbx/prds/build-queue/PRD-other-repo.md" <<'EOF'
+- Status: queued
+- build_target: shell
+- build_into: /home/x/wintermute/some-other-repo
+
+## Acceptance criteria
+
+1. P0 — Given a, When b, Then c.
+EOF
+  local out; out="$(PRD_DIR="$sbx/prds" "$DECISIONS" list --repo sbytest-repo)"
+  local chain_ok=0
+  printf '%s' "$out" | grep -qF "Evidence:" \
+    && printf '%s' "$out" | grep -qF "sbytest-pred -> PRD-sbytest-succ.md (transferred=2)" \
+    && chain_ok=1
+
+  local unrelated_out; unrelated_out="$(PRD_DIR="$sbx/prds" "$DECISIONS" list --repo some-other-repo)"
+  local unrelated_ok=0
+  printf '%s' "$unrelated_out" | grep -qF "Evidence:" || unrelated_ok=1
+
+  local no_repo_out; no_repo_out="$(PRD_DIR="$sbx/prds" "$DECISIONS" list)"
+  local no_repo_ok=0
+  printf '%s' "$no_repo_out" | grep -qF "Evidence:" || no_repo_ok=1
+
+  local json_out; json_out="$(PRD_DIR="$sbx/prds" "$DECISIONS" list --json --repo sbytest-repo)"
+  local json_ok=0
+  [ "$json_out" = "[]" ] && json_ok=1
+
+  if [ "$chain_ok" = "1" ] && [ "$unrelated_ok" = "1" ] && [ "$no_repo_ok" = "1" ] && [ "$json_ok" = "1" ]; then
+    ok "req8: list --repo folds superseded chains under Evidence; unrelated repo/no-repo/--json unaffected"
+  else
+    notok "req8: list --repo folds superseded chains under Evidence" "chain_ok=$chain_ok unrelated_ok=$unrelated_ok no_repo_ok=$no_repo_ok json_ok=$json_ok out=[$out]"
+  fi
+  rm -rf "$sbx"
+}
+
 case "${1:-all}" in
   ac1) ac1 ;;
   ac2) ac2 ;;
@@ -209,8 +274,9 @@ case "${1:-all}" in
   ac6) ac6 ;;
   ac7) ac7 ;;
   ac8) ac8 ;;
-  all) ac1; ac2; ac3; ac4; ac5; ac6; ac7; ac8 ;;
-  *) echo "usage: decisions-selftest.sh [ac1|ac2|ac3|ac4|ac5|ac6|ac7|ac8|all]" >&2; exit 2 ;;
+  superseded_evidence) superseded_evidence ;;
+  all) ac1; ac2; ac3; ac4; ac5; ac6; ac7; ac8; superseded_evidence ;;
+  *) echo "usage: decisions-selftest.sh [ac1|ac2|ac3|ac4|ac5|ac6|ac7|ac8|superseded_evidence|all]" >&2; exit 2 ;;
 esac
 
 total=$((pass + fail))
