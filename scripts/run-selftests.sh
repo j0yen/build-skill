@@ -50,6 +50,12 @@ source "$HERE/lib/journal.sh"
 # the PRD's drafted line numbers/counts.
 SELFTEST_REGISTRY=(
   scripts/gate-wedge-selftest.sh
+  tests/contractsplit_ac1_branch_contract_size_and_dates.sh
+  tests/contractsplit_ac2_skill_size_and_links_resolve.sh
+  tests/contractsplit_ac3_lint_fails_naming_file_over_cap.sh
+  tests/contractsplit_ac4_history_covers_every_presplit_date.sh
+  tests/contractsplit_ac6_history_entries_carry_attribution.sh
+  tests/contractsplit_ac7_scripts_index_undocumented_bucket.sh
   tests/chained-tick_ac2_stop_on_red.sh
   tests/chained-tick_ac3_lock_contention.sh
   tests/chained-tick_ac4_no_default_cap.sh
