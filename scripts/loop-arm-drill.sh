@@ -85,8 +85,12 @@
 #                  on claude-build.timer.
 #   --detach       re-launch this same command (minus --detach) as a
 #                  transient systemd --user unit and return immediately;
-#                  the detached copy blocks on the tick.lock wait. Exits 0
-#                  once the unit is started, 3 if systemd-run is missing.
+#                  the detached copy blocks on the tick.lock wait. The
+#                  unit carries RuntimeMaxSec = LOCK_WAIT + 3x the child
+#                  timeout + 600s, so a drill that wedges while holding
+#                  tick.lock is killed (cgroup-wide, lock released) rather
+#                  than stalling every real tick on the host. Exits 0 once
+#                  the unit is started, 3 if systemd-run is missing.
 #   --no-wait      do not wait for tick.lock (equivalent to
 #                  LOOP_ARM_DRILL_LOCK_WAIT=0): fail fast with exit 4 if a
 #                  tick is in flight. The pre-2026-09-18 behaviour.
@@ -169,11 +173,22 @@ if [ "$detach" -eq 1 ]; then
   unit="loop-arm-drill-$(date -u +%Y%m%d%H%M%S)"
   args=()
   [ "$resolve_now" -eq 1 ] && args+=(--resolve-now)
+  # Hard ceiling on the whole detached run. A detached drill that wedged
+  # AFTER acquiring tick.lock would stall every real tick on this host for
+  # as long as it lived -- precisely the "loop is armed but not building"
+  # failure this PRD exists to make visible, caused by this PRD's own
+  # tooling. RuntimeMaxSec bounds it at the unit level (systemd SIGTERMs
+  # the whole cgroup, releasing the lock) rather than trusting the
+  # in-script per-child `timeout` alone. Budget: the lock wait plus three
+  # child timeouts plus slack.
+  max_sec=$(( LOCK_WAIT + 3 * CHILD_TIMEOUT + 600 ))
   if systemd-run --user --unit="$unit" --collect \
+      --property=RuntimeMaxSec="$max_sec" \
       --setenv=LOOP_ARM_DRILL_LOCK_WAIT="$LOCK_WAIT" \
+      --setenv=LOOP_ARM_DRILL_CHILD_TIMEOUT="$CHILD_TIMEOUT" \
       --setenv=BUILD_STATE_DIR="$STATE_DIR" \
       -- bash "$HERE/$(basename "${BASH_SOURCE[0]}")" "${args[@]}" >/dev/null 2>&1; then
-    echo "loop-arm-drill: detached as $unit (waits up to ${LOCK_WAIT}s for tick.lock, then drills); follow with: journalctl --user -u $unit -f"
+    echo "loop-arm-drill: detached as $unit (waits up to ${LOCK_WAIT}s for tick.lock, then drills; RuntimeMaxSec=${max_sec}s); follow with: journalctl --user -u $unit -f"
     exit 0
   fi
   echo "loop-arm-drill: systemd-run --user failed to start $unit" >&2; exit 3
