@@ -80,6 +80,7 @@ SELFTEST_REGISTRY=(
   scripts/secret-store-selftest.sh
   scripts/routepar-selftest.sh
   scripts/canary-selftest.sh
+  scripts/select-guard-same-target-cap-selftest.sh
   scripts/main-push-pr-path-selftest.sh
   scripts/main-verdict-pin-selftest.sh
   scripts/skill-single-source-selftest.sh
