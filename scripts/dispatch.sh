@@ -300,15 +300,42 @@ launch_entry() {
   local prompt
   prompt="$(cat "$prompt_file")"
 
+  # Burst-lane arm bridge (PRD-build-dispatch-burst-lane-arm): a branch
+  # unit's OWN cargo clippy/test calls (rustbuild inside the branch, not
+  # just the parent gate) only route to the burst box when BURST_LANE=1
+  # is set in ITS shell -- cargo_route_current() (scripts/lib/cargo-
+  # route.sh) checks burst_configured() first, then BURST_LANE=1 second,
+  # same two-step extend-gate.sh's own bridge (scripts/extend-gate.sh
+  # ~1386) already does for the gate's cargo calls. systemd-run does not
+  # inherit this shell's exported vars into the transient unit, so the
+  # bridge has to be an explicit -E per launch. BUILD_BURST_ENABLED=1 is
+  # armed alongside BURST_LANE=1 so the branch's own burst_configured()
+  # check (case (a): explicit opt-in) doesn't depend on the unit's HOME
+  # resolving the same ~/.config/wm-burst/.env this process just read.
+  # Never export BUILD_BURST_ENABLED=0 when unconfigured -- burst-
+  # configured.sh treats an explicit 0 as a pinned local opt-out that
+  # wins over the env file, which would break hermetic-build's own child
+  # (it pins BUILD_BURST_ENABLED=0 itself, deliberately, for its own
+  # nested cargo call).
+  local -a burst_env_args=()
+  local burst_cause="not-configured"
+  if burst_configured; then
+    burst_env_args=(-E "BURST_LANE=1" -E "BUILD_BURST_ENABLED=1")
+    burst_cause="configured"
+  fi
+
   "$SYSTEMD_RUN" --user --unit "$unit" --collect \
     -p WorkingDirectory="$wd" \
     -p StandardOutput="file:$out_file" \
     -p StandardError="file:$out_file" \
+    "${burst_env_args[@]}" \
     -- flock -n "$lockfile" "$CLAUDE_BIN" -p "$prompt" --model "$model" \
        --dangerously-skip-permissions --output-format text >&2
   local sr_rc=$?
 
   jlog "$(printf '%s  launched (model=%s unit=%s prompt-source=branch-contract lane=%s)' "$slug" "$model" "$unit" "$LANE")"
+  jlog "$(printf '%s  burst-lane %s cause=%s' "$slug" \
+    "$([ "${#burst_env_args[@]}" -gt 0 ] && echo armed || echo unarmed)" "$burst_cause")"
 
   printf '%s\t%s\t%s\t%s\n' "$slug" "$unit" "$model" "$(now_epoch)" >> "$tick_dir/launched.tsv"
   [ "$sr_rc" -eq 0 ] || echo "dispatch: systemd-run failed to launch $unit (rc=$sr_rc)" >&2
