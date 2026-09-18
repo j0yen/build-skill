@@ -4,8 +4,16 @@
 #
 #   AC1 — a small hand-built fixture: 2 slugs gate-blocked (blockers a,b
 #     and a), 1 slug archived, and one of the blocked slugs later landed.
-#     Expect green=2 red=1, families "a x2 b x1", red_slugs names only
-#     the still-red slug.
+#     Expect green=2 red=1, red_slugs names only the still-red slug (slug2).
+#     PRD-build-gate-red-retraction-family-leak: families and oldest-red
+#     are now derived from each slug's FINAL class only — slug1 went red
+#     then green inside the window, so its blockers=a,b line and its
+#     00:00:00Z red timestamp must NOT surface; only slug2 (still red)
+#     contributes, so families is "a x1" (not "a x2 b x1") and oldest-red
+#     is slug2's own 00:05:00Z line (not slug1's earlier 00:00:00Z).
+#   AC5/AC6/AC7/AC8 — PRD-build-gate-red-retraction-family-leak: the
+#     defect this closes (red=0 yet blockers/oldest-red named a slug that
+#     went red-then-green, or was retracted, inside the window).
 #   AC2 — the REAL 2026-09-16 journal, frozen at the 14:35:09Z line the
 #     stopgap (~/.local/bin/gate-red-alarm.sh) actually produced that
 #     issued j0yen/prds#9 (see tests/fixtures/gatered/README.md), copied
@@ -16,6 +24,22 @@
 #     stopgap's red_slugs output was itself bug-shaped at delivery time;
 #     this selftest asserts R1's CORRECT classification against the same
 #     real data, not the stopgap's buggy issue body).
+#     PRD-build-gate-red-retraction-family-leak: hermetic-build's count
+#     drops from x9 to x6 under the corrected semantics — the other 3
+#     mentions are non-classifying annotation lines for slugs already
+#     counted from their own gate-block line (e.g. the 11:52:26Z
+#     "mcphost-agent-consent  gate-then-land  gate-red  (blockers=...)"
+#     line and the 11:54:30Z "mcphost-agent-wake  gate-then-land
+#     blocked-gate-red  (blockers=...)" line duplicate blockers already
+#     tallied from that same slug's 11:51:xxZ gate-block line; a fourth,
+#     mcphost-tenant-self-offboard's 12:07:54Z "reverify-gate-with-fresh-
+#     run  blocked-corrected-blocker-list" line, duplicates the same
+#     slug's 12:02:16Z gate-block line). None of these three lines is
+#     itself a red-classifying line (is_red requires $2=="gate-then-land"
+#     or $3~/^verify-gate-red/, which none of the three match), so under
+#     "tallied only from red lines belonging to slugs whose final class
+#     is red" they correctly no longer contribute — x6 is the count of
+#     the six actual gate-block lines' hermetic-build tokens in-window.
 #   AC3 — a journal line with no leading ISO timestamp (a continuation
 #     line, `  ACTION: ...`) is skipped, counted in the JSON twin's
 #     `parse_skipped`, and the run still exits 0.
@@ -63,7 +87,7 @@ expect "AC1 exit 0" "[ $rc1 -eq 0 ]"
 # `blockers:`) — both `0`/`none` here since this fixture has no
 # gate-incomplete lines. Format only, not this PRD's own behavior under
 # test (see gate-infra-selftest.sh for that).
-expect "AC1 exact line" "[ \"\$out1\" = 'GATES(2h): green=2 red=1 incomplete=0 blockers: a x2 b x1 incomplete_infra: none oldest-red=2026-01-01T00:00:00Z red_slugs: slug2' ]"
+expect "AC1 exact line" "[ \"\$out1\" = 'GATES(2h): green=2 red=1 incomplete=0 blockers: a x1 incomplete_infra: none oldest-red=2026-01-01T00:05:00Z red_slugs: slug2' ]"
 json1="$(cat "$D/state/gate-red.json")"
 expect "AC1 json green=2" "[ \"\$(printf '%s' \"\$json1\" | jq -r .green)\" = 2 ]"
 expect "AC1 json red=1" "[ \"\$(printf '%s' \"\$json1\" | jq -r .red)\" = 1 ]"
@@ -80,7 +104,7 @@ if [ -r "$FIXTURE" ]; then
   rc2=$?
   expect "AC2 exit 0" "[ $rc2 -eq 0 ]"
   expect "AC2 red=5" "[[ \"\$out2\" == *'red=5'* ]]"
-  expect "AC2 top family hermetic-build" "[[ \"\$out2\" == *'blockers: hermetic-build x9'* ]]"
+  expect "AC2 top family hermetic-build" "[[ \"\$out2\" == *'blockers: hermetic-build x6'* ]]"
   for s in mcphost-agent-consent mcphost-agent-wake mcphost-gate-debt-4f1112d mcphost-stdlib-pseudo-modules mcphost-tenant-self-offboard; do
     expect "AC2 names $s" "[[ \"\$out2\" == *'$s'* ]]"
   done
@@ -147,6 +171,72 @@ expect "AC4 control names slugR still red" "[[ \"\$out4c\" == *'red_slugs: slugR
 expect "AC4 control no retracted suffix" "[[ \"\$out4c\" != *'retracted:'* ]]"
 json4c="$(cat "$D/state/gate-red.json")"
 expect "AC4 control json retracted_slugs=[]" "[ \"\$(printf '%s' \"\$json4c\" | jq -c .retracted_slugs)\" = '[]' ]"
+
+# ============================================================================
+# AC5 — PRD-build-gate-red-retraction-family-leak: a single slug that went
+# red then green inside the window must not surface its blockers or its
+# red timestamp at all (red=0 case — no other slug is red).
+# ============================================================================
+D="$T/ac5"; mkdir -p "$D/journal" "$D/state"
+cat > "$D/journal/2026-01-04.md" <<'EOF'
+2026-01-04T00:00:00Z  gate-then-land  slugQ  gate-block attempt=1 blockers=x,y
+2026-01-04T00:05:00Z  gate-then-land  slugQ  landed attempt=2 version=1.0.0 sha=deadbeef
+EOF
+out5="$(BUILD_JOURNAL_ROOT="$D/journal" BUILD_STATE_DIR="$D/state" "$GRS" --now 2026-01-04T01:00:00Z --window-h 2)"
+expect "AC5 exit 0" "[ $? -eq 0 ]"
+expect "AC5 exact line" "[ \"\$out5\" = 'GATES(2h): green=1 red=0 incomplete=0 blockers: none incomplete_infra: none oldest-red=none red_slugs: ' ]"
+json5="$(cat "$D/state/gate-red.json")"
+expect "AC5 json families={}" "[ \"\$(printf '%s' \"\$json5\" | jq -c .families)\" = '{}' ]"
+expect "AC5 json oldest_red=none" "[ \"\$(printf '%s' \"\$json5\" | jq -r .oldest_red)\" = none ]"
+
+# ============================================================================
+# AC6 — PRD-build-gate-red-retraction-family-leak: slugA red-then-green
+# inside the window, slugB red throughout and newer. Only slugB (the
+# still-red slug) may contribute a family or set oldest-red.
+# ============================================================================
+D="$T/ac6"; mkdir -p "$D/journal" "$D/state"
+cat > "$D/journal/2026-01-05.md" <<'EOF'
+2026-01-05T00:00:00Z  gate-then-land  slugA  gate-block attempt=1 blockers=a
+2026-01-05T00:05:00Z  gate-then-land  slugA  landed attempt=2 version=1.0.0 sha=deadbeef
+2026-01-05T00:10:00Z  gate-then-land  slugB  gate-block attempt=1 blockers=b
+EOF
+out6="$(BUILD_JOURNAL_ROOT="$D/journal" BUILD_STATE_DIR="$D/state" "$GRS" --now 2026-01-05T01:00:00Z --window-h 2)"
+expect "AC6 exit 0" "[ $? -eq 0 ]"
+expect "AC6 exact line" "[ \"\$out6\" = 'GATES(2h): green=1 red=1 incomplete=0 blockers: b x1 incomplete_infra: none oldest-red=2026-01-05T00:10:00Z red_slugs: slugB' ]"
+
+# ============================================================================
+# AC7 — PRD-build-gate-red-retraction-family-leak: a retracted slug (red,
+# then archived in the manifest, never landed) must not contribute its
+# family to the JSON twin either — 52d699c left this uncorrected.
+# ============================================================================
+D="$T/ac7"; mkdir -p "$D/journal" "$D/state"
+cat > "$D/journal/2026-01-06.md" <<'EOF'
+2026-01-06T00:00:00Z  gate-then-land  slugR  gate-block attempt=1 blockers=r
+EOF
+python3 -c "
+import json
+json.dump({'prds': {'slugR': {'slug': 'slugR', 'status': 'archived'}}}, open('$D/state/manifest.json', 'w'))
+"
+out7="$(BUILD_JOURNAL_ROOT="$D/journal" BUILD_STATE_DIR="$D/state" "$GRS" --now 2026-01-06T01:00:00Z --window-h 2)"
+expect "AC7 exit 0" "[ $? -eq 0 ]"
+expect "AC7 blockers none" "[[ \"\$out7\" == *'blockers: none incomplete_infra:'* ]]"
+json7="$(cat "$D/state/gate-red.json")"
+expect "AC7 json families={}" "[ \"\$(printf '%s' \"\$json7\" | jq -c .families)\" = '{}' ]"
+
+# ============================================================================
+# AC8 — incomplete analogue: slugI incomplete (infra=p), then lands.
+# incomplete_infra must not surface a family for a slug whose final class
+# is green.
+# ============================================================================
+D="$T/ac8"; mkdir -p "$D/journal" "$D/state"
+cat > "$D/journal/2026-01-07.md" <<'EOF'
+2026-01-07T00:00:00Z  gate-then-land  slugI  gate-incomplete attempt=1 infra=p
+2026-01-07T00:05:00Z  gate-then-land  slugI  landed attempt=2 version=1.0.0 sha=deadbeef
+EOF
+out8="$(BUILD_JOURNAL_ROOT="$D/journal" BUILD_STATE_DIR="$D/state" "$GRS" --now 2026-01-07T01:00:00Z --window-h 2)"
+expect "AC8 exit 0" "[ $? -eq 0 ]"
+expect "AC8 incomplete=0" "[[ \"\$out8\" == *'incomplete=0'* ]]"
+expect "AC8 incomplete_infra none" "[[ \"\$out8\" == *'incomplete_infra: none'* ]]"
 
 # ============================================================================
 # R9 — gate-status.sh --red prints the JSON twin verbatim.

@@ -37,11 +37,14 @@
 #
 # A slug seen both red and green in the window counts as green ONLY if
 # its green line is strictly newer than its red line (requirement R1).
-# Blocker family counts are over every `blockers=<csv>` token in ANY
-# gate-block-shaped line in the window, regardless of whether that slug's
-# later line turned it green — this matches the stopgap's behavior and
-# AC1's worked example (a slug that gate-blocked and later landed still
-# contributes to the family tally, it just doesn't appear in red_slugs).
+# Blocker family counts, `incomplete_infra` counts and oldest-red are
+# derived only from slugs whose FINAL class in the window is red (or
+# incomplete), after manifest retraction. Since 2026-09-18: a slug that
+# gate-blocked and later landed (or was archived) contributes nothing —
+# earlier the tally ran over every `blockers=` token in any red-shaped
+# line, so red=0 could still name blockers and an oldest-red (the
+# agent-wake stale-red banner). Annotation lines that echo a block
+# (`gate-red`, `blocked-corrected-blocker-list`) never classify.
 #
 # Usage:
 #   gate-red-summary.sh [--window-h N] [--now ISO_TS]
@@ -152,12 +155,48 @@ awk -v since="$since" -v now="$now" '
 parse_skipped="$(cat "$skip_marker" 2>/dev/null || echo 0)"
 [ -z "$parse_skipped" ] && parse_skipped=0
 
-# One classification pass: red/green per slug (newest wins per the rule
-# above), blocker family counts, and the oldest red line's timestamp
-# (first red-pattern line encountered — the journal is append-only
-# chronological, so first-encountered is oldest).
+# ---- retracted slug set (PRD-build-gate-red-retraction, 2026-09-17
+# mcphost-agent-wake): manifest-reconcile.sh's dir-detection archive path
+# writes no journal line, so a slug archived that way can outlive its own
+# red past this window with nothing to say the alarm is stale. Read the
+# archived/vanished slugs out of the manifest cache BEFORE classification
+# so the awk pass can treat them as green in one place, instead of
+# reclassifying green/red after the fact (that used to leave oldest_red
+# and the family tallies uncorrected for a retracted slug — see this
+# PRD's Defect note). Manifest absent/unparsable is a no-op, never an
+# error (this script's exit-0 contract) — same tolerance as before.
+MANIFEST="${BUILD_MANIFEST:-$STATE_DIR/manifest.json}"
+retracted_set=""
+if [ -f "$MANIFEST" ]; then
+  retracted_set="$(MANIFEST_PATH="$MANIFEST" python3 -c '
+import json, os, sys
+try:
+    m = json.load(open(os.environ["MANIFEST_PATH"]))
+except (OSError, ValueError):
+    sys.exit(0)
+prds = m.get("prds", {})
+if isinstance(prds, list):
+    entries = [p for p in prds if isinstance(p, dict)]
+else:
+    entries = list(prds.values()) if isinstance(prds, dict) else []
+slugs = [e.get("slug") for e in entries if isinstance(e, dict) and e.get("slug") and e.get("status") in ("archived", "vanished")]
+print(" ".join(slugs))
+' 2>/dev/null)"
+fi
+
+# One classification pass: red/green/incomplete per slug (newest wins per
+# the rule above, manifest-retracted reds forced green), blocker/infra
+# family counts, and the oldest red line's timestamp — ALL derived from
+# each slug's FINAL class, computed once here (PRD-build-gate-red-
+# retraction-family-leak): a slug that went red then green inside the
+# window (or was retracted) must not contribute a family or an oldest-red
+# timestamp, since its final state is not red.
 class_out="$work_dir/class.txt"
-awk '
+awk -v retracted_set="$retracted_set" '
+  BEGIN {
+    n = split(retracted_set, arr, " ")
+    for (i = 1; i <= n; i++) if (arr[i] != "") retracted[arr[i]] = 1
+  }
   function fam_add(csv,    n, arr, i) {
     n = split(csv, arr, ",")
     for (i = 1; i <= n; i++) if (arr[i] != "") fam_count[arr[i]]++
@@ -172,49 +211,20 @@ awk '
   }
   {
     ts = $1
-    # PRD-build-reviewer-receipt-primary R6/R10: a family name can now be
-    # "<producer>:<reason>" (e.g. reviewer-agent:must-ac-failing-at-head)
-    # — the char class here used to stop at the first `:`, silently
-    # truncating every reason-qualified name back to the bare producer.
-    if (match($0, /blockers=[A-Za-z0-9,_:-]+/)) {
-      fam_add(substr($0, RSTART + 9, RLENGTH - 9))
-    }
-    if (match($0, /infra=[A-Za-z0-9,_:-]+/)) {
-      infam_add(substr($0, RSTART + 6, RLENGTH - 6))
-    }
     is_incomplete = 0
     incomplete_slug = ""
     if ($2 == "gate-then-land" && ($4 ~ /^gate-incomplete/ || $4 ~ /^gate-infra-attempts-exhausted/)) {
       is_incomplete = 1; incomplete_slug = $3
     }
-    if (is_incomplete && incomplete_slug != "") {
-      if (!(incomplete_slug in incomplete_ts) || ts > incomplete_ts[incomplete_slug]) incomplete_ts[incomplete_slug] = ts
-      seen[incomplete_slug] = 1
-      next
-    }
     is_red = 0
     slug = ""
     if ($2 == "gate-then-land" && $4 ~ /^gate-block/) { is_red = 1; slug = $3 }
     else if ($3 ~ /^verify-gate-red/) { is_red = 1; slug = $2 }
-    if (is_red && slug != "") {
-      if (!(slug in red_ts) || ts > red_ts[slug]) red_ts[slug] = ts
-      # PRD-build-gate-red-retraction: kept separate from red_ts (newest-
-      # wins) so a later retraction can drop a slug oldest-red
-      # contribution without disturbing which line counts as its CURRENT
-      # red/green classification above.
-      if (!(slug in first_red_ts)) first_red_ts[slug] = ts
-      if (oldest_red == "") oldest_red = ts
-      seen[slug] = 1
-      next
-    }
     is_green = 0
     gslug = ""
     if ($2 == "gate-then-land" && ($4 == "landed" || $4 == "gate-pass" || $4 == "land")) { is_green = 1; gslug = $3 }
     else if ($3 == "archive" && $4 == "archived") { is_green = 1; gslug = $2 }
-    if (is_green && gslug != "") {
-      if (!(gslug in green_ts) || ts > green_ts[gslug]) green_ts[gslug] = ts
-      seen[gslug] = 1
-    }
+
     # PRD-build-main-verdict-pinned-to-landing R9/AC11: extend-gate.sh
     # writes its OWN "gate <crate> <outcome> (...)" line (see extend-gate.sh
     # journal_line call, scope_prefix + journal_suffix) — a third shape
@@ -225,6 +235,7 @@ awk '
     # block at a *different* M is never attributed to this M (AC11 "never
     # attributed to S"), and a main-health red is keyed by repo@sha7 per
     # R6, not by the "main-health" sentinel slug alone.
+    pin_key = ""; pin_class = ""
     if ($2 == "gate" && match($0, /slug=[^ ]+/)) {
       pin_slug = substr($0, RSTART + 5, RLENGTH - 5)
       pin_head7 = ""
@@ -233,44 +244,103 @@ awk '
       pin_is_pinned = ($0 ~ / pinned=landing$/)
       if ((pin_is_mainhealth || pin_is_pinned) && pin_head7 != "") {
         pin_key = pin_is_mainhealth ? ($3 "@" pin_head7 " main-health") : (pin_slug "@" pin_head7)
-        if ($4 == "block") {
-          if (!(pin_key in red_ts) || ts > red_ts[pin_key]) red_ts[pin_key] = ts
-          if (!(pin_key in first_red_ts)) first_red_ts[pin_key] = ts
-          if (oldest_red == "") oldest_red = ts
-          seen[pin_key] = 1
-        } else if ($4 == "pass") {
-          if (!(pin_key in green_ts) || ts > green_ts[pin_key]) green_ts[pin_key] = ts
-          seen[pin_key] = 1
-        } else if ($4 == "incomplete") {
-          # PRD-build-gate-infra-outcome R2/R6: extend-gate.sh own pinned/
-          # main-health line can carry `incomplete` too (same fourth outcome,
-          # same pin_key scheme) — tracked here so a phase that could not
-          # run on a main-scope/pinned run is never misread as either a
-          # red or a green.
-          if (!(pin_key in incomplete_ts) || ts > incomplete_ts[pin_key]) incomplete_ts[pin_key] = ts
-          seen[pin_key] = 1
-        }
+        if ($4 == "block") pin_class = "red"
+        else if ($4 == "pass") pin_class = "green"
+        else if ($4 == "incomplete") pin_class = "incomplete"
+      }
+    }
+
+    # Family attribution keyed by the OWNING slug/pin_key of this line —
+    # blockers= only ever meaningful on a red-shaped line, infra= only
+    # ever meaningful on an incomplete-shaped line (kept separate per the
+    # comment above); tallied later in END, once each key final class is
+    # known, instead of unconditionally here.
+    fam_key = ""
+    if (is_red) fam_key = slug
+    else if (pin_class == "red") fam_key = pin_key
+    if (fam_key != "" && match($0, /blockers=[A-Za-z0-9,_:-]+/)) {
+      n_fam_line++
+      fam_line_key[n_fam_line] = fam_key
+      fam_line_csv[n_fam_line] = substr($0, RSTART + 9, RLENGTH - 9)
+    }
+    infam_key = ""
+    if (is_incomplete) infam_key = incomplete_slug
+    else if (pin_class == "incomplete") infam_key = pin_key
+    if (infam_key != "" && match($0, /infra=[A-Za-z0-9,_:-]+/)) {
+      n_infam_line++
+      infam_line_key[n_infam_line] = infam_key
+      infam_line_csv[n_infam_line] = substr($0, RSTART + 6, RLENGTH - 6)
+    }
+
+    if (is_incomplete && incomplete_slug != "") {
+      if (!(incomplete_slug in incomplete_ts) || ts > incomplete_ts[incomplete_slug]) incomplete_ts[incomplete_slug] = ts
+      seen[incomplete_slug] = 1
+      next
+    }
+    if (is_red && slug != "") {
+      if (!(slug in red_ts) || ts > red_ts[slug]) red_ts[slug] = ts
+      # PRD-build-gate-red-retraction: kept separate from red_ts (newest-
+      # wins) so a retraction can drop a slug oldest-red contribution
+      # without disturbing which line counts as its CURRENT classification.
+      if (!(slug in first_red_ts)) first_red_ts[slug] = ts
+      seen[slug] = 1
+      next
+    }
+    if (is_green && gslug != "") {
+      if (!(gslug in green_ts) || ts > green_ts[gslug]) green_ts[gslug] = ts
+      seen[gslug] = 1
+    }
+    if (pin_key != "") {
+      if (pin_class == "red") {
+        if (!(pin_key in red_ts) || ts > red_ts[pin_key]) red_ts[pin_key] = ts
+        if (!(pin_key in first_red_ts)) first_red_ts[pin_key] = ts
+        seen[pin_key] = 1
+      } else if (pin_class == "green") {
+        if (!(pin_key in green_ts) || ts > green_ts[pin_key]) green_ts[pin_key] = ts
+        seen[pin_key] = 1
+      } else if (pin_class == "incomplete") {
+        if (!(pin_key in incomplete_ts) || ts > incomplete_ts[pin_key]) incomplete_ts[pin_key] = ts
+        seen[pin_key] = 1
       }
     }
   }
   END {
-    green_n = 0
-    incomplete_n = 0
+    # Pass 1: final class per key, newest-wins, then a manifest retraction
+    # forces a would-be-red key green (only if it would otherwise have
+    # been red — a green/incomplete key is unaffected).
     for (s in seen) {
       best_ts = ""; best_class = "red"
       if (s in red_ts) { best_ts = red_ts[s]; best_class = "red" }
       if ((s in green_ts) && (best_ts == "" || green_ts[s] > best_ts)) { best_ts = green_ts[s]; best_class = "green" }
       if ((s in incomplete_ts) && (best_ts == "" || incomplete_ts[s] > best_ts)) { best_ts = incomplete_ts[s]; best_class = "incomplete" }
-      if (best_class == "green") { green_n++ }
-      else if (best_class == "incomplete") { incomplete_n++; print "INCOMPLETE_SLUG\t" s }
+      if (best_class == "red" && (s in retracted)) {
+        best_class = "green"
+        print "RETRACTED_SLUG\t" s
+      }
+      final_class[s] = best_class
+    }
+    # Pass 2: counts and slug listings from the final class.
+    green_n = 0
+    incomplete_n = 0
+    for (s in seen) {
+      if (final_class[s] == "green") { green_n++ }
+      else if (final_class[s] == "incomplete") { incomplete_n++; print "INCOMPLETE_SLUG\t" s }
       else { print "RED_SLUG\t" s }
     }
     print "COUNT_GREEN\t" green_n
     print "COUNT_INCOMPLETE\t" incomplete_n
+    # oldest_red: earliest first_red_ts among keys whose FINAL class is red.
+    oldest_red = ""
+    for (s in first_red_ts) {
+      if (final_class[s] == "red" && (oldest_red == "" || first_red_ts[s] < oldest_red)) oldest_red = first_red_ts[s]
+    }
     print "OLDEST_RED\t" oldest_red
+    # families: only from lines whose owning key final-classed red.
+    for (i = 1; i <= n_fam_line; i++) if (final_class[fam_line_key[i]] == "red") fam_add(fam_line_csv[i])
     for (f in fam_count) print "FAM\t" f "\t" fam_count[f]
+    # incomplete_infra: only from lines whose owning key final-classed incomplete.
+    for (i = 1; i <= n_infam_line; i++) if (final_class[infam_line_key[i]] == "incomplete") infam_add(infam_line_csv[i])
     for (f in infam_count) print "INFAM\t" f "\t" infam_count[f]
-    for (s in first_red_ts) print "FIRSTRED\t" s "\t" first_red_ts[s]
   }
 ' "$filtered" > "$class_out"
 
@@ -288,66 +358,10 @@ incomplete_n="$(awk -F'\t' '$1=="COUNT_INCOMPLETE"{print $2}' "$class_out")"
 incomplete_n="${incomplete_n:-0}"
 oldest_red="$(awk -F'\t' '$1=="OLDEST_RED"{print $2}' "$class_out")"
 
-# ---- retract archived reds (PRD-build-gate-red-retraction, 2026-09-17
-# mcphost-agent-wake): manifest-reconcile.sh's dir-detection archive path
-# writes no journal line, so a slug archived that way can outlive its own
-# red past this window with nothing to say the alarm is stale. Cross-check
-# every still-red slug against the manifest cache and drop anything
-# already archived/vanished there — manifest absent/unparsable is a no-op,
-# never an error (this script's exit-0 contract).
-retracted_slugs=""
+retracted_slugs="$(awk -F'\t' '$1=="RETRACTED_SLUG"{print $2}' "$class_out" | sort -u)"
 retracted_slugs_json='[]'
-MANIFEST="${BUILD_MANIFEST:-$STATE_DIR/manifest.json}"
-if [ -n "$red_slugs" ] && [ -f "$MANIFEST" ]; then
-  retraction_out="$(RED_SLUGS="$red_slugs" MANIFEST_PATH="$MANIFEST" python3 -c '
-import json, os, sys
-red_slugs = [s for s in os.environ["RED_SLUGS"].split("\n") if s]
-try:
-    m = json.load(open(os.environ["MANIFEST_PATH"]))
-except (OSError, ValueError):
-    print(json.dumps({"kept": red_slugs, "retracted": []}))
-    sys.exit(0)
-prds = m.get("prds", {})
-if isinstance(prds, list):
-    entries = {p.get("slug"): p for p in prds if isinstance(p, dict) and p.get("slug")}
-else:
-    entries = dict(prds) if isinstance(prds, dict) else {}
-kept, retracted = [], []
-for s in red_slugs:
-    st = (entries.get(s) or {}).get("status")
-    (retracted if st in ("archived", "vanished") else kept).append(s)
-print(json.dumps({"kept": kept, "retracted": retracted}))
-' 2>/dev/null)"
-  if [ -n "$retraction_out" ]; then
-    retracted_slugs="$(printf '%s' "$retraction_out" | python3 -c 'import json,sys;print("\n".join(json.load(sys.stdin)["retracted"]))')"
-    if [ -n "$retracted_slugs" ]; then
-      red_slugs="$(printf '%s' "$retraction_out" | python3 -c 'import json,sys;print("\n".join(json.load(sys.stdin)["kept"]))')"
-      red_n="$(printf '%s\n' "$red_slugs" | grep -c . || true)"
-      [ -z "$red_slugs" ] && red_n=0
-      retracted_n="$(printf '%s\n' "$retracted_slugs" | grep -c . || true)"
-      green_n=$((green_n + retracted_n))
-      retracted_slugs_json="$(printf '%s\n' "$retracted_slugs" | "$JQ" -R -s 'split("\n") | map(select(length > 0))')"
-      # oldest_red must not credit a retracted slug oldest-red line — the
-      # earliest remaining timestamp is recomputed from first_red_ts,
-      # excluding every retracted slug contribution.
-      oldest_red="$(awk -F'\t' '$1=="FIRSTRED"{print $2"\t"$3}' "$class_out" | \
-        RETRACTED="$retracted_slugs" python3 -c '
-import os, sys
-retracted = set(os.environ["RETRACTED"].split("\n"))
-best = ""
-for line in sys.stdin:
-    line = line.rstrip("\n")
-    if not line:
-        continue
-    slug, ts = line.split("\t", 1)
-    if slug in retracted:
-        continue
-    if best == "" or ts < best:
-        best = ts
-print(best)
-')"
-    fi
-  fi
+if [ -n "$retracted_slugs" ]; then
+  retracted_slugs_json="$(printf '%s\n' "$retracted_slugs" | "$JQ" -R -s 'split("\n") | map(select(length > 0))')"
 fi
 
 # Families sorted by count desc, then name asc, for a deterministic line.
