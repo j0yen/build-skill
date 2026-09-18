@@ -136,6 +136,13 @@ WT_ROOT="${BUILD_WT_ROOT:-$HOME/.cache/build-worktrees}"
 EXTEND="$(dirname "$0")/extend-handler.sh"
 SIDECAR="$(dirname "$0")/manifest-sidecar.sh"
 SERIAL_FALLBACK="$(dirname "$0")/loom-serial-fallback.sh"
+# PRD-build-flow-ledger requirement 2: this script is the sole writer of
+# the ledger's `landed` event, appended at cmd_land's success points
+# (both the fast-forward-after-rebase early return and the merge-based
+# fall-through at the end of the function) — never re-derived later from
+# a journal grep. flow_ledger_append never fails the caller.
+# shellcheck source=lib/flow-ledger.sh
+source "$(dirname "$0")/lib/flow-ledger.sh"
 GIT_ID=(-c user.email=jyen.tech@gmail.com -c user.name="Joe Yen")
 # PRD-build-land-conflict-resolver R8: cmd_land's own conflict paths get
 # the same policy-classified resolve gate-then-land.sh's rebase_onto_main
@@ -732,6 +739,7 @@ cmd_land() {
             "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$slug" "$default_tip" "${pre_commits:-0}" >>"$rj"
           [ -x "$SERIAL_FALLBACK" ] && "$SERIAL_FALLBACK" streak-reset "$repo" >&2 || true
           local rebased_sha; rebased_sha="$(git -C "$repo" rev-parse HEAD)"
+          flow_ledger_append "$slug" "landed" --sha "$rebased_sha"
           local rcleanup; rcleanup="$(cmd_cleanup "$repo" "$slug")"
           echo "worktree-extend: $slug: land: $rcleanup" >&2
           printf '%s\n' "$rebased_sha"
@@ -843,6 +851,7 @@ cmd_land() {
   # worktree $verdict_path may live under.
   local landed_sha; landed_sha="$(git -C "$repo" rev-parse HEAD)"
   [ -n "$gated_at" ] && gate_cache_transfer "$repo" "$slug" "$verdict_path" "" "$landed_sha"
+  flow_ledger_append "$slug" "landed" --sha "$landed_sha"
   # Land is complete: free the worktree now, same reasoning as integrate
   # (PRD-build-worktree-targets-off-root) — keep the branch (no --drop-branch)
   # so the caller's own cleanup/--drop-branch decision stays theirs.
