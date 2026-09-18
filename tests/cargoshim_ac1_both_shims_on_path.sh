@@ -2,11 +2,15 @@
 # cargoshim_ac1_both_shims_on_path.sh — PRD-build-cargo-shim-recursion-guard
 # requirement 3 / AC1+AC2. Puts the real cargo-budget-bin/cargo and the real
 # rustbuild bin/cargo on PATH in both orders, with a fake real cargo behind
-# both, and asserts: the fake runs exactly once per order, no
-# recursion-refused line is journaled, and (AC4) the check is realpath-based
-# — a symlinked rustbuild skill dir is still excluded correctly, which is
-# exercised implicitly since ~/.claude/skills/rustbuild is itself commonly a
-# symlink and the production resolver (readlink -f) is what's under test.
+# both, and asserts: the fake runs exactly once per order and no
+# recursion-refused line is journaled.
+#
+# This test does NOT cover AC4 (realpath-based exclusion): it resolves
+# RUSTBUILD_BIN with `readlink -f` below, so the resolver only ever sees
+# canonical PATH entries and a raw-string resolver passes this test too
+# (confirmed by mutation 2026-09-18). AC4 lives in
+# cargoshim_ac4_symlinked_shim_dir_excluded.sh, which puts symlinked shim
+# dirs on PATH and does fail against that mutant.
 #
 # `cargo --version` is used as the driving command: rustbuild's own shim
 # already special-cases --version to resolve locally regardless of host, so
