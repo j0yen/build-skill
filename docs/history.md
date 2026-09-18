@@ -425,3 +425,49 @@ script's own `:-` default is applied) — exactly what this PRD's own new
 `host-contract-tick-selftest.sh` does, pointed at a small fixture double,
 so the new behavior is still exercised deterministically without every
 untouched selftest in the tree silently starting to probe the real host.
+
+## host-contract-gate-integration — 2026-09-18, PRD-build-host-contract
+
+Step 3: requirement 3's last leg, AC7. `extend-gate.sh` gained
+`emit_host_drift_and_exit`, the same shape as the reviewer-agent-auth-
+contract PRD's `emit_reviewer_auth_missing_and_exit` right above it in
+the file — a critical `docs/host-contract.md` drift ends the gate before
+ANY of the 24 receipt producers, verdict `incomplete
+infra=host-drift:<keys>`, never `block`.
+
+Unlike the reviewer-auth probe (which is unconditional in production,
+just conditionally SKIPPED under scope/canary rules), this check is
+opt-in: `EXTEND_GATE_HOST_CONTRACT_CHECK=1`, default off. The reason is
+structural, not cosmetic — `extend-gate.sh` has an unusually large
+existing selftest surface (`extend-gate-*-selftest.sh`,
+`tests/revauth_ac*.sh`, `tests/gatescope_*`, dozens more) that invoke the
+real script directly, with no shared `BUILD_TEST=1` isolation wrapper the
+way `run-selftests.sh`'s own suite gets — each test fakes only the
+specific binaries it cares about via `$PATH` or a named override var.
+Learned this the hard way twice in this PRD already: step 2's first cut
+of `select-tick.sh`'s host-drift gate defaulted on for `lane=redbaron`
+with no isolation awareness and broke `select-tick-selftest.sh`'s AC6
+against this box's actual live drift; the first cut of THIS gate reused
+that PRD's `BUILD_TEST=1`-skip trick, which is exactly wrong here because
+none of extend-gate.sh's own test suite sets `BUILD_TEST=1` at all — an
+unguarded default-on probe would have silently called the real
+`host-contract.sh` inside every one of those fixture runs. `gate-
+launch.sh` — the one place a live gate actually starts, via `systemd-run
+--user --unit ... --setenv=`, already the exact mechanism
+`unit-env-inheritance` (another key in this same contract) exists to
+audit — is the one place that sets the flag; nothing else does, so every
+existing test stays exactly as isolated as it always was, verified: `git
+stash` the three changed files back to HEAD and re-run both `extend-
+gate-explain-scope-class-selftest.sh` (1 pre-existing unrelated failure,
+identical stashed or not — `--explain-scope` returns before this code
+even runs) and `extend-gate-scope-selftest.sh` (2 pre-existing unrelated
+`AC1c` failures about a DIFFERENT journal field, identical stashed or
+not) to separate "pre-existing" from "caused by this step" line by line,
+plus a clean `gate-launch-selftest.sh` run (its own fixture double for
+extend-gate.sh, so the new `--setenv` is inert there) and a dedicated new
+`tests/hostcontract_ac7_gate_incomplete_on_critical_drift.sh` proving
+both shapes: flag on + a fixture double at `$HOST_CONTRACT_SH` -> exits 9
+before any producer, journal carries `infra=host-drift:<keys>`, no
+`block`; flag unset (the shape every other selftest already runs under)
+-> the same fixture double is never even consulted, gate proceeds
+normally to the reviewer-auth-probe point next.

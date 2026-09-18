@@ -1942,6 +1942,97 @@ emit_reviewer_auth_missing_and_exit() {
   exit 9
 }
 
+# emit_host_drift_and_exit — PRD-build-host-contract requirement 3/AC7:
+# ends the WHOLE gate here, before ANY of the 24 receipt producers, the
+# same shape as emit_reviewer_auth_missing_and_exit above for a missing
+# auth token -- a critical docs/host-contract.md drift means the host
+# beneath the gate is broken, not the change under test, so the verdict
+# is `incomplete infra=host-drift:<key>`, never `block`.
+emit_host_drift_and_exit() {
+  local check_secs="$1" keys_csv="$2"
+  record_phase host-contract-check "$check_secs" fail
+  echo "extend-gate: INFRA: host-drift:${keys_csv}" >&2
+
+  local wall phases_str="" phase_sum=0 _pi _pname _pval
+  wall=$(( $(date +%s) - t0 ))
+  for _pi in "${!phase_names[@]}"; do
+    _pname="${phase_names[$_pi]}"; _pval="${phase_vals[$_pi]}"
+    case "$_pval" in
+      skip|defer) : ;;
+      *!) phase_sum=$(( phase_sum + ${_pval%!} )) ;;
+      *)  phase_sum=$(( phase_sum + _pval )) ;;
+    esac
+    if [ -n "$phases_str" ]; then phases_str="$phases_str,$_pname:$_pval"; else phases_str="$_pname:$_pval"; fi
+  done
+  local phases_field="phases=$phases_str"
+
+  local scope_prefix=""
+  [ "$scope" = branch ] && scope_prefix="scope=branch slug=$slug "
+  $pinned_landing && scope_prefix="scope=main slug=$slug "
+  $main_health && scope_prefix="scope=main slug=$slug "
+
+  local journal_suffix=" infra=host-drift:${keys_csv}"
+  $pinned_landing && journal_suffix="$journal_suffix pinned=landing"
+  $main_health && journal_suffix="$journal_suffix main-health"
+
+  journal_line --file "$journal" "$(printf '%s  gate  %s  %s  (%shead=%s base=%s %s blocking=%s wall=%ss %s lock_wait=%ss cargo=burst:%s/local:%s shim_trips=0 route=%s)%s' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$crate_name" "incomplete" "$scope_prefix" "$head_now" "$journal_base_field" \
+    "gate: no-summary-line (host-drift before any producer ran)" "none" "$wall" "$phases_field" "${lock_wait:-0}" \
+    "0" "0" "$GATE_ROUTE" "$journal_suffix")"
+
+  [ -n "$slug" ] && flow_ledger_append "$slug" "gate_verdict" --sha "$head_now" --detail "verdict=incomplete"
+
+  mkdir -p "$(dirname "$cache_file")"
+  jq -n --arg head "$head_now" --arg tree "$tree_now" --arg hash "$self_hash" \
+       --arg host "$route_host" --arg intended "$route_intended" \
+       --argjson wall_s "$wall" --arg scope "$scope" --arg slug "$slug" \
+       --arg gate_route "$GATE_ROUTE" --arg reason "host-drift:${keys_csv}" '{
+    head_sha: $head, head: $head, tree_sha: $tree, script_sha256: $hash,
+    verdict: "incomplete", exit_code: 9,
+    new_blocks: [], inherited_blocks: [],
+    cargo_route: {intended: $intended, burst: 0, local: 0, passthrough: 0, host: $host},
+    route: $gate_route, routed: {n: 0, receipts: 0},
+    blocks: [], attribution: {in_scope: 0, inherited: 0}, attribution_range: null,
+    phases: {}, wall_s: $wall_s, scope: $scope, slug: $slug,
+    deferred_receipts: [],
+    infra_notes: [("host-contract — " + $reason)],
+    reviewer_auth_source: ""
+  }' > "$cache_file" 2>/dev/null || true
+  if [ -n "$verdict_cache_mirror" ]; then
+    mkdir -p "$(dirname "$verdict_cache_mirror")" 2>/dev/null && cp "$cache_file" "$verdict_cache_mirror" 2>/dev/null || true
+  fi
+
+  exit 9
+}
+
+# --- PRD-build-host-contract requirement 3: host-contract.sh check --fast
+# (no auth probe -- cheap) runs at gate start, before ANY receipt producer.
+# Opt-in via EXTEND_GATE_HOST_CONTRACT_CHECK=1 (default OFF) -- this repo's
+# extend-gate-*-selftest.sh suite is large, invokes extend-gate.sh
+# directly (not through any BUILD_TEST=1 isolation wrapper), and has no
+# idea this check exists; an unguarded default-on probe here would
+# silently call the REAL host-contract.sh against whatever RedBaron's
+# actual live drift state happens to be during every one of those runs.
+# gate-launch.sh -- the one place a live gate actually starts -- sets the
+# flag; every other caller (every selftest, any ad-hoc manual run) stays
+# off by default. Also gated on this process's own hostname being
+# redbaron (docs/host-contract.md's Migration note: carbon/ryzen7 are
+# disabled), belt-and-braces even though gate-launch.sh's own env only
+# ever reaches a redbaron unit today.
+HOST_CONTRACT_SH="${HOST_CONTRACT_SH:-$BUILD_SCRIPTS/host-contract.sh}"
+if [ "${EXTEND_GATE_HOST_CONTRACT_CHECK:-0}" = "1" ] && [ "$(hostname)" = "redbaron" ] \
+   && [ -x "$HOST_CONTRACT_SH" ]; then
+  _hc_t0=$(date +%s)
+  _hc_out="$("$HOST_CONTRACT_SH" check --fast 2>/dev/null)"
+  _hc_rc=$?
+  _hc_secs=$(( $(date +%s) - _hc_t0 ))
+  if [ "$_hc_rc" -eq 2 ]; then
+    _hc_keys="$(printf '%s\n' "$_hc_out" | grep 'severity=critical' | sed -E 's/=drift.*$//' | paste -sd, -)"
+    emit_host_drift_and_exit "$_hc_secs" "$_hc_keys"
+  fi
+  record_phase host-contract-check "$_hc_secs" ok
+fi
+
 if reviewer_auth_probe_needed; then
   _probe_t0=$(date +%s)
   _probe_ok=true

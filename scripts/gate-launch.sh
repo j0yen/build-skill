@@ -73,6 +73,15 @@
 #
 # --wait blocks until the unit is inactive and exits with the gate's own
 # exit code (`systemctl --user show -p ExecMainStatus --value`).
+#
+# PRD-build-host-contract requirement 3: the unit's environment carries
+# EXTEND_GATE_HOST_CONTRACT_CHECK=1, opting the launched extend-gate.sh
+# into its own gate-start `host-contract.sh check --fast` (see that
+# script's header) -- extend-gate.sh defaults this OFF so the wide
+# existing extend-gate-*-selftest.sh suite, which invokes extend-gate.sh
+# directly and knows nothing of this flag, never probes the real host;
+# this is the one real place a live gate actually starts, so it is the
+# one place that turns the check on.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
@@ -254,6 +263,7 @@ started_ts="$(now_iso)"
 "$SYSTEMD_RUN" --user --unit "$unit" --collect \
   -p WorkingDirectory="$repo" \
   --setenv="PATH=$launch_path" \
+  --setenv="EXTEND_GATE_HOST_CONTRACT_CHECK=1" \
   bash -c "$inner" >&2
 sr_rc=$?
 [ "$sr_rc" -eq 0 ] || die 2 "systemd-run failed to launch $unit (rc=$sr_rc)"
