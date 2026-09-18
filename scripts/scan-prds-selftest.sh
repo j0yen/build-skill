@@ -136,5 +136,40 @@ else
   echo "FAIL: AC6 order differs under en_US.UTF-8"; fails=$((fails+1))
 fi
 
+
+# --- PRD-build-prd-superseded-by AC1: Superseded-by/transferred_acs/
+# Absorbs parse into superseded_by, transferred_acs, and absorbs (target +
+# p:s map) -----------------------------------------------------------------
+cat >"$tmp/PRD-pred-x.md" <<'EOF'
+# PRD: pred-x
+- Status: queued
+- Superseded-by: PRD-succ-y.md
+- transferred_acs: [9, 10]
+
+## Acceptance criteria
+1. thing
+EOF
+cat >"$tmp/PRD-succ-y.md" <<'EOF'
+# PRD: succ-y
+- Status: queued
+- Absorbs: PRD-pred-x.md [9:15, 10:16]
+
+## Acceptance criteria
+1. thing
+EOF
+out="$(PRD_DIR="$tmp" JQ="$JQ" JOURNAL="$tmp/journal.md" bash "$SCAN")" || { echo "FAIL: scan exited non-zero (superseded-by fixture)"; exit 1; }
+check pred-x superseded_by "PRD-succ-y.md"
+if "$JQ" -e '.[] | select(.slug=="pred-x") | .transferred_acs == [9,10]' >/dev/null <<<"$out"; then
+  echo "ok: AC1 pred-x.transferred_acs = [9,10]"
+else
+  echo "FAIL: AC1 pred-x.transferred_acs"; fails=$((fails+1))
+fi
+if "$JQ" -e '.[] | select(.slug=="succ-y") | .absorbs == {"target":"PRD-pred-x.md","map":[[9,15],[10,16]]}' >/dev/null <<<"$out"; then
+  echo "ok: AC1 succ-y.absorbs target+map"
+else
+  echo "FAIL: AC1 succ-y.absorbs"; fails=$((fails+1))
+fi
+rm -f "$tmp/PRD-pred-x.md" "$tmp/PRD-succ-y.md"
+
 if [ "$fails" -ne 0 ]; then echo "SELFTEST FAILED ($fails)"; exit 1; fi
 echo "SELFTEST PASSED"

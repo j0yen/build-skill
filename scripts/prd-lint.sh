@@ -534,6 +534,105 @@ def find_cycle(graph, start):
     return None
 
 
+_superseded_graph_cache = {}
+
+
+def build_superseded_graph(dirs):
+    """slug -> {successor slug} (0 or 1 elements) via each PRD's own
+    `Superseded-by:` line, plus slug -> filename -- same shape as
+    build_graph's Depends-on graph above, reused by find_cycle for the
+    `superseded-by-cycle` check (PRD-build-prd-superseded-by requirement
+    3)."""
+    key = tuple(sorted(dirs))
+    if key in _superseded_graph_cache:
+        return _superseded_graph_cache[key]
+    graph = {}
+    fname_by_slug = {}
+    for d in dirs:
+        try:
+            names = sorted(os.listdir(d))
+        except OSError:
+            continue
+        for name in names:
+            if not (name.startswith("PRD-") and name.endswith(".md")):
+                continue
+            fpath = os.path.join(d, name)
+            fm2 = parse_frontmatter(fpath)
+            sup = fm2.get("superseded-by")
+            s = slug_of(name)
+            graph[s] = {slug_of(sup)} if sup else set()
+            fname_by_slug[s] = name
+    _superseded_graph_cache[key] = (graph, fname_by_slug)
+    return graph, fname_by_slug
+
+
+ABSORBS_RE = re.compile(r"^(\S+)\s+\[([^\]]*)\]$")
+
+
+def parse_absorbs(raw):
+    """`PRD-<slug>.md [p:s, p:s, ...]` -> (target_filename, [(p, s), ...]),
+    or (None, None) if absent/unparseable -- same shape scan-prds.sh's bash
+    parser produces (PRD-build-prd-superseded-by requirement 1)."""
+    if not raw:
+        return None, None
+    m = ABSORBS_RE.match(raw.strip())
+    if not m:
+        return None, None
+    target = m.group(1)
+    pairs = []
+    for tok in m.group(2).split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        pm = re.match(r"^(\d+):(\d+)$", tok)
+        if not pm:
+            return None, None
+        pairs.append((int(pm.group(1)), int(pm.group(2))))
+    if not pairs:
+        return None, None
+    return target, pairs
+
+
+def read_ac_numbers_and_live(fpath):
+    """Numbered AC-line numbers, and the subset carrying an un-quoted
+    `(Live` marker, for a PRD file OTHER than the one lint_file is
+    currently walking (successor cross-read for the Superseded-by/Absorbs
+    checks below). Deliberately a standalone read rather than a refactor
+    of lint_file's own per-file AC walk, so this addition can't perturb
+    that already-covered code path."""
+    lines = read_lines(fpath)
+    if not lines:
+        return set(), set()
+    section, found = ac_section_lines(lines)
+    if not found:
+        return set(), set()
+    items = []
+    cur = None
+    for l in section:
+        if AC_NUM_RE.match(l.strip()):
+            if cur is not None:
+                items.append(cur)
+            cur = [l.strip()]
+        elif cur is not None and l.strip():
+            cur.append(l.strip())
+        elif cur is not None and not l.strip():
+            items.append(cur)
+            cur = None
+    if cur is not None:
+        items.append(cur)
+    nums, live = set(), set()
+    for it in items:
+        m = AC_NUM_RE.match(it[0])
+        if not m:
+            continue
+        n = int(m.group(1))
+        nums.add(n)
+        s = " ".join(it)
+        if LIVE_AC_RE.search(re.sub(r"`[^`]*`", "", s)):
+            live.add(n)
+    return nums, live
+
+
 def lint_file(path):
     fails = []
     warns = []
@@ -899,6 +998,114 @@ def lint_file(path):
                         "real-box-ac-no-authorization",
                         f"AC mentions a real-box/real-money spend ({m.group(0)!r}) "
                         f"with no `Operator-authorization:` key in frontmatter: {it[0]!r}",
+                    )
+
+        # -- Superseded-by / transferred_acs (predecessor) and Absorbs
+        # (successor) -- PRD-build-prd-superseded-by requirement 3. Two
+        # independent halves of one transfer: a predecessor names
+        # `Superseded-by:` + `transferred_acs:` and this lint cross-reads
+        # the successor's own `Absorbs:` map; a successor names `Absorbs:`
+        # and this lint checks it purely against ITS OWN AC lines/
+        # deferred_acs -- the map lives on the successor (Technical
+        # considerations: its AC numbers are the ones still free to change
+        # before dispatch), so lint on the predecessor cross-reads out,
+        # lint on the successor never needs to.
+        own_ac_nums = set()
+        for it in items:
+            m = AC_NUM_RE.match(it[0])
+            if m:
+                own_ac_nums.add(int(m.group(1)))
+
+        transferred_raw = fm.get("transferred_acs")
+        transferred_nums = []
+        if transferred_raw:
+            if re.match(r"^\[\s*\d+(\s*,\s*\d+)*\s*\]$", transferred_raw) or re.match(r"^\[\s*\]$", transferred_raw):
+                has_t_items = bool(re.match(r"^\[\s*\d+", transferred_raw))
+                transferred_nums = [int(n) for n in re.findall(r"\d+", transferred_raw)] if has_t_items else []
+            else:
+                fail("transferred-acs-prose", "transferred_acs must be a list, e.g. [9, 10]")
+
+        sup_raw = fm.get("superseded-by")
+        if sup_raw:
+            sup_target = sup_raw.strip()
+            corpus_dirs_all = slug_corpus_dirs_for(path)
+            bq_bp_dirs = [d for d in corpus_dirs_all if os.path.basename(d) in ("build-queue", "built-prds")]
+            parked_dirs = [d for d in corpus_dirs_all if os.path.basename(d) == "parked"]
+            found_active = any(os.path.isfile(os.path.join(d, sup_target)) for d in bq_bp_dirs)
+            found_parked = any(os.path.isfile(os.path.join(d, sup_target)) for d in parked_dirs)
+            if not found_active and not found_parked:
+                fail(
+                    "superseded-by-target-missing",
+                    f"Superseded-by names {sup_target!r}, not found in build-queue/, built-prds/, or parked/",
+                )
+            elif found_parked and not found_active:
+                fail(
+                    "superseded-by-target-parked",
+                    f"Superseded-by target {sup_target!r} is sitting in parked/ -- "
+                    f"unpark it (git mv to build-queue/) before the transfer can resolve",
+                )
+            else:
+                sgraph, sfname_by_slug = build_superseded_graph(corpus_dirs_all)
+                sgraph.setdefault(slug, set()).add(slug_of(sup_target))
+                cyc = find_cycle(sgraph, slug)
+                if cyc:
+                    loop = " -> ".join(sfname_by_slug.get(s, f"PRD-{s}.md") for s in cyc)
+                    fail("superseded-by-cycle", f"Superseded-by graph has a cycle: {loop}")
+                elif transferred_nums:
+                    succ_path = next(
+                        (os.path.join(d, sup_target) for d in bq_bp_dirs if os.path.isfile(os.path.join(d, sup_target))),
+                        None,
+                    )
+                    succ_fm = parse_frontmatter(succ_path) if succ_path else {}
+                    succ_target, succ_pairs = parse_absorbs(succ_fm.get("absorbs"))
+                    if not succ_pairs or slug_of(succ_target) != slug:
+                        named = ", ".join(str(n) for n in sorted(transferred_nums))
+                        fail(
+                            "transferred-ac-unmapped",
+                            f"successor {sup_target} has no `Absorbs: PRD-{slug}.md [...]` "
+                            f"map naming this predecessor -- transferred AC(s) {named} unmapped",
+                        )
+                    else:
+                        mapped_from = dict(succ_pairs)
+                        unmapped = sorted(n for n in transferred_nums if n not in mapped_from)
+                        if unmapped:
+                            fail(
+                                "transferred-ac-unmapped",
+                                f"transferred AC(s) {', '.join(str(n) for n in unmapped)} "
+                                f"absent from successor's Absorbs map",
+                            )
+                        succ_ac_nums, succ_live_nums = read_ac_numbers_and_live(succ_path)
+                        mismatches = [
+                            (n, mapped_from[n])
+                            for n in transferred_nums
+                            if n in live_ac_nums and n in mapped_from and mapped_from[n] not in succ_live_nums
+                        ]
+                        if mismatches:
+                            named = ", ".join(f"{p}->{s}" for p, s in mismatches)
+                            fail(
+                                "transferred-live-ac-not-live",
+                                f"predecessor (Live AC(s) mapped to a successor AC without (Live: {named}",
+                            )
+
+        absorbs_raw = fm.get("absorbs")
+        if absorbs_raw:
+            absorbs_target, absorbs_pairs = parse_absorbs(absorbs_raw)
+            if not absorbs_pairs:
+                fail("absorbs-prose", f"Absorbs must be `PRD-<slug>.md [p:s, p:s, ...]`, got {absorbs_raw!r}")
+            else:
+                missing_s = sorted({s for (_p, s) in absorbs_pairs if s not in own_ac_nums})
+                if missing_s:
+                    fail(
+                        "absorbs-ac-missing",
+                        f"Absorbs maps to AC(s) {', '.join(str(n) for n in missing_s)} "
+                        f"which are not numbered AC lines in this PRD",
+                    )
+                conflict = sorted({s for (_p, s) in absorbs_pairs if s in deferred_nums})
+                if conflict:
+                    fail(
+                        "absorbed-ac-cannot-defer",
+                        f"AC(s) {', '.join(str(n) for n in conflict)} are both an Absorbs "
+                        f"map target and in deferred_acs -- an absorbed AC must be proven, never deferred",
                     )
 
     # -- credential-reuse claim with no backing secrets-path file ------------

@@ -252,7 +252,7 @@ JQ="${JQ:-$(command -v jq 2>/dev/null || echo /usr/bin/jq)}"
 [ -x "$JQ" ] || { echo "jq not at $JQ" >&2; exit 1; }
 
 emit_one() {
-  local path="$1" slug status_line build_auto build_target build_priority build_into build_version_bump deferred_acs deferred_ac_reasons publish test_prefix deferred_acs_unparsed operator_authorization operator_authorization_unparsed
+  local path="$1" slug status_line build_auto build_target build_priority build_into build_version_bump deferred_acs deferred_ac_reasons publish test_prefix deferred_acs_unparsed operator_authorization operator_authorization_unparsed superseded_by transferred_acs transferred_acs_unparsed absorbs absorbs_unparsed
   slug="$(basename "$path" .md)"
   slug="${slug#PRD-}"
 
@@ -291,6 +291,16 @@ emit_one() {
   # `test_prefix: [http, https]`) so the archive gate's derivation doesn't
   # have to guess. Always emitted as a JSON array (possibly empty).
   test_prefix="[]"
+  # Per PRD-build-prd-superseded-by requirement 2: a predecessor's
+  # `Superseded-by:`/`transferred_acs:` and a successor's `Absorbs:` are
+  # parsed the same way as deferred_acs above -- inline-list/inline-map
+  # forms only, prose flagged `_unparsed` rather than silently dropped.
+  # null/[] when absent so every PRD without these keys behaves unchanged.
+  superseded_by="null"
+  transferred_acs="[]"
+  transferred_acs_unparsed=false
+  absorbs="null"
+  absorbs_unparsed=false
   status_line=""
   gate_stale=false
 
@@ -300,7 +310,7 @@ emit_one() {
   # the parse. First-match-wins for build_* keys so real frontmatter
   # always beats later in-doc examples.
   local in_fence=false
-  local seen_target=false seen_priority=false seen_into=false seen_bump=false seen_deferred=false seen_test_prefix=false seen_operator_authorization=false
+  local seen_target=false seen_priority=false seen_into=false seen_bump=false seen_deferred=false seen_test_prefix=false seen_operator_authorization=false seen_superseded_by=false seen_transferred_acs=false seen_absorbs=false
   # strip leading ws, trailing ws, trailing inline-comment (` #...`), surrounding quotes
   strip_val() {
     printf '%s' "$1" | sed -E 's/^[[:space:]]*//;s/[[:space:]]+#.*$//;s/[[:space:]]*$//;s/^"//;s/"$//'
@@ -384,6 +394,83 @@ emit_one() {
             ;;
         esac
         seen_deferred=true
+        ;;
+      "Superseded-by:"*)
+        # Per PRD-build-prd-superseded-by requirement 1: predecessor names
+        # the successor file it handed remaining ACs to.
+        [ "$seen_superseded_by" = true ] && continue
+        v="$(strip_val "$(printf '%s' "$kline" | sed -E 's/^Superseded-by[[:space:]]*:[[:space:]]*//')")"
+        if [ -n "$v" ]; then
+          esc="$(printf '%s' "$v" | sed 's/\\/\\\\/g;s/"/\\"/g')"
+          superseded_by="\"$esc\""
+        fi
+        seen_superseded_by=true
+        ;;
+      "transferred_acs:"*)
+        # Same inline-list code path as deferred_acs above (requirement 1);
+        # prose form flags transferred_acs_unparsed instead of silently
+        # parsing to [] (Technical considerations: "the prose form gets the
+        # same _unparsed=true flag and a lint diagnosis").
+        [ "$seen_transferred_acs" = true ] && continue
+        v="$(strip_val "$(printf '%s' "$kline" | sed -E 's/^transferred_acs[[:space:]]*:[[:space:]]*//')")"
+        case "$v" in
+          '['*']')
+            inner="${v#\[}"; inner="${inner%\]}"
+            csv=""
+            IFS=',' read -ra toks <<<"$inner"
+            for t in "${toks[@]}"; do
+              tt="$(printf '%s' "$t" | sed -E 's/^[[:space:]]+//;s/[[:space:]]+$//')"
+              case "$tt" in
+                ''|*[!0-9]*) continue ;;
+                *) csv+="${csv:+,}$tt" ;;
+              esac
+            done
+            transferred_acs="[$csv]"
+            ;;
+          '')
+            : # block-list form or bare `transferred_acs:` — no-op, not prose
+            ;;
+          *)
+            transferred_acs_unparsed=true
+            ;;
+        esac
+        seen_transferred_acs=true
+        ;;
+      "Absorbs:"*)
+        # Per PRD-build-prd-superseded-by requirement 1: successor shape is
+        # `PRD-<slug>.md [p:s, p:s, ...]` -- predecessor AC p maps to
+        # successor AC s. Any other shape flags absorbs_unparsed rather
+        # than silently dropping the map (same contract as the other
+        # `_unparsed` flags above).
+        [ "$seen_absorbs" = true ] && continue
+        v="$(strip_val "$(printf '%s' "$kline" | sed -E 's/^Absorbs[[:space:]]*:[[:space:]]*//')")"
+        if [ -n "$v" ]; then
+          if [[ "$v" =~ ^([^[:space:]]+)[[:space:]]+\[([^]]*)\]$ ]]; then
+            ab_target="${BASH_REMATCH[1]}"
+            ab_pairs="${BASH_REMATCH[2]}"
+            map_json=""
+            ab_ok=true
+            IFS=',' read -ra ptoks <<<"$ab_pairs"
+            for t in "${ptoks[@]}"; do
+              tt="$(printf '%s' "$t" | sed -E 's/^[[:space:]]+//;s/[[:space:]]+$//')"
+              [ -n "$tt" ] || continue
+              if [[ "$tt" =~ ^([0-9]+):([0-9]+)$ ]]; then
+                map_json+="${map_json:+,}[${BASH_REMATCH[1]},${BASH_REMATCH[2]}]"
+              else
+                ab_ok=false
+              fi
+            done
+            if [ "$ab_ok" = true ] && [ -n "$map_json" ]; then
+              esc="$(printf '%s' "$ab_target" | sed 's/\\/\\\\/g;s/"/\\"/g')"
+              absorbs="{\"target\":\"$esc\",\"map\":[$map_json]}"
+            else
+              absorbs_unparsed=true
+            fi
+          else
+            absorbs_unparsed=true
+          fi
+        fi
+        seen_absorbs=true
         ;;
       "Operator-authorization:"*)
         # PRD-build-operator-authorization-contract AC2/AC3: shape is
@@ -554,7 +641,12 @@ except Exception:
     --argjson gate_stale "$gate_stale" \
     --arg substrate "$substrate" \
     --argjson live_acs "$live_acs" \
-    '{slug:$slug, path:$path, build_auto:$build_auto, build_target:$build_target, build_priority:$build_priority, build_into:$build_into, build_version_bump:$build_version_bump, publish:$publish, deferred_acs:$deferred_acs, deferred_acs_unparsed:$deferred_acs_unparsed, deferred_ac_reasons:$deferred_ac_reasons, operator_authorization:$operator_authorization, operator_authorization_unparsed:$operator_authorization_unparsed, test_prefix:$test_prefix, status_line:$status_line, size_bytes:$size, mtime_iso:$mtime, gate_stale:$gate_stale, substrate:$substrate, live_acs:$live_acs}'
+    --argjson superseded_by "$superseded_by" \
+    --argjson transferred_acs "$transferred_acs" \
+    --argjson transferred_acs_unparsed "$transferred_acs_unparsed" \
+    --argjson absorbs "$absorbs" \
+    --argjson absorbs_unparsed "$absorbs_unparsed" \
+    '{slug:$slug, path:$path, build_auto:$build_auto, build_target:$build_target, build_priority:$build_priority, build_into:$build_into, build_version_bump:$build_version_bump, publish:$publish, deferred_acs:$deferred_acs, deferred_acs_unparsed:$deferred_acs_unparsed, deferred_ac_reasons:$deferred_ac_reasons, operator_authorization:$operator_authorization, operator_authorization_unparsed:$operator_authorization_unparsed, test_prefix:$test_prefix, status_line:$status_line, size_bytes:$size, mtime_iso:$mtime, gate_stale:$gate_stale, substrate:$substrate, live_acs:$live_acs, superseded_by:$superseded_by, transferred_acs:$transferred_acs, transferred_acs_unparsed:$transferred_acs_unparsed, absorbs:$absorbs, absorbs_unparsed:$absorbs_unparsed}'
 }
 
 # Emit top-level PRDs (buildable) AND ARCHIVE/ PRDs (already done).
