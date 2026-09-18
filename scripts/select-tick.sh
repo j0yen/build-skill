@@ -546,6 +546,12 @@ while [ "$i" -lt "$n" ]; do
         *) [ "$ticks_invested" -ge 3 ] && model="opus" ;;
       esac
     fi
+    # Operator model cap (Joe 2026-09-18: always the cheapest capable model).
+    # BUILD_DISPATCH_MODEL_MAX=sonnet turns every opus escalation (retry,
+    # ticks_invested>=3, kernel-extend) into sonnet; unset = old behaviour.
+    if [ -n "${BUILD_DISPATCH_MODEL_MAX:-}" ] && [ "$model" = "opus" ]; then
+      model="$BUILD_DISPATCH_MODEL_MAX"
+    fi
     entry="$("$JQ" -n \
       --arg slug "$slug" --arg path "$path" \
       --argjson build_target "$build_target" \
