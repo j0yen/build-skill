@@ -215,7 +215,7 @@ check_path_cargo_shims() {
 
 check_unit_env_inheritance() {
   local out
-  out="$("$SYSTEMD_RUN" --user --wait --collect -p Type=oneshot /bin/sh -c \
+  out="$("$SYSTEMD_RUN" --user --wait --pipe --quiet --collect -p Type=oneshot /bin/sh -c \
     'echo "TOK=${CLAUDE_CODE_OAUTH_TOKEN:-}"; echo "CEIL=${CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS:-}"; echo "TMP=${TMPDIR:-}"' \
     2>/dev/null)"
   local missing=()
