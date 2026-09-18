@@ -125,4 +125,54 @@ grep -q 'ticks-invested-delta-ignored' "$AC4_JOURNAL" || fail "no journal line s
 rm -rf "$AC4_STATE"
 echo ok
 
+# =======================================================================
+# AC5 — a day with three archived PRDs: day-ledger.sh's JSON has
+# flow.lead_time_p50_h and flow.prds_measured = 3, schema = build.day_ledger.v2.
+# =======================================================================
+echo "== AC5: day-ledger.sh flow{} block over three archived PRDs =="
+DL="$HERE/day-ledger.sh"
+AC5_STATE=$(mktemp -d /tmp/flow-ledger-ac5-state.XXXXXX)
+AC5_LEDGER="$AC5_STATE/flow-ledger.jsonl"
+AC5_DATE="2030-07-01"
+python3 - "$AC5_LEDGER" "$AC5_DATE" <<'PY'
+import json, sys, datetime
+path, day = sys.argv[1], sys.argv[2]
+t0 = datetime.datetime.strptime(day, "%Y-%m-%d")
+def ts(mins):
+    return (t0 + datetime.timedelta(minutes=mins)).strftime("%Y-%m-%dT%H:%M:%SZ")
+events = []
+for i, slug in enumerate(["ac5-slug-a", "ac5-slug-b", "ac5-slug-c"]):
+    base = i * 10
+    events += [
+        {"ts": ts(base + 0),  "slug": slug, "stage": "queued",       "lane": "redbaron"},
+        {"ts": ts(base + 5),  "slug": slug, "stage": "claimed",      "lane": "redbaron"},
+        {"ts": ts(base + 10), "slug": slug, "stage": "gate_start",   "lane": "redbaron"},
+        {"ts": ts(base + 20), "slug": slug, "stage": "gate_verdict", "lane": "redbaron", "detail": "verdict=pass"},
+        {"ts": ts(base + 25), "slug": slug, "stage": "landed",       "lane": "redbaron"},
+        {"ts": ts(base + 30), "slug": slug, "stage": "archived",     "lane": "redbaron"},
+    ]
+with open(path, "w") as f:
+    for e in events:
+        f.write(json.dumps(e) + "\n")
+PY
+AC5_OUT="$AC5_STATE/day-ledger.json"
+# day-ledger.sh's day window is [target_date 00:00, +1day) in America/New_York,
+# not UTC -- derive which NY calendar date the fixture's first UTC
+# timestamp ($AC5_DATE 00:00:00Z) actually falls on, rather than
+# hand-computing the TZ offset (and risking an off-by-one across a DST
+# transition).
+AC5_FIRST_EPOCH="$(date -u -d "${AC5_DATE}T00:00:00Z" +%s)"
+AC5_TZ_DATE="$(TZ="America/New_York" date -d "@$AC5_FIRST_EPOCH" +%F)"
+PRD_DIR="$AC5_STATE/no-such-prd-dir" DAY_LEDGER_FLOW_LEDGER_FILE="$AC5_LEDGER" \
+  "$DL" --date "$AC5_TZ_DATE" --no-push --out "$AC5_OUT" >/dev/null 2>&1
+[ -s "$AC5_OUT" ] || fail "day-ledger.sh produced no output file"
+schema="$(jq -r '.schema' "$AC5_OUT")"
+[ "$schema" = "build.day_ledger.v2" ] || fail "AC5 schema: got '$schema', want build.day_ledger.v2"
+measured="$(jq -r '.flow.prds_measured' "$AC5_OUT")"
+[ "$measured" = "3" ] || fail "AC5 flow.prds_measured: got '$measured', want 3"
+jq -e '.flow.lead_time_p50_h | type == "number"' "$AC5_OUT" >/dev/null \
+  || fail "AC5 flow.lead_time_p50_h missing or not a number: $(jq -c .flow "$AC5_OUT")"
+rm -rf "$AC5_STATE"
+echo ok
+
 echo "flow-ledger-selftest: PASS"
