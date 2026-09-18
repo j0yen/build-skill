@@ -90,9 +90,22 @@ expect "R7: loop-liveness names claude-burst-canary.timer in its WARN" \
 echo "=== R7.5: hourly wakeup with no live box is a free no-op ==="
 STATE="$ROOT/burst-state"; mkdir -p "$STATE"
 JOURNAL="$ROOT/journal.log"; : > "$JOURNAL"
+# R17 knob files get isolated copies too: the timer runs canary-daily as the
+# user, so a future code path that wrote BUILD_BURST_ENABLED on the way to
+# the skip would edit the operator's REAL ~/.config/wm-burst/.env from a
+# test run. Both the isolated knob files and (when present) the production
+# one are checked for byte-identity after the call.
+FAKE_ENV="$ROOT/wm-burst.env"; printf 'BUILD_BURST_ENABLED=0\n' > "$FAKE_ENV"
+FAKE_DROPIN="$ROOT/dropin/burst.conf"; mkdir -p "$(dirname "$FAKE_DROPIN")"
+PROD_ENV="$HOME/.config/wm-burst/.env"
+prod_before=""; [ -f "$PROD_ENV" ] && prod_before="$(md5sum "$PROD_ENV" | cut -d' ' -f1)"
+env_before="$(md5sum "$FAKE_ENV" | cut -d' ' -f1)"
 daily_out="$(BURST_LANE_STATE_DIR="$STATE" BURST_LANE_JOURNAL="$JOURNAL" \
   BUILD_JOURNAL_ROOT="$ROOT/journal-root" HCLOUD_TOKEN="" \
+  BURST_LANE_ENV_FILE="$FAKE_ENV" BURST_LANE_SYSTEMD_DROPIN="$FAKE_DROPIN" \
   "$BL" canary-daily 2>&1)"; daily_rc=$?
+env_after="$(md5sum "$FAKE_ENV" | cut -d' ' -f1)"
+prod_after=""; [ -f "$PROD_ENV" ] && prod_after="$(md5sum "$PROD_ENV" | cut -d' ' -f1)"
 expect "R7: canary-daily exits 0 with no active box" "[ $daily_rc -eq 0 ]"
 expect "R7: canary-daily says skipped cause=no-active-session" \
   "printf '%s' \"\$daily_out\" | grep -qF 'canary-daily skipped (cause=no-active-session)'"
@@ -100,6 +113,11 @@ expect "R7: the skip is journaled" \
   "grep -qF 'canary-daily  skipped  (cause=no-active-session)' '$JOURNAL'"
 expect "R7: no canary.json was written anywhere under the isolated state dir" \
   "! find '$STATE' -name canary.json -print -quit | grep -q ."
+expect "R7: the skip wrote no BUILD_BURST_ENABLED knob (R17: only enable/disable may)" \
+  "[ \"\$env_before\" = \"\$env_after\" ]"
+expect "R7: the skip wrote no systemd drop-in" "[ ! -e '$FAKE_DROPIN' ]"
+expect "R7: the operator's real wm-burst/.env is byte-identical after the run" \
+  "[ \"\$prod_before\" = \"\$prod_after\" ]"
 
 echo "-----"
 if [ "$fail" -eq 0 ]; then
