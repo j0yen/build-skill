@@ -18,6 +18,13 @@
 # note (lib/gate-red-age.sh) — a handoff read hours later must not mistake
 # a resolved gate-red for a current one (PRD-build-gate-red-render-age).
 #
+# PRD-buildloop-tick-outcome-liveness R6: ALSO prints, first, a
+# `LOOP: last_ok=<s> streak_failed=<n>  [<age_note>]` line from
+# state/tick-outcome.json (tick-run.sh's own R1 artifact) via
+# lib/loop-line.sh — silent (no line at all) if that record doesn't exist
+# yet. "GATES green" and "LOOP last_ok=<recent>" are two different claims;
+# a handoff must never let one stand in for the other.
+#
 # Exit: always 0.
 set -uo pipefail
 
@@ -25,8 +32,18 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SKILL_DIR="$(cd "$HERE/.." && pwd)"
 STATE_DIR="${BUILD_STATE_DIR:-$SKILL_DIR/state}"
 SUMMARY_FILE="${GATE_RED_SUMMARY_FILE:-$STATE_DIR/gate-red.summary}"
+TICK_OUTCOME_FILE="${TICK_OUTCOME_FILE:-$STATE_DIR/tick-outcome.json}"
+JQ="${JQ:-$(command -v jq 2>/dev/null || echo /usr/bin/jq)}"
 # shellcheck source=lib/gate-red-age.sh
 source "$HERE/lib/gate-red-age.sh"
+# shellcheck source=lib/loop-line.sh
+source "$HERE/lib/loop-line.sh"
+
+# PRD-buildloop-tick-outcome-liveness R6: the LOOP: line is independent of
+# the gate-red summary below (a missing gate-red.summary must not also
+# suppress this) -- printed first so "when did the loop last succeed" is
+# never buried under a gate section a reader skips.
+loop_line
 
 [ -r "$SUMMARY_FILE" ] || exit 0
 summary_line="$(sed -n '1p' "$SUMMARY_FILE" | cut -d' ' -f2-)"

@@ -8,6 +8,11 @@
 # screen said otherwise).
 #
 # Prints, in order:
+#   0. `LOOP: last_ok=<s> streak_failed=<n>  [<age_note>]`
+#      (PRD-buildloop-tick-outcome-liveness R6, via lib/loop-line.sh) from
+#      state/tick-outcome.json — always local, printed even when the
+#      gate-red data below is unreachable (they're independent claims).
+#      Silent (no line) if that record doesn't exist yet.
 #   1. the current gate-red summary line (from gate-red-summary.sh's own
 #      state/gate-red.summary, read locally on RedBaron, over ssh with a
 #      4s connect timeout elsewhere, cached 10 min in
@@ -32,12 +37,13 @@
 #   GATES_BANNER_CACHE_TTL      cache freshness window, seconds (default: 600)
 #   GATES_BANNER_SSH_BIN        override the `ssh` binary (fake ssh in tests)
 #   GATES_BANNER_NO_AGE         set (any value) to suppress the age/STALE
-#                                suffix and STALE line below — for a
-#                                machine caller (day-ledger.sh) that parses
-#                                this script's own summary line back apart
-#                                (green=/red=/red_slugs:) and would have
-#                                the age note's tokens land in its
-#                                red_slugs split otherwise.
+#                                suffix and STALE line below (and the new
+#                                LOOP: line's own bracketed age note) — for
+#                                a machine caller (day-ledger.sh) that
+#                                parses this script's own summary line
+#                                back apart (green=/red=/red_slugs:) and
+#                                would have the age note's tokens land in
+#                                its red_slugs split otherwise.
 #
 # gate-red-age.sh's note/threshold env (GATE_RED_NOW, GATE_RED_STALE_AFTER_S)
 # apply here too -- see lib/gate-red-age.sh.
@@ -49,8 +55,12 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SKILL_DIR="$(cd "$HERE/.." && pwd)"
 STATE_DIR="${BUILD_STATE_DIR:-$SKILL_DIR/state}"
 SUMMARY_FILE="${GATE_RED_SUMMARY_FILE:-$STATE_DIR/gate-red.summary}"
+TICK_OUTCOME_FILE="${TICK_OUTCOME_FILE:-$STATE_DIR/tick-outcome.json}"
+JQ="${JQ:-$(command -v jq 2>/dev/null || echo /usr/bin/jq)}"
 # shellcheck source=lib/gate-red-age.sh
 source "$HERE/lib/gate-red-age.sh"
+# shellcheck source=lib/loop-line.sh
+source "$HERE/lib/loop-line.sh"
 
 HOSTNAME_VAL="${GATES_BANNER_HOSTNAME:-$(hostname 2>/dev/null || echo unknown)}"
 REDBARON_HOST="${GATES_BANNER_REDBARON_HOST:-redbaron}"
@@ -118,6 +128,17 @@ else
     fi
     rm -f "$tmp"
   fi
+fi
+
+# PRD-buildloop-tick-outcome-liveness R6: printed regardless of gate-red
+# reachability below -- tick-outcome.json is a separate local artifact, and
+# "GATES: unknown (redbaron unreachable)" must not also silence a LOOP
+# line this host can actually answer. GATES_BANNER_NO_AGE suppresses the
+# bracketed age note the same way it does for the gate-red line below.
+if [ -n "${GATES_BANNER_NO_AGE:-}" ]; then
+  loop_line --no-age
+else
+  loop_line
 fi
 
 if [ -z "$summary_line" ]; then
