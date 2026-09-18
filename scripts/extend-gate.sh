@@ -1342,6 +1342,23 @@ mkdir -p "$(dirname "$route_log_file")" 2>/dev/null || true
 export BURST_ROUTE_LOG="$route_log_file"
 export BURST_LANE_PRD_SLUG="gate-$crate_name"
 
+# --- cargo-shim recursion trip counter (PRD-build-cargo-shim-recursion-
+# guard AC5) ---------------------------------------------------------------
+# Every wintermute cargo shim that refuses a third frame (exit 9) appends
+# one line to $WM_CARGO_SHIM_TRIP_LOG — see scripts/cargo-budget-bin/cargo's
+# header for the protocol. Truncated fresh HERE, next to the route log and
+# for the same reason: the count on this gate's summary line must be
+# per-gate, not global. Exported, so every producer's shell (and anything
+# they exec) writes into this gate's file. The gate summary line carries
+# `shim_trips=<n>` from it unconditionally, so a clean gate positively
+# attests 0 rather than leaving the reader to infer it from a missing
+# journal line. This never blocks: a tripped shim already failed its own
+# caller with exit 9, and that failure surfaces as an ordinary producer
+# block; this counter is a witness, not a second verdict.
+shim_trip_log_file="$project_abs/target/autobuilder/shim-trips.log"
+: > "$shim_trip_log_file"
+export WM_CARGO_SHIM_TRIP_LOG="$shim_trip_log_file"
+
 route_intended="local"
 route_host="local"
 if [ -x "$BURST_LANE_SH" ]; then
@@ -1622,7 +1639,7 @@ emit_reviewer_auth_missing_and_exit() {
   $pinned_landing && journal_suffix="$journal_suffix pinned=landing"
   $main_health && journal_suffix="$journal_suffix main-health"
 
-  journal_line --file "$journal" "$(printf '%s  gate  %s  %s  (%shead=%s base=%s %s blocking=%s wall=%ss %s lock_wait=%ss cargo=burst:%s/local:%s route=%s)%s' \
+  journal_line --file "$journal" "$(printf '%s  gate  %s  %s  (%shead=%s base=%s %s blocking=%s wall=%ss %s lock_wait=%ss cargo=burst:%s/local:%s shim_trips=0 route=%s)%s' \
     "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$crate_name" "incomplete" "$scope_prefix" "$head_now" "$journal_base_field" \
     "gate: no-summary-line (auth-missing before any producer ran)" "none" "$wall" "$phases_field" "${lock_wait:-0}" \
     "0" "0" "$GATE_ROUTE" "$journal_suffix")"
@@ -2869,6 +2886,14 @@ fi
 # is a silent regression — the whole reason this PRD exists — so it is
 # journaled by name (never just a block, per the PRD's Non-goals: "a route
 # mismatch is a journaled guard event, never a block").
+# AC5 witness: how many times a cargo shim refused a recursive frame during
+# THIS gate (see the trip-log setup above). Counted from the per-gate file,
+# never from the shared journal, so a concurrent gate's trips cannot leak
+# into this line.
+shim_trips_n=0
+if [ -n "${shim_trip_log_file:-}" ] && [ -f "$shim_trip_log_file" ]; then
+  shim_trips_n="$(awk 'END{print NR+0}' "$shim_trip_log_file")"
+fi
 route_burst_n=0; route_local_n=0; route_passthrough_n=0; route_first_local_cause=""
 if [ -f "$route_log_file" ]; then
   route_burst_n="$(awk '$4=="burst"{n++} END{print n+0}' "$route_log_file")"
@@ -3399,10 +3424,10 @@ $main_health && scope_prefix="scope=main slug=$slug "
 # greps `(scope=branch ` immediately after the opening paren; nothing here
 # moves), so a parser reading only the pre-existing fields sees byte-
 # identical output up to this addition.
-journal_line --file "$journal" "$(printf '%s  gate  %s  %s  (%shead=%s base=%s %s blocking=%s wall=%ss %s lock_wait=%ss cargo=burst:%s/local:%s %s route=%s)%s' \
+journal_line --file "$journal" "$(printf '%s  gate  %s  %s  (%shead=%s base=%s %s blocking=%s wall=%ss %s lock_wait=%ss cargo=burst:%s/local:%s %s shim_trips=%s route=%s)%s' \
   "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$crate_name" "$outcome" "$scope_prefix" "$head_now" "$journal_base_field" \
   "${summary:-gate: no-summary-line}" "${blockers_csv:-none}" "$wall" "$phases_field" "$lock_wait" \
-  "$route_burst_n" "$route_local_n" "$routed_field" "$GATE_ROUTE" "$journal_suffix")"
+  "$route_burst_n" "$route_local_n" "$routed_field" "$shim_trips_n" "$GATE_ROUTE" "$journal_suffix")"
 
 # PRD-build-flow-ledger requirement 1/2: gate_verdict, detail carries
 # verdict=pass|delta-pass|block|infra (whatever this run's own $outcome

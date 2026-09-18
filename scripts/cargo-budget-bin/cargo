@@ -34,6 +34,17 @@
 # its own exec) is read as an alias for depth >= 1 for one release, so a
 # PATH composed before this guard shipped on the other shim still gets one
 # level of protection from this side (see PRD Migration section).
+#
+# Trip counter (PRD-build-cargo-shim-recursion-guard AC5): when the
+# environment carries WM_CARGO_SHIM_TRIP_LOG, a refusing frame ALSO appends
+# one line to that file before exiting 9. extend-gate.sh truncates the file
+# at gate start, exports it to every producer, and counts its lines onto the
+# gate summary journal line as `shim_trips=<n>` — so a gate that never
+# tripped the guard says so positively (`shim_trips=0`) instead of proving a
+# negative from the absence of a journal line. The file is per-gate and
+# append-only; every wintermute cargo shim honouring this protocol writes
+# one line per refusal and nothing else. Unset (the ordinary interactive
+# case) means "nobody is counting" and the shim skips the append entirely.
 set -uo pipefail
 
 WM_CARGO_SHIM_DEPTH="${WM_CARGO_SHIM_DEPTH:-0}"
@@ -46,6 +57,12 @@ if [ "$WM_CARGO_SHIM_DEPTH" -ge 2 ]; then
   printf '%s  cargo-shim  recursion-refused (depth=%s path=%s)\n' \
     "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$WM_CARGO_SHIM_DEPTH" "${PATH%%:*}" \
     >> "$cargo_shim_journal_file" 2>/dev/null || true
+  if [ -n "${WM_CARGO_SHIM_TRIP_LOG:-}" ]; then
+    mkdir -p "$(dirname "$WM_CARGO_SHIM_TRIP_LOG")" 2>/dev/null || true
+    printf '%s\tcargo-budget-bin\tdepth=%s\n' \
+      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$WM_CARGO_SHIM_DEPTH" \
+      >> "$WM_CARGO_SHIM_TRIP_LOG" 2>/dev/null || true
+  fi
   echo "cargo-budget-bin/cargo: recursion-refused depth=$WM_CARGO_SHIM_DEPTH (two shims already exec'd into each other)" >&2
   exit 9
 fi
