@@ -161,6 +161,14 @@ BURST_LANE_SH="${BURST_LANE_SH:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/bu
 # BURST_LANE_SH above) so a selftest can point BUILD_STATE_DIR/BUILD_MANIFEST
 # at a scratch dir without a real manifest.json.
 MANIFEST_SET_SH="${MANIFEST_SET_SH:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/manifest-set.sh}"
+
+# PRD-build-flow-ledger requirement 2: this script is the sole writer of
+# the ledger's `claimed` stage event, appended once a claim's own push has
+# won (cmd_claim, below) — never before, so a lost push race never records
+# a claim that didn't actually happen. flow_ledger_append never fails the
+# caller (a claim still succeeds even if the ledger write does not, AC3).
+# shellcheck source=lib/flow-ledger.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/flow-ledger.sh"
 # PRD-build-burst-selftest-isolation: this script never resolves a
 # state/journal/box path of its own for the burst-lane call above — it
 # only shells out to burst-lane.sh (which owns and guards those paths
@@ -714,6 +722,7 @@ cmd_claim() {
   git -C "$root" -c user.name="Joe Yen" -c user.email=jyen.tech@gmail.com \
     commit -q -m "$subject" -- "$prd"
   push_or_resolve_race "$root" "$prd" "$lane" "claim"
+  flow_ledger_append "$slug" "claimed" --lane "$lane"
   echo "claimed: $slug lane=$lane ts=$ts_new"
 }
 
