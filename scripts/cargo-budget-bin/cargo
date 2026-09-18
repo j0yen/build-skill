@@ -19,7 +19,37 @@
 # function's own header for the full chain (this wrapper is always
 # outermost; burst-lane-bin decides box-or-local next; real cargo is
 # last).
+#
+# PRD-build-cargo-shim-recursion-guard: shared recursion-guard protocol,
+# documented here so every wintermute cargo shim (including the companion
+# rustbuild shim, PRD-rustbuild-shim-mutual-exclusion) implements the same
+# two checks. Each shim increments WM_CARGO_SHIM_DEPTH by exactly 1 before
+# it execs anything — another shim, the budget wrapper, or the real cargo
+# — so a shim that starts running with depth already >= 2 knows two shims
+# already handed off to each other once and this third frame is a loop,
+# not a legitimate single-hop handoff (cargo-budget-bin -> burst-lane-bin
+# is depth 0 -> 1, still fine). That third frame refuses outright: exit 9
+# (the existing unhealable code), one journal line, no child process ever
+# spawned. BURST_SHIM_ACTIVE=1 (set by burst-lane-bin/cargo right before
+# its own exec) is read as an alias for depth >= 1 for one release, so a
+# PATH composed before this guard shipped on the other shim still gets one
+# level of protection from this side (see PRD Migration section).
 set -uo pipefail
+
+WM_CARGO_SHIM_DEPTH="${WM_CARGO_SHIM_DEPTH:-0}"
+if [ "${BURST_SHIM_ACTIVE:-0}" = "1" ] && [ "$WM_CARGO_SHIM_DEPTH" -lt 1 ]; then
+  WM_CARGO_SHIM_DEPTH=1
+fi
+if [ "$WM_CARGO_SHIM_DEPTH" -ge 2 ]; then
+  cargo_shim_journal_file="${CARGO_BUDGET_JOURNAL:-$HOME/brain/journal/build/$(date -u +%F).md}"
+  mkdir -p "$(dirname "$cargo_shim_journal_file")" 2>/dev/null || true
+  printf '%s  cargo-shim  recursion-refused (depth=%s path=%s)\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$WM_CARGO_SHIM_DEPTH" "${PATH%%:*}" \
+    >> "$cargo_shim_journal_file" 2>/dev/null || true
+  echo "cargo-budget-bin/cargo: recursion-refused depth=$WM_CARGO_SHIM_DEPTH (two shims already exec'd into each other)" >&2
+  exit 9
+fi
+export WM_CARGO_SHIM_DEPTH=$(( WM_CARGO_SHIM_DEPTH + 1 ))
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 WRAPPER="$HERE/../cargo-budget.sh"
@@ -39,17 +69,26 @@ else
 fi
 
 # Find the real cargo: walk $PATH entries in order, skip this shim's own
-# directory *and every other known cargo shim directory* (currently just
-# burst-lane-bin — see PRD-build-cargo-shim-reexec-loop), so that when both
-# shim dirs are on PATH they don't resolve into each other and mutually
-# re-exec forever. Any dir in PATH matching a shim dir is skipped
-# regardless of how many times it appears. Falls back to `command -v
-# cargo` outside this process's PATH-search loop only if nothing else was
-# found (should not happen in practice — that would mean no real cargo is
-# installed).
+# directory *and every other known cargo shim directory* — burst-lane-bin
+# (PRD-build-cargo-shim-reexec-loop) and rustbuild's bin
+# (PRD-build-cargo-shim-recursion-guard requirement 2) — so that when any
+# combination of shim dirs is on PATH they don't resolve into each other
+# and mutually re-exec forever. Every dir is compared by realpath
+# (`readlink -f` / `pwd -P`, same thing) so a symlinked skill path can't
+# re-admit a shim under a different name. Any dir in PATH matching a shim
+# dir is skipped regardless of how many times it appears. Falls back to
+# `command -v cargo` outside this process's PATH-search loop only if
+# nothing else was found (should not happen in practice — that would mean
+# no real cargo is installed).
+_rustbuild_target="$(readlink -f "$HOME/.claude/skills/rustbuild" 2>/dev/null || true)"
+_rustbuild_bin=""
+if [ -n "$_rustbuild_target" ] && [ -d "$_rustbuild_target/bin" ]; then
+  _rustbuild_bin="$(cd "$_rustbuild_target/bin" 2>/dev/null && pwd -P || true)"
+fi
 SHIM_DIRS=(
   "$HERE"
   "$(cd "$HERE/../burst-lane-bin" 2>/dev/null && pwd -P || true)"
+  "$_rustbuild_bin"
 )
 real_cargo() {
   # PRD-build-cargo-route-precedence: this budget wrapper must be
