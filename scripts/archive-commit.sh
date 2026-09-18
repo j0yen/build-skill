@@ -125,6 +125,12 @@ PRD_DIR="${PRD_DIR:-$HOME/Documents/PRDs}"
 BUILD_MANIFEST="${BUILD_MANIFEST:-$SKILL_DIR/state/manifest.json}"
 export JQ PRD_DIR BUILD_MANIFEST
 GIT_ID=(-c user.email=jyen.tech@gmail.com -c user.name="Joe Yen")
+# PRD-build-flow-ledger requirement 2: this script is the sole writer of
+# the ledger's `archived` event — appended once the push-verified
+# postcondition above holds (pushed=yes), right before this script's own
+# success line, never re-derived later from a journal grep.
+# shellcheck source=lib/flow-ledger.sh
+source "$HERE/lib/flow-ledger.sh"
 
 log() { printf '%s\n' "archive-commit: $*" >&2; }
 die() { printf '%s\n' "archive-commit: $*" >&2; exit "${2:-2}"; }
@@ -576,5 +582,6 @@ if [ "$pushed" = yes ]; then
   fi
 fi
 
+[ "$pushed" = yes ] && flow_ledger_append "$slug" "archived" --sha "$commit_sha"
 printf 'archive-commit %s commit=%s pushed=%s lock_wait=%s\n' "$slug" "$commit_sha" "$pushed" "$lock_wait_secs"
 [ "$pushed" = yes ] || exit 6
