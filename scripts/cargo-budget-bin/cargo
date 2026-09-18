@@ -83,6 +83,7 @@ if [ -r "$CARGO_ROUTE_LIB" ]; then
   source "$CARGO_ROUTE_LIB"
 else
   burst_configured() { return 1; }
+  cargo_route_current() { printf 'local'; return 0; }
 fi
 
 # Find the real cargo: walk $PATH entries in order, skip this shim's own
@@ -194,6 +195,34 @@ if [ "$route" -eq 1 ] && [ -x "$WRAPPER" ]; then
   # caller that set it via a function-local `local` (which does not
   # export) never silently produces a `parent_step: null` ledger row.
   export CARGO_BUDGET_PARENT_STEP="${CARGO_BUDGET_PARENT_STEP:-}"
+
+  # PRD-build-cargo-budget-routed-no-slot: a routable call
+  # (test/clippy/deny/nextest/build --release) that is actually about to
+  # be routed to the burst box holds a local budget slot for its whole
+  # REMOTE wall-clock time under the `run --` path below even though it
+  # burns zero local CPU (17:07:45Z incident: a routed mcphost gate test
+  # run waited 250+s on a slot held by unrelated local builds).
+  # cargo_route_current() (scripts/lib/cargo-route.sh, sourced above) is
+  # the SAME predicate burst-lane-bin/cargo's own routing `if` branches on
+  # (burst_configured + BURST_LANE=1 + a live session — see that
+  # function's header comment), re-derived from local file/env state only
+  # — no hcloud call. When it resolves to "burst:<server_id>" this
+  # invocation really is about to route, so skip slot acquisition
+  # entirely: record one unslotted ledger row (slotted:false,
+  # route:"burst") via cargo-budget.sh's record-routed, then exec straight
+  # to $REAL_CARGO (already the burst-lane-bin shim per real_cargo()
+  # above), which makes the identical routing decision and actually sends
+  # the call to the box. CARGO_BUDGET_SLOT_ROUTED=1 is the escape hatch
+  # back to the old always-slot behavior.
+  if [ "${CARGO_BUDGET_SLOT_ROUTED:-0}" != "1" ]; then
+    current_route="$(cargo_route_current 2>/dev/null || printf local)"
+    case "$current_route" in
+      burst:*)
+        exec "$WRAPPER" record-routed -- "$REAL_CARGO" "$@"
+        ;;
+    esac
+  fi
+
   exec "$WRAPPER" run -- "$REAL_CARGO" "$@"
 fi
 

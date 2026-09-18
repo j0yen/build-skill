@@ -134,7 +134,7 @@ CURSOR_FILE="$STATE_DIR/.summary-cursor"
 TIMEOUTS_LOG="$STATE_DIR/timeouts.jsonl"
 
 die() { echo "cargo-budget: $1" >&2; exit "${2:-2}"; }
-usage() { echo "usage: cargo-budget.sh {run -- <cmd...>|record-unslotted -- <cmd...>|status|summary [--since <epoch>]|last [n]}" >&2; exit 2; }
+usage() { echo "usage: cargo-budget.sh {run -- <cmd...>|record-unslotted -- <cmd...>|record-routed -- <cmd...>|status|summary [--since <epoch>]|last [n]}" >&2; exit 2; }
 
 now_iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 now_epoch() { date -u +%s; }
@@ -321,7 +321,8 @@ write_ledger_row() {
   local ts_start="$1" ts_end="$2" wait_s="$3" peak_load="$4" slot="$5" pid="$6" \
         cmd="$7" exit_code="$8" mem_avail_gb_start="$9" sccache_pid="${10}" \
         sccache_started_at="${11}" parent_step="${12}" nested="${13}" \
-        tree_cpu_s_val="${14}" idle_released="${15}" slotted="${16:-true}"
+        tree_cpu_s_val="${14}" idle_released="${15}" slotted="${16:-true}" \
+        route="${17:-local}"
   mkdir -p "$STATE_DIR"
   local parent_step_json
   if [ -n "$parent_step" ]; then
@@ -347,7 +348,8 @@ write_ledger_row() {
     --argjson tree_cpu_s "$tree_cpu_s_val" \
     --argjson idle_released "$idle_released" \
     --argjson slotted "$slotted" \
-    '{ts_start:$ts_start, ts_end:$ts_end, wait_s:$wait_s, peak_load:$peak_load, slot:$slot, pid:$pid, cmd:$cmd, exit_code:$exit_code, mem_avail_gb_start:$mem_avail_gb_start, sccache_server:{pid:$sccache_pid, started_at:$sccache_started_at}, parent_step:$parent_step, nested:$nested, tree_cpu_s:$tree_cpu_s, idle_released:$idle_released, slotted:$slotted}')"
+    --arg route "$route" \
+    '{ts_start:$ts_start, ts_end:$ts_end, wait_s:$wait_s, peak_load:$peak_load, slot:$slot, pid:$pid, cmd:$cmd, exit_code:$exit_code, mem_avail_gb_start:$mem_avail_gb_start, sccache_server:{pid:$sccache_pid, started_at:$sccache_started_at}, parent_step:$parent_step, nested:$nested, tree_cpu_s:$tree_cpu_s, idle_released:$idle_released, slotted:$slotted, route:$route}')"
   {
     exec {lfd}>>"$LEDGER.lock"
     flock -x "$lfd"
@@ -375,7 +377,31 @@ cmd_record_unslotted() {
   local ts; ts="$(now_iso)"
   local meminfo_file="${CARGO_BUDGET_MEMINFO:-/proc/meminfo}"
   write_ledger_row "$ts" "$ts" 0 0 -1 "$$" "$*" null \
-    "$(mem_avail_gb "$meminfo_file")" unknown unknown "$parent_step" false 0 false false
+    "$(mem_avail_gb "$meminfo_file")" unknown unknown "$parent_step" false 0 false false local
+  exec "$@"
+}
+
+# cmd_record_routed — PRD-build-cargo-budget-routed-no-slot: cargo-budget-
+# bin/cargo calls this instead of cmd_run's slot-acquiring `run --` path
+# whenever it has already determined (via cargo_route_current(), the SAME
+# predicate burst-lane-bin/cargo's own routing `if` uses) that this
+# invocation is actually about to be routed to the burst box. A routed
+# call burns zero local CPU/slot time — holding a local budget slot for
+# its whole REMOTE wall-clock duration is exactly the bug this fixes (see
+# the shim's own header for the incident). Writes one ledger row with
+# slotted:false, route:"burst" (ts_start==ts_end, exit_code null since we
+# exec away and never see it) tagged with whatever CARGO_BUDGET_PARENT_STEP
+# the caller set, then execs the real command (or the next shim in the
+# chain) — no gating, no waiting, no slot.
+cmd_record_routed() {
+  [ "${1:-}" = "--" ] || usage
+  shift
+  [ $# -ge 1 ] || usage
+  local parent_step="${CARGO_BUDGET_PARENT_STEP:-}"
+  local ts; ts="$(now_iso)"
+  local meminfo_file="${CARGO_BUDGET_MEMINFO:-/proc/meminfo}"
+  write_ledger_row "$ts" "$ts" 0 0 -1 "$$" "$*" null \
+    "$(mem_avail_gb "$meminfo_file")" unknown unknown "$parent_step" false 0 false false burst
   exec "$@"
 }
 
@@ -710,6 +736,7 @@ main() {
   case "$sub" in
     run) cmd_run "$@" ;;
     record-unslotted) cmd_record_unslotted "$@" ;;
+    record-routed) cmd_record_routed "$@" ;;
     status) cmd_status "$@" ;;
     summary) cmd_summary "$@" ;;
     last) cmd_last "$@" ;;
