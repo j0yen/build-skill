@@ -39,6 +39,13 @@ burst_configured() {
     return 0
   fi
 
+  # An explicit exported opt-out (BUILD_BURST_ENABLED=0, as hermetic-build pins
+  # its cargo child) wins over the env file: the file says what the lane policy
+  # is, the exported 0 says this process must not route (route-not-local block
+  # on burst-lane 68fa182, 2026-09-18 2:53 pm).
+  if [ -n "${BUILD_BURST_ENABLED+x}" ] && [ "$BUILD_BURST_ENABLED" != "1" ]; then
+    return 1
+  fi
   local env_file="${BURST_LANE_ENV_FILE:-$HOME/.config/wm-burst/.env}"
   [ -r "$env_file" ] || return 1
   # 2026-09-18: `burst-lane.sh enable` writes BUILD_BURST_ENABLED=1 into the
