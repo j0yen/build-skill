@@ -39,6 +39,12 @@
 #
 # Env:
 #   BUILD_STATE_DIR   state dir (default <skill-dir>/state)
+#   TICK_OUTCOME_FILE tick-outcome.json path (default $BUILD_STATE_DIR/
+#                     tick-outcome.json) — PRD-buildloop-tick-outcome-
+#                     liveness R1: written on every exit path (ok, failed
+#                     w/ classified cause, or skipped w/ tick-lock-held),
+#                     atomically (temp+rename). See scripts/lib/tick-
+#                     cause.sh for the cause classifier.
 #   TICK_LOCK_FILE    lock path (default $BUILD_STATE_DIR/tick.lock)
 #   TICK_LOCK_HOLDER_FILE  holder path (default $TICK_LOCK_FILE.holder)
 #   TICK_RUN_JOURNAL  daily journal (default ~/brain/journal/build/<date>.md)
@@ -67,6 +73,8 @@ LOCKFILE="${TICK_LOCK_FILE:-$STATE_DIR/tick.lock}"
 HOLDERFILE="${TICK_LOCK_HOLDER_FILE:-$LOCKFILE.holder}"
 # shellcheck source=lib/journal.sh
 source "$SKILL_DIR/scripts/lib/journal.sh"
+# shellcheck source=lib/tick-cause.sh
+source "$SKILL_DIR/scripts/lib/tick-cause.sh"
 JOURNAL="${TICK_RUN_JOURNAL:-$(journal_root)/$(date -u +%F).md}"
 CLAUDE_BIN="${CLAUDE_BIN:-$HOME/.local/bin/claude}"
 BOOT_ID_FILE="${TICK_RUN_BOOT_ID_FILE:-/proc/sys/kernel/random/boot_id}"
@@ -74,6 +82,9 @@ JQ="${JQ:-$(command -v jq 2>/dev/null || echo /usr/bin/jq)}"
 LANE="${TICK_RUN_LANE:-$(hostname)}"
 RECONCILE_PY="${TICK_RECONCILE_PY:-$SKILL_DIR/scripts/tick-reconcile.py}"
 SELECT_TICK_STATE_DIR="${SELECT_TICK_STATE_DIR:-$STATE_DIR/select-tick}"
+# PRD-buildloop-tick-outcome-liveness R1: the one outcome record a tick
+# ever writes, whatever happened to its child.
+TICK_OUTCOME_FILE="${TICK_OUTCOME_FILE:-$STATE_DIR/tick-outcome.json}"
 # Alarm hourly gate (requirement 4): never more than one alarm per hour per
 # lane. State is separate from select-tick.sh's own admitted/skipped
 # persistence so a read of one never races a write of the other.
@@ -174,6 +185,67 @@ atomic_write_json() {
   tmp="$(mktemp "$(dirname "$path")/.tmp.XXXXXX" 2>/dev/null)" || return 1
   printf '%s\n' "$json" > "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
   mv -f "$tmp" "$path"
+}
+
+# write_tick_outcome <rc> <outcome> <cause> <evidence> — PRD-buildloop-
+# tick-outcome-liveness R1. Writes $TICK_OUTCOME_FILE atomically (via
+# atomic_write_json, temp+rename — AC3: no partial JSON ever observable).
+# outcome is ok|failed|skipped. Reads the previous record (if any) to:
+#   - bump the running "n" counter,
+#   - carry `last_ok_ts` forward on anything but ok (AC1),
+#   - compute `streak_failed`: 0 on ok, prev+1 on failed, unchanged on
+#     skipped (a lock-contended tick is not evidence the loop is broken —
+#     it neither breaks nor resolves an existing failure streak).
+write_tick_outcome() {
+  local rc="$1" outcome="$2" cause="$3" evidence="$4"
+  local ts; ts="$(now_iso)"
+  local prev_n=0 prev_streak=0 prev_last_ok=""
+  if [ -x "$JQ" ] && [ -r "$TICK_OUTCOME_FILE" ]; then
+    prev_n="$("$JQ" -r '.n // 0' "$TICK_OUTCOME_FILE" 2>/dev/null)"
+    prev_streak="$("$JQ" -r '.streak_failed // 0' "$TICK_OUTCOME_FILE" 2>/dev/null)"
+    prev_last_ok="$("$JQ" -r '.last_ok_ts // empty' "$TICK_OUTCOME_FILE" 2>/dev/null)"
+  fi
+  case "$prev_n" in ''|*[!0-9]*) prev_n=0 ;; esac
+  case "$prev_streak" in ''|*[!0-9]*) prev_streak=0 ;; esac
+
+  local n=$((prev_n + 1))
+  local streak_failed last_ok_ts
+  case "$outcome" in
+    ok)
+      streak_failed=0
+      last_ok_ts="$ts"
+      ;;
+    failed)
+      streak_failed=$((prev_streak + 1))
+      last_ok_ts="$prev_last_ok"
+      ;;
+    *)
+      streak_failed="$prev_streak"
+      last_ok_ts="$prev_last_ok"
+      ;;
+  esac
+
+  local json
+  if [ -x "$JQ" ]; then
+    json="$("$JQ" -n \
+      --arg ts "$ts" --argjson n "$n" --argjson rc "$rc" --arg outcome "$outcome" \
+      --arg cause "$cause" --arg evidence "$evidence" --argjson streak_failed "$streak_failed" \
+      --arg last_ok_ts "$last_ok_ts" --arg lane "$LANE" \
+      '{ts:$ts, n:$n, rc:$rc, outcome:$outcome,
+        cause: (if $cause == "" then null else $cause end),
+        evidence: (if $evidence == "" then null else $evidence end),
+        streak_failed:$streak_failed,
+        last_ok_ts: (if $last_ok_ts == "" then null else $last_ok_ts end),
+        lane:$lane}')" || return 0
+  else
+    # jq missing (should never happen in production -- every other
+    # atomic_write_json caller in this script already requires it): a
+    # best-effort record beats no record at all.
+    local esc_evidence="${evidence//\"/\\\"}"
+    json="$(printf '{"ts":"%s","n":%d,"rc":%d,"outcome":"%s","cause":"%s","evidence":"%s","streak_failed":%d,"last_ok_ts":"%s","lane":"%s"}' \
+      "$ts" "$n" "$rc" "$outcome" "$cause" "$esc_evidence" "$streak_failed" "$last_ok_ts" "$LANE")"
+  fi
+  atomic_write_json "$TICK_OUTCOME_FILE" "$json"
 }
 
 # maybe_alarm <admitted> <dispatched> <missing-csv> — requirement 4.
@@ -364,6 +436,7 @@ main() {
     local msg="tick-lock-held (pid=$H_PID age=${age}s cmd=$H_CMD)"
     echo "$msg" >&2
     journal "build-tick  skip  $msg"
+    write_tick_outcome 75 skipped tick-lock-held "$msg"
     exit 75
   fi
 
@@ -426,8 +499,45 @@ main() {
   # sleep even after this wrapper had already exited and removed the
   # holder file. Closing it here means only this wrapper's own fd 9 can
   # ever hold the lock, exactly as the holder file already claims.
-  "${coord_cmd[@]}" 9>&-
-  local rc=$?
+  #
+  # PRD-buildloop-tick-outcome-liveness R1/R2: the child's merged
+  # stdout/stderr is teed to a private capture file so tick-cause.sh can
+  # classify a failure after the fact, while still streaming through to
+  # this script's own stdout unchanged (a caller like
+  # claude-build-tick.sh's own `| tee -a "$LOG"` sees byte-identical
+  # output to before this PRD — merging stdout/stderr here changes
+  # nothing observable, since that caller already merges them with its
+  # own `2>&1`). PIPESTATUS[0], not pipefail's $?, is the child's real
+  # exit code (matches claude-build-tick.sh's own convention) — this is
+  # what makes AC3's rc=143 (child SIGTERM'd) land in the record: the
+  # foreground pipeline still returns 128+signum for a killed child.
+  local capture_file rc
+  capture_file="$(mktemp "${TMPDIR:-/tmp}/tick-run-capture.XXXXXX" 2>/dev/null)" || capture_file=""
+  if [ -n "$capture_file" ]; then
+    # `9>&-` on BOTH pipeline stages, not just coord_cmd: `tee` is its own
+    # forked process and, unless closed here too, inherits fd 9 wide open
+    # from this shell exactly like coord_cmd would without its own
+    # `9>&-` — an orphaned `tee` (its stdin held open by an orphaned
+    # grandchild coord_cmd spawned, the same AC6 shape noted above) would
+    # then keep the flock held after this wrapper and its coordinator are
+    # both gone, reintroducing the exact bug that comment describes.
+    "${coord_cmd[@]}" 9>&- 2>&1 | tee "$capture_file" 9>&-
+    rc=${PIPESTATUS[0]}
+  else
+    "${coord_cmd[@]}" 9>&-
+    rc=$?
+  fi
+
+  if [ "$rc" -eq 0 ]; then
+    write_tick_outcome "$rc" ok "" ""
+  else
+    local cause="other" evidence=""
+    if [ -n "$capture_file" ]; then
+      IFS=$'\t' read -r cause evidence < <(tick_cause_classify "$capture_file")
+    fi
+    write_tick_outcome "$rc" failed "$cause" "$evidence"
+  fi
+  [ -n "$capture_file" ] && rm -f "$capture_file" 2>/dev/null
 
   reconcile "$rc"
 
