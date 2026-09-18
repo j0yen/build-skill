@@ -1,27 +1,38 @@
 #!/usr/bin/env bash
-# inhblocks_p0_acs.sh — PRD-build-inherited-blocks-delta-pass, P0 ACs 1-5.
+# inhblocks_p0_acs.sh — PRD-build-inherited-blocks-delta-pass, P0 ACs 1-5
+# plus P1 ACs 7-8 and P2 AC9. Invoked as a whole suite by
+# scripts/inhblocks-selftest.sh (verified-completed.sh's whole-suite
+# pairing rule — each AC's own line in the PRD names that script).
 #
 # Exercises the scripts most of this PRD's Engineering target touches
 # directly (gate-delta.sh, gate-attribution.sh via extend-gate.sh's own
-# fail-closed fix, archive-trailer.sh, gate-debt.sh) without needing a
-# real `autobuilder` binary or cargo — the same "drive the script in
-# isolation with a hand-built fixture" style tests/gate_delta_ac*.sh
-# already uses, one file per requirement instead of per-AC so a single
-# `bash tests/inhblocks_p0_acs.sh` covers the whole delta-verdict path.
+# fail-closed fix, archive-trailer.sh, gate-debt.sh, extend-gate.sh
+# itself) without needing a real mcphost checkout — the same "drive the
+# script in isolation with a hand-built fixture" style tests/gate_delta_
+# ac*.sh already uses, one file per requirement instead of per-AC so a
+# single `bash tests/inhblocks_p0_acs.sh` covers the whole delta-verdict
+# path. extend-gate.sh IS invoked for real (AC7) — this machine has a real
+# `autobuilder` on $PATH — against a disposable 2-file fixture crate, not
+# mcphost.
 #
-# AC6 (Live, real mcphost branch gate) and AC8 (--main-health end-to-end
-# through the full producer pipeline) are not exercised here — both need
-# a real repo + autobuilder run this offline fixture can't fake cheaply;
-# AC8's guarantee is structural instead (extend-gate.sh only ever passes
-# --attribution to gate-delta.sh when `$scope = branch`, and
-# --main-health/--pinned-landing are only valid with --scope main per
-# this script's own arg-parse `die` checks, so a --main-health run can
-# never reach the attribution verdict path at all).
+# AC6 (Live, real mcphost branch gate) is not exercised here — it needs a
+# real mcphost branch gate to actually run; see the PRD's own AC6 evidence
+# clause. AC8 (--main-health ignores attribution) is exercised at the
+# gate-delta.sh unit level below (the exact mechanism the guarantee rests
+# on: extend-gate.sh only ever builds `gate_delta_attr_args` when `$scope
+# = branch`, so a main-scope/--main-health run always calls gate-delta.sh
+# verdict WITHOUT --attribution and gets the pre-existing legacy verdict,
+# which mirrors <gate-rc> exactly — an inherited-only block still blocks)
+# rather than a full producer-pipeline run, which would just be re-testing
+# unrelated producers (proof-receipt, ci-checks, ...) that this PRD never
+# touches.
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 GATE_DELTA="$HERE/../scripts/gate-delta.sh"
 GATE_DEBT="$HERE/../scripts/gate-debt.sh"
+GATE_ATTRIBUTION="$HERE/../scripts/gate-attribution.sh"
 ARCHIVE_TRAILER="$HERE/../scripts/archive-trailer.sh"
+EXTEND_GATE="$HERE/../scripts/extend-gate.sh"
 PRD_LINT="$HERE/../scripts/prd-lint.sh"
 export PRD_LINT
 
@@ -58,7 +69,7 @@ expect "AC2: in-scope receipt named" "grep -q '^new_blocks=x\$' <<<\"\$out2\""
 # --- AC3: unknown producer inputs -> in-scope, fail-closed --------------
 notes="$T/notes.tsv"
 printf 'mystery-receipt\tno path or test token here\n' > "$notes"
-diff_out="$("$HERE/../scripts/gate-attribution.sh" compute "$T/repo" HEAD HEAD "$notes" 2>"$T/attr3.stderr")"
+diff_out="$("$GATE_ATTRIBUTION" compute "$T/repo" HEAD HEAD "$notes" 2>"$T/attr3.stderr")"
 expect "AC3: scope is in-scope"          "echo \"\$diff_out\" | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if d[\"blocks\"][0][\"scope\"]==\"in-scope\" else 1)'"
 expect "AC3: block flagged unknown-inputs" "echo \"\$diff_out\" | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if d[\"blocks\"][0].get(\"attribution\")==\"unknown-inputs\" else 1)'"
 expect "AC3: unknown_inputs count is 1"    "echo \"\$diff_out\" | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if d[\"unknown_inputs\"]==1 else 1)'"
@@ -111,5 +122,60 @@ expect "AC5: a debt PRD exists after the FIRST check" "[ -n \"\$drafted5\" ]"
 expect "AC5: no Depends-on line anywhere in build-queue" \
   "! grep -rlE '^-?\s*Depends-on:' \"$T/prds5/build-queue\" >/dev/null 2>&1"
 expect "AC5: journal has no gate-debt parked line" "! grep -q 'gate-debt  parked' \"$T/journal5.md\""
+
+# --- AC7: --explain-verdict prints scope, path, producer(=receipt), and --
+# ------- the range used, per cached block ------------------------------
+T7="$(mktemp -d "${TMPDIR:-/tmp}/inhblocks-ac7.XXXXXX")"
+trap 'rm -rf "$T" "$T7"' EXIT
+git init -q "$T7/repo"
+git -C "$T7/repo" -c user.name=t -c user.email=t@t commit -q --allow-empty -m init
+printf '[package]\nname = "inhblocks-ac7-fixture"\nversion = "0.0.0"\n' > "$T7/repo/Cargo.toml"
+git -C "$T7/repo" add -A
+git -C "$T7/repo" -c user.name=t -c user.email=t@t commit -q -m cargo
+mkdir -p "$T7/repo/target/autobuilder"
+cat > "$T7/repo/target/autobuilder/last-verdict.json" <<'EOF'
+{"attribution_range":{"base":"aaa1111","head":"bbb2222"},"blocks":[{"scope":"inherited","receipt":"risk-gate","path":"src/x.rs"},{"scope":"in-scope","receipt":"ci-checks","path":"-"}]}
+EOF
+out7="$("$EXTEND_GATE" "$T7/repo" --explain-verdict 2>/dev/null)"; rc7=$?
+expect "AC7: exit 0"                    "[ $rc7 -eq 0 ]"
+expect "AC7: inherited block line: scope+receipt+path+range" \
+  "grep -qE '^scope=inherited  receipt=risk-gate  path=src/x\\.rs  range=aaa1111\\.\\.bbb2222\$' <<<\"\$out7\""
+expect "AC7: in-scope block line: scope+receipt+path+range" \
+  "grep -qE '^scope=in-scope  receipt=ci-checks  path=-  range=aaa1111\\.\\.bbb2222\$' <<<\"\$out7\""
+
+# --- AC8: --main-health never sees --attribution — an inherited-only ----
+# ------- block on main still blocks (legacy verdict mirrors gate-rc) ----
+# Structural half: extend-gate.sh only builds gate_delta_attr_args when
+# $scope = branch (main-health/pinned-landing are --scope main only).
+expect "AC8 (structural): attribution only wired for scope=branch" \
+  "grep -qE '^\\s*if \\[ \"\\\$scope\" = branch \\] && \\[ -n \"\\\$attribution_json\" \\]; then\$' \"$HERE/../scripts/extend-gate.sh\""
+# Functional half: the SAME inherited-only finding that would be
+# delta-pass under --attribution (AC1) still blocks via the legacy path
+# gate-delta.sh falls back to when no --attribution is passed (exactly
+# what a main-scope/--main-health call does) and gate-rc is non-zero.
+out8="$("$GATE_DELTA" verdict "$T/repo" /dev/null 1)"; rc8=$?
+expect "AC8: legacy path (no --attribution) blocks on gate-rc=1"     "[ $rc8 -eq 1 ]"
+expect "AC8: legacy path verdict=block regardless of scope shape"    "grep -q '^verdict=block\$' <<<\"\$out8\""
+
+# --- AC9: weekly digest line, one per crate with an open debt PRD -------
+T9="$(mktemp -d "${TMPDIR:-/tmp}/inhblocks-ac9.XXXXXX")"
+trap 'rm -rf "$T" "$T7" "$T9"' EXIT
+mkdir -p "$T9/prds/build-queue"
+cat > "$T9/prds/build-queue/PRD-crate9-gate-debt-abc1234.md" <<EOF
+# PRD — crate9-gate-debt-abc1234
+
+- Status: queued
+- Drafted: $(date -u -d '3 days ago' +%F)
+- build_target: rust-extend
+- build_into: /tmp/crate9
+
+## Acceptance criteria
+
+1. risk-gate passes: something.
+EOF
+out9="$("$GATE_DEBT" digest --prd-dir "$T9/prds" --journal "$T9/journal9.md")"
+expect "AC9: prints inherited-debt line for crate9"             "grep -qE '^inherited-debt: crate=crate9 open=1 oldest=[0-9]+d\$' <<<\"\$out9\""
+expect "AC9: oldest is at least 3 days"                          "n=\$(grep -oE 'oldest=[0-9]+d' <<<\"\$out9\" | grep -oE '[0-9]+'); [ \"\$n\" -ge 3 ]"
+expect "AC9: journal carries the same inherited-debt line"       "grep -q 'inherited-debt: crate=crate9 open=1' \"$T9/journal9.md\""
 
 exit $fail
