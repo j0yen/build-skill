@@ -48,18 +48,62 @@ route_log() {
   return 0
 }
 
+# PRD-build-cargo-shim-recursion-guard protocol v2 (2026-09-18T15:10Z
+# operator ruling): burst-lane-bin/cargo now honours the same guard
+# cargo-budget-bin/cargo does (req1/req3 — "every wintermute cargo shim in
+# this repo") — (2) refuse when this shim's own realpath is already in
+# WM_CARGO_SHIM_CHAIN (the actual mutual-recursion signature, independent
+# of depth); (4) WM_CARGO_SHIM_DEPTH is a backstop ceiling of 3 shim
+# frames (designed chain cargo-budget-bin -> burst-lane-bin -> real
+# cargo, depth 0->1->2), so a THIRD frame (depth already >= 2 at entry)
+# refuses too. Live defect this closes (2026-09-18 19:39-19:46Z, pid
+# 3902168): with no guard here at all, a PATH carrying rustbuild's shim
+# ahead of the real cargo let this shim's own real_cargo() (below) treat
+# rustbuild's shim as "the real cargo" and exec straight into it forever
+# — 6,779 `--version passthrough unrouted-subcommand` route.log lines in
+# under 7 minutes, never bounded because nothing here ever incremented or
+# checked a depth. (3) Once $REAL_CARGO below is confirmed not another
+# known shim, both vars are cleared for the child so a nested cargo call
+# (an xtask/build.rs shelling back out) starts a fresh chain instead of
+# inheriting an already-elevated depth and being wrongly refused.
+_wm_shim_self="$HERE/cargo"
+WM_CARGO_SHIM_DEPTH="${WM_CARGO_SHIM_DEPTH:-0}"
+WM_CARGO_SHIM_CHAIN="${WM_CARGO_SHIM_CHAIN:-}"
+
+_wm_shim_refuse() {
+  route_log "${1:--}" local recursion-refused
+  printf 'cargo-shim  recursion-refused (depth=%s path=%s)\n' "$WM_CARGO_SHIM_DEPTH" "${PATH%%:*}" >&2
+  exit 9
+}
+
+case ":$WM_CARGO_SHIM_CHAIN:" in
+  *":$_wm_shim_self:"*) _wm_shim_refuse "${1:-}" ;;
+esac
+[ "$WM_CARGO_SHIM_DEPTH" -ge 2 ] && _wm_shim_refuse "${1:-}"
+
+export WM_CARGO_SHIM_DEPTH=$(( WM_CARGO_SHIM_DEPTH + 1 ))
+export WM_CARGO_SHIM_CHAIN="${WM_CARGO_SHIM_CHAIN:+$WM_CARGO_SHIM_CHAIN:}$_wm_shim_self"
+
 # Find the next real cargo behind this shim on PATH: skip this shim's own
-# directory *and every other known cargo shim directory* (currently just
-# cargo-budget-bin — see PRD-build-cargo-shim-reexec-loop). Previously this
-# only skipped its own directory, which meant with both shim dirs on PATH
-# each shim's real_cargo() would resolve straight into the *other* shim,
-# which resolved back into this one, forever — a silent hang with no
-# error, no exit. Skipping the whole shared shim set (regardless of PATH
-# order or duplicate entries) guarantees this always lands on the real
-# cargo (or a legitimate non-shim cargo further down PATH) in one pass.
+# directory *and every other known cargo shim directory* — cargo-budget-bin
+# (PRD-build-cargo-shim-reexec-loop) and rustbuild's bin
+# (PRD-build-cargo-shim-recursion-guard, same realpath resolution
+# cargo-budget-bin/cargo's own real_cargo() uses, requirement 2) — so that
+# whichever of these is on PATH, none of them ever resolves another as
+# "the real cargo". Previously this only skipped its own directory and
+# cargo-budget-bin, which meant a PATH with rustbuild's shim ahead of the
+# real cargo made this resolve straight into rustbuild's shim — the live
+# defect above. Every dir compared by realpath (`pwd -P`) so a symlinked
+# skill path can't re-admit a shim under a different name.
+_rustbuild_target="$(readlink -f "$HOME/.claude/skills/rustbuild" 2>/dev/null || true)"
+_rustbuild_bin=""
+if [ -n "$_rustbuild_target" ] && [ -d "$_rustbuild_target/bin" ]; then
+  _rustbuild_bin="$(cd "$_rustbuild_target/bin" 2>/dev/null && pwd -P || true)"
+fi
 SHIM_DIRS=(
   "$HERE"
   "$(cd "$HERE/../cargo-budget-bin" 2>/dev/null && pwd -P || true)"
+  "$_rustbuild_bin"
 )
 real_cargo() {
   local dir bin resolved shim skip
@@ -98,6 +142,13 @@ fi
 # the remote/local `$REAL_CARGO` run below) never gets redirected back
 # into this shim a second time (no re-exec loop).
 export BURST_SHIM_ACTIVE=1
+
+# PRD-build-cargo-shim-recursion-guard protocol v2 item 3: real_cargo()
+# above already skipped every known shim dir (SHIM_DIRS, including
+# rustbuild's bin now), so $REAL_CARGO here is always the confirmed
+# non-shim real cargo — clear the guard state so the child (the real
+# cargo, and anything it shells back out to) starts a fresh chain.
+unset WM_CARGO_SHIM_CHAIN WM_CARGO_SHIM_DEPTH
 
 route=0
 sub="${1:-}"

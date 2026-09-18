@@ -47,11 +47,29 @@
 # case) means "nobody is counting" and the shim skips the append entirely.
 set -uo pipefail
 
+# PRD-build-cargo-shim-recursion-guard protocol v2 (2026-09-18T15:10Z
+# operator ruling, superseding the depth-only rule above where it
+# conflicts): (2) a shim that finds its OWN realpath already in
+# WM_CARGO_SHIM_CHAIN refuses -- the actual mutual-recursion signature,
+# independent of depth; (4) WM_CARGO_SHIM_DEPTH stays only as a backstop
+# ceiling of 3 shim frames (this repo's designed chain is
+# cargo-budget-bin -> burst-lane-bin -> real cargo, depth 0->1->2), so a
+# THIRD shim frame (depth already >= 2 at entry) refuses too. (3) Once a
+# shim hands off to the confirmed REAL (non-shim) cargo it clears both
+# vars for the child -- see CARGO_ROUTE_VIA_BURST_SHIM below -- so a build
+# script/xtask/nextest that shells out to cargo again starts a fresh
+# chain instead of inheriting an already-elevated depth.
+_wm_shim_here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+_wm_shim_self="$_wm_shim_here/cargo"
+
 WM_CARGO_SHIM_DEPTH="${WM_CARGO_SHIM_DEPTH:-0}"
 if [ "${BURST_SHIM_ACTIVE:-0}" = "1" ] && [ "$WM_CARGO_SHIM_DEPTH" -lt 1 ]; then
   WM_CARGO_SHIM_DEPTH=1
 fi
-if [ "$WM_CARGO_SHIM_DEPTH" -ge 2 ]; then
+WM_CARGO_SHIM_CHAIN="${WM_CARGO_SHIM_CHAIN:-}"
+
+_wm_shim_refuse() {
+  local cargo_shim_journal_file
   cargo_shim_journal_file="${CARGO_BUDGET_JOURNAL:-$HOME/brain/journal/build/$(date -u +%F).md}"
   mkdir -p "$(dirname "$cargo_shim_journal_file")" 2>/dev/null || true
   printf '%s  cargo-shim  recursion-refused (depth=%s path=%s)\n' \
@@ -63,10 +81,22 @@ if [ "$WM_CARGO_SHIM_DEPTH" -ge 2 ]; then
       "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$WM_CARGO_SHIM_DEPTH" \
       >> "$WM_CARGO_SHIM_TRIP_LOG" 2>/dev/null || true
   fi
-  echo "cargo-budget-bin/cargo: recursion-refused depth=$WM_CARGO_SHIM_DEPTH (two shims already exec'd into each other)" >&2
+  if [ -r "$_wm_shim_here/../lib/cargo-route.sh" ]; then
+    # shellcheck source=../lib/cargo-route.sh
+    source "$_wm_shim_here/../lib/cargo-route.sh" 2>/dev/null || true
+    command -v cargo_route_log >/dev/null 2>&1 && cargo_route_log "-" local recursion-refused
+  fi
+  printf 'cargo-shim  recursion-refused (depth=%s path=%s)\n' "$WM_CARGO_SHIM_DEPTH" "${PATH%%:*}" >&2
   exit 9
-fi
+}
+
+case ":$WM_CARGO_SHIM_CHAIN:" in
+  *":$_wm_shim_self:"*) _wm_shim_refuse ;;
+esac
+[ "$WM_CARGO_SHIM_DEPTH" -ge 2 ] && _wm_shim_refuse
+
 export WM_CARGO_SHIM_DEPTH=$(( WM_CARGO_SHIM_DEPTH + 1 ))
+export WM_CARGO_SHIM_CHAIN="${WM_CARGO_SHIM_CHAIN:+$WM_CARGO_SHIM_CHAIN:}$_wm_shim_self"
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 WRAPPER="$HERE/../cargo-budget.sh"
@@ -170,6 +200,18 @@ fi
 # (about to run as $REAL_CARGO) will write its own.
 CARGO_ROUTE_VIA_BURST_SHIM=0
 [ "$REAL_CARGO" = "$HERE/../burst-lane-bin/cargo" ] && CARGO_ROUTE_VIA_BURST_SHIM=1
+
+# PRD-build-cargo-shim-recursion-guard protocol v2 item 3: $REAL_CARGO is
+# confirmed not another shim (real_cargo()'s PATH walk already skipped
+# every dir in SHIM_DIRS, and it isn't the burst-lane-bin hand-off) only
+# when CARGO_ROUTE_VIA_BURST_SHIM is 0 — clear the guard state so the
+# child (the real cargo, and anything IT shells back out to) starts a
+# fresh chain instead of inheriting this depth/chain and being wrongly
+# refused. When REAL_CARGO IS the burst-lane-bin shim, leave both
+# exported as-is — that shim is the next frame in the chain, not the end.
+if [ "$CARGO_ROUTE_VIA_BURST_SHIM" != "1" ]; then
+  unset WM_CARGO_SHIM_CHAIN WM_CARGO_SHIM_DEPTH
+fi
 
 route=0
 # PRD-build-burst-gate-canary-invariant R15 (2026-09-18): find the real
