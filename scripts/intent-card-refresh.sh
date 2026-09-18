@@ -385,7 +385,7 @@ def ac_section_lines(all_lines):
     return out, in_section
 
 
-def extract_acceptance_criteria(all_lines, test_map):
+def extract_acceptance_criteria(all_lines, test_map, repo):
     section, found_heading = ac_section_lines(all_lines)
     if not found_heading:
         return None
@@ -418,7 +418,38 @@ def extract_acceptance_criteria(all_lines, test_map):
         # validates this 500 limit as UTF-8 byte length, not codepoints.
         desc = truncate_utf8_bytes(desc, 500)
         ac_id = f"AC{num}"
-        test = test_map.get(ac_id) or f"tests/acceptance_ac{num}.rs"
+        mapped_test = test_map.get(ac_id)
+        if mapped_test:
+            test = mapped_test
+        else:
+            # PRD-build-intent-card-refresh-ac-narrowing: scope/non_goals/
+            # five_whys_trace are never PRD-sourced at all (see carry()
+            # below) -- for a repo-scoped/partial-PRD commit (a shared-
+            # build_into repo where this PRD document numbers ACs across
+            # more than this commit's own slice) that already keeps a
+            # sibling's or a not-yet-built phase's ACs out of the card.
+            # acceptance_criteria had no equivalent guard: it re-parses
+            # every numbered AC line in THIS PRD's own document, and an
+            # AC not covered by agent/test-map.json's ac_test_map fell
+            # back to the scaffold-convention path unconditionally, even
+            # when that file does not exist in the tree (mcphost-stdlib-
+            # pseudo-modules picking up sibling mcphost-proof-lane-loop-
+            # config's AC1-4; build-land-conflict-resolver pointing at
+            # nonexistent tests/acceptance_ac{8,9,10,11}.rs -- both
+            # deterministic flake-audit failures, 2026-09-17). Once a repo
+            # curates its own ac_test_map (non-empty test_map -- it has
+            # graduated past the cold-start "nothing built yet" case),
+            # trust that map for the ACs it names, and for any AC it does
+            # NOT name only emit the scaffold pointer when that file is
+            # actually present; otherwise this AC is dropped as inherited,
+            # not pointed at a file the tree does not have. A repo with no
+            # curated map yet keeps the pre-existing behavior (always emit
+            # the scaffold pointer) -- there is nothing yet to narrow
+            # against.
+            scaffold = f"tests/acceptance_ac{num}.rs"
+            if test_map and not os.path.isfile(os.path.join(repo, scaffold)):
+                continue
+            test = scaffold
         acs.append({
             "id": ac_id,
             "level": LEVEL_MAP.get(level_code, "SHOULD"),
@@ -489,7 +520,7 @@ if not root_motivation:
     die(3, f"no Problem statement (or TL;DR) paragraph found in {prd_path} to source root_motivation from")
 
 test_map = load_test_map(repo)
-acceptance_criteria = extract_acceptance_criteria(all_lines, test_map)
+acceptance_criteria = extract_acceptance_criteria(all_lines, test_map, repo)
 if acceptance_criteria is None:
     die(3, f"no `## Acceptance` (criteria/tests) section found in {prd_path}")
 if not acceptance_criteria:
