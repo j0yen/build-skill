@@ -383,7 +383,7 @@ usage() {
   cat <<'EOF'
 usage: extend-gate.sh <build_into> [--base <tag>] [--head <sha>] [--dry-run]
                        [--parallelism N] [--record-baseline] [--force]
-                       [--phases-json] [--print-verdict-path]
+                       [--phases-json] [--print-verdict-path] [--explain-verdict]
                        [--scope main|branch --slug <slug>]
        extend-gate.sh --explain-scope
 EOF
@@ -503,6 +503,7 @@ force=false
 project_root_override=""
 phases_json_mode=false
 print_verdict_path_mode=false
+explain_verdict_mode=false
 # PRD-build-gate-before-land requirement 1 (P0): a branch-scoped gate runs
 # the full producer sequence inside a worktree, under a per-branch lock,
 # instead of the shared per-crate `autobuilder-integrate.lock` — so N
@@ -557,6 +558,7 @@ while [ $# -gt 0 ]; do
     --project-root)     project_root_override="${2:?extend-gate: --project-root needs a value}"; shift 2 ;;
     --phases-json)      phases_json_mode=true; shift ;;
     --print-verdict-path) print_verdict_path_mode=true; shift ;;
+    --explain-verdict)  explain_verdict_mode=true; shift ;;
     --scope)            scope="${2:?extend-gate: --scope needs a value}"; shift 2 ;;
     --slug)             slug="${2:?extend-gate: --slug needs a value}"; shift 2 ;;
     --pinned-landing)   pinned_landing=true; shift ;;
@@ -801,6 +803,32 @@ fi
 # find_cargo_root's search itself.
 if $print_verdict_path_mode; then
   echo "$project_abs/target/autobuilder/last-verdict.json"
+  exit 0
+fi
+
+# --- --explain-verdict (P1 requirement 5, AC7, PRD-build-inherited-blocks-
+# delta-pass) — "prints each block with scope, path, producer, and the
+# range used." Reads the cached last-verdict.json (same file
+# --print-verdict-path resolves) for <build_into> — read-only, same class
+# as --phases-json/--print-verdict-path: no producer, no lock, no journal.
+# `attribution_range` is one value for the whole run (attribution computes
+# a single diff range per run, not per-finding) and is printed on every
+# line. `(no cached verdict yet)` on a fresh repo or a cache written before
+# this PRD (no `blocks` key) is a legitimate "nothing to explain yet", not
+# an error.
+if $explain_verdict_mode; then
+  explain_cache_file="$project_abs/target/autobuilder/last-verdict.json"
+  if [ ! -f "$explain_cache_file" ]; then
+    echo "extend-gate: no cached verdict at $explain_cache_file"
+    exit 0
+  fi
+  jq -r '
+    (.attribution_range // {base:"?", head:"?"}) as $r
+    | (.blocks // []) as $b
+    | if ($b | length) == 0 then "(no blocking receipts in the cached verdict)"
+      else ($b[] | "scope=\(.scope)  receipt=\(.receipt)  path=\(.path // "-")  range=\($r.base)..\($r.head)")
+      end
+  ' "$explain_cache_file"
   exit 0
 fi
 
@@ -2425,24 +2453,33 @@ if [ "$phase_unattributed" -gt "$phase_tolerance" ]; then
   phases_field="$phases_field,unattributed:$phase_unattributed"
 fi
 
-# --- attribution (P0 requirement 1, PRD-build-gate-debt-auto-prd) --------
+# --- attribution (P0 requirement 1, PRD-build-gate-debt-auto-prd; diff
+# range widened by PRD-build-inherited-blocks-delta-pass requirement 2) ---
 # Split blocking_notes into in-scope (the building PRD's own diff touched
-# it) vs inherited (landed by an earlier merge). The diff range is the
-# building PRD's own merge: when HEAD is a no-ff merge commit (two
-# parents), that's exactly <head>^1..<head> — the merge's first parent is
-# mainline immediately before this PRD landed, so the diff against it is
-# what the PRD's own merge introduced (Technical considerations: "the
-# archive line already records base=... and the merge sha, so git
-# merge-base gives the diff range"). A non-merge HEAD (e.g. a fast-forward
-# land, or a gate run ahead of any merge) has no such single-parent split,
-# so this falls back to the wider $base_ref..HEAD range — less surgical,
-# but never crashes attribution into treating a fast-forwarded PRD's own
-# changes as "no diff at all".
+# it) vs inherited (landed by an earlier merge). The diff range:
+#   - HEAD is a no-ff merge commit (two parents, the post-land case) ->
+#     <head>^1..<head> exactly — the merge's first parent is mainline
+#     immediately before this PRD landed, so the diff against it is what
+#     the PRD's own merge introduced ("for main scope after a landing it
+#     is the landing's own merge range").
+#   - `--scope branch` (an un-landed branch gate, in its own worktree) ->
+#     `git merge-base <main-at-gate-start> <head>`..<head> — requirement
+#     2's literal "merge-base(main, branch)..branch": main_sha_at_gate_start
+#     (set above, PRD-build-gate-before-land) is this run's own reading of
+#     main's tip, so the merge-base against it is exactly that.
+#   - anything else (a `--scope main` run ahead of any merge, e.g. a fresh
+#     repo) -> the wider $base_ref..HEAD range — less surgical, but never
+#     crashes attribution into treating an unlanded main's own changes as
+#     "no diff at all".
 attribution_json=""
 attribution_inherited=0
 attribution_in_scope=0
+attribution_unknown_inputs=0
 if [ "${#blocking_notes[@]}" -gt 0 ] && [ -x "$GATE_ATTRIBUTION" ]; then
   attr_diff_base="$base_ref"
+  if [ "$scope" = branch ] && [ -n "${main_sha_at_gate_start:-}" ]; then
+    attr_diff_base="$(git -C "$repo" merge-base "$main_sha_at_gate_start" "$head_now" 2>/dev/null || echo "$main_sha_at_gate_start")"
+  fi
   parent_count="$(git -C "$repo" rev-list --parents -n1 "$head_now" 2>/dev/null | awk '{print NF-1}')"
   if [ "${parent_count:-0}" -eq 2 ]; then
     attr_diff_base="${head_now}^1"
@@ -2458,6 +2495,7 @@ if [ "${#blocking_notes[@]}" -gt 0 ] && [ -x "$GATE_ATTRIBUTION" ]; then
     attribution_json="$attr_out"
     attribution_in_scope="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("in_scope",0))' "$attribution_json" 2>/dev/null || echo 0)"
     attribution_inherited="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("inherited",0))' "$attribution_json" 2>/dev/null || echo 0)"
+    attribution_unknown_inputs="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("unknown_inputs",0))' "$attribution_json" 2>/dev/null || echo 0)"
   fi
   rm -f "$attr_notes_file"
 fi
@@ -2497,16 +2535,40 @@ if $record_baseline; then
   exit 0
 fi
 
-# --- delta verdict against the committed baseline (PRD-build-gate-delta-baseline) ---
+# --- delta verdict (PRD-build-inherited-blocks-delta-pass requirement 1,
+# superseding PRD-build-gate-delta-baseline's committed-baseline-only path)
 # `gate-delta.sh verdict`'s own exit code already mirrors <gate_rc>
-# byte-for-byte whenever there is no committed baseline (see that
-# script's header) — using it unconditionally as this script's final
-# exit code is what makes the absent-baseline path identical to the
-# pre-this-PRD behavior. Only the PRESENT-baseline path prints or
-# journals anything new.
-delta_out="$("$GATE_DELTA" verdict "$repo" "$gate_out_file" "$gate_rc")"
+# byte-for-byte whenever neither attribution nor a committed baseline is
+# usable (see that script's header) — using it unconditionally as this
+# script's final exit code is what makes that path identical to the
+# pre-this-PRD behavior.
+#
+# Attribution is the PREFERRED path for BRANCH-scope verdicts (Goals:
+# "verdict = f(in-scope blocks) for branch scope" — explicitly scoped to
+# branches, not main) — written to a temp file and passed via --attribution
+# whenever this is a `--scope branch` run that actually computed one.
+# Every other scope (plain `--scope main`, `--pinned-landing`, and
+# `--main-health`) keeps the legacy baseline-file path byte-identical to
+# before this PRD: Non-goals — "an inherited block on main is still red on
+# the main-health line" — and requirement 6 (P1) generalizes that to every
+# main-scope verdict, not just the `--main-health`-flagged one. Attribution
+# is still COMPUTED for these scopes (the `inherited=.../in-scope=...`
+# journal tokens above are unconditional on scope) — only the VERDICT
+# computation is restricted to branches. `--main-health`/`--pinned-landing`
+# are only ever valid with `--scope main` (enforced by the arg-parse `die`
+# checks above), so gating on `$scope = branch` alone already satisfies
+# requirement 6 without a separate main_health check.
+gate_delta_attr_args=()
+attr_tmp_file=""
+if [ "$scope" = branch ] && [ -n "$attribution_json" ]; then
+  attr_tmp_file="$(mktemp "${TMPDIR:-/tmp}/extend-gate-attribution.XXXXXX")"
+  printf '%s\n' "$attribution_json" > "$attr_tmp_file"
+  gate_delta_attr_args=(--attribution "$attr_tmp_file")
+fi
+delta_out="$("$GATE_DELTA" verdict "$repo" "$gate_out_file" "$gate_rc" "${gate_delta_attr_args[@]}")"
 delta_rc=$?
 rm -f "$gate_out_file"
+[ -n "$attr_tmp_file" ] && rm -f "$attr_tmp_file"
 baseline_state="$(printf '%s\n' "$delta_out" | sed -n 's/^baseline=//p')"
 delta_verdict="$(printf '%s\n' "$delta_out" | sed -n 's/^verdict=//p')"
 new_blocks="$(printf '%s\n' "$delta_out" | sed -n 's/^new_blocks=//p')"
@@ -2515,10 +2577,18 @@ inherited_blocks="$(printf '%s\n' "$delta_out" | sed -n 's/^inherited_blocks=//p
 final_rc="$delta_rc"
 outcome="pass"; [ "$gate_rc" -eq 0 ] || outcome="block"
 journal_suffix=""
-if [ "$baseline_state" = "present" ]; then
-  echo "extend-gate: delta verdict=$delta_verdict baseline=present new_blocks=${new_blocks:-none} inherited_blocks=${inherited_blocks:-none}"
+if [ "$baseline_state" = "present" ] || [ "$baseline_state" = "attribution" ]; then
+  echo "extend-gate: delta verdict=$delta_verdict baseline=$baseline_state new_blocks=${new_blocks:-none} inherited_blocks=${inherited_blocks:-none}"
   outcome="$delta_verdict"
   journal_suffix=" verdict=$delta_verdict inherited_blocks=[${inherited_blocks}]"
+fi
+# requirement 1: "the committed baseline file is consulted only when
+# attribution is absent (legacy path), and its use is journaled
+# baseline=legacy" — present/absent are exactly the two states gate-delta.sh
+# prints when it fell back to (or found nothing in) the committed-baseline
+# path instead of using --attribution.
+if [ "$baseline_state" = "present" ] || [ "$baseline_state" = "absent" ]; then
+  journal_suffix="$journal_suffix baseline=legacy"
 fi
 # Attribution suffix (requirement 1, AC1: "the journal gate line reads
 # inherited=1 in-scope=1") — appended whenever this run had at least one
@@ -2526,6 +2596,12 @@ fi
 # different axis: "known before" vs "whose diff introduced it").
 if [ "${#blocking_notes[@]}" -gt 0 ]; then
   journal_suffix="$journal_suffix inherited=$attribution_inherited in-scope=$attribution_in_scope"
+fi
+# requirement 2 (AC3): a finding attributed in-scope for want of a known
+# producer-input mapping (fail-closed) is called out by name so it never
+# reads as an ordinary in-scope finding in the journal.
+if [ "${attribution_unknown_inputs:-0}" -gt 0 ]; then
+  journal_suffix="$journal_suffix attribution=unknown-inputs"
 fi
 # requirement 4 (AC5): `deferred=<names>` — appended whenever this run
 # scope-deferred at least one receipt, independent of both suffixes above.
@@ -2676,6 +2752,13 @@ mkdir -p "$(dirname "$cache_file")"
 # 1: "the tags land in the summary receipt").
 attribution_empty='{"blocks":[],"in_scope":0,"inherited":0}'
 attribution_for_cache="${attribution_json:-$attribution_empty}"
+# PRD-build-inherited-blocks-delta-pass requirement 5 (P1, AC7): the diff
+# range attribution actually used this run, one value for every block in
+# it (attribution computes ONE range per run, not per-finding) — read by
+# --explain-verdict below. Empty/empty when attribution never ran.
+attribution_range_base="${attr_diff_base:-}"
+attribution_range_head="${head_now:-}"
+[ -n "$attribution_json" ] || attribution_range_head=""
 # Phase timing (PRD-build-gate-phase-timing requirement: "the gate receipt
 # ... gains a phases object with the same values plus wall_s and head") —
 # built from the same phase_names/phase_vals arrays the journal line's
@@ -2694,7 +2777,8 @@ jq -n --arg head "$head_now" --arg tree "$tree_now" --arg hash "$self_hash" --ar
      --argjson deferred "$deferred_json" \
      --arg gate_route "$GATE_ROUTE" --argjson routed_n "$routed_n" --argjson receipts_total "$receipts_total" \
      --argjson over "$phase_over_tolerance" --argjson unattr "$phase_unattributed" \
-     --argjson infra "$infra_notes_json" '
+     --argjson infra "$infra_notes_json" \
+     --arg attr_base "$attribution_range_base" --arg attr_head "$attribution_range_head" '
   {
     head_sha: $head,
     head: $head,
@@ -2709,6 +2793,7 @@ jq -n --arg head "$head_now" --arg tree "$tree_now" --arg hash "$self_hash" --ar
     routed: {n: $routed_n, receipts: $receipts_total},
     blocks: $attribution.blocks,
     attribution: {in_scope: $attribution.in_scope, inherited: $attribution.inherited},
+    attribution_range: (if $attr_head == "" then null else {base: $attr_base, head: $attr_head} end),
     phases: $phases,
     wall_s: $wall_s,
     scope: $scope,

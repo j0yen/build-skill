@@ -39,7 +39,19 @@
 #         2's threshold), whichever fires first.
 #       - anything else (new head, or the inherited set changed) -> reset
 #         the tracked observation to consecutive=1, first_seen=now; no
-#         draft this run (a fresh block needs to repeat before it's debt).
+#         draft this run (a fresh block needs to repeat before it's debt) —
+#         UNLESS the current inherited receipt names are already a subset
+#         of <repo>'s own main checkout's last main-scope blocking set
+#         (PRD-build-inherited-blocks-delta-pass requirement 4): that
+#         means main itself already carries this exact debt, so it drafts
+#         on this FIRST sight instead of waiting for a repeat, and skips
+#         `park_blocked_prds` entirely — a branch already ships past an
+#         inherited-only block via extend-gate.sh's own delta-pass verdict
+#         (requirement 1), so parking it here would just re-block work the
+#         gate itself already let through. Journaled with
+#         `fast=main-corroborated no-park=true`. A set NOT yet corroborated
+#         by main keeps the slower consecutive/elapsed path (and its park)
+#         exactly as before this PRD.
 #
 #     On draft: writes `<prd-dir>/build-queue/PRD-<repo>-gate-debt-<shortsha>.md`
 #     (one `N. P0 —` line per inherited finding, `build_priority: high`,
@@ -180,6 +192,33 @@ print(json.dumps(inherited))
 PY
 }
 
+# main_blocking_receipts <repo> — PRD-build-inherited-blocks-delta-pass
+# requirement 4: the set of receipt NAMES that were blocking on <repo>'s
+# own MAIN checkout at its last main-scope gate run (main-health or
+# otherwise — every main-scope verdict's blocks[] is exactly its blocking
+# receipts, requirement 6 in extend-gate.sh only changes how main-scope
+# VERDICTS are computed, not that this cache still lists what blocked).
+# <repo> may itself already be the main checkout (nothing to resolve) or a
+# branch worktree of it (`git worktree list`'s first entry is always the
+# main checkout, same resolution extend-gate.sh's own journal_base_field
+# uses). Prints a JSON array of receipt names, `[]` on anything missing.
+main_blocking_receipts() {
+  local repo="$1" main_root vfile
+  main_root="$(git -C "$repo" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print $2; exit}')"
+  [ -n "$main_root" ] || main_root="$repo"
+  vfile="$main_root/target/autobuilder/last-verdict.json"
+  [ -f "$vfile" ] || { echo "[]"; return 0; }
+  python3 -c '
+import json, sys
+try:
+    doc = json.load(open(sys.argv[1]))
+except Exception:
+    print("[]"); sys.exit(0)
+blocks = doc.get("blocks") or []
+print(json.dumps(sorted({str(b.get("receipt","")) for b in blocks if b.get("receipt")})))
+' "$vfile" 2>/dev/null || echo "[]"
+}
+
 # ------------------------------------------------------------------ check --
 cmd_check() {
   local repo="${1:-}" head="${2:-}"
@@ -241,9 +280,39 @@ cmd_check() {
     first_seen="$(now_epoch)"
   fi
 
+  # PRD-build-inherited-blocks-delta-pass requirement 4 (AC5): "drafts the
+  # debt PRD on the FIRST gate whose inherited set is non-empty and
+  # unchanged from main's last main-health run" — a receipt-name match
+  # against main's own last blocking set means this debt is ALREADY
+  # confirmed real (main itself carries it), not a transient local blip,
+  # so it never needs to repeat/wait out the elapsed-seconds threshold
+  # below. "the branch is not parked behind it (Depends-on is not added)"
+  # — this fast path also skips park_blocked_prds entirely: the whole
+  # point of delta-pass (extend-gate.sh requirement 1) is that a branch
+  # already ships past an inherited-only block, so re-parking it here
+  # would reintroduce exactly the wait this PRD removes. The slower
+  # consecutive/elapsed path below (pre-existing, PRD-build-gate-debt-
+  # auto-prd) is untouched for a set NOT yet corroborated by main — still
+  # parks, same as before this PRD.
+  local main_receipts current_receipts fast_path=0
+  main_receipts="$(main_blocking_receipts "$repo")"
+  current_receipts="$(python3 -c '
+import json, sys
+findings = json.loads(sys.argv[1])
+print(json.dumps(sorted({str(f.get("receipt","")) for f in findings if f.get("receipt")})))
+' "$findings_json" 2>/dev/null || echo '[]')"
+  if [ "$main_receipts" != "[]" ] \
+    && [ "$(python3 -c '
+import json, sys
+cur, main = json.loads(sys.argv[1]), json.loads(sys.argv[2])
+print(bool(cur) and set(cur) <= set(main))
+' "$current_receipts" "$main_receipts" 2>/dev/null)" = "True" ]; then
+    fast_path=1
+  fi
+
   local elapsed=$(( $(now_epoch) - first_seen ))
   local should_draft=0
-  if [ "$consecutive" -ge "$STALE_CONSECUTIVE" ] || [ "$elapsed" -ge "$STALE_SECONDS" ]; then
+  if [ "$fast_path" -eq 1 ] || [ "$consecutive" -ge "$STALE_CONSECUTIVE" ] || [ "$elapsed" -ge "$STALE_SECONDS" ]; then
     should_draft=1
   fi
 
@@ -265,7 +334,12 @@ json.dump({
 ' "$sfile" "$head" "$ids_json" "$consecutive" "$first_seen" "$debt_prd_name"
 
   if [ -n "$debt_prd_name" ]; then
-    park_blocked_prds "$repo" "$debt_prd_name" "$prd_dir"
+    if [ "$fast_path" -eq 1 ]; then
+      echo "gate-debt: drafted $debt_prd_name (main-corroborated, no park — debt is parallel work)"
+      gd_journal_line "$(repo_basename "$repo")" "gate-debt" "drafted" "prd=$debt_prd_name head=$head inherited=$inherited_count fast=main-corroborated no-park=true"
+    else
+      park_blocked_prds "$repo" "$debt_prd_name" "$prd_dir"
+    fi
   else
     echo "gate-debt: tracking $repo at $head (consecutive=$consecutive elapsed=${elapsed}s, threshold consecutive>=$STALE_CONSECUTIVE or elapsed>=${STALE_SECONDS}s)"
   fi
@@ -531,8 +605,63 @@ cmd_open() {
   fi
 }
 
+#  gate-debt.sh digest [--prd-dir <dir>] [--journal <path>]
+#
+#    P2 requirement 7 (AC9): "a weekly journal line: inherited-debt:
+#    crate=<c> open=<n> oldest=<age>" — one line per crate that currently
+#    has at least one open (`build-queue/`, not yet archived) gate-debt
+#    PRD, same corpus `cmd_open` already lists, grouped by the crate name
+#    embedded in the slug (`<crate>-gate-debt-<shortsha>`). `oldest` is the
+#    age (in whole days) of the oldest open debt PRD's own `Drafted:` date
+#    for that crate. Prints to stdout AND journals each line (this is the
+#    reporting surface itself — WIRING it to an actual weekly cadence is a
+#    caller/cron concern outside this script's own Engineering target,
+#    same interim-surface note as `cmd_open` above). No open debt PRDs ->
+#    prints and journals nothing, exits 0.
+cmd_digest() {
+  local prd_dir="$PRD_DIR_DEFAULT"
+  JOURNAL="$JOURNAL_DEFAULT"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --prd-dir) prd_dir="$2"; shift 2 ;;
+      --journal) JOURNAL="$2"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  mkdir -p "$(dirname "$JOURNAL")"
+  local f crate drafted today_epoch drafted_epoch age_days
+  declare -A open_count oldest_days
+  today_epoch="$(now_epoch)"
+  for f in "$prd_dir"/build-queue/PRD-*-gate-debt-*.md; do
+    [ -f "$f" ] || continue
+    crate="$(basename "$f" .md | sed -E 's/^PRD-//; s/-gate-debt-[0-9a-f]+$//')"
+    drafted="$(read_field "$f" "drafted")"
+    age_days=0
+    if [ -n "$drafted" ] && drafted_epoch="$(date -u -d "$drafted" +%s 2>/dev/null)"; then
+      age_days=$(( (today_epoch - drafted_epoch) / 86400 ))
+      [ "$age_days" -lt 0 ] && age_days=0
+    fi
+    open_count[$crate]=$(( ${open_count[$crate]:-0} + 1 ))
+    if [ -z "${oldest_days[$crate]:-}" ] || [ "$age_days" -gt "${oldest_days[$crate]}" ]; then
+      oldest_days[$crate]="$age_days"
+    fi
+  done
+  local c
+  for c in "${!open_count[@]}"; do
+    # Requirement 7's literal line shape (AC9) — journaled verbatim, not
+    # wrapped in gd_journal_line's slug/action/outcome convenience shape,
+    # so a reader grepping for "inherited-debt: crate=" finds it exactly.
+    local line
+    line="$(printf '%s  inherited-debt: crate=%s open=%s oldest=%sd' \
+      "$(now_iso)" "$c" "${open_count[$c]}" "${oldest_days[$c]}")"
+    echo "inherited-debt: crate=$c open=${open_count[$c]} oldest=${oldest_days[$c]}d"
+    journal_line --file "$JOURNAL" "$line"
+  done
+  return 0
+}
+
 usage() {
-  echo "usage: gate-debt.sh {check <repo> <head> [opts]|release-check [opts]|open [opts]}" >&2
+  echo "usage: gate-debt.sh {check <repo> <head> [opts]|release-check [opts]|open [opts]|digest [opts]}" >&2
   exit 2
 }
 
@@ -543,6 +672,7 @@ main() {
     check) cmd_check "$@" ;;
     release-check) cmd_release_check "$@" ;;
     open) cmd_open "$@" ;;
+    digest) cmd_digest "$@" ;;
     *) usage ;;
   esac
 }

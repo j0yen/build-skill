@@ -29,9 +29,12 @@
 #                         names a `delta-pass` gate verdict named as
 #                         baseline-covered debt — see extend-gate.sh's
 #                         `inherited_blocks=` summary field. Comma-
-#                         separated, empty/absent omits the block below
-#                         entirely (a plain `pass` ship has nothing to
-#                         report here).
+#                         separated. When ABSENT (the common case as of
+#                         PRD-build-inherited-blocks-delta-pass requirement
+#                         3), auto-populated from the PRD's own `build_into`
+#                         repo's `target/autobuilder/last-verdict.json`
+#                         (extend-gate.sh's own verdict cache) — an
+#                         explicit flag still wins over the auto-read.
 #
 # Output (stdout):
 #   Verified-completed:
@@ -44,11 +47,16 @@
 #
 #   inherited_blocks=[name1, name2]
 #
+#   Receipts: verdict=delta-pass inherited=2
+#
 # When `deferred_acs` is empty, the `Deferred:` block is omitted entirely.
 # When no ACs are paired, the `Verified-completed:` block is still
 # emitted with no body lines (so the gate caller's intent stays visible).
-# The `inherited_blocks=[...]` line is emitted only when
-# `--inherited-blocks` is given a non-empty value.
+# The `inherited_blocks=[...]` line is emitted whenever the (explicit or
+# auto-populated) inherited-blocks value is non-empty. The `Receipts:
+# verdict=... inherited=<n>` line (requirement 3, AC4) is emitted whenever
+# a verdict was resolvable — from `--inherited-blocks`'s sibling auto-read
+# of `build_into`'s last-verdict.json, so it needs no separate flag.
 #
 # Exit codes:
 #   0  trailer emitted; every AC is paired-or-deferred.
@@ -114,6 +122,26 @@ json="$(PRD_DIR="$prd_dir" "$SCAN")" || {
 
 deferred="$("$JQ" -c --arg s "$slug" '.[] | select(.slug==$s) | .deferred_acs // []' <<<"$json")"
 [ -n "$deferred" ] || deferred="[]"
+
+# PRD-build-inherited-blocks-delta-pass requirement 3: `--inherited-blocks`
+# is populated from attribution AUTOMATICALLY — an explicit flag still wins
+# (a caller that already knows the set doesn't pay a second file read), but
+# when it's absent, read the PRD's own `build_into` repo's last gate
+# verdict (target/autobuilder/last-verdict.json — the same cache
+# extend-gate.sh's delta path writes `inherited_blocks`/`verdict` into,
+# "last-verdict.json.blocks[] already carries scope; no new producer
+# output needed") and derive both the inherited-blocks list and the
+# `Receipts:` verdict line from it.
+verdict_val=""
+build_into_val="$("$JQ" -r --arg s "$slug" '.[] | select(.slug==$s) | .build_into // empty' <<<"$json")"
+if [ -n "$build_into_val" ] && [ -f "$build_into_val/target/autobuilder/last-verdict.json" ]; then
+  auto_verdict_file="$build_into_val/target/autobuilder/last-verdict.json"
+  if [ -z "$inherited_blocks" ]; then
+    auto_inherited="$("$JQ" -r '(.inherited_blocks // []) | join(",")' "$auto_verdict_file" 2>/dev/null)"
+    [ -n "$auto_inherited" ] && inherited_blocks="$auto_inherited"
+  fi
+  verdict_val="$("$JQ" -r '.verdict // empty' "$auto_verdict_file" 2>/dev/null)"
+fi
 
 if [ -n "$reasons_json" ]; then
   reasons="$reasons_json"
@@ -191,6 +219,20 @@ fi
 if [ -n "$inherited_blocks" ]; then
   echo
   echo "inherited_blocks=[${inherited_blocks//,/, }]"
+fi
+
+# PRD-build-inherited-blocks-delta-pass requirement 3 (AC4): "the Receipts:
+# line reads verdict=delta-pass inherited=<n>" — printed whenever a verdict
+# was resolvable (auto from build_into's last gate, above), independent of
+# whether inherited_blocks itself is empty (a plain `pass` ship still gets
+# `Receipts: verdict=pass inherited=0`).
+if [ -n "$verdict_val" ]; then
+  n_inherited=0
+  if [ -n "$inherited_blocks" ]; then
+    n_inherited="$("$JQ" -rn --arg s "$inherited_blocks" '$s | split(",") | length')"
+  fi
+  echo
+  echo "Receipts: verdict=$verdict_val inherited=$n_inherited"
 fi
 
 exit 0

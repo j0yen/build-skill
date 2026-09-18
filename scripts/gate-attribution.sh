@@ -39,19 +39,28 @@
 #       - a finding WITH a path/test token is `in-scope` if ANY of its
 #         listed paths appears in `git -C <repo> diff --name-only
 #         <diff_base>..<diff_head>`, else `inherited`.
-#       - a PATHLESS finding is `inherited` UNLESS the diff touches at
-#         least one of that receipt's producer-input files — a small
-#         built-in default map (proof-receipt / intake -> the intent
-#         card + Cargo.toml, the files those two producers actually read)
-#         plus whatever `--producer-inputs` adds or overrides.
+#       - a PATHLESS finding whose receipt has a KNOWN producer-input map
+#         (the small built-in default — proof-receipt / intake -> the
+#         intent card + Cargo.toml, the files those two producers actually
+#         read — plus whatever `--producer-inputs` adds or overrides) is
+#         `inherited` UNLESS the diff touches at least one of those files.
+#       - a PATHLESS finding whose receipt has NO producer-input map (an
+#         unregistered receipt, or one registered with an empty file list)
+#         is `in-scope`, fail-closed (PRD-build-inherited-blocks-delta-pass
+#         requirement 2: "a finding whose producer inputs are unknown is
+#         in-scope") — an unmapped producer must never quietly become free
+#         inherited debt just because nobody wired its inputs yet. Such a
+#         block also carries `"attribution":"unknown-inputs"` and the
+#         summary line below gains an `attribution=unknown-inputs` token.
 #
 #     Prints ONE line of JSON to stdout:
 #       {"blocks":[{"receipt":"...","finding":"...","path":"...",
-#                   "scope":"in-scope"|"inherited"}, ...],
-#        "in_scope":<N>, "inherited":<M>}
+#                   "scope":"in-scope"|"inherited"[,"attribution":"unknown-inputs"]}, ...],
+#        "in_scope":<N>, "inherited":<M>, "unknown_inputs":<K>}
 #     and a human summary to stderr: "gate-attribution: inherited=M in-scope=N"
 #     (the exact token order extend-gate.sh's journal gate line reuses,
-#     AC1: "the journal gate line reads inherited=1 in-scope=1").
+#     AC1: "the journal gate line reads inherited=1 in-scope=1"), with an
+#     appended " attribution=unknown-inputs" when K > 0.
 #
 #     Exit 0 always — this is a computation, never a verdict; the caller's
 #     own gate outcome (pass/block) is unaffected by anything here
@@ -118,6 +127,7 @@ test_re = re.compile(r'\btest=(\S+)')
 blocks = []
 in_scope = 0
 inherited = 0
+unknown_inputs = 0
 
 with open(notes_file) as fh:
     for line in fh:
@@ -129,24 +139,43 @@ with open(notes_file) as fh:
         note = parts[1] if len(parts) > 1 else ""
 
         m = path_re.search(note) or test_re.search(note)
+        unknown = False
         if m:
             paths = [p for p in m.group(1).split(",") if p]
             scope = "in-scope" if any(p in diff_files for p in paths) else "inherited"
             path_field = ",".join(paths)
         else:
-            inputs = producer_inputs.get(receipt, [])
-            touched = any(f in diff_files for f in inputs)
-            scope = "in-scope" if touched else "inherited"
+            # PRD-build-inherited-blocks-delta-pass requirement 2: a finding
+            # whose producer input list is unknown (no entry in the map, or
+            # an entry registered with an empty file list) is in-scope,
+            # fail-closed — a mis-attributed real defect must never pass as
+            # "just inherited debt" for want of a producer-input mapping.
+            # This is distinct from a KNOWN producer whose registered inputs
+            # simply weren't touched (still legitimately inherited).
+            inputs = producer_inputs.get(receipt)
+            if not inputs:
+                scope = "in-scope"
+                unknown = True
+            else:
+                touched = any(f in diff_files for f in inputs)
+                scope = "in-scope" if touched else "inherited"
             path_field = ""
 
-        blocks.append({"receipt": receipt, "finding": note, "path": path_field, "scope": scope})
+        block = {"receipt": receipt, "finding": note, "path": path_field, "scope": scope}
+        if unknown:
+            block["attribution"] = "unknown-inputs"
+            unknown_inputs += 1
+        blocks.append(block)
         if scope == "in-scope":
             in_scope += 1
         else:
             inherited += 1
 
-print(json.dumps({"blocks": blocks, "in_scope": in_scope, "inherited": inherited}))
-print(f"gate-attribution: inherited={inherited} in-scope={in_scope}", file=sys.stderr)
+print(json.dumps({"blocks": blocks, "in_scope": in_scope, "inherited": inherited, "unknown_inputs": unknown_inputs}))
+summary = f"gate-attribution: inherited={inherited} in-scope={in_scope}"
+if unknown_inputs:
+    summary += " attribution=unknown-inputs"
+print(summary, file=sys.stderr)
 PY
   local py_rc=$?
   rm -f "$diff_file"
