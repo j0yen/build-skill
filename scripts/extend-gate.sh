@@ -584,6 +584,24 @@ if $main_health && $pinned_landing; then
 fi
 
 repo="$(cd "$repo_arg" 2>/dev/null && pwd)" || die 1 "no such directory: $repo_arg"
+
+# PRD-build-gate-infra-outcome AC13, route A2 (decision 261f5b2c, Joe
+# 2026-09-18): one-shot operator injection of REVIEWER_PROMPT for exactly
+# ONE branch gate, armed as $STATE_DIR/reviewer-prompt-inject-once.json.
+# See lib/reviewer-prompt-inject.sh; main scope and non-matching slugs are
+# untouched, and the file is consumed atomically so only one gate wins.
+# shellcheck source=lib/reviewer-prompt-inject.sh
+source "$BUILD_SCRIPTS/lib/reviewer-prompt-inject.sh"
+REVIEWER_PROMPT_INJECT_ONCE="${REVIEWER_PROMPT_INJECT_ONCE:-$STATE_DIR/reviewer-prompt-inject-once.json}"
+_inj_journal=""
+if declare -F journal_root >/dev/null 2>&1; then
+  _inj_journal="${EXTEND_GATE_JOURNAL:-$(journal_root)/$(date -u +%Y-%m-%d).md}"
+fi
+_inj_prompt="$(reviewer_prompt_inject_once "$scope" "$slug" "$REVIEWER_PROMPT_INJECT_ONCE" "$_inj_journal")"
+if [ -n "$_inj_prompt" ]; then
+  REVIEWER_PROMPT="$_inj_prompt"
+  echo "extend-gate: REVIEWER_PROMPT injected once (AC13 route A2): $REVIEWER_PROMPT" >&2
+fi
 git -C "$repo" rev-parse --git-dir >/dev/null 2>&1 || die 1 "not a git repo: $repo"
 command -v autobuilder >/dev/null 2>&1 || die 2 "autobuilder not on \$PATH (cargo install --path ~/wintermute/rustbuild/autobuilder --locked)"
 [ -x "$RUSTBUILD_SCRIPTS/extended-receipts.sh" ] || die 2 "missing $RUSTBUILD_SCRIPTS/extended-receipts.sh"
