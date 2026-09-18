@@ -15,10 +15,17 @@ below that apply to this PRD's shape. See history.md#branch-prompt-origin.
 
 ## 1. Lock
 
-Acquire `~/.claude/skills/build/state/prd-<slug>.lock` via `flock -n`
-before any state mutation, held once for the entire dispatch (including
-every chained step — see §8). Can't acquire it → log `prd-lock-held` and
-exit. See history.md#lock-holder.
+Your dispatch already holds `~/.claude/skills/build/state/prd-<slug>.lock`:
+`dispatch.sh` launches you as `flock -n <lock> claude -p …`, so the lock is
+held by your own process for the entire dispatch (including every chained
+step — see §8). Do NOT re-acquire it: a `flock -n` from your shell is a child
+of the holder and fails by design; that failure is not a foreign holder.
+Verify instead with `fuser <lock>` — if every holder pid is in your own
+ancestor chain (walk `ps -o ppid= -p <pid>` upward from `$$`), proceed. Only
+when a holder is NOT your ancestor: log `prd-lock-held` and exit. (Hotfix
+2026-09-18 11:58Z, operator: the dispatch.sh wrapper plus this section made
+every branch skip itself; PRD-build-programmatic-dispatch owns the permanent
+wording and a test.) See history.md#lock-holder.
 
 ## 2. Worktree isolation
 
