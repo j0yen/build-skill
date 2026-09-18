@@ -406,15 +406,22 @@ fi
 # Live phase (AC11): run once against the REAL sources for today, on the
 # real host, against the real PRDs repo. No fixture overrides.
 #
-# DAY_LEDGER_SELFTEST_SKIP_LIVE=1 skips this phase — a development knob
-# only (each real run commits+pushes a new produced_at to the real PRDs
-# repo, so re-running the fixture phases while iterating should not also
-# spam that repo). Unset (the default) for every real AC11 pass.
+# Opt-in since 2026-09-18: DAY_LEDGER_SELFTEST_LIVE=1 runs this phase; it
+# commits+pushes to the real PRDs repo, and a bare run on carbon on
+# 2026-09-17 overwrote RedBaron's real day record with a stub (a0faa8f,
+# restored in 6fe0eb3). The live phase also refuses to run off the build
+# host unless DAY_LEDGER_SELFTEST_LIVE_ANY_HOST=1. The old
+# DAY_LEDGER_SELFTEST_SKIP_LIVE=1 still skips. A skipped run is NOT a
+# real AC11 pass.
 # ======================================================================
-if [ "${DAY_LEDGER_SELFTEST_SKIP_LIVE:-0}" = "1" ]; then
-  echo "---- live phase SKIPPED (DAY_LEDGER_SELFTEST_SKIP_LIVE=1) ----"
+if [ "${DAY_LEDGER_SELFTEST_SKIP_LIVE:-0}" = "1" ] || [ "${DAY_LEDGER_SELFTEST_LIVE:-0}" != "1" ]; then
+  echo "---- live phase SKIPPED (set DAY_LEDGER_SELFTEST_LIVE=1 on the build host to run it) ----"
   echo "day-ledger-selftest: PASS=$PASS FAIL=$FAIL (live phase skipped — NOT a real AC11 pass)"
   if [ "$FAIL" -eq 0 ]; then exit 0; else exit 1; fi
+fi
+if [ "$(hostname 2>/dev/null | tr '[:upper:]' '[:lower:]')" != "redbaron" ] && [ "${DAY_LEDGER_SELFTEST_LIVE_ANY_HOST:-0}" != "1" ]; then
+  echo "day-ledger-selftest: REFUSED live phase on $(hostname): it would push this host's stub over the build host's real record (set DAY_LEDGER_SELFTEST_LIVE_ANY_HOST=1 to override)" >&2
+  exit 1
 fi
 echo "---- live phase (real sources, today) ----"
 LIVE_OUT="$HOME/Documents/PRDs/notes/day-ledger/$(TZ=America/New_York date +%F).json"
