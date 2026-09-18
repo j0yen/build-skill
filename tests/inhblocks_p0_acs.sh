@@ -136,6 +136,23 @@ mkdir -p "$T7/repo/target/autobuilder"
 cat > "$T7/repo/target/autobuilder/last-verdict.json" <<'EOF'
 {"attribution_range":{"base":"aaa1111","head":"bbb2222"},"blocks":[{"scope":"inherited","receipt":"risk-gate","path":"src/x.rs"},{"scope":"in-scope","receipt":"ci-checks","path":"-"}]}
 EOF
+# Under scripts/run-selftests.sh, HOME is redirected into the isolated
+# test root (scripts/lib/isolation.sh), so extend-gate.sh's hard
+# requirement on $HOME/.claude/skills/rustbuild/scripts/extended-
+# receipts.sh cannot be met: it dies `missing .../extended-receipts.sh`
+# with exit 2 before printing a single --explain-verdict line, and all
+# three AC7 assertions then fail for a reason that has nothing to do with
+# the verdict explanation they exist to check. (Found 2026-09-18: AC7 was
+# green when run bare and red under the runner.) Link the REAL rustbuild
+# skill into the isolated HOME -- extend-gate only ever sources that
+# helper, so a read-only symlink is the whole fix. Deliberately NOT a
+# skip: if rustbuild is absent from both HOMEs, AC7 is genuinely
+# unprovable on this box and must fail loudly rather than self-excuse.
+if [ ! -r "$HOME/.claude/skills/rustbuild/scripts/extended-receipts.sh" ] \
+   && [ -r "${BUILD_TEST_REAL_HOME:-/nonexistent}/.claude/skills/rustbuild/scripts/extended-receipts.sh" ]; then
+  mkdir -p "$HOME/.claude/skills"
+  ln -sfn "$BUILD_TEST_REAL_HOME/.claude/skills/rustbuild" "$HOME/.claude/skills/rustbuild"
+fi
 out7="$("$EXTEND_GATE" "$T7/repo" --explain-verdict 2>/dev/null)"; rc7=$?
 expect "AC7: exit 0"                    "[ $rc7 -eq 0 ]"
 expect "AC7: inherited block line: scope+receipt+path+range" \
@@ -484,5 +501,192 @@ expect "AC11: extend-gate.sh journals attribution=baseline-witness" \
   "grep -q 'journal_suffix attribution=baseline-witness' \"$HERE/../scripts/extend-gate.sh\""
 expect "AC11: extend-gate.sh reads the baseline_witness counter" \
   "grep -q 'attribution_baseline_witness=' \"$HERE/../scripts/extend-gate.sh\""
+
+# ---- SHIP PATH: operator `(Live` AC pairing rulings ---------------------
+# Not an AC of this PRD; the mechanism this PRD needed in order to BE
+# shippable. AC6 is a (Live AC whose evidence clause asks for
+# `<slug>  delta-pass` in the journal's OUTCOME slot. The behaviour it
+# demands happened (burst-lane-gate-debt-2b2982e, 2026-09-18T13:37:22Z:
+# `verdict=delta-pass inherited_blocks=[rollback-plan] inherited=1
+# in-scope=0`), but extend-gate.sh's gate-infra-outcome override relabels
+# that outcome slot `incomplete`, so the clause can never match and only
+# the in-parens `verdict=` token carries the computed verdict. The
+# operator ruled on 2026-09-18T13:35Z that AC6 pairs against that line and
+# that the AC text must NOT be edited. Nothing in the archive path could
+# execute that ruling: verified-completed.sh only ever derived, so the PRD
+# stayed `built` and live-ac-reality-check.sh opened a decision for a
+# question already answered. scripts/live-ac-ruling.sh + rule h's new
+# operator-ruling branch are that missing executor, and these cases pin
+# its fail-closed edges — an override that is easy to reach by accident is
+# worse than no override at all.
+RULING="$HERE/../scripts/live-ac-ruling.sh"
+VC_SP="$HERE/../scripts/verified-completed.sh"
+RC_SP="$HERE/../scripts/live-ac-reality-check.sh"
+TSP="$(mktemp -d "${TMPDIR:-/tmp}/inhblocks-shippath.XXXXXX")"
+mkdir -p "$TSP/rulings" "$TSP/repo/tests" "$TSP/journal" "$TSP/prds/build-queue"
+cat > "$TSP/loop-tooling-repos.txt" <<EOF
+$TSP/repo
+EOF
+sp_prd="$TSP/prds/build-queue/PRD-shippath-fixture.md"
+cat > "$sp_prd" <<EOF
+# PRD: shippath-fixture
+
+- Status: built
+- build_target: shell
+- build_into: $TSP/repo
+- test_prefix: shippath
+- Drafted: 2026-09-18
+- Grounding: failure-derived
+- Vision: x.md
+
+## Acceptance criteria
+
+1. P0 — Given a real loop, When it runs, Then it proves this. (Live; evidence: journal:TOKEN_NEVER_WRITTEN)
+EOF
+
+sp_class() { # -> "<status>|<rule>|<path>"
+  LOOP_TOOLING_REPOS_FILE="$TSP/loop-tooling-repos.txt" VC_JOURNAL_DIR="$TSP/journal" \
+    LIVE_AC_RULINGS_DIR="${1:-$TSP/rulings}" \
+    "$VC_SP" "$sp_prd" --derive --format json 2>/dev/null \
+    | python3 -c 'import json,sys
+c=[x for x in json.load(sys.stdin)["classifications"] if x["ac"]==1][0]
+print(c["status"], c.get("rule") or "", c.get("path") or "", sep="|")'
+}
+
+expect "ship-path: with NO ruling on file the (Live AC stays unproven (fail-closed)" \
+  "[ \"\$(sp_class)\" = 'live-ac-unproven||' ]"
+
+# An incomplete row is not a ruling. Written by hand rather than via
+# record, because record itself refuses to produce one — the point of the
+# case is that a hand-edited or truncated state file cannot pair an AC.
+printf '%s\n' '{"slug":"shippath-fixture","rulings":[{"ac":1,"evidence":"e","ruled_at":"2026-09-18T13:35:00Z"}]}' \
+  > "$TSP/rulings/shippath-fixture.json"
+expect "ship-path: a ruling row with no ruled_by is no ruling (still unproven)" \
+  "[ \"\$(sp_class)\" = 'live-ac-unproven||' ]"
+printf '%s\n' 'not json at all' > "$TSP/rulings/shippath-fixture.json"
+expect "ship-path: an unparseable rulings file is no ruling (still unproven)" \
+  "[ \"\$(sp_class)\" = 'live-ac-unproven||' ]"
+: > "$TSP/rulings/shippath-fixture.json"
+expect "ship-path: an empty rulings file is no ruling (still unproven)" \
+  "[ \"\$(sp_class)\" = 'live-ac-unproven||' ]"
+rm -f "$TSP/rulings/shippath-fixture.json"
+
+LIVE_AC_RULINGS_DIR="$TSP/rulings" "$RULING" record shippath-fixture --ac 1 \
+  --evidence 'journal 2026-09-18T13:37:22Z: verdict=delta-pass inherited=1 in-scope=0' \
+  --ruled-by Joe --ruled-at 2026-09-18T13:35:00Z --note 'equivalent evidence' >/dev/null 2>&1
+sp_after="$(sp_class)"
+expect "ship-path: a complete ruling pairs the (Live AC as live-operator-ruling" \
+  "[ \"\${sp_after%%|*}\" = PAIRED ]" 
+expect "ship-path: the pairing carries who ruled it and when into the rule name" \
+  "[ \"\$(printf '%s' \"\$sp_after\" | cut -d'|' -f2)\" = 'live-operator-ruling:Joe@2026-09-18T13:35:00Z' ]"
+expect "ship-path: the pairing's evidence is the operator's text, not the unmatched clause" \
+  "[ \"\$(printf '%s' \"\$sp_after\" | cut -d'|' -f3)\" = 'journal 2026-09-18T13:37:22Z: verdict=delta-pass inherited=1 in-scope=0' ]"
+
+# A ruling is scoped to the slug that owns it. Same AC number, wrong slug:
+# the file is named for another PRD, so it must not reach this one.
+mkdir -p "$TSP/rulings-other"
+LIVE_AC_RULINGS_DIR="$TSP/rulings-other" "$RULING" record some-other-prd --ac 1 \
+  --evidence 'someone else evidence' --ruled-by Joe --ruled-at 2026-09-18T13:35:00Z >/dev/null 2>&1
+expect "ship-path: a ruling filed under a DIFFERENT slug never pairs this PRD's AC" \
+  "[ \"\$(sp_class \"$TSP/rulings-other\")\" = 'live-ac-unproven||' ]"
+
+# The classification protocol is `CLASS|rule|path|other` read with
+# IFS='|'. A pipe in the evidence would shift every later field, so it is
+# refused at write time — checked here because the corruption it prevents
+# would otherwise surface as a silently wrong archive trailer.
+LIVE_AC_RULINGS_DIR="$TSP/rulings" "$RULING" record shippath-fixture --ac 1 \
+  --evidence 'a|b' --ruled-by Joe >/dev/null 2>&1
+sp_pipe_rc=$?
+expect "ship-path: evidence containing '|' is refused at write time (exit 2)" \
+  "[ \"\$sp_pipe_rc\" -eq 2 ]"
+expect "ship-path: the refused write left the earlier good ruling intact" \
+  "[ \"\$(sp_class | cut -d'|' -f1)\" = PAIRED ]"
+
+# A ruling can only rescue an AC the PRD text itself tagged `(Live`. rule h
+# is the ONLY branch that consults one, so an ordinary MISSING AC is
+# untouched by a ruling naming its number.
+sp_prd2="$TSP/prds/build-queue/PRD-shippath-nonlive.md"
+sed 's/PRD: shippath-fixture/PRD: shippath-nonlive/; s/ (Live; evidence: journal:TOKEN_NEVER_WRITTEN)//' \
+  "$sp_prd" > "$sp_prd2"
+LIVE_AC_RULINGS_DIR="$TSP/rulings" "$RULING" record shippath-nonlive --ac 1 \
+  --evidence 'trying to rescue a non-live AC' --ruled-by Joe >/dev/null 2>&1
+sp_nonlive="$(LOOP_TOOLING_REPOS_FILE="$TSP/loop-tooling-repos.txt" VC_JOURNAL_DIR="$TSP/journal" \
+  LIVE_AC_RULINGS_DIR="$TSP/rulings" "$VC_SP" "$sp_prd2" --derive --format json 2>/dev/null \
+  | python3 -c 'import json,sys; print([x for x in json.load(sys.stdin)["classifications"] if x["ac"]==1][0]["status"])')"
+expect "ship-path: a ruling cannot pair an AC that is not (Live-tagged (rule h only)" \
+  "[ \"\$sp_nonlive\" = MISSING ]"
+rm -rf "$TSP"
+
+# ---- SHIP PATH end-to-end: the ruling actually ships the PRD ------------
+# The unit cases above prove verified-completed.sh honours a ruling. This
+# proves the ARCHIVE path does, which is a separate claim: before the fix
+# live-ac-reality-check.sh selected (Live ACs with `rule | startswith
+# ("live:")` alone, so an operator-ruled AC (rule `live-operator-ruling:`)
+# read as "this PRD has no (Live AC at all" and the script exited
+# `no-live-ac` WITHOUT archiving — the ruling would have been honoured by
+# every consumer except the one that ships. Same bare-origin/clone fixture
+# shape scripts/live-ac-selftest.sh's own AC6 case uses; the difference is
+# that the journal here NEVER gains the token, so the ONLY thing that can
+# ship this PRD is the ruling.
+TE="$(mktemp -d "${TMPDIR:-/tmp}/inhblocks-shipe2e.XXXXXX")"
+gce() { git -C "$1" -c user.email=t@t -c user.name=t "${@:2}"; }
+git init -q --bare "$TE/origin.git"
+git clone -q "$TE/origin.git" "$TE/prds" 2>/dev/null
+mkdir -p "$TE/prds/build-queue" "$TE/prds/built-prds" "$TE/repo/tests" "$TE/journal" \
+         "$TE/pending" "$TE/receipts" "$TE/rulings"
+printf '# MANIFEST\n\n## build-queue\n- PRD-shipe2e.md — built · shell · 2026-09-18\n\n## built-prds\n' \
+  > "$TE/prds/MANIFEST.md"
+gce "$TE/prds" add -A; gce "$TE/prds" commit -qm init
+defbre="$(git -C "$TE/prds" symbolic-ref --short HEAD)"
+git -C "$TE/prds" push -q origin "$defbre"
+printf '%s\n' "$TE/repo" > "$TE/loop-tooling-repos.txt"
+echo receipt > "$TE/receipts/r.txt"
+printf '{"prds":{"shipe2e":{"slug":"shipe2e","receipts_dir":"%s","gate":{"verdict":"pass"}}}}\n' \
+  "$TE/receipts" > "$TE/bmanifest.json"
+fe="$TE/prds/build-queue/PRD-shipe2e.md"
+cat > "$fe" <<EOF
+# PRD: shipe2e
+
+- Status: built
+- build_target: shell
+- build_into: $TE/repo
+- test_prefix: shipe2e
+- Drafted: 2026-09-18
+- Grounding: failure-derived
+- Vision: x.md
+
+## Acceptance criteria
+
+1. P0 — Given a real loop, When it runs, Then it proves this. (Live; evidence: journal:TOKEN_NEVER_WRITTEN_E2E)
+EOF
+gce "$TE/prds" add -A; gce "$TE/prds" commit -qm "add shipe2e"
+git -C "$TE/prds" push -q origin "$defbre"
+
+run_rce() {
+  LOOP_TOOLING_REPOS_FILE="$TE/loop-tooling-repos.txt" VC_JOURNAL_DIR="$TE/journal" \
+    LIVE_AC_PENDING_DIR="$TE/pending" LIVE_AC_MAX_WALL=6h BUILD_JOURNAL_ROOT="$TE/journal" \
+    LIVE_AC_RULINGS_DIR="$TE/rulings" \
+    PRD_DIR="$TE/prds" BUILD_MANIFEST="$TE/bmanifest.json" \
+    "$RC_SP" check "$fe" 2>&1
+}
+out_e_before="$(run_rce)"
+expect "ship-path e2e: with no ruling the PRD is NOT archived (stays in build-queue)" \
+  "[ -f \"$TE/prds/build-queue/PRD-shipe2e.md\" ] && [ ! -f \"$TE/prds/built-prds/PRD-shipe2e.md\" ]"
+
+LIVE_AC_RULINGS_DIR="$TE/rulings" "$HERE/../scripts/live-ac-ruling.sh" record shipe2e --ac 1 \
+  --evidence 'journal 2026-09-18T13:37:22Z burst-lane-gate-debt-2b2982e: verdict=delta-pass inherited=1 in-scope=0' \
+  --ruled-by Joe --ruled-at 2026-09-18T13:35:00Z >/dev/null 2>&1
+out_e_after="$(run_rce)"
+expect "ship-path e2e: the ruled PRD does not read as 'no-live-ac' (the selector regression)" \
+  "! printf '%s' \"\$out_e_after\" | grep -q 'no-live-ac'"
+expect "ship-path e2e: the ruling archives the PRD for real (build-queue copy gone)" \
+  "[ ! -f \"$TE/prds/build-queue/PRD-shipe2e.md\" ]"
+expect "ship-path e2e: built-prds/PRD-shipe2e.md exists" \
+  "[ -f \"$TE/prds/built-prds/PRD-shipe2e.md\" ]"
+expect "ship-path e2e: the archived copy records the ruling, not a derived match" \
+  "grep -q 'live-operator-ruling:Joe@2026-09-18T13:35:00Z' \"$TE/prds/built-prds/PRD-shipe2e.md\""
+expect "ship-path e2e: MANIFEST.md flips the slug to shipped" \
+  "grep -q 'PRD-shipe2e.md — shipped' \"$TE/prds/MANIFEST.md\""
+rm -rf "$TE"
 
 exit $fail

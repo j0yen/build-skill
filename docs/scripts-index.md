@@ -129,6 +129,7 @@ points here instead of listing scripts inline).
 - `scripts/lint-journal-fixtures.sh` — scripts/lint-journal-fixtures.sh — the corpus tripwire's reporting side
 - `scripts/live-ac-reality-check.sh` — PRD-build-live-ac-no-defer R6/R7.
 - `scripts/live-ac-report.sh` — PRD-build-live-ac-no-defer R9/AC9: a one-time,
+- `scripts/live-ac-ruling.sh` — durable record of an operator's `(Live` AC pairing
 - `scripts/live-ac-selftest.sh` — acceptance harness for the `(Live` AC marker
 - `scripts/loom-serial-fallback.sh` — per-target conflict-streak ledger and serial-routing gate.
 - `scripts/loop-arm-drill.sh` — operator-run: prove the auth-expired classification
@@ -167,6 +168,7 @@ points here instead of listing scripts inline).
 - `scripts/requeue-prd-selftest.sh` — acceptance harness for requeue-prd.sh
 - `scripts/requeue-prd.sh` — path-or-slug> <reason-text> — the durable inverse of
 - `scripts/resurrection-guard.sh` — after a stale-base recovery merge whose conflict
+- `scripts/reviewer-misfile-digest.sh` — PRD-build-gate-finalize-verdict-split P2
 - `scripts/reviewer-receipt-selftest.sh` — the one entrypoint for PRD-build-
 - `scripts/routepar-selftest.sh` — the one entrypoint for PRD-build-gate-route-
 - `scripts/run-selftests.sh` — scripts/run-selftests.sh — the one selftest entrypoint

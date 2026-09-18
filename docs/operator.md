@@ -1911,6 +1911,34 @@ only which sha/form a main-scope gate call uses.
   do nothing here. Contract for both is build-contract.md's "`(Live`
   marker" section.
 
+  **When the evidence clause itself is unmatchable.** A `(Live` AC pairs
+  only with the evidence its own text names, which is what stops a unit
+  test from standing in for a live outcome. Occasionally the behaviour the
+  AC demands genuinely happened and the clause still cannot match, because
+  a component the PRD does not own changed the line it reads (worked
+  example: PRD-build-inherited-blocks-delta-pass AC6 asks for `delta-pass`
+  in the journal's OUTCOME slot, and `extend-gate.sh`'s gate-infra-outcome
+  override relabels that slot `incomplete`, leaving the computed verdict
+  only in the in-parens `verdict=` token). Editing the clause to match is
+  weakening the AC after the fact. Instead the operator rules it paired
+  and the ruling is RECORDED, not left in a chat log:
+
+      scripts/live-ac-ruling.sh record <slug> --ac <N> \
+        --evidence '<the real line this pairs against>' \
+        --ruled-by <who> [--ruled-at <ISO>] [--note '<why>']
+
+  `verified-completed.sh` consults that row only AFTER the AC's own
+  derived evidence has already failed, only for a `(Live`-tagged AC, and
+  only when the row carries evidence + ruled_by + ruled_at — anything
+  missing, empty or unparseable is no ruling and the AC stays
+  `live-ac-unproven`. A ruled pairing is announced on stderr, carries the
+  rule name `live-operator-ruling:<who>@<when>` into the archive trailer,
+  and is written into the archived PRD's `Live-AC-evidence:` line with
+  that rule, so it can never be mistaken for a derived match. Because the
+  ruling lives in state rather than in a flag, every caller
+  (`archive-live-ac-refusal.sh`, `live-ac-reality-check.sh`, the branch
+  agent's own archive step) honours the same one.
+
   **Clerical-only failures are auto-finishable.** If the only failing
   checks are C2/C3/C4 (publish/push, README/CHANGELOG, REPOS.md) and both
   C1 and C5 pass, do NOT re-build or re-queue — run the

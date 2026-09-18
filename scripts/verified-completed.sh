@@ -268,6 +268,46 @@ is_loop_tooling_build_into() {
   return 1
 }
 
+# ---- operator live-AC pairing rulings (PRD-build-inherited-blocks-delta-
+# pass, ship path 2026-09-18) ------------------------------------------
+# A `(Live` AC's evidence clause is a regex over the real journal. When the
+# clause can never match because of a defect in a DIFFERENT component --
+# build-inherited-blocks-delta-pass AC6 wanted `<slug>  delta-pass` in the
+# journal OUTCOME slot, but extend-gate.sh's gate-infra-outcome override
+# relabels that slot `incomplete`, so only the in-parens `verdict=delta-pass`
+# token ever carries the computed verdict -- the operator can rule the AC
+# paired against equivalent evidence rather than weaken the AC text. That
+# ruling used to be a sentence in a chat log that no archive path could
+# execute (the branch sat `built`, not `shipped`, and opened a decision at
+# 6h for a question already answered). It is now a durable row, written by
+# scripts/live-ac-ruling.sh and read here, so EVERY consumer of this script
+# -- archive-live-ac-refusal.sh, live-ac-reality-check.sh, the branch's own
+# archive step -- honours the same ruling without a per-caller flag.
+#
+# Fail-closed by construction: the ruling is consulted ONLY after
+# check_live_evidence has already failed, only for an AC this PRD's own
+# text tagged `(Live`, and only when the row carries all three of
+# evidence/ruled_by/ruled_at. A missing, empty, unparseable or incomplete
+# rulings file is no ruling at all and the AC stays live-ac-unproven.
+LIVE_AC_RULINGS_DIR="${LIVE_AC_RULINGS_DIR:-${BUILD_STATE_DIR:-$SKILL_DIR/state}/live-ac-rulings}"
+
+# live_ac_ruling <slug> <ac> -- stdout `<ruled_at>\t<ruled_by>\t<evidence>`
+# and rc 0 when a complete operator ruling exists for that (slug, ac); rc 1
+# otherwise. Never writes, never prompts.
+live_ac_ruling() {
+  local rslug="$1" rac="$2" rfile="$LIVE_AC_RULINGS_DIR/$1.json"
+  [ -s "$rfile" ] || return 1
+  "$JQ" -er --arg ac "$rac" --arg slug "$rslug" '
+      select((.slug // "") == $slug)
+      | (.rulings // [])
+      | map(select(((.ac // "") | tostring) == $ac))
+      | .[0] // empty
+      | select((.evidence // "") != "" and (.ruled_by // "") != ""
+               and (.ruled_at // "") != "")
+      | "\(.ruled_at)\t\(.ruled_by)\t\(.evidence)"
+    ' "$rfile" 2>/dev/null
+}
+
 usage() {
   sed -n '2,121p' "$0" | sed 's/^# \{0,1\}//'
   exit 2
@@ -1244,6 +1284,15 @@ classify_ac() {
       printf 'LIVE-DEFERRED|||\n'
     elif evidence="$(check_live_evidence "${ac_live_evidence[$n]:-}")"; then
       printf 'PAIRED|live:%s|%s|\n' "${ac_live_evidence[$n]:-}" "$evidence"
+    elif ruling="$(live_ac_ruling "$slug" "$n")"; then
+      # Operator ruling (see LIVE_AC_RULINGS_DIR above). Announced on
+      # stderr on every run so a pairing this script did not DERIVE can
+      # never be mistaken for one it did; the rule name carried into the
+      # text/table/json output says so too.
+      IFS=$'\t' read -r ruled_at ruled_by ruled_ev <<<"$ruling"
+      printf 'verified-completed: AC%s paired by operator ruling (%s, %s) — derived evidence %s never matched\n' \
+        "$n" "$ruled_by" "$ruled_at" "${ac_live_evidence[$n]:-(none)}" >&2
+      printf 'PAIRED|live-operator-ruling:%s@%s|%s|\n' "$ruled_by" "$ruled_at" "$ruled_ev"
     else
       printf 'LIVE-UNPROVEN|||\n'
     fi

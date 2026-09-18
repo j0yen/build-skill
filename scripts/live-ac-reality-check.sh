@@ -60,6 +60,9 @@
 # scripts this one composes):
 #   LIVE_AC_MAX_WALL          default 6h.
 #   LIVE_AC_PENDING_DIR       default $SKILL_DIR/state/live-ac-pending.
+#   LIVE_AC_RULINGS_DIR       passed through to verified-completed.sh —
+#                             operator `(Live` AC pairing rulings; see
+#                             scripts/live-ac-ruling.sh.
 #   LOOP_TOOLING_REPOS_FILE   passed through to verified-completed.sh.
 #   VC_JOURNAL_DIR            passed through (journal:<regex> evidence).
 #   PRD_DIR / BUILD_MANIFEST  passed through to archive-commit.sh.
@@ -141,7 +144,14 @@ max_wall_s="$(parse_wall "$max_wall_spec")" || die "LIVE_AC_MAX_WALL='$max_wall_
 payload="$("$VC" "$prd" --derive --format json 2>/dev/null)" || true
 [ -n "$payload" ] || die "verified-completed.sh produced no output for $prd"
 
-live_acs="$("$JQ" -r '[.classifications[] | select((.rule // "" | startswith("live:")) or .status=="live-ac-unproven" or .status=="live-ac-deferred") | .ac] | unique | sort | join(",")' <<<"$payload")"
+# A `(Live` AC is one whose classification came from verified-completed.sh
+# rule h: either its own derived evidence matched (`live:<clause>`) or an
+# operator ruling paired it (`live-operator-ruling:<who>@<when>`, see
+# scripts/live-ac-ruling.sh), or it is still unproven/deferred. The
+# operator-ruling form must be counted here too: miss it and a PRD whose
+# only (Live AC was ruled paired looks like a PRD with NO (Live AC at all,
+# and this script exits `no-live-ac` without ever shipping it.
+live_acs="$("$JQ" -r '[.classifications[] | select((.rule // "" | startswith("live:")) or (.rule // "" | startswith("live-operator-ruling:")) or .status=="live-ac-unproven" or .status=="live-ac-deferred") | .ac] | unique | sort | join(",")' <<<"$payload")"
 unproven_acs="$("$JQ" -r '[.classifications[] | select(.status=="live-ac-unproven") | .ac] | join(",")' <<<"$payload")"
 deferred_acs_live="$("$JQ" -r '[.classifications[] | select(.status=="live-ac-deferred") | .ac] | join(",")' <<<"$payload")"
 other_gaps="$("$JQ" -r '(.missing + .collisions) | length' <<<"$payload")"
@@ -215,17 +225,25 @@ fi
 # ---- every (Live AC (and every other AC) is paired or deferred: ship --
 paired_flags=()
 live_evidence_lines=()
-while IFS=$'\t' read -r ac path; do
+# Same two live rule forms as above. An operator-ruled pairing is written
+# into the durable `Live-AC-evidence:` frontmatter line WITH its rule, so
+# the archived PRD says out loud that this AC was ruled rather than
+# derived -- the whole point of the record is that a reader a month later
+# can tell the two apart without re-deriving anything.
+while IFS=$'\t' read -r ac rule path; do
   [ -n "$ac" ] || continue
   paired_flags+=(--paired "${ac}=${path}")
-  live_evidence_lines+=("AC${ac}: ${path}")
-done < <("$JQ" -r '.classifications[] | select(.rule // "" | startswith("live:")) | "\(.ac)\t\(.path)"' <<<"$payload")
+  case "$rule" in
+    live-operator-ruling:*) live_evidence_lines+=("AC${ac}: ${path} (${rule})") ;;
+    *) live_evidence_lines+=("AC${ac}: ${path}") ;;
+  esac
+done < <("$JQ" -r '.classifications[] | select((.rule // "" | startswith("live:")) or (.rule // "" | startswith("live-operator-ruling:"))) | "\(.ac)\t\(.rule)\t\(.path)"' <<<"$payload")
 
 while IFS=$'\t' read -r ac path; do
   [ -n "$ac" ] || continue
   case "$path" in ""|null) continue ;; esac
   paired_flags+=(--paired "${ac}=${path}")
-done < <("$JQ" -r '.classifications[] | select(((.rule // "") != "") and ((.rule // "") | startswith("live:") | not)) | "\(.ac)\t\(.path // "")"' <<<"$payload")
+done < <("$JQ" -r '.classifications[] | select(((.rule // "") != "") and ((.rule // "") | startswith("live:") | not) and ((.rule // "") | startswith("live-operator-ruling:") | not)) | "\(.ac)\t\(.path // "")"' <<<"$payload")
 
 trailer_out="$("$TRAILER" "$prd" "${paired_flags[@]+"${paired_flags[@]}"}" 2>&1)"
 trailer_rc=$?
