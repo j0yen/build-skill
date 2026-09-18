@@ -67,6 +67,9 @@ LOCK_RETRY_INTERVAL="${MANIFEST_LOCK_RETRY:-0.2}"
 LOCK_CEILING_SECS="${MANIFEST_LOCK_CEILING:-60}"
 VANISHED_GRACE_DAYS="${VANISHED_GRACE_DAYS:-7}"
 
+# shellcheck source=lib/journal.sh
+source "$HERE/lib/journal.sh"
+
 log() { printf 'manifest-reconcile: %s\n' "$*" >&2; }
 die() { log "$*"; exit "${2:-1}"; }
 
@@ -238,6 +241,13 @@ EXTEND_TARGETS = {"rust-extend", "kernel-extend"}
 
 results = []   # [{slug, patch, changes:[{field,file_or_dir_value,manifest_value,resolution}]}]
 drops = []     # slugs to hard-delete after grace period
+# PRD-build-gate-red-retraction: slugs whose status is transitioning TO
+# archived this pass (dir-detection path — no journal line existed for
+# this before 2026-09-17's mcphost-agent-wake incident, where gate-red-
+# summary.sh named an already-archived slug red for 4h with nothing
+# saying the archive had happened). Bash journals these after patches
+# apply, via the one shared journal_line (never from python directly).
+archived_transitions = []
 
 for slug, f in file_map.items():
     entry = entries.get(slug, {})
@@ -260,6 +270,8 @@ for slug, f in file_map.items():
             patch["output_repo_path"] = f["build_into"]
         changes.append({"field": "status", "file_or_dir_value": new_status,
                          "manifest_value": None, "resolution": "new entry created"})
+        if new_status == "archived":
+            archived_transitions.append(slug)
     else:
         effective_target = dir_status
         if cur_status == "vanished" and effective_target is None:
@@ -268,6 +280,8 @@ for slug, f in file_map.items():
             patch["status"] = effective_target
             changes.append({"field": "status", "file_or_dir_value": effective_target,
                              "manifest_value": cur_status, "resolution": "file/dir wins"})
+            if effective_target == "archived":
+                archived_transitions.append(slug)
             if cur_status == "archived" and f["dir"] == "queue" and entry.get("verified_completed") is not None:
                 patch["verified_completed"] = None
                 changes.append({"field": "verified_completed", "file_or_dir_value": None,
@@ -335,7 +349,8 @@ for slug, entry in entries.items():
                  "manifest_value": "vanished", "resolution": f"vanished >= {grace_days}d; entry removed"},
             ]})
 
-print(json.dumps({"results": results, "drops": drops}, sort_keys=True))
+print(json.dumps({"results": results, "drops": drops,
+                   "archived_transitions": archived_transitions}, sort_keys=True))
 PY
 )" || die "planning pass failed"
 
@@ -369,6 +384,38 @@ plan = json.load(sys.stdin)
 for r in plan["results"]:
     if r["patch"] is not None:
         print(json.dumps({"slug": r["slug"], "patch": r["patch"]}))
+')
+
+  # PRD-build-gate-red-retraction (2026-09-17 mcphost-agent-wake): journal
+  # every slug that actually landed at status=archived this pass via the
+  # dir-detection path above — the one archive path that wrote no journal
+  # line before this fix, which let gate-red-summary.sh keep naming an
+  # already-archived slug red for 4h. Re-read from the manifest (not the
+  # plan) so a manifest-set.sh failure above — status left unchanged —
+  # journals nothing; the plan simply retries next tick like any other
+  # failed patch.
+  while IFS= read -r at_slug; do
+    [ -n "$at_slug" ] || continue
+    at_status="$(MANIFEST="$MANIFEST" SLUG="$at_slug" python3 -c '
+import json, os
+try:
+    m = json.load(open(os.environ["MANIFEST"]))
+except (OSError, ValueError):
+    m = {}
+prds = m.get("prds", {})
+entry = prds.get(os.environ["SLUG"]) if isinstance(prds, dict) else next(
+    (p for p in prds if isinstance(p, dict) and p.get("slug") == os.environ["SLUG"]), None)
+print((entry or {}).get("status") or "")
+')"
+    if [ "$at_status" = "archived" ]; then
+      journal_line "$(printf '%s  %s  archive  archived  (source=manifest-reconcile dir=built-prds)' \
+        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$at_slug")"
+    fi
+  done < <(printf '%s' "$plan_json" | python3 -c '
+import json, sys
+plan = json.load(sys.stdin)
+for s in plan["archived_transitions"]:
+    print(s)
 ')
 
   # Drops (vanished >= grace period): delete the entry entirely. Not

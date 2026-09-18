@@ -18,11 +18,17 @@ field_of()  { "$JQ" -r --arg s "$1" --arg k "$2" '.prds[$s][$k] // "null"' "$3";
 
 new_fixture() {
   T="$(mktemp -d "${TMPDIR:-/tmp}/reconcile-selftest.XXXXXX")"
-  mkdir -p "$T/prds/build-queue" "$T/prds/built-prds" "$T/prds/parked" "$T/state"
+  mkdir -p "$T/prds/build-queue" "$T/prds/built-prds" "$T/prds/parked" "$T/state" "$T/journal"
 }
 
 run_rc() { # [extra args...]
+  # BUILD_JOURNAL_ROOT isolates the archived-transition journal_line
+  # (PRD-build-gate-red-retraction) under $T — without this, reconcile's
+  # new journal write would land fixture-shaped slugs (ac2, ac6a, ...) in
+  # the REAL production journal (the exact "fixture leaks into
+  # production" defect class).
   PRD_DIR="$T/prds" BUILD_STATE_DIR="$T/state" BUILD_MANIFEST="$T/state/manifest.json" \
+    BUILD_JOURNAL_ROOT="$T/journal" \
     bash "$RC" "$@"
 }
 
@@ -143,8 +149,28 @@ EOF
 cat > "$T/state/manifest.json" <<EOF
 {"prds": {"delegate": {"slug":"delegate","status":"queued"}}}
 EOF
-out="$(PRD_DIR="$T/prds" BUILD_STATE_DIR="$T/state" BUILD_MANIFEST="$T/state/manifest.json" bash "$HERE/scan-prds.sh" --reconcile --dry-run)"
+out="$(PRD_DIR="$T/prds" BUILD_STATE_DIR="$T/state" BUILD_MANIFEST="$T/state/manifest.json" BUILD_JOURNAL_ROOT="$T/journal" bash "$HERE/scan-prds.sh" --reconcile --dry-run)"
 ck "scan-prds.sh --reconcile delegates" 'grep -q "delegate" <<<"$out"'
+rm -rf "$T"
+
+
+# ---- AC7 (PRD-build-gate-red-retraction, 2026-09-17 mcphost-agent-wake):
+# a slug transitioning to archived via the dir-detection path (file found
+# in built-prds/) gets exactly one journal line, never a second on a
+# steady-state re-run. -------------------------------------------------
+new_fixture
+cat > "$T/prds/built-prds/PRD-ac7.md" <<'EOF'
+- Status: queued
+EOF
+cat > "$T/state/manifest.json" <<EOF
+{"prds": {"ac7": {"slug":"ac7","status":"queued"}}}
+EOF
+run_rc >/dev/null
+journal_hits="$(grep -c '  ac7  archive  archived  (source=manifest-reconcile dir=built-prds)' "$T/journal/$(date -u +%F).md" 2>/dev/null || true)"
+ck "AC7 journal line written exactly once" '[ "$journal_hits" = 1 ]'
+run_rc >/dev/null   # steady state: already archived, no new line
+journal_hits2="$(grep -c '  ac7  archive  archived  (source=manifest-reconcile dir=built-prds)' "$T/journal/$(date -u +%F).md" 2>/dev/null || true)"
+ck "AC7 no duplicate line on steady-state re-run" '[ "$journal_hits2" = 1 ]'
 rm -rf "$T"
 
 echo "----"

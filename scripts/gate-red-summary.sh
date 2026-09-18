@@ -55,7 +55,18 @@
 # Writes (atomic: tempfile + rename):
 #   $BUILD_STATE_DIR/gate-red.summary   "<ts> <one-line summary>"
 #   $BUILD_STATE_DIR/gate-red.json      {ts, window_h, green, red, families,
-#                                        oldest_red, red_slugs, parse_skipped}
+#                                        oldest_red, red_slugs, parse_skipped,
+#                                        retracted_slugs}
+#
+# Retraction (PRD-build-gate-red-retraction, 2026-09-17): a RED_SLUG whose
+# $BUILD_MANIFEST (default $BUILD_STATE_DIR/manifest.json) status is
+# archived/vanished is dropped from red_slugs, counted green instead, and
+# listed in `retracted_slugs` (always present, `[]` when none) — the
+# summary line gains a trailing ` retracted: <slugs>` only when non-empty.
+# Closes the gap where manifest-reconcile.sh's dir-detection archive path
+# writes no journal line, so a slug's red could otherwise outlive its own
+# archive (mcphost-agent-wake, red for 4h after archiving). Manifest
+# absent/unparsable is a no-op, never an error.
 #
 # Prints the summary line (without the leading write-ts) on stdout.
 #
@@ -187,6 +198,11 @@ awk '
     else if ($3 ~ /^verify-gate-red/) { is_red = 1; slug = $2 }
     if (is_red && slug != "") {
       if (!(slug in red_ts) || ts > red_ts[slug]) red_ts[slug] = ts
+      # PRD-build-gate-red-retraction: kept separate from red_ts (newest-
+      # wins) so a later retraction can drop a slug oldest-red
+      # contribution without disturbing which line counts as its CURRENT
+      # red/green classification above.
+      if (!(slug in first_red_ts)) first_red_ts[slug] = ts
       if (oldest_red == "") oldest_red = ts
       seen[slug] = 1
       next
@@ -219,6 +235,7 @@ awk '
         pin_key = pin_is_mainhealth ? ($3 "@" pin_head7 " main-health") : (pin_slug "@" pin_head7)
         if ($4 == "block") {
           if (!(pin_key in red_ts) || ts > red_ts[pin_key]) red_ts[pin_key] = ts
+          if (!(pin_key in first_red_ts)) first_red_ts[pin_key] = ts
           if (oldest_red == "") oldest_red = ts
           seen[pin_key] = 1
         } else if ($4 == "pass") {
@@ -253,6 +270,7 @@ awk '
     print "OLDEST_RED\t" oldest_red
     for (f in fam_count) print "FAM\t" f "\t" fam_count[f]
     for (f in infam_count) print "INFAM\t" f "\t" infam_count[f]
+    for (s in first_red_ts) print "FIRSTRED\t" s "\t" first_red_ts[s]
   }
 ' "$filtered" > "$class_out"
 
@@ -261,6 +279,7 @@ red_n="$(printf '%s\n' "$red_slugs" | grep -c . || true)"
 [ -z "$red_slugs" ] && red_n=0
 green_n="$(awk -F'\t' '$1=="COUNT_GREEN"{print $2}' "$class_out")"
 green_n="${green_n:-0}"
+
 # PRD-build-gate-infra-outcome R6/AC6: a phase that could not run is its
 # own column, never counted toward red (Goals: "GATES red hours caused by
 # infra failures... target 0").
@@ -268,6 +287,68 @@ incomplete_slugs="$(awk -F'\t' '$1=="INCOMPLETE_SLUG"{print $2}' "$class_out" | 
 incomplete_n="$(awk -F'\t' '$1=="COUNT_INCOMPLETE"{print $2}' "$class_out")"
 incomplete_n="${incomplete_n:-0}"
 oldest_red="$(awk -F'\t' '$1=="OLDEST_RED"{print $2}' "$class_out")"
+
+# ---- retract archived reds (PRD-build-gate-red-retraction, 2026-09-17
+# mcphost-agent-wake): manifest-reconcile.sh's dir-detection archive path
+# writes no journal line, so a slug archived that way can outlive its own
+# red past this window with nothing to say the alarm is stale. Cross-check
+# every still-red slug against the manifest cache and drop anything
+# already archived/vanished there — manifest absent/unparsable is a no-op,
+# never an error (this script's exit-0 contract).
+retracted_slugs=""
+retracted_slugs_json='[]'
+MANIFEST="${BUILD_MANIFEST:-$STATE_DIR/manifest.json}"
+if [ -n "$red_slugs" ] && [ -f "$MANIFEST" ]; then
+  retraction_out="$(RED_SLUGS="$red_slugs" MANIFEST_PATH="$MANIFEST" python3 -c '
+import json, os, sys
+red_slugs = [s for s in os.environ["RED_SLUGS"].split("\n") if s]
+try:
+    m = json.load(open(os.environ["MANIFEST_PATH"]))
+except (OSError, ValueError):
+    print(json.dumps({"kept": red_slugs, "retracted": []}))
+    sys.exit(0)
+prds = m.get("prds", {})
+if isinstance(prds, list):
+    entries = {p.get("slug"): p for p in prds if isinstance(p, dict) and p.get("slug")}
+else:
+    entries = dict(prds) if isinstance(prds, dict) else {}
+kept, retracted = [], []
+for s in red_slugs:
+    st = (entries.get(s) or {}).get("status")
+    (retracted if st in ("archived", "vanished") else kept).append(s)
+print(json.dumps({"kept": kept, "retracted": retracted}))
+' 2>/dev/null)"
+  if [ -n "$retraction_out" ]; then
+    retracted_slugs="$(printf '%s' "$retraction_out" | python3 -c 'import json,sys;print("\n".join(json.load(sys.stdin)["retracted"]))')"
+    if [ -n "$retracted_slugs" ]; then
+      red_slugs="$(printf '%s' "$retraction_out" | python3 -c 'import json,sys;print("\n".join(json.load(sys.stdin)["kept"]))')"
+      red_n="$(printf '%s\n' "$red_slugs" | grep -c . || true)"
+      [ -z "$red_slugs" ] && red_n=0
+      retracted_n="$(printf '%s\n' "$retracted_slugs" | grep -c . || true)"
+      green_n=$((green_n + retracted_n))
+      retracted_slugs_json="$(printf '%s\n' "$retracted_slugs" | "$JQ" -R -s 'split("\n") | map(select(length > 0))')"
+      # oldest_red must not credit a retracted slug oldest-red line — the
+      # earliest remaining timestamp is recomputed from first_red_ts,
+      # excluding every retracted slug contribution.
+      oldest_red="$(awk -F'\t' '$1=="FIRSTRED"{print $2"\t"$3}' "$class_out" | \
+        RETRACTED="$retracted_slugs" python3 -c '
+import os, sys
+retracted = set(os.environ["RETRACTED"].split("\n"))
+best = ""
+for line in sys.stdin:
+    line = line.rstrip("\n")
+    if not line:
+        continue
+    slug, ts = line.split("\t", 1)
+    if slug in retracted:
+        continue
+    if best == "" or ts < best:
+        best = ts
+print(best)
+')"
+    fi
+  fi
+fi
 
 # Families sorted by count desc, then name asc, for a deterministic line.
 fam_sorted="$(awk -F'\t' '$1=="FAM"{printf "%s\t%s\n", $3, $2}' "$class_out" | sort -t$'\t' -k1,1nr -k2,2)"
@@ -300,6 +381,10 @@ incomplete_slugs_json="$(printf '%s\n' "$incomplete_slugs" | "$JQ" -R -s 'split(
 oldest_display="${oldest_red:-none}"
 
 summary_line="GATES(${window_h}h): green=${green_n} red=${red_n} incomplete=${incomplete_n} blockers: ${fam_display} incomplete_infra: ${infam_display} oldest-red=${oldest_display} red_slugs: ${red_slugs_display}"
+if [ -n "$retracted_slugs" ]; then
+  retracted_display="$(printf '%s' "$retracted_slugs" | tr '\n' ' ' | sed 's/[[:space:]]*$//')"
+  summary_line="${summary_line} retracted: ${retracted_display}"
+fi
 
 write_ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
@@ -322,10 +407,11 @@ tmp_json="$(mktemp "$STATE_DIR/.gate-red.json.XXXXXX")"
   --argjson incomplete "$incomplete_n" \
   --argjson incomplete_families "$infam_json" \
   --argjson incomplete_slugs "$incomplete_slugs_json" \
+  --argjson retracted_slugs "$retracted_slugs_json" \
   '{ts:$ts, window_h:$window_h, green:$green, red:$red, families:$families,
     oldest_red:$oldest_red, red_slugs:$red_slugs, parse_skipped:$parse_skipped,
     incomplete:$incomplete, incomplete_families:$incomplete_families,
-    incomplete_slugs:$incomplete_slugs}' \
+    incomplete_slugs:$incomplete_slugs, retracted_slugs:$retracted_slugs}' \
   > "$tmp_json"
 mv -f "$tmp_json" "$JSON_FILE"
 

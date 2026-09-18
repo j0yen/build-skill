@@ -108,6 +108,47 @@ expect "AC3 parse_skipped=1" "[ \"\$(printf '%s' \"\$json3\" | jq -r .parse_skip
 expect "AC3 still counts slugA red, slugB green" "[[ \"\$out3\" == *'green=1 red=1'* ]]"
 
 # ============================================================================
+# AC4 — PRD-build-gate-red-retraction: a RED_SLUG whose manifest.json
+# status is archived is retracted (counted green, red_slugs empties,
+# retracted_slugs names it, summary line gains ` retracted: <slug>`).
+# Control case: same fixture, status queued instead -> the red stands.
+# ============================================================================
+D="$T/ac4"; mkdir -p "$D/journal" "$D/state"
+cat > "$D/journal/2026-01-03.md" <<'EOF'
+2026-01-03T00:00:00Z  gate-then-land  slugR  gate-block attempt=1 blockers=x
+EOF
+python3 -c "
+import json
+json.dump({'prds': {'slugR': {'slug': 'slugR', 'status': 'archived'}}}, open('$D/state/manifest.json', 'w'))
+"
+out4="$(BUILD_JOURNAL_ROOT="$D/journal" BUILD_STATE_DIR="$D/state" "$GRS" --now 2026-01-03T01:00:00Z --window-h 2)"
+rc4=$?
+expect "AC4 exit 0" "[ $rc4 -eq 0 ]"
+expect "AC4 red=0" "[[ \"\$out4\" == *'red=0'* ]]"
+expect "AC4 no red_slugs" "[[ \"\$out4\" == *'red_slugs: '* ]]"
+expect "AC4 summary names retracted slug" "[[ \"\$out4\" == *'retracted: slugR'* ]]"
+json4="$(cat "$D/state/gate-red.json")"
+expect "AC4 json red_slugs=[]" "[ \"\$(printf '%s' \"\$json4\" | jq -c .red_slugs)\" = '[]' ]"
+expect "AC4 json retracted_slugs=[slugR]" "[ \"\$(printf '%s' \"\$json4\" | jq -c .retracted_slugs)\" = '[\"slugR\"]' ]"
+expect "AC4 json oldest_red=none" "[ \"\$(printf '%s' \"\$json4\" | jq -r .oldest_red)\" = none ]"
+
+# Control: same fixture, slugR still queued -> the red stands, no retraction.
+D="$T/ac4-control"; mkdir -p "$D/journal" "$D/state"
+cat > "$D/journal/2026-01-03.md" <<'EOF'
+2026-01-03T00:00:00Z  gate-then-land  slugR  gate-block attempt=1 blockers=x
+EOF
+python3 -c "
+import json
+json.dump({'prds': {'slugR': {'slug': 'slugR', 'status': 'queued'}}}, open('$D/state/manifest.json', 'w'))
+"
+out4c="$(BUILD_JOURNAL_ROOT="$D/journal" BUILD_STATE_DIR="$D/state" "$GRS" --now 2026-01-03T01:00:00Z --window-h 2)"
+expect "AC4 control red=1 (queued, not retracted)" "[[ \"\$out4c\" == *'red=1'* ]]"
+expect "AC4 control names slugR still red" "[[ \"\$out4c\" == *'red_slugs: slugR'* ]]"
+expect "AC4 control no retracted suffix" "[[ \"\$out4c\" != *'retracted:'* ]]"
+json4c="$(cat "$D/state/gate-red.json")"
+expect "AC4 control json retracted_slugs=[]" "[ \"\$(printf '%s' \"\$json4c\" | jq -c .retracted_slugs)\" = '[]' ]"
+
+# ============================================================================
 # R9 — gate-status.sh --red prints the JSON twin verbatim.
 # ============================================================================
 GS="$SKILL_DIR/scripts/gate-status.sh"

@@ -64,6 +64,7 @@ MANIFEST_SET="${MANIFEST_SET:-$HERE/manifest-set.sh}"
 PRD_LINT="${PRD_LINT:-$HERE/prd-lint.sh}"
 REQUEUE_PRD="${REQUEUE_PRD:-$HERE/requeue-prd.sh}"
 LANE_CLAIM="${LANE_CLAIM:-$HERE/lane-claim.sh}"
+GATE_RED_JSON="${GATE_RED_JSON:-$STATE_DIR/gate-red.json}"
 SHIPPED_NOT_ARCHIVED_MINUTES="${SHIPPED_NOT_ARCHIVED_MINUTES:-20}"
 STALE_ACTIVITY_HOURS="${STALE_ACTIVITY_HOURS:-24}"
 LOCK_WAIT_SECS="${LOCK_WAIT_SECS:-60}"
@@ -432,6 +433,46 @@ for c in json.loads(sys.argv[2]):
                     " files, not one: " + ", ".join(c["paths"]),
     })
 print(json.dumps(alarms))' "$alarms_json" "$collisions_json")"
+
+# PRD-build-gate-red-retraction (2026-09-17 mcphost-agent-wake): gate-red-
+# summary.sh's own retraction only reaches slugs already archived at the
+# TIME it runs — a slug archived in between two summary runs can still
+# name an archived PRD in gate-red.json until the next summary tick.
+# Report-only (never modifies the manifest, same posture as
+# unknown-status): surfaces the inconsistency so a human/tick notices
+# instead of the GATES banner alarming on a PRD that's already done.
+# gate-red.json absent/unparsable -> no alarm, no error.
+if [ -f "$GATE_RED_JSON" ]; then
+  red_archived_json="$(python3 -c '
+import json, sys
+try:
+    gr = json.load(open(sys.argv[1]))
+except (OSError, ValueError):
+    print("[]"); sys.exit(0)
+red_slugs = gr.get("red_slugs") or []
+try:
+    m = json.load(open(sys.argv[2]))
+except (OSError, ValueError):
+    print("[]"); sys.exit(0)
+prds = m.get("prds", {})
+if isinstance(prds, list):
+    entries = {p.get("slug"): p for p in prds if isinstance(p, dict) and p.get("slug")}
+else:
+    entries = dict(prds) if isinstance(prds, dict) else {}
+out = []
+for slug in red_slugs:
+    st = (entries.get(slug) or {}).get("status")
+    if st in ("archived", "vanished"):
+        out.append({"slug": slug, "class": "red-archived",
+                     "message": "gate-red names an archived PRD (retraction missing)"})
+print(json.dumps(out))
+' "$GATE_RED_JSON" "$MANIFEST" 2>/dev/null)"
+  [ -n "$red_archived_json" ] || red_archived_json="[]"
+  alarms_json="$(python3 -c 'import json,sys
+alarms = json.loads(sys.argv[1])
+alarms.extend(json.loads(sys.argv[2]))
+print(json.dumps(alarms))' "$alarms_json" "$red_archived_json")"
+fi
 
 heals_count="$(python3 -c 'import json,sys; print(len(json.loads(sys.argv[1])))' "$final_heals")"
 alarms_count="$(python3 -c 'import json,sys; print(len(json.loads(sys.argv[1])))' "$alarms_json")"
