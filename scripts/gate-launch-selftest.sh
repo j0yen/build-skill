@@ -221,6 +221,64 @@ out_f2n="$("$CHAIN_GUARD" check slug-f2 --skip-select-guard --prd-dir "$T" 2>&1)
 expect "no marker: chain-guard falls through to preconditions-hold" "grep -q 'preconditions-hold' <<<\"$out_f2n\" && [ $rc_f2n -eq 0 ]"
 
 # ---------------------------------------------------------------------------
+# AC(h): a "lost" reading gets one grace re-check before --wait treats it as
+# terminal (PRD-build-burst-gate-canary-invariant AC1, observed
+# 2026-09-18T04:36:03Z/04Z on RedBaron: a cache-hit-fast box gate finished
+# and its receipts landed on disk, but gate-status.sh's single, un-retried
+# poll still read "lost" and gate-launch.sh's wait loop exited 1 on the
+# first sighting -- the same race class as the 2026-09-18T01:36:28Z
+# mcphost-agent-wake incident ("unit finished as a ~1s cached pass").
+# ---------------------------------------------------------------------------
+echo "== AC(h): lost reading gets one grace retry before --wait gives up =="
+FAKE_STATUS_H="$T/fake-gate-status-h.sh"
+cat > "$FAKE_STATUS_H" <<'FAKESTATUS'
+#!/usr/bin/env bash
+# Reports "lost" the first N times for a slug, then "finished:<rc>".
+set -uo pipefail
+slug="${1:?}"
+counter="$FAKE_STATUS_COUNTER_DIR/$slug.count"
+mkdir -p "$FAKE_STATUS_COUNTER_DIR"
+n="$(cat "$counter" 2>/dev/null || echo 0)"
+n=$((n + 1))
+echo "$n" > "$counter"
+lost_until="${FAKE_STATUS_LOST_UNTIL:-1}"
+if [ "$n" -le "$lost_until" ]; then
+  echo "lost"
+else
+  echo "finished:${FAKE_STATUS_FINISHED_RC:-0}"
+fi
+FAKESTATUS
+chmod +x "$FAKE_STATUS_H"
+
+# (h1) recovers: gate-status.sh's FIRST call says lost, the grace re-check
+# (second call) says finished:0 -- --wait must exit 0, not report wait-lost.
+export FAKE_STATUS_COUNTER_DIR="$T/fake-status-counts-h1"
+export FAKE_STATUS_LOST_UNTIL=1 FAKE_STATUS_FINISHED_RC=0
+export GATE_LAUNCH_GATE_STATUS="$FAKE_STATUS_H"
+export GATE_LAUNCH_LOST_GRACE_S=0
+REPO_H1="$(new_repo repo-h1)"
+SHA_H1="$(git -C "$REPO_H1" rev-parse HEAD)"
+export BUILD_STATE_DIR="$T/state-h1"
+export FAKE_EXTEND_GATE_SLEEP=0 FAKE_EXTEND_GATE_WRITE_RECEIPT=0
+"$GATE_LAUNCH" "$REPO_H1" --head "$SHA_H1" --scope main --slug slug-h1 --wait >/dev/null 2>&1
+rc_h1=$?
+expect "one lost + a recovering re-check: --wait exits 0, not 1" "[ $rc_h1 -eq 0 ]"
+expect "one lost + recovery is never journaled as wait-lost" "! grep -q 'slug-h1.*wait-lost' \"$GATE_LAUNCH_JOURNAL\""
+
+# (h2) truly lost: every call says lost -- the grace re-check does not
+# manufacture a pass; --wait still exits 1 and still journals wait-lost.
+export FAKE_STATUS_COUNTER_DIR="$T/fake-status-counts-h2"
+export FAKE_STATUS_LOST_UNTIL=99
+REPO_H2="$(new_repo repo-h2)"
+SHA_H2="$(git -C "$REPO_H2" rev-parse HEAD)"
+export BUILD_STATE_DIR="$T/state-h2"
+"$GATE_LAUNCH" "$REPO_H2" --head "$SHA_H2" --scope main --slug slug-h2 --wait >/dev/null 2>&1
+rc_h2=$?
+expect "genuinely lost twice: --wait still exits 1" "[ $rc_h2 -eq 1 ]"
+expect "genuinely lost twice: still journaled wait-lost" "grep -q 'slug-h2.*wait-lost' \"$GATE_LAUNCH_JOURNAL\""
+unset GATE_LAUNCH_GATE_STATUS GATE_LAUNCH_LOST_GRACE_S FAKE_STATUS_COUNTER_DIR FAKE_STATUS_LOST_UNTIL FAKE_STATUS_FINISHED_RC
+
+# ---------------------------------------------------------------------------
 # AC(g): the launcher never uses a login shell
 # ---------------------------------------------------------------------------
 echo "== AC(g): launcher never uses bash -l =="

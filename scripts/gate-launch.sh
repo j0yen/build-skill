@@ -283,7 +283,24 @@ if [ "$wait_flag" -eq 1 ]; then
     case "$st" in
       running) sleep 1 ;;
       finished:*) exit "${st#finished:}" ;;
-      lost) jlog "$slug" "wait-lost (unit=$unit)"; exit 1 ;;
+      lost)
+        # PRD-build-burst-gate-canary-invariant AC1, observed
+        # 2026-09-18T04:36:03Z/04Z: a cache-hit-fast gate can complete and
+        # get systemd --collect'd, with its receipts landing on disk,
+        # inside the same wall-clock second gate-status.sh's very first
+        # (and, before this fix, only) poll ran -- the receipts existed
+        # one second after started_ts (canary-runs/1789706163-main's
+        # 25-file receipt set), yet the single un-retried check still
+        # read "lost" and this loop exited terminally on the first
+        # sighting, unlike "running" which re-polls. Give the sub-second
+        # write-lag one grace re-check before committing to lost.
+        sleep "${GATE_LAUNCH_LOST_GRACE_S:-2}"
+        st2="$("$GATE_STATUS" "$slug")"
+        case "$st2" in
+          finished:*) exit "${st2#finished:}" ;;
+          *) jlog "$slug" "wait-lost (unit=$unit)"; exit 1 ;;
+        esac
+        ;;
       none|*) jlog "$slug" "wait-marker-vanished (unit=$unit status=$st)"; exit 1 ;;
     esac
   done
