@@ -3,8 +3,11 @@
 # PRD-build-skill-instruction-single-source's fixture coverage
 # (test_prefix: skillsrc; R6/AC9 names this file). Exercises
 # archive-gate.sh (AC1-AC4), gate-launch.sh's R3 refusal (AC4),
-# skill-prose-lint.sh (AC6/AC7/AC10), the shipped SKILL.md itself
-# (AC5/AC8), and prompt-file coverage (AC8). Every fixture builds its own
+# skill-prose-lint.sh (AC6/AC7/AC10), the shipped docs/operator.md itself
+# (AC5/AC8 — PRD-build-branch-contract-split moved the canonical section
+# out of SKILL.md and into docs/operator.md's full-procedure appendix;
+# this selftest's file targets and the AC5 heading-level check moved with
+# it), and prompt-file coverage (AC8). Every fixture builds its own
 # throwaway git repo + state dir under $TMPDIR and tears it down on exit
 # — nothing here touches the running skill's production state/journal or
 # a real fleet repo (BUILD_STATE_DIR/journal overrides are exported per
@@ -171,30 +174,32 @@ expect "AC4: --main-health calls are unaffected" "[ $rc_d_health -eq 0 ]"
 unset BUILD_STATE_DIR GATE_LAUNCH_EXTEND_GATE GATE_LAUNCH_MAIN_VERDICT_PIN_GATE GATE_LAUNCH_JOURNAL GATE_LAUNCH_SYSTEMD_RUN GATE_LAUNCH_SYSTEMCTL FAKE_SYSTEMD_STATE_DIR
 
 # ---------------------------------------------------------------------------
-# AC5 — the shipped SKILL.md has exactly one canonical section and no raw
-# fenced-block form outside it
+# AC5 — the shipped docs/operator.md has exactly one canonical section and
+# no raw fenced-block form outside it (PRD-build-branch-contract-split
+# moved the section here from SKILL.md; heading level bumped ### -> ####
+# since it now nests under operator.md's own "Full tick procedure" H2)
 # ---------------------------------------------------------------------------
-echo "== AC5: shipped SKILL.md has exactly one canonical section =="
+echo "== AC5: shipped docs/operator.md has exactly one canonical section =="
 expect "AC5: marker appears exactly once" \
-  "[ \"\$(grep -c -- '<!-- single-source: archive-gate -->' '$SKILL_DIR/SKILL.md')\" -eq 1 ]"
+  "[ \"\$(grep -c -- '<!-- single-source: archive-gate -->' '$SKILL_DIR/docs/operator.md')\" -eq 1 ]"
 expect "AC5: heading appears exactly once" \
-  "[ \"\$(grep -c -- '^### Archive gate (single source)' '$SKILL_DIR/SKILL.md')\" -eq 1 ]"
+  "[ \"\$(grep -c -- '^#### Archive gate (single source)' '$SKILL_DIR/docs/operator.md')\" -eq 1 ]"
 
 # ---------------------------------------------------------------------------
-# AC6 (R6e) — lint passes on the shipped SKILL.md, fails on a fixture copy
-# with one raw form re-added outside the section
+# AC6 (R6e) — lint passes on the shipped docs/operator.md, fails on a
+# fixture copy with one raw form re-added outside the section
 # ---------------------------------------------------------------------------
-echo "== AC6: lint clean on shipped SKILL.md, red on a reintroduced raw form =="
-"$LINT" "$SKILL_DIR/SKILL.md" >/dev/null 2>&1
-expect "AC6: lint exits 0 on the shipped SKILL.md" "[ $? -eq 0 ]"
+echo "== AC6: lint clean on shipped docs/operator.md, red on a reintroduced raw form =="
+"$LINT" "$SKILL_DIR/docs/operator.md" >/dev/null 2>&1
+expect "AC6: lint exits 0 on the shipped docs/operator.md" "[ $? -eq 0 ]"
 
 bad_raw="$T/skillmd-bad-raw.md"
-python3 - "$SKILL_DIR/SKILL.md" "$bad_raw" <<'PY'
+python3 - "$SKILL_DIR/docs/operator.md" "$bad_raw" <<'PY'
 import sys
 src, dst = sys.argv[1], sys.argv[2]
 with open(src) as f:
     lines = f.readlines()
-insert_at = 1200  # well past the canonical section (ends ~line 1020)
+insert_at = 1200  # well past the canonical section (ends ~line 1155)
 block = ["\n", "```\n",
          "scripts/gate-launch.sh <build_into> --head <landed sha> --scope main --slug <slug> --wait\n",
          "```\n"]
@@ -212,7 +217,7 @@ expect "AC6: lint names the offending line" "grep -qE ':1203: raw main-gate form
 # ---------------------------------------------------------------------------
 echo "== AC7: lint fails on an unknown flag, naming flag + script =="
 bad_flag="$T/skillmd-bad-flag.md"
-python3 - "$SKILL_DIR/SKILL.md" "$bad_flag" <<'PY'
+python3 - "$SKILL_DIR/docs/operator.md" "$bad_flag" <<'PY'
 import sys
 src, dst = sys.argv[1], sys.argv[2]
 with open(src) as f:
@@ -233,12 +238,16 @@ expect "AC7: run-selftests.sh lists this selftest" \
   "grep -q 'skill-single-source-selftest.sh' '$SKILL_DIR/scripts/run-selftests.sh'"
 
 # ---------------------------------------------------------------------------
-# AC8 (R5) — no prompt-shaped file under the build skill quotes the raw form
+# AC8 (R5) — no prompt-shaped file under the build skill quotes the raw
+# form outside its one designated home. docs/operator.md is excluded from
+# this scan — it's the canonical section's home since
+# PRD-build-branch-contract-split (the same exemption SKILL.md itself
+# implicitly had before that PRD, by living outside templates/+docs/).
 # ---------------------------------------------------------------------------
 echo "== AC8: no prompt/doc/template file quotes the raw main-gate form =="
 prompt_hits="$(grep -rlE 'gate-launch\.sh .*--scope main|extend-gate\.sh .*--head' \
-  "$SKILL_DIR/templates" "$SKILL_DIR/docs" 2>/dev/null || true)"
-expect "AC8: templates/ and docs/ are clean of the raw form" "[ -z \"$prompt_hits\" ]"
+  --exclude=operator.md "$SKILL_DIR/templates" "$SKILL_DIR/docs" 2>/dev/null || true)"
+expect "AC8: templates/ and docs/ (excl. operator.md) are clean of the raw form" "[ -z \"$prompt_hits\" ]"
 
 # ---------------------------------------------------------------------------
 # AC10 (R7) — heading renamed but marker kept still allowlists the section;
@@ -246,12 +255,12 @@ expect "AC8: templates/ and docs/ are clean of the raw form" "[ -z \"$prompt_hit
 # ---------------------------------------------------------------------------
 echo "== AC10: marker (not heading text) controls the allowlist =="
 renamed="$T/skillmd-renamed.md"
-sed 's/^### Archive gate (single source)$/### Archive gate (renamed)/' "$SKILL_DIR/SKILL.md" > "$renamed"
+sed 's/^#### Archive gate (single source)$/#### Archive gate (renamed)/' "$SKILL_DIR/docs/operator.md" > "$renamed"
 "$LINT" "$renamed" >/dev/null 2>&1
 expect "AC10: renamed heading with marker kept still lints clean" "[ $? -eq 0 ]"
 
 no_marker="$T/skillmd-no-marker.md"
-grep -v -- '<!-- single-source: archive-gate -->' "$SKILL_DIR/SKILL.md" > "$no_marker"
+grep -v -- '<!-- single-source: archive-gate -->' "$SKILL_DIR/docs/operator.md" > "$no_marker"
 out_no_marker="$("$LINT" "$no_marker" 2>&1)"; rc_no_marker=$?
 expect "AC10: marker removed fails the whole lint" "[ $rc_no_marker -eq 3 ]"
 expect "AC10: failure names the missing marker" "grep -q 'missing marker' <<<\"$out_no_marker\""

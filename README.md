@@ -45,6 +45,25 @@ rescued across re-installs.
 └── LICENSE-APACHE
 ```
 
+## The four-document rule (PRD-build-branch-contract-split)
+
+`SKILL.md` used to be four documents at once — the coordinator's own
+procedure, the branch agent's contract, the operator's manual, and the
+incident history — and every model touching the loop paid to read all
+four, every tick. It is now a ≤200-line index over four separate homes;
+new text goes to whichever one it actually is, never back into SKILL.md:
+
+| this is... | goes in | cap |
+|---|---|---|
+| a directive a dispatched branch agent must follow (Phases 3→4→5→7) | `docs/branch-contract.md` | ≤400 lines, lint-enforced, no dates |
+| the coordinator's own phase-by-phase mechanics, or a runbook (manual invocation, re-arm, burst config, status commands) | `docs/operator.md` | none |
+| a dated incident, rationale, or "why does the gate do X" | `docs/history.md`, headed with the date + originating PRD slug | none |
+| a one-line phase summary, a link, or a script pointer | `SKILL.md` | ≤200 lines, lint-enforced |
+
+`scripts/lint-contract-size.sh` (wired into `scripts/run-selftests.sh
+--all`) enforces the two caps; nothing enforces where NEW text lands
+beyond this table and reviewer judgment.
+
 ## Timer setup
 
 The timer unit is not installed by this script (it lives in

@@ -25,8 +25,12 @@
 # naming it, so the exemption can never be silently disabled by deleting
 # the comment.
 #
-# Usage: skill-prose-lint.sh [<skill.md path>]
-#   Defaults to $SKILL_DIR/SKILL.md. Patterns file defaults to
+# Usage: skill-prose-lint.sh [<doc path>]
+#   Defaults to $SKILL_DIR/docs/operator.md (PRD-build-branch-contract-split
+#   moved the canonical `<!-- single-source: archive-gate -->` section out
+#   of SKILL.md and into docs/operator.md's full-procedure appendix — this
+#   lint's target moved with it; SKILL.md itself is now a 200-line index
+#   that no longer carries the section at all). Patterns file defaults to
 #   $HERE/skill-prose-lint.patterns (override: SKILL_PROSE_LINT_PATTERNS).
 #   Marker comment text defaults to the real one (override:
 #   SKILL_PROSE_LINT_MARKER — fixtures use this to test a renamed/removed
@@ -39,7 +43,7 @@ set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SKILL_DIR="$(cd "$HERE/.." && pwd)"
-SKILLMD="${1:-$SKILL_DIR/SKILL.md}"
+SKILLMD="${1:-$SKILL_DIR/docs/operator.md}"
 PATTERNS_FILE="${SKILL_PROSE_LINT_PATTERNS:-$HERE/skill-prose-lint.patterns}"
 MARKER="${SKILL_PROSE_LINT_MARKER:-<!-- single-source: archive-gate -->}"
 

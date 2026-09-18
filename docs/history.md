@@ -152,6 +152,143 @@ fixed to own `tick.lock` for its whole span after ten consecutive
 dispatches lost the drill's own lock race to the very tick it was trying
 to test against.
 
+## auto-publish-uncapped — 2026-05-25 / 2026-05-27 / 2026-05-30, user instruction
+
+Auto-publish became the default with no opt-outs and no daily caps
+(2026-05-27): `build_auto` is no longer parsed, every PRD is treated as
+auto-buildable, and external mutations (new repo creation, push,
+settings.json edits, hook installs, follow-on PRD commit+push) are all on.
+Budget caps were set to null the same window (`caps[k]` always null,
+`used[k]` telemetry-only, per user instruction 2026-05-30). The blanket
+"defer while an interactive session is live" guard was removed 2026-05-25
+per user request — ticks now coexist with live terminals; `tick.lock` plus
+one-action/chained-step-at-a-time are the only guardrails. If file-write
+races with an interactive user are observed in practice, add a per-repo
+flock around the Phase 4 action rather than reinstating the blanket guard.
+
+## publish-authorization-scope — 2026-05-25 / 2026-05-27 / 2026-05-30 / 2026-08-03, user instruction
+
+The no-operator-confirm publish authorization (private `j0yen/<slug>` repos
+by default, public only when the PRD says `publish: j0yen/public`,
+`~/.local/bin` installs, `~/.claude/scripts/` hook symlinks,
+`~/.claude/settings.json` edits with timestamped backups, follow-on PRD
+authorship) was granted 2026-05-25, expanded 2026-05-27, reaffirmed
+2026-05-30, then re-scoped to AtScale-primary on 2026-08-03 (see
+`atscale-retired` below for what "AtScale-primary" meant before the org
+itself was retired).
+
+## fan-out-cap-growth — 2026-05-28 / 2026-05-29 / 2026-06-11, user instruction
+
+The per-tick parallel-dispatch cap grew three times on user instruction:
+1 → 5 (2026-05-28, "this laptop can handle it"), 5 → 10 (2026-05-29), then
+10 → 30 (2026-06-11) — 30 is the default `BUILD_MAX_BRANCHES` fan-out
+today, overridable per-host (PRD-build-max-branches-cap, 2026-09-11) for a
+lane that needs a lower ceiling. See "Parallelism" in `SKILL.md`.
+
+## worktree-conflict-root-cause — 2026-06-06, project incident
+
+The 2026-06-06 conflict (3 of 6 branches deferred to the same
+`build_into`, all landing in the same window) is the incident that
+motivated worktree isolation for shared-target branches — see
+`worktree-isolation` above for the mechanism it led to.
+
+## rebuild-gate-ported — 2026-08-03, gap #68 (ported from ryzen7)
+
+The rebuild gate (`scripts/archive-rebuild-gate.sh`) was ported from
+ryzen7 on 2026-08-03: a re-queued PRD (`manifest.revision > 1`, e.g. a
+dreamer reconciliation caught a false-ship) must prove it actually
+advanced the work — bump the crate strictly past `last_shipped_version`,
+prepend a matching `## v<new-version>` CHANGELOG section, and record a
+non-empty `rebuild_reason` — before archive is allowed. The legacy
+`commit-reachable`/`changelog-v<X>-exists` checks alone are satisfiable by
+the *prior* ship's stale artifacts, which is the gap this closed.
+
+## atscale-retired — 2026-08-18 / 2026-08-27, project milestone
+
+The AtScale org (`joeyen-atscale`) was retired 2026-08-18, with access
+gone by 2026-08-27; every remaining AtScale-era PRD in this workspace is
+historical. Never publish, push, or `gh repo view` against that org —
+`j0yen/<slug>` (private by default) is the publish target since.
+
+## manifest-reconcile-and-lint-gate — 2026-09-04, PRD-build-manifest-reconcile / PRD-build-prd-lint
+
+`scripts/manifest-reconcile.sh` (also reachable as `scan-prds.sh
+--reconcile`) landed 2026-09-04 to patch `manifest.json`'s cache back to
+what the PRD files and directory placement actually say before Phase 1's
+scan-vs-manifest diff runs — a PRD `built` in the file and `queued` in the
+cache, or `shipped` in the cache while still sitting in `build-queue/`,
+had each cost a cycle or a human the day before. The same date landed the
+lint gate: `scan-prds.sh` runs `scripts/prd-lint.sh` over every
+`build-queue/` PRD first, routing a contract-shape failure straight to
+`needs_classification` before it ever reaches the Phase 2 candidate pool.
+
+## intent-card-refresh-incident — 2026-09-05, PRD-build-intent-card-refresh
+
+An extend ship that never touches `agent/intent-card.json` leaves it
+describing whatever PRD last refreshed it. On mcphost, 2026-09-05, a card
+frozen since v0.5.x blocked two routinely-shipped heads in one night
+(`intent-card-diff-scope-mismatch`) while six PRDs and eight version bumps
+had landed underneath it unnoticed. `intent-card-refresh` now runs after
+changelog & install, before push, for every rust-extend ship.
+
+## dispatch-boundary-and-worktree-targets — 2026-09-08, PRD-build-select-target-busy-unskippable / PRD-build-lane-roster-ryzen7 / PRD-build-worktree-targets-off-root
+
+Three unrelated fixes landed the same day. (1) `select-guard.sh
+<slug> [lane] [prd-dir] <branch-count> [admitted-targets]` became a
+required, unskippable call immediately before every Agent/Task dispatch —
+closing a target-busy race a coordinator could otherwise sidestep by
+composing the check differently each time. (2) the cargo-free lane roster
+(`CARGO_FREE_LANES`, today just `carbon`, 15 GB RAM / 0 swap) restricted
+that lane to non-cargo `build_target`s, added for ryzen7's own onboarding.
+(3) rust worktree `target/` dirs (50G+ each) moved off the root
+filesystem to `$BUILD_TARGET_ROOT`/`/mnt/data/jsy/cargo-targets` — two
+landed-but-uncleaned worktrees had filled `WT_ROOT` on the root filesystem
+to 100% and killed two truth-tier measure runs that day.
+
+## classification-bounce-and-loop-arm — 2026-09-12, PRD-build-classification-self-heal / PRD-buildloop-unit-liveness
+
+`classification-self-heal.sh bounce-check` landed 2026-09-12 to stop a
+`needs_classification` PRD from bouncing back to `queued` on a diagnosis
+that hadn't actually changed, alarming on a second identical bounce
+instead of silently re-admitting it a third time. The same date,
+`loop-arm.sh` became the only arming step for the buildloop's systemd
+units (reads `scripts/loop-units.txt`'s declared per-host set, enables
+`--now` exactly those, verifies with `loop-liveness.sh`) — a restart that
+silently dropped one unit had gone unnoticed for 29h before this.
+
+## mid-september-incident-cluster — 2026-09-13, PRD-build-gate-before-land / PRD-build-selector-honors-priority / PRD-build-tenant-secret-continuity / burst-lane incident
+
+Several 2026-09-13 fixes: (1) the mcphost-agent-consent incident — a
+hand-resolved "missing" Depends-on that was, in the same commit, sitting
+right in `build-queue/` — closed the loophole letting an agent resolve a
+dependency name by hand instead of through `prd-lint.sh`'s verdict. (2)
+`select-tick.sh`'s priority-then-path ordering became real (previously
+aspirational prose). (3) shared-target gate wall time (332s-3864s
+observed) held the crate's integration lock because the gate's producers
+wrote into the main checkout's shared receipts dir — moving receipts
+per-branch let `gate-before-land` stop capping same-target admission at 1
+purely for that reason. (4) a dead `prove` process's pid on `burst-lane.sh`'s
+`up.lock` refused every retry until locks were tied to the owning process
+exiting, not a disowned child outliving it. (5) PRD-build-tenant-secret-continuity:
+a dispatch that mints a credential a later dispatch needs (that day, an
+mcphost.dev tenant key) and holds it only in-process memory loses it the
+instant the process exits — read-only DB inspection confirmed the key was
+gone for good, non-reversibly hashed server-side.
+
+## under-dispatch-ledger-and-cross-repo-gate — 2026-09-16, PRD-build-tick-under-dispatch-ledger / PRD-build-cross-repo-commit-gate
+
+`select-tick.sh` started persisting its own `admitted[]` result to
+`state/select-tick/<tick-id>.json` so `tick-run.sh` could compare it
+against real dispatch evidence itself, instead of relying on the
+coordinator noticing and narrating its own deviation — a 21:24Z tick that
+admitted 5 and worked 3 had written nothing at all under the old,
+honesty-dependent scheme. The same date's grounding incident: a
+build-skill shell PRD wrote `.buildloop/ci-equivalent.toml` straight into
+mcphost, landed through a green-CI PR, and reds every mcphost branch's
+vti-plan because the commit was unrouted in `agent/proof-lanes.toml` — the
+`gated-targets.sh is-gated` check before any cross-repo write traces to
+this.
+
 ## test-isolation — 2026-09-15, PRD-build-test-isolation-by-default
 
 A bare `*-selftest.sh` invocation (bypassing `run-selftests.sh`) leaked

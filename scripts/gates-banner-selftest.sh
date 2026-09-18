@@ -100,8 +100,10 @@ n="$(BUILD_JOURNAL_ROOT="$D/journal" "$HERE/shipped-count.sh")"
 expect "shipped-count counts only the in-window archive" "[ \"\$n\" = 1 ]"
 
 # ============================================================================
-# AC11 — handoff-header.sh prints the current summary line; SKILL.md's
-# Handoff section names it.
+# AC11 — handoff-header.sh prints the current summary line; docs/operator.md's
+# Handoff section names it (PRD-build-branch-contract-split moved the
+# Handoff section out of SKILL.md, which is now a 200-line index with no
+# Handoff prose of its own).
 # ============================================================================
 HH="$HERE/handoff-header.sh"
 if [ -x "$HH" ]; then
@@ -124,9 +126,9 @@ else
   echo "FAIL AC11: handoff-header.sh not found at $HH" >&2
   FAIL=$((FAIL + 1))
 fi
-SKILL_MD="$(cd "$HERE/.." && pwd)/SKILL.md"
-expect "AC11 SKILL.md names handoff-header.sh in a Handoff section" \
-  "grep -q '^## Handoff' '$SKILL_MD' && grep -q 'handoff-header.sh' '$SKILL_MD'"
+OPERATOR_MD="$(cd "$HERE/.." && pwd)/docs/operator.md"
+expect "AC11 docs/operator.md names handoff-header.sh in a Handoff section" \
+  "grep -q '^#\{1,4\} Handoff' '$OPERATOR_MD' && grep -q 'handoff-header.sh' '$OPERATOR_MD'"
 
 echo "gates-banner-selftest: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

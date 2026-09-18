@@ -72,6 +72,9 @@ SELFTEST_REGISTRY=(
   scripts/lane-predicate-selftest.sh
   scripts/manifest-reconcile-selftest.sh
   scripts/prd-lint-selftest.sh
+  scripts/lint-contract-size-selftest.sh
+  scripts/lint-contract-size.sh
+  scripts/scripts-index-gen-selftest.sh
   scripts/python-worktree-selftest.sh
   scripts/worktree-extend-selftest.sh
   scripts/requeue-prd-selftest.sh

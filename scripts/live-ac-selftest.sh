@@ -503,9 +503,15 @@ rm -rf "$T"
 # naming it, and the only script by that name (reality-check.sh) has no
 # `(Live` handling at all. A (Live mechanism that no caller ever runs is
 # precisely the failure shape this whole PRD exists to prevent, so the
-# wiring is asserted mechanically here rather than trusted to prose. ----
+# wiring is asserted mechanically here rather than trusted to prose.
+#
+# PRD-build-branch-contract-split moved the coordinator's full phase
+# procedure (where these two scripts are actually named) out of SKILL.md
+# and into docs/operator.md -- SKILL.md is now a 200-line index with no
+# per-script prose at all, so this check follows the content to its new
+# home instead of the file it used to live in. ----
 REPO_ROOT="$(cd "$HERE/.." && pwd -P)"
-for doc in SKILL.md build-contract.md; do
+for doc in docs/operator.md build-contract.md; do
   ck "anti-orphan: $doc names scripts/live-ac-reality-check.sh as the (Live retry runner" \
     'grep -q "live-ac-reality-check.sh" "$REPO_ROOT/$doc"' \
     "$doc never names the runner -- the (Live built->shipped flip has no caller"
@@ -517,7 +523,7 @@ done
 # so out loud, because substituting one for the other is a silent no-op.
 # (No backticks in these patterns -- ck evals its argument, so a backtick
 # inside the pattern would be command-substituted, not matched.)
-for doc in SKILL.md build-contract.md; do
+for doc in docs/operator.md build-contract.md; do
   ck "anti-orphan: $doc warns the two reality checks are not interchangeable" \
     'grep -q "do not substitute one for the other" "$REPO_ROOT/$doc"' \
     "$doc does not warn that reality-check.sh is the wrong script for (Live ACs"

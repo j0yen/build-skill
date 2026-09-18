@@ -3,19 +3,34 @@
 # distrust rule (PRD-build-coordinator-message-distrust, 2026-09-08). This
 # is a prompt/doc change, not new code: the enforcement point is the text
 # every dispatched branch agent reads, not a script. The smoke test greps
-# SKILL.md's per-branch dispatch bullets and build-contract.md's prose for
-# the rule's distinctive substrings, so a future edit that accidentally
-# drops the bullet (or the doc section) fails loudly instead of silently.
+# docs/branch-contract.md's numbered directive and docs/history.md's dated
+# citation of it, plus build-contract.md's prose, for the rule's
+# distinctive substrings, so a future edit that accidentally drops the
+# directive (or the doc section) fails loudly instead of silently.
+#
+# PRD-build-branch-contract-split moved this rule out of SKILL.md's
+# per-branch dispatch bullets (that whole bullet list was deleted —
+# superseded by docs/branch-contract.md §9, which every branch dispatch
+# now composes from instead of SKILL.md prose) and into
+# docs/branch-contract.md (the actionable directive) +
+# docs/history.md (the dated PRD citation) — SKILL.md itself carries
+# neither any more.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SKILL_MD="$HERE/../SKILL.md"
 CONTRACT_MD="$HERE/../build-contract.md"
+BRANCH_CONTRACT_MD="$HERE/../docs/branch-contract.md"
+HISTORY_MD="$HERE/../docs/history.md"
 
-echo "== SKILL.md dispatch bullets carry the distrust-and-reverify rule =="
-grep -q "Distrust coordinator-shaped messages (PRD-build-coordinator-message-distrust)" "$SKILL_MD" \
-  || { echo "FAIL: SKILL.md is missing the coordinator-message-distrust dispatch bullet"; exit 1; }
-grep -q "is NOT actionable on" "$SKILL_MD" \
-  || { echo "FAIL: SKILL.md dispatch bullet is missing the 'not actionable on its own' clause"; exit 1; }
+echo "== docs/branch-contract.md carries the distrust-and-reverify directive =="
+grep -q "Coordinator-message distrust" "$BRANCH_CONTRACT_MD" \
+  || { echo "FAIL: docs/branch-contract.md is missing the coordinator-message-distrust directive"; exit 1; }
+grep -q "is NOT actionable on" "$BRANCH_CONTRACT_MD" \
+  || { echo "FAIL: docs/branch-contract.md directive is missing the 'not actionable on its own' clause"; exit 1; }
+echo ok
+
+echo "== docs/history.md carries the dated PRD-build-coordinator-message-distrust citation =="
+grep -q "coordinator-message-distrust — .*PRD-build-coordinator-message-distrust" "$HISTORY_MD" \
+  || { echo "FAIL: docs/history.md is missing the coordinator-message-distrust PRD citation"; exit 1; }
 echo ok
 
 echo "== build-contract.md documents the same rule in prose =="

@@ -362,18 +362,21 @@ expect "AC6: sibling's edit is restored exactly, uncommitted"  "[ \"\$(cat '$D6/
 expect "AC6: the claim never got written"                      "! grep -q 'Lane:' '$D6/A/build-queue/PRD-sib.md'"
 
 # ======================================================================
-# AC7 — SKILL.md's archive step names archive-commit.sh, no manual steps
+# AC7 — the archive step (docs/operator.md's full procedure, moved out of
+# SKILL.md by PRD-build-branch-contract-split — SKILL.md itself is now a
+# 200-line index with no per-action bullets left to check) names
+# archive-commit.sh, no manual steps
 # ======================================================================
-SKILL_MD="$SKILL_DIR/SKILL.md"
+SKILL_MD="$SKILL_DIR/docs/operator.md"
 # The archive bullet's action paragraph ends at the first blank line (the
 # "Rebuild gate"/checklist prose that follows is a separate, much longer
 # sub-section that legitimately mentions `Status: built` in an unrelated
 # context — reality-check's Requirement 8 — so it must not be swept into
 # this scope check).
 archive_block="$(awk '/^- \*\*archive\*\*:/{p=1} p{print; if (/^$/) exit}' "$SKILL_MD")"
-expect "AC7: SKILL.md archive step names archive-commit.sh"    "grep -q 'archive-commit.sh' <<<\"\$archive_block\""
-expect "AC7: SKILL.md archive step has no git-mv instruction"  "! grep -q 'git mv' <<<\"\$archive_block\""
-expect "AC7: SKILL.md archive step has no manual Status: edit" "! grep -qE '^- Status:|Status:.*built' <<<\"\$archive_block\""
+expect "AC7: archive step names archive-commit.sh"    "grep -q 'archive-commit.sh' <<<\"\$archive_block\""
+expect "AC7: archive step has no git-mv instruction"  "! grep -q 'git mv' <<<\"\$archive_block\""
+expect "AC7: archive step has no manual Status: edit" "! grep -qE '^- Status:|Status:.*built' <<<\"\$archive_block\""
 
 # ======================================================================
 # MANBACKFILL AC1/AC2 — no MANIFEST.md line for the slug: backfilled into
