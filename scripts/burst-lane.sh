@@ -4013,6 +4013,11 @@ run_pending_reality_check_if_gate_ready() {
 CANARY_REPO="${BURST_LANE_CANARY_REPO:-${BURST_PROVE_MCPHOST_REPO:-$HOME/wintermute/mcphost}}"
 CANARY_GATE_LAUNCH="${BURST_LANE_CANARY_GATE_LAUNCH:-$HERE/gate-launch.sh}"
 CANARY_RECEIPT_DIFF="${BURST_LANE_CANARY_RECEIPT_DIFF:-$HERE/gate-receipt-diff.sh}"
+# PRD-build-burst-canary-live-parity R2: consulted only to tell a genuinely
+# "lost" gate (systemd unit gone, no fresh receipt — gate-status.sh's own
+# defect classification) apart from a gate that ran and just left stale
+# receipts sitting in the directory (the 2026-09-18 04:36Z bug).
+CANARY_GATE_STATUS="${BURST_LANE_CANARY_GATE_STATUS:-$HERE/gate-status.sh}"
 CANARY_GH="${BURST_LANE_GH:-gh}"
 # R7: shared gate-red alarm channel (PRD-build-gate-red-alarm-invariant),
 # same rule select-tick.sh's R17 knob-ownership alarm already uses — never
@@ -4181,19 +4186,103 @@ canary_diverged_lines() {
 # (never BURST_LANE=1 — this IS the local baseline the box is compared
 # against). R1: repo_path is the pinned canary worktree, never CANARY_REPO
 # directly — the shared checkout's HEAD can move mid-run.
+
+# canary_write_baseline_json <baseline_dir> <head> <launch_ts> <gate_rc>
+# <receipts_n> <state> — R2's baseline.json, tmp+mv atomic like
+# canary_write_state_json. launch_ts is an epoch integer (not ISO) so
+# canary_build_baseline's own freshness filter and this record use the
+# same clock reading.
+canary_write_baseline_json() {
+  local baseline_dir="$1" head="$2" launch_ts="$3" gate_rc="$4" receipts_n="$5" state="$6"
+  mkdir -p "$baseline_dir"
+  local tmp; tmp="$(mktemp "$baseline_dir/.baseline.XXXXXX")"
+  python3 -c '
+import json, sys
+head, launch_ts, gate_rc, receipts_n, state, out_path = sys.argv[1:7]
+json.dump({
+    "head": head,
+    "launch_ts": int(launch_ts),
+    "gate_rc": int(gate_rc),
+    "receipts_n": int(receipts_n),
+    "state": state,
+}, open(out_path, "w"), indent=2, sort_keys=True)
+' "$head" "$launch_ts" "$gate_rc" "$receipts_n" "$state" "$tmp"
+  mv -f "$tmp" "$baseline_dir/baseline.json"
+}
+
+# canary_baseline_json_state <baseline_dir> -> stdout state field, or
+# empty when baseline.json is absent/unreadable — AC3: "A baseline
+# directory without baseline.json is rebuilt, never trusted", so absence
+# here must read as "not built", not as an error to swallow silently.
+canary_baseline_json_state() {
+  local f="$1/baseline.json"
+  [ -f "$f" ] || { printf ''; return 0; }
+  python3 -c '
+import json, sys
+try:
+    print(json.load(open(sys.argv[1])).get("state", ""))
+except Exception:
+    print("")
+' "$f" 2>/dev/null
+}
+
+# canary_build_baseline <head_sha> <baseline_dir> <repo_path> — R2: a local
+# --scope main gate at that HEAD, nice -n 10, CARGO_BUDGET_TEST_THREADS=2
+# (never BURST_LANE=1 — this IS the local baseline the box is compared
+# against). R1: repo_path is the pinned canary worktree, never CANARY_REPO
+# directly — the shared checkout's HEAD can move mid-run. R2: fail-closed —
+# only receipts written after launch_ts are ever copied (never the stale
+# leftovers that caused the 2026-09-18 04:36Z false baseline), and
+# baseline.json records state=built only when at least one such fresh
+# receipt exists; otherwise state=failed with a named cause.
 canary_build_baseline() {
   local head_sha="$1" baseline_dir="$2" repo_path="${3:-$CANARY_REPO}" ts rc=0
   ts="$(now_epoch)"
   journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  canary  baseline  building  (head=$head_sha)"
+  local slug="canary-baseline-$ts"
   nice -n 10 env CARGO_BUDGET_TEST_THREADS=2 "$CANARY_GATE_LAUNCH" "$repo_path" \
-    --head "$head_sha" --scope main --slug "canary-baseline-$ts" --wait \
+    --head "$head_sha" --scope main --slug "$slug" --wait \
     >/dev/null 2>&1 || rc=$?
+
+  local src_dir="$repo_path/target/autobuilder/receipts" had_any="no"
+  [ -n "$(ls -A "$src_dir" 2>/dev/null)" ] && had_any="yes"
+
   mkdir -p "$baseline_dir"
-  cp -f "$repo_path"/target/autobuilder/receipts/*.json "$baseline_dir"/ 2>/dev/null || true
-  if [ -n "$(ls -A "$baseline_dir" 2>/dev/null)" ]; then
-    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  canary  baseline  built  (head=$head_sha rc=$rc)"
+  rm -f "$baseline_dir"/*.json 2>/dev/null || true
+  local f mtime receipts_n=0
+  if [ -d "$src_dir" ]; then
+    for f in "$src_dir"/*.json; do
+      [ -e "$f" ] || continue
+      mtime="$(stat -c %Y "$f" 2>/dev/null || stat -f %m "$f" 2>/dev/null || echo 0)"
+      if [ "$mtime" -ge "$ts" ]; then
+        cp -f "$f" "$baseline_dir"/
+        receipts_n=$((receipts_n + 1))
+      fi
+    done
+  fi
+
+  local state cause=""
+  if [ "$receipts_n" -ge 1 ]; then
+    state="built"
   else
-    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  canary  baseline  failed  (head=$head_sha rc=$rc)"
+    state="failed"
+    local status_line=""
+    [ -x "$CANARY_GATE_STATUS" ] && status_line="$("$CANARY_GATE_STATUS" "$slug" 2>/dev/null)"
+    if [ "$status_line" = "lost" ]; then
+      cause="wait-lost"
+    elif [ "$had_any" = "yes" ]; then
+      cause="no-fresh-receipts"
+    else
+      cause="gate-rc:$rc"
+    fi
+  fi
+
+  canary_write_baseline_json "$baseline_dir" "$head_sha" "$ts" "$rc" "$receipts_n" "$state"
+
+  if [ "$state" = "built" ]; then
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  canary  baseline  built  (head=$head_sha rc=$rc receipts=$receipts_n)"
+  else
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  canary  baseline  failed  (cause=$cause head=$head_sha rc=$rc)"
   fi
 }
 
@@ -4389,9 +4478,14 @@ canary_run_variant_lane() {
 # _V_BRANCH/_V_DELTA (each pass|block|diverged|delta-pass|unknown|skipped),
 # CANARY_CORE_DIVERGED_NDJSON (gate-receipt-diff.sh's own DIVERGED lines,
 # newline-joined across variants), CANARY_CORE_FIRST_DIVERGED_PRODUCER
-# (first token of the first diverged line, empty when nothing diverged).
+# (first token of the first diverged line, empty when nothing diverged),
+# CANARY_CORE_REFUSAL_CAUSE (R2: empty on a non-refusal return, otherwise
+# "no-green-head"/"worktree-add-failed"/"baseline-failed" — lets a caller
+# tell "ran nothing" (no-green-head) apart from "ran a baseline attempt
+# that cost real wall time" (baseline-failed) for cost-line purposes).
 _canary_core() {
   local head="$1" variants="$2" no_baseline="$3" keep_worktree="${4:-false}"
+  CANARY_CORE_REFUSAL_CAUSE=""
 
   mkdir -p "$BOX_STATE_DIR" "$CANARY_BASELINE_ROOT" "$CANARY_RUNS_ROOT"
 
@@ -4399,6 +4493,7 @@ _canary_core() {
   if ! resolved="$(canary_resolve_head "$CANARY_REPO" "$head")"; then
     journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  canary  refused  (cause=no-green-head)"
     echo "canary refused (cause=no-green-head)" >&2
+    CANARY_CORE_REFUSAL_CAUSE="no-green-head"
     return 4
   fi
   read -r head_sha head_source <<<"$resolved"
@@ -4414,6 +4509,7 @@ _canary_core() {
   if ! git -C "$CANARY_REPO" worktree add --detach "$canary_wt" "$head_sha" >/dev/null 2>&1; then
     journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  canary  refused  (cause=worktree-add-failed head=$head_sha)"
     echo "canary refused (cause=worktree-add-failed)" >&2
+    CANARY_CORE_REFUSAL_CAUSE="worktree-add-failed"
     return 4
   fi
   journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  canary  worktree  (path=$canary_wt head=$head_sha)"
@@ -4443,10 +4539,28 @@ _canary_core() {
     journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  canary  baseline=skipped  (head=$head_sha)"
   else
     baseline_dir="$CANARY_BASELINE_ROOT/$head_sha/receipts"
-    if [ ! -d "$baseline_dir" ] || [ -z "$(ls -A "$baseline_dir" 2>/dev/null)" ]; then
+    # R2/AC3: a baseline directory without baseline.json (or whose
+    # recorded state is not "built") is never trusted as-is — rebuild it.
+    local baseline_json_state; baseline_json_state="$(canary_baseline_json_state "$baseline_dir")"
+    if [ "$baseline_json_state" != "built" ]; then
       canary_build_baseline "$head_sha" "$baseline_dir" "$canary_wt"
+      baseline_json_state="$(canary_baseline_json_state "$baseline_dir")"
     fi
-    [ -d "$baseline_dir" ] && [ -n "$(ls -A "$baseline_dir" 2>/dev/null)" ] && baseline_state="present"
+    if [ "$baseline_json_state" = "built" ]; then
+      baseline_state="present"
+    else
+      # R2: fail-closed — a baseline that never produced a fresh receipt
+      # refuses the whole canary rather than diffing against nothing (or
+      # against stale leftovers). No variant runs, no canary.json is
+      # written, no enable/disable state changes.
+      journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  canary  verdict  refused  (cause=baseline-failed head=$head_sha)"
+      echo "canary refused (cause=baseline-failed)" >&2
+      CANARY_CORE_REFUSAL_CAUSE="baseline-failed"
+      if [ "$keep_worktree" != true ]; then
+        git -C "$CANARY_REPO" worktree remove --force "$canary_wt" >/dev/null 2>&1 || rm -rf "$canary_wt"
+      fi
+      return 4
+    fi
   fi
 
   local -a want=()
@@ -4601,11 +4715,14 @@ cmd_canary() {
   # no-green-head refusal (rc=4) never reaches here.
   [ "$rc" -eq 0 ] && canary_maybe_reenable "$CANARY_CORE_HEAD"
 
-  # R11: cost line through the existing cost-rate path (cost_rate_eur, the
-  # same €/h `prove`'s own cost line uses), scoped to this canary's own
-  # wall time so it folds additively into the box-day cost total. rc=4
-  # (no-green-head) never ran a variant -- nothing to cost, nothing printed.
-  if [ "$rc" -ne 4 ]; then
+  # R11/AC17: cost line through the existing cost-rate path (cost_rate_eur,
+  # the same €/h `prove`'s own cost line uses), scoped to this canary's own
+  # wall time so it folds additively into the box-day cost total. A
+  # no-green-head refusal never ran anything, so it alone stays silent;
+  # a baseline-failed or worktree-add-failed refusal (R2) still spent real
+  # wall time on a gate-launch attempt and must report it (AC17: "the
+  # canary cost line reports <= 2 minutes" on exactly this refusal).
+  if [ "$rc" -ne 4 ] || [ "$CANARY_CORE_REFUSAL_CAUSE" != "no-green-head" ]; then
     local canary_minutes; canary_minutes=$(( ($(now_epoch) - canary_start_epoch) / 60 ))
     local canary_eur; canary_eur="$(awk -v m="$canary_minutes" -v r="$(cost_rate_eur)" 'BEGIN{printf "%.4f", (m/60.0)*r}')"
     journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  canary  cost  (eur=$canary_eur minutes=$canary_minutes)"
