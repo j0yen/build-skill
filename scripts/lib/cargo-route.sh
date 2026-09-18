@@ -215,8 +215,14 @@ cargo_route_current() {
 # from here — it predates this lib and keeps its own copy for its own
 # call sites — but this is the one place a NEW caller reuses instead of
 # re-deriving the STATE_DIR/BURST_ROUTE_LOG resolution a third time).
-# Fields: <ts> <pid> <sub> <decision> <cause> <cwd>. flock-guarded, never
-# fatal to the caller.
+# Fields: <ts> <pid> <sub> <decision> <cause> <cwd> [<run-id>]. flock-
+# guarded, never fatal to the caller. The 7th field is written only when
+# the caller's environment carries HERMETIC_BUILD_RUN_ID (PRD-rustbuild-
+# hermetic-route-pid: a producer that spawns its own cargo child under a
+# unique run id can then match route.log lines back to itself exactly,
+# for the rare case pid alone is not enough) — omitted (a plain 6-field
+# line) whenever that var is unset, so every existing reader that only
+# looks at fields up to <cwd> keeps working unchanged.
 cargo_route_log() {
   local sub="${1:--}" decision="${2:-local}" cause="${3:--}"
   local state_dir="${BURST_LANE_STATE_DIR:-$(cargo_route_scripts_dir)/../state/burst-lane}"
@@ -224,8 +230,13 @@ cargo_route_log() {
   mkdir -p "$(dirname "$route_log")" 2>/dev/null || return 0
   (
     flock -w 2 204 2>/dev/null || exit 0
-    printf '%s %s %s %s %s %s\n' \
-      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$$" "$sub" "$decision" "$cause" "$PWD" >&204
+    if [ -n "${HERMETIC_BUILD_RUN_ID:-}" ]; then
+      printf '%s %s %s %s %s %s %s\n' \
+        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$$" "$sub" "$decision" "$cause" "$PWD" "$HERMETIC_BUILD_RUN_ID" >&204
+    else
+      printf '%s %s %s %s %s %s\n' \
+        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$$" "$sub" "$decision" "$cause" "$PWD" >&204
+    fi
   ) 204>>"$route_log" 2>/dev/null || true
   return 0
 }
