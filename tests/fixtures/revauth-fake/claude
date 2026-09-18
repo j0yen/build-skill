@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# Fake `claude` CLI for revauth_ac*.sh (PRD-build-reviewer-agent-auth-
+# contract, test_prefix revauth). Stands in for BOTH the preflight probe
+# call (extend-gate.sh's resolve/probe step, before any receipt producer
+# runs) and the real reviewer `claude -p` spawn (run_reviewer) — this
+# fake cannot tell them apart except by the prompt text, so it answers
+# both the same way: succeed only when CLAUDE_CODE_OAUTH_TOKEN matches the
+# fixture value this test expects, else print the REAL incident error
+# text on stdout (never stderr — this PRD's own R4 grounding: the 2026-
+# 09-17 incident's error was on stdout) and exit 1. Fixture strings below
+# are copied verbatim from the PRD text (agent-written-fixture tautology
+# guard), never re-derived from extend-gate.sh's own source.
+#
+# Env vars:
+#   FAKE_REVAUTH_EXPECTED_TOKEN   token value that counts as "authenticated"
+#                                 (default: revauth-fixture-token-9f3c)
+#   FAKE_REVAUTH_CALL_COUNTER     path to a counter file, incremented on
+#                                 every invocation (probe call is #1, the
+#                                 real reviewer call is #2) — unset means
+#                                 no counting, every call judged the same way
+#   FAKE_REVAUTH_FAIL_ON_CALL     call number (per the counter above) that
+#                                 always fails auth regardless of token —
+#                                 simulates a token revoked mid-run (AC5)
+set -uo pipefail
+
+prompt=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -p) prompt="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+
+expected="${FAKE_REVAUTH_EXPECTED_TOKEN:-revauth-fixture-token-9f3c}"
+
+call_n=0
+if [ -n "${FAKE_REVAUTH_CALL_COUNTER:-}" ]; then
+  call_n=$(( $(cat "$FAKE_REVAUTH_CALL_COUNTER" 2>/dev/null || echo 0) + 1 ))
+  echo "$call_n" > "$FAKE_REVAUTH_CALL_COUNTER"
+fi
+
+auth_ok=true
+[ "${CLAUDE_CODE_OAUTH_TOKEN:-}" = "$expected" ] || auth_ok=false
+if [ -n "${FAKE_REVAUTH_FAIL_ON_CALL:-}" ] && [ "$call_n" = "${FAKE_REVAUTH_FAIL_ON_CALL}" ]; then
+  auth_ok=false
+fi
+
+if ! $auth_ok; then
+  # Verbatim from the PRD's own Problem statement / Technical
+  # considerations — printed on STDOUT, exactly like the real incident.
+  echo "Failed to authenticate: OAuth session expired and could not be refreshed"
+  exit 1
+fi
+
+case "$prompt" in
+  "Reply with only the single word: ok")
+    echo "ok"
+    exit 0
+    ;;
+  *)
+    head_sha="$(git rev-parse HEAD 2>/dev/null || echo fake)"
+    mkdir -p target/autobuilder/receipts
+    cat > target/autobuilder/receipts/reviewer-agent.json <<JSON
+{"schema":"autobuilder.reviewer_agent_receipt.v1","head_sha":"$head_sha","intent_card_sha":"fake","decision":"pass","block_reasons":[],"concern_reasons":[],"falsification":{"test_audit":"ok","panic_audit":"ok","unsafe_audit":"ok","public_api_audit":"ok","deps_audit":"ok","drift_audit":"ok","counter_attack":{"description":"n/a","test_skeleton":"n/a"}}}
+JSON
+    cat target/autobuilder/receipts/reviewer-agent.json
+    exit 0
+    ;;
+esac

@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Fake `gh` for routepar-selftest.sh. Defaults to "not authenticated" so
+# ci-checks takes extend-gate.sh's documented skip branch (this PRD does
+# not need a real ci-checks path exercised); FAKE_GH_AUTH_RC=0 opts a test
+# into the authenticated branch when it needs a real ci-checks receipt.
+set -uo pipefail
+case "${1:-}" in
+  auth) exit "${FAKE_GH_AUTH_RC:-1}" ;;
+  *)    exit 0 ;;
+esac

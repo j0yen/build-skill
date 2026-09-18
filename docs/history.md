@@ -297,3 +297,26 @@ runner now sets `BUILD_TEST_ROOT`/`BUILD_TEST=1` and redirects `HOME` and
 every state dir into a temp root before any test runs; `journal.sh`'s
 `journal_line` additionally refuses (exit 3) a fixture-shaped line aimed
 at the unmodified production root even if isolation was somehow skipped.
+
+## reviewer-auth — 2026-09-18, PRD-build-reviewer-agent-auth-contract
+
+Claude Code strips `CLAUDE_CODE_OAUTH_TOKEN` from Bash-tool children, so
+the reviewer's nested `claude -p` (spawned from inside a branch agent's
+own Bash tool) never had it in `extend-gate.sh`'s ambient environment and
+always fell through, silently, to the file fallback
+`~/.claude/.credentials.json` — a copy nothing refreshes since the
+12:07 am setup-token-in-environment.d migration. Its access token expired
+at 7:51 am EDT on 2026-09-18; every gate on a Rust target ran its full
+24-receipt sequence (~276 s), then the reviewer failed in 1–2 s with
+`Failed to authenticate: OAuth session expired and could not be
+refreshed` — printed on stdout, not stderr, so the receipt's own
+`infra_detail` read `stderr_tail=<empty>` and nobody could tell it was an
+auth failure from the receipt alone. `run_reviewer` now resolves the
+token from a named source (env, then `REVIEWER_AUTH_FILE`, then
+`systemctl --user show-environment`), hands it to the `claude -p`
+invocation's own environment only (never exported into this script's
+shell), and a branch-scope (or pinned-landing) gate probes it once before
+any receipt producer runs — a missing token ends the gate
+`incomplete infra=reviewer-agent:auth-missing` in well under the 276 s the
+old failure cost, naming every source checked, before paying for a single
+receipt.

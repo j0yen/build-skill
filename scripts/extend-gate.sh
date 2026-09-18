@@ -273,6 +273,14 @@ echo "extend-gate: cargo=${_extend_gate_resolved_cargo:-not-found}" >&2
 # without touching production behavior (default unchanged).
 RUSTBUILD_SCRIPTS="${RUSTBUILD_SCRIPTS:-$HOME/.claude/skills/rustbuild/scripts}"
 REVIEWER_PROMPT="${REVIEWER_PROMPT:-$HOME/.claude/skills/rustbuild/prompts/reviewer-agent.md}"
+# PRD-build-reviewer-agent-auth-contract R1: the named fallback the
+# reviewer's `claude -p` token resolves from when CLAUDE_CODE_OAUTH_TOKEN
+# is not already in this script's own environment (it never is, when this
+# script itself was launched from inside a Bash-tool child — Claude Code
+# strips the var from Bash-tool children; see docs/branch-contract.md's
+# "reviewer auth" paragraph). Overridable so tests/ can point at a fixture
+# file without touching production behavior (default unchanged).
+REVIEWER_AUTH_FILE="${REVIEWER_AUTH_FILE:-$HOME/.config/environment.d/90-claude-oauth.conf}"
 # Canonical autobuilder crate Cargo.toml — the install-freshness guard
 # (AC4, PRD-autobuilder-source-unify, exit 7 below) reads its
 # `[package] version` and compares it to the installed `autobuilder
@@ -1473,6 +1481,204 @@ else
   echo "extend-gate: project-root: $project_rel (resolved from repo root)"
 fi
 
+# --- PRD-build-reviewer-agent-auth-contract R1/R2/R3 ----------------------
+# The reviewer's `claude -p` (run_reviewer, below) authenticates from a
+# NAMED source, resolved once here (never re-resolved per retry inside
+# this run — R3's "one probe per run") and handed to the reviewer child on
+# its own invocation's environment only, never exported into this script's
+# own shell (R2). Grounding: Claude Code strips CLAUDE_CODE_OAUTH_TOKEN
+# from Bash-tool children, so a nested `claude -p` spawned from inside a
+# branch agent's Bash tool always used to fall through, silently, to the
+# stale `~/.claude/.credentials.json` file fallback — which the 2026-09-18
+# migration to setup-token-in-environment.d left dead. Non-goals: this
+# never reads or touches that credentials file itself.
+reviewer_auth_token=""
+reviewer_auth_source=""
+reviewer_auth_checked_csv=""
+resolve_reviewer_auth() {  # sets reviewer_auth_token/source/checked_csv
+  local checked=() tok=""
+  reviewer_auth_token=""
+  reviewer_auth_source=""
+  checked+=("env")
+  if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
+    reviewer_auth_token="$CLAUDE_CODE_OAUTH_TOKEN"
+    reviewer_auth_source="env"
+    reviewer_auth_checked_csv="$(IFS=','; echo "${checked[*]}")"
+    return 0
+  fi
+  checked+=("environment.d:$REVIEWER_AUTH_FILE")
+  if [ -f "$REVIEWER_AUTH_FILE" ]; then
+    tok="$(sed -n 's/^CLAUDE_CODE_OAUTH_TOKEN=//p' "$REVIEWER_AUTH_FILE" 2>/dev/null | tail -n1)"
+    if [ -n "$tok" ]; then
+      reviewer_auth_token="$tok"
+      reviewer_auth_source="environment.d"
+      reviewer_auth_checked_csv="$(IFS=','; echo "${checked[*]}")"
+      return 0
+    fi
+  fi
+  checked+=("systemctl")
+  if command -v systemctl >/dev/null 2>&1; then
+    tok="$(systemctl --user show-environment 2>/dev/null | sed -n 's/^CLAUDE_CODE_OAUTH_TOKEN=//p' | tail -n1)"
+    if [ -n "$tok" ]; then
+      reviewer_auth_token="$tok"
+      reviewer_auth_source="systemctl"
+      reviewer_auth_checked_csv="$(IFS=','; echo "${checked[*]}")"
+      return 0
+    fi
+  fi
+  # None yielded a token: R1's "it never falls through to the file-
+  # credentials fallback silently" — reviewer_auth_token stays empty, so
+  # run_reviewer's claude -p invocation is handed an explicit empty token
+  # rather than ambient auth that might silently resolve to the dead
+  # credentials file. reviewer_auth_source stays empty too (journaled as
+  # "none" — R5).
+  reviewer_auth_checked_csv="$(IFS=','; echo "${checked[*]}")"
+  return 1
+}
+# Resolved unconditionally (cheap — no subprocess spend beyond one
+# `systemctl` call in the worst case) so R5's `reviewer_auth=` journal
+# token is always present, even on a run where the reviewer itself never
+# executes (main scope, no pinned-landing/main-health).
+resolve_reviewer_auth || true
+
+# reviewer_auth_probe_needed — true only for a run where run_reviewer()
+# (step 6, below) will actually execute: --scope branch (an un-landed
+# branch gate), or --pinned-landing (R3 of PRD-build-intent-card-pregate-
+# refresh widens main scope to run it too). Never for --main-health (no
+# card to review against) or a canary run that named reviewer-agent in
+# EXTEND_GATE_SKIP_PRODUCERS (no Sonnet spend, unchanged) — matches the
+# step-6 call site's own skip conditions (Open question default: skip the
+# probe when no reviewer child will ever spawn).
+reviewer_auth_probe_needed() {
+  $main_health && return 1
+  { [ "${#canary_skip_producers[@]}" -gt 0 ] && canary_skip_listed reviewer-agent; } && return 1
+  [ "$scope" = branch ] && return 0
+  $pinned_landing && return 0
+  return 1
+}
+
+# emit_reviewer_auth_missing_and_exit — R3: ends the WHOLE gate here, in
+# under 90s, before ANY of the 24 receipt producers below (step 1 onward)
+# ever runs — never just the reviewer phase. Replicates the minimal slice
+# of the tail's own journal-line / verdict-cache / exit-code machinery
+# (most of those vars — t0, crate_name, journal_base_field, GATE_ROUTE,
+# route_host/route_intended, self_hash, tree_now, cache_file,
+# verdict_cache_mirror — are already set above this point; the ones that
+# are not, because they are only ever computed by producers this run never
+# reaches (route_burst_n et al, attribution, new_blocks/inherited_blocks)
+# default to their empty/zero shape) rather than restructuring the whole
+# best-effort producer sequence into a conditional block.
+emit_reviewer_auth_missing_and_exit() {
+  local probe_secs="$1"
+  record_phase reviewer-auth-probe "$probe_secs" fail
+  local reviewer_receipt="$project_abs/target/autobuilder/receipts/reviewer-agent.json"
+  mkdir -p "$(dirname "$reviewer_receipt")" 2>/dev/null || true
+  local skip_reason="infra:reviewer-agent:auth-missing:${reviewer_auth_checked_csv}"
+  jq -n --arg head "$head_now" --arg captured "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg reason "$skip_reason" '{
+    schema: "autobuilder.reviewer_agent_receipt.v1",
+    head_sha: $head, intent_card_sha: "", decision: "pass",
+    block_reasons: [], concern_reasons: [],
+    scope_deferred: true, skip_reason: $reason,
+    captured_at: $captured, receipt_digest: ""
+  }' > "$reviewer_receipt" 2>/dev/null
+  echo "extend-gate: INFRA: reviewer-agent:auth-missing — no token from any of: ${reviewer_auth_checked_csv}" >&2
+
+  local wall phases_str="" phase_sum=0 _pi _pname _pval
+  wall=$(( $(date +%s) - t0 ))
+  for _pi in "${!phase_names[@]}"; do
+    _pname="${phase_names[$_pi]}"; _pval="${phase_vals[$_pi]}"
+    case "$_pval" in
+      skip|defer) : ;;
+      *!) phase_sum=$(( phase_sum + ${_pval%!} )) ;;
+      *)  phase_sum=$(( phase_sum + _pval )) ;;
+    esac
+    if [ -n "$phases_str" ]; then phases_str="$phases_str,$_pname:$_pval"; else phases_str="$_pname:$_pval"; fi
+  done
+  local phases_field="phases=$phases_str"
+
+  local scope_prefix=""
+  [ "$scope" = branch ] && scope_prefix="scope=branch slug=$slug "
+  $pinned_landing && scope_prefix="scope=main slug=$slug "
+  $main_health && scope_prefix="scope=main slug=$slug "
+
+  local journal_suffix=" infra=reviewer-agent:auth-missing reviewer_auth=${reviewer_auth_source:-none}"
+  $pinned_landing && journal_suffix="$journal_suffix pinned=landing"
+  $main_health && journal_suffix="$journal_suffix main-health"
+
+  journal_line --file "$journal" "$(printf '%s  gate  %s  %s  (%shead=%s base=%s %s blocking=%s wall=%ss %s lock_wait=%ss cargo=burst:%s/local:%s route=%s)%s' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$crate_name" "incomplete" "$scope_prefix" "$head_now" "$journal_base_field" \
+    "gate: no-summary-line (auth-missing before any producer ran)" "none" "$wall" "$phases_field" "${lock_wait:-0}" \
+    "0" "0" "$GATE_ROUTE" "$journal_suffix")"
+
+  [ -n "$slug" ] && flow_ledger_append "$slug" "gate_verdict" --sha "$head_now" --detail "verdict=incomplete"
+
+  mkdir -p "$(dirname "$cache_file")"
+  jq -n --arg head "$head_now" --arg tree "$tree_now" --arg hash "$self_hash" \
+       --arg host "$route_host" --arg intended "$route_intended" \
+       --argjson wall_s "$wall" --arg scope "$scope" --arg slug "$slug" \
+       --arg gate_route "$GATE_ROUTE" --arg reason "$skip_reason" \
+       --arg auth_source "${reviewer_auth_source:-}" '{
+    head_sha: $head, head: $head, tree_sha: $tree, script_sha256: $hash,
+    verdict: "incomplete", exit_code: 9,
+    new_blocks: [], inherited_blocks: [],
+    cargo_route: {intended: $intended, burst: 0, local: 0, passthrough: 0, host: $host},
+    route: $gate_route, routed: {n: 0, receipts: 0},
+    blocks: [], attribution: {in_scope: 0, inherited: 0}, attribution_range: null,
+    phases: {}, wall_s: $wall_s, scope: $scope, slug: $slug,
+    deferred_receipts: [],
+    infra_notes: [("reviewer-agent — " + $reason)],
+    reviewer_auth_source: $auth_source
+  }' > "$cache_file" 2>/dev/null || true
+  if [ -n "$verdict_cache_mirror" ]; then
+    mkdir -p "$(dirname "$verdict_cache_mirror")" 2>/dev/null && cp "$cache_file" "$verdict_cache_mirror" 2>/dev/null || true
+  fi
+
+  exit 9
+}
+
+if reviewer_auth_probe_needed; then
+  _probe_t0=$(date +%s)
+  _probe_ok=true
+  if [ -z "$reviewer_auth_token" ]; then
+    _probe_ok=false
+  elif ! command -v claude >/dev/null 2>&1; then
+    _probe_ok=false
+  else
+    _probe_raw="$(mktemp "${TMPDIR:-/tmp}/extend-gate-auth-probe.XXXXXX")"
+    if ! ( cd "$repo" && env CLAUDE_CODE_OAUTH_TOKEN="$reviewer_auth_token" timeout 60 \
+           claude -p "Reply with only the single word: ok" --model haiku \
+           --permission-mode bypassPermissions --output-format text \
+         ) 9>&- >"$_probe_raw" 2>"$_probe_raw.err"; then
+      # A non-zero probe exit is only "auth-missing" when the output
+      # actually says so — same pattern R4's mid-run classification uses.
+      # A probe call that fails for some OTHER reason (rate limit, a
+      # transient network blip, a prompt the fixture double rejects for
+      # reasons that have nothing to do with auth) is not this PRD's
+      # scope (Non-goals) and must not be mislabeled auth-missing — G3
+      # cuts both ways: mislabeling a different infra hiccup as
+      # auth-missing is exactly the illegible-failure problem this PRD
+      # exists to fix, not a case it gets to shortcut through. Best-effort
+      # like every other producer here: log and let the pipeline continue;
+      # the real reviewer call downstream will hit the same wall and get
+      # classified through its own (unrelated) infra path.
+      if grep -qiE "Failed to authenticate|OAuth session expired" "$_probe_raw" "$_probe_raw.err" 2>/dev/null; then
+        _probe_ok=false
+      else
+        echo "extend-gate: reviewer-auth-probe failed for a non-auth reason — continuing (the real reviewer call will classify its own failure independently)" >&2
+      fi
+    elif grep -qiE "Failed to authenticate|OAuth session expired" "$_probe_raw" "$_probe_raw.err" 2>/dev/null; then
+      _probe_ok=false
+    fi
+    rm -f "$_probe_raw" "$_probe_raw.err"
+  fi
+  _probe_secs=$(( $(date +%s) - _probe_t0 ))
+  if $_probe_ok; then
+    record_phase reviewer-auth-probe "$_probe_secs" ok
+  else
+    emit_reviewer_auth_missing_and_exit "$_probe_secs"
+  fi
+fi
+
 # 1. audit.sh, when the crate has one. Feeds the risk-gate receipt; a
 #    non-zero exit here is logged but does not abort the run — the final
 #    `autobuilder gate` is authoritative (see file header).
@@ -1933,6 +2139,26 @@ _mark_finalize_refusal() {
   _reviewer_verdict="infra"
 }
 
+# _stamp_reviewer_auth_source <file> — PRD-build-reviewer-agent-auth-
+# contract R1: the subagent itself has no way to know which of the three
+# named sources (env/environment.d/systemctl) its token came from — only
+# this script's own resolve_reviewer_auth() does — so this is a
+# non-destructive jq merge onto whatever the subagent/finalize already
+# wrote, same convention as the cargo_route merge onto autobuilder's own
+# release receipt near this script's tail. Fails open (never blocks the
+# gate) if the file is absent or jq can't merge it.
+_stamp_reviewer_auth_source() {
+  local file="$1"
+  [ -f "$file" ] || return 0
+  local tmp
+  tmp="$(mktemp "${TMPDIR:-/tmp}/extend-gate-reviewer-auth-stamp.XXXXXX")"
+  if jq --arg src "${reviewer_auth_source:-unknown}" '. + {auth_source: $src}' "$file" > "$tmp" 2>/dev/null; then
+    mv "$tmp" "$file"
+  else
+    rm -f "$tmp"
+  fi
+}
+
 # _mark_reviewer_block <reasons-csv> — the one place a genuine reviewer
 # block verdict is recorded, whether finalize exited 0 (legacy path) or
 # non-zero (R1/R2: a verdict exit classified by classify_finalize_exit).
@@ -1989,18 +2215,37 @@ verbatim from review-request.json's intent_card_sha256 (prefix included) —
 do not recompute it yourself:
 {\"schema\":\"autobuilder.reviewer_agent_receipt.v1\",\"head_sha\":\"...\",\"intent_card_sha\":\"<copy intent_card_sha256 from review-request.json verbatim>\",\"decision\":\"pass|concern|block\",\"block_reasons\":[...],\"concern_reasons\":[{\"id\":\"...\",\"note\":\"...\"}],\"falsification\":{\"test_audit\":\"...\",\"panic_audit\":\"...\",\"unsafe_audit\":\"...\",\"public_api_audit\":\"...\",\"deps_audit\":\"...\",\"drift_audit\":\"...\",\"counter_attack\":{\"description\":\"...\",\"test_skeleton\":\"...\"}}}"
 
-  if ! ( cd "$repo" && claude -p "$prompt" --model sonnet --permission-mode bypassPermissions --output-format text ) 9>&- >"$raw" 2>"$raw.err"; then
+  # PRD-build-reviewer-agent-auth-contract R2: the resolved token is
+  # handed only to THIS invocation's own environment (never exported into
+  # this script's shell) — reviewer_auth_token/source were resolved once,
+  # before any receipt producer ran, above.
+  if ! ( cd "$repo" && env CLAUDE_CODE_OAUTH_TOKEN="$reviewer_auth_token" claude -p "$prompt" --model sonnet --permission-mode bypassPermissions --output-format text ) 9>&- >"$raw" 2>"$raw.err"; then
     local _cp_rc=$?
-    _reviewer_fail_note="reviewer-agent — claude -p subagent invocation failed (see $raw.err)"
-    # R8: the 2026-09-17 failures had an EMPTY .err file, so the cause was
-    # unknown after the fact — this captures whatever is there (rc always,
-    # stderr tail when non-empty) so the next such failure is diagnosable
-    # from the receipt alone, no worktree required.
     _reviewer_infra_detail="rc=$_cp_rc"
+    # R4: a token that authenticated fine at the preflight probe but was
+    # revoked/expired mid-run still shows up here — classified distinctly
+    # from a generic invocation failure so gate-then-land's decision names
+    # the auth source, not just "invocation failed". Checked on BOTH
+    # stdout and stderr (`-h` suppresses grep's per-file prefix) — claude
+    # prints this error on stdout, not stderr (R4/AC5; the 2026-09-17
+    # incident's own review-output.raw.txt).
+    local _auth_line
+    _auth_line="$(grep -hiE 'Failed to authenticate|OAuth session expired' "$raw" "$raw.err" 2>/dev/null | head -n1)"
+    if [ -n "$_auth_line" ]; then
+      _reviewer_infra_kind="auth"
+      _reviewer_fail_note="reviewer-agent — auth failed (source=${reviewer_auth_source:-unknown}): ${_auth_line}"
+    else
+      _reviewer_fail_note="reviewer-agent — claude -p subagent invocation failed (see $raw.err)"
+    fi
+    # R8/R4: the 2026-09-17 failures had an EMPTY .err file (the auth
+    # error prints on stdout, not stderr) — captures whatever is there
+    # (rc always, stderr tail when non-empty, else the first 200 chars of
+    # stdout) so the next such failure is diagnosable from the receipt
+    # alone, no worktree required.
     if [ -s "$raw.err" ]; then
       _reviewer_infra_detail="$_reviewer_infra_detail stderr_tail=$(tail -n 20 "$raw.err" | tr '\n' ' ' | cut -c1-2000)"
     else
-      _reviewer_infra_detail="$_reviewer_infra_detail stderr_tail=<empty>"
+      _reviewer_infra_detail="$_reviewer_infra_detail stdout_head=$(head -c 200 "$raw" 2>/dev/null | tr '\n' ' ')"
     fi
     _reviewer_verdict="infra"
     return 1
@@ -2041,6 +2286,7 @@ do not recompute it yourself:
       return 1
     fi
     rm -f "$_finalize_err"
+    _stamp_reviewer_auth_source "$receipt"
     local stdout_found stdout_decision
     stdout_found="$(printf '%s' "$resolve_json" | jq -r '.stdout_object_found // false')"
     if [ "$stdout_found" = "true" ]; then
@@ -2089,6 +2335,10 @@ do not recompute it yourself:
       return 1
     fi
     rm -f "$_finalize_err2"
+    # finalize --input "$out" (above) is what actually COPIES this run's
+    # verdict to the canonical $receipt path — stamp that file, not $out,
+    # or the merge lands on a copy nothing reads again.
+    _stamp_reviewer_auth_source "$receipt"
     if [ "$stdout_decision" = "block" ]; then
       _mark_reviewer_block "$stdout_reasons_csv"
       return 1
@@ -2444,6 +2694,12 @@ elif { [ "$scope" = branch ] && [ "$intent_card_stale" != true ]; } || [ "${#blo
       # though this run's own verdict is `infra`, never `block`.
       _reviewer_infra_phase="reviewer-agent"
       [ "$_reviewer_infra_kind" = "finalize-rejected" ] && _reviewer_infra_phase="reviewer-agent:finalize-rejected"
+      # PRD-build-reviewer-agent-auth-contract R4/R6: a mid-run auth
+      # failure (token revoked between the preflight probe and this call)
+      # reads the same phase tag the preflight probe's own early exit
+      # uses, so gate-then-land.sh's fast path (R6) and the journal's
+      # infra= field treat both the same way — retryable, sources-checked.
+      [ "$_reviewer_infra_kind" = "auth" ] && _reviewer_infra_phase="reviewer-agent:auth-missing"
       _reviewer_infra_receipt="$project_abs/target/autobuilder/receipts/reviewer-agent.json"
       mkdir -p "$(dirname "$_reviewer_infra_receipt")" 2>/dev/null || true
       jq -n --arg head "$head_now" --arg captured "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
@@ -3074,6 +3330,10 @@ if [ "${#infra_notes[@]}" -gt 0 ]; then
     final_rc=9
   fi
 fi
+# PRD-build-reviewer-agent-auth-contract R5: on EVERY run (pass, block,
+# incomplete alike) — not just a reviewer-agent infra run — so a day's
+# journal can be grepped for which source each gate used (AC10).
+journal_suffix="$journal_suffix reviewer_auth=${reviewer_auth_source:-none}"
 # R3: a `block` line always names at least one blocker — this is a safety
 # net for any block path this PRD did not instrument with note_infra (the
 # aggregator's own gate_rc/delta_verdict can still say block off a receipt

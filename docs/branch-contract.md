@@ -190,3 +190,21 @@ here, numbered, with the script it invokes — not appended to `SKILL.md`.
 ## 12. Release
 
 Release your `state/prd-<slug>.lock` once the chain stops.
+
+## 13. Reviewer auth
+
+`extend-gate.sh`'s reviewer-agent step (`claude -p`, run from inside a
+Bash-tool child — Claude Code strips `CLAUDE_CODE_OAUTH_TOKEN` from Bash-
+tool children, so it is never in this script's own ambient environment)
+resolves its token in this order and stops at the first non-empty value:
+`CLAUDE_CODE_OAUTH_TOKEN` already in the environment, then
+`REVIEWER_AUTH_FILE` (default `$HOME/.config/environment.d/90-claude-
+oauth.conf`), then `systemctl --user show-environment`. It never falls
+through to `~/.claude/.credentials.json` silently. A branch-scope (or
+pinned-landing) gate probes this once, before any of the 24 receipt
+producers run; if no source yields a token, the gate ends
+`outcome=incomplete infra=reviewer-agent:auth-missing`, naming every
+source it checked. If you see `auth-missing` in a gate line or receipt,
+stop with `needs-user` — the fix is to the auth source itself (rotate or
+re-export the token), not to retry the gate by hand. See
+history.md#reviewer-auth.

@@ -259,6 +259,22 @@ independently-verified verdict, so a human reading the journal can tell
 "branch verified and complied" from "branch verified and correctly
 refused" from "branch complied blind."
 
+## Nested `claude -p` auth (PRD-build-reviewer-agent-auth-contract, 2026-09-18)
+
+Claude Code strips `CLAUDE_CODE_OAUTH_TOKEN` from Bash-tool children —
+verified with `env -u CLAUDE_CODE_OAUTH_TOKEN bash -c 'echo count=$(env |
+grep -c ^CLAUDE_CODE_OAUTH_TOKEN=)'` inside a `claude -p` Bash call: it
+prints `count=0` while the parent process (the branch agent itself)
+carries it. Any script this fleet spawns as a nested `claude -p` producer
+— `extend-gate.sh`'s reviewer-agent step is the first, and the one this
+PRD fixed after a stale `~/.claude/.credentials.json` fallback silently
+ate an expired token for hours — starts from this fact: never assume the
+ambient environment carries the token, resolve it from a named source
+(env, then a `REVIEWER_AUTH_FILE`-shaped file, then `systemctl --user
+show-environment`), and hand it to the child's own invocation only. See
+`docs/branch-contract.md`'s "Reviewer auth" section and
+`docs/history.md#reviewer-auth` for the reference implementation.
+
 ## Follow-ups (updated 2026-09-10 — items 1–3 below are DONE; see SKILL.md)
 
 All three items previously tracked here (`publish:` honoring in Phase 4,
