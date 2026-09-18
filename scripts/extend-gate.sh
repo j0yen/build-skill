@@ -426,7 +426,7 @@ intake            tree            unchanged
 proof-receipt     tree            unchanged (autobuilder loop --iteration 0 --trace)
 vti-plan          tree            unchanged
 rollback-plan     history-infra   a head-untagged block on THIS run's own fresh HEAD is
-                                  post-classified scope-deferred (never blocking) — a
+                                  post-classified not-run (never blocking) — a
                                   branch HEAD never carries a release tag; any other
                                   block_reason still blocks. land re-runs this producer
                                   at --scope main before tagging.
@@ -438,10 +438,10 @@ reviewer-agent    tree            always runs at branch scope (the quota-guard s
 ci-checks         history-infra   BRANCH_GATE_PUSH=1 (default): pushes the branch to
                                   origin under its own ref, waits up to
                                   CI_CHECKS_BRANCH_WAIT (default 900s) for a run to
-                                  appear; run_count==0 after the wait -> scope-deferred
+                                  appear; run_count==0 after the wait -> not-run
                                   (no-runs-on-ref). BRANCH_GATE_PUSH=0: never invoked,
-                                  scope-deferred (push-disabled). A push failure ->
-                                  scope-deferred (push-failed). Any OTHER outcome
+                                  not-run (push-disabled). A push failure ->
+                                  not-run (push-failed). Any OTHER outcome
                                   (a real run that failed/is pending) still blocks.
                                   land re-runs this producer at --scope main.
 extended-receipts per-producer    all 17 still run, in parallel, at any scope; each
@@ -2298,7 +2298,7 @@ else
     else
       rm -f "$_tmp_rb" 2>/dev/null || true
     fi
-    note_defer "rollback-plan — scope-deferred (head-untagged) class=history-infra — branch HEAD carries no release tag; land re-runs this at main scope"
+    note_defer "rollback-plan — not-run (head-untagged) class=history-infra — branch HEAD carries no release tag; land re-runs this at main scope"
     record_phase rollback-plan $(( $(date +%s) - _phase_t0 )) defer
   else
     # PRD-build-inherited-blocks-delta-pass AC10: name the GUILTY commits
@@ -2729,13 +2729,13 @@ elif [ "$scope" = branch ]; then
   _phase_t0=$(date +%s)
   if [ "${BRANCH_GATE_PUSH:-1}" = "0" ]; then
     write_ci_defer_receipt "push-disabled: BRANCH_GATE_PUSH=0, branch was never pushed"
-    note_defer "ci-checks — scope-deferred (push-disabled) class=history-infra — BRANCH_GATE_PUSH=0, branch was never pushed; land re-runs this at main scope"
+    note_defer "ci-checks — not-run (push-disabled) class=history-infra — BRANCH_GATE_PUSH=0, branch was never pushed; land re-runs this at main scope"
     record_phase ci-checks 0 defer
   else
     _push_ref="$(git -C "$repo" symbolic-ref --short HEAD 2>/dev/null || echo "autobuilder/$slug")"
     if ! ( cd "$repo" && git push origin "HEAD:refs/heads/$_push_ref" ) >&2; then
       write_ci_defer_receipt "push-failed: could not push $_push_ref to origin"
-      note_defer "ci-checks — scope-deferred (push-failed) class=history-infra — could not push $_push_ref to origin; land re-runs this at main scope"
+      note_defer "ci-checks — not-run (push-failed) class=history-infra — could not push $_push_ref to origin; land re-runs this at main scope"
       record_phase ci-checks 0 defer
     else
       _ci_wait_s="${CI_CHECKS_BRANCH_WAIT:-900}"
@@ -2775,7 +2775,7 @@ elif [ "$scope" = branch ]; then
           else
             write_ci_defer_receipt "no-runs-on-ref: ci-checks never wrote a receipt within ${_ci_wait_s}s (see gate output above)"
           fi
-          note_defer "ci-checks — scope-deferred (no-runs-on-ref) class=history-infra — no workflow runs observed for $head_now within ${_ci_wait_s}s; land re-runs this at main scope"
+          note_defer "ci-checks — not-run (no-runs-on-ref) class=history-infra — no workflow runs observed for $head_now within ${_ci_wait_s}s; land re-runs this at main scope"
           record_phase ci-checks $(( $(date +%s) - _phase_t0 )) defer
         else
           note_block "ci-checks — workflow(s) on HEAD are not green, or still pending (the next tick retries)"
