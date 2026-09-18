@@ -13,10 +13,17 @@
 #   (no flag)  live check: `systemctl --user is-active <unit>` per unit
 #              declared for this host, print one `unit=<u> state=...`
 #              line per unit, update the streak state file, then print a
-#              summary — `LIVENESS ok n=<N>` (exit 0) or one
-#              `LIVENESS WARN unit=<u> inactive_since=<ISO>` line per
-#              currently-inactive unit (exit 1). Costs one `systemctl`
-#              call per declared unit — no model call, ever.
+#              summary — exit 0 clean (bad=0): `LIVENESS ok n=<N>
+#              last_ok_age=<s|unknown> streak_failed=<n>`, or, when
+#              tick-outcome.json's own streak_failed is >= 2, `LIVENESS
+#              degraded cause=<cause> streak=<n> last_ok_age=<s>` instead
+#              (PRD-buildloop-tick-outcome-liveness R3 — outcome-level
+#              liveness, distinct from this unit-level check below, which
+#              is unaffected); or one `LIVENESS WARN unit=<u>
+#              inactive_since=<ISO>` line per currently-inactive unit
+#              (exit 1, unchanged). Costs one `systemctl` call per
+#              declared unit plus, when clean, one read of
+#              $TICK_OUTCOME_FILE — no model call, ever.
 #   --json     same live check, JSON output instead of the plain lines
 #              above (P2 — a digest/consumer-friendly shape).
 #   --digest   NO live check, NO systemctl calls: pure read of the streak
@@ -52,6 +59,12 @@ UNITS_FILE="${LOOP_UNITS_FILE:-$SKILL_DIR/scripts/loop-units.txt}"
 STATE_DIR="${LOOP_LIVENESS_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/build-skill}"
 STATE_FILE="${LOOP_LIVENESS_STATE_FILE:-$STATE_DIR/loop-liveness.state}"
 HOST="${LOOP_LIVENESS_HOST:-$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo unknown)}"
+# PRD-buildloop-tick-outcome-liveness R3: separate from $STATE_DIR above
+# (this file's own unit-inactive-streak state, under XDG_STATE_HOME) —
+# tick-outcome.json lives in tick-run.sh's BUILD_STATE_DIR, the skill's
+# own state/ dir, a different tree entirely.
+TICK_OUTCOME_FILE="${TICK_OUTCOME_FILE:-${BUILD_STATE_DIR:-$SKILL_DIR/state}/tick-outcome.json}"
+JQ="${JQ:-$(command -v jq 2>/dev/null || echo /usr/bin/jq)}"
 
 mode="plain"
 while [ $# -gt 0 ]; do
@@ -72,6 +85,40 @@ done
 ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 same_host() { [ "${1,,}" = "${2,,}" ]; }
 trim() { sed -E 's/^[[:space:]]+|[[:space:]]+$//g'; }
+
+# tick_outcome_line <unit-count> — PRD-buildloop-tick-outcome-liveness R3:
+# the plain-mode summary line for a CLEAN unit check (bad=0). Reads
+# $TICK_OUTCOME_FILE (tick-run.sh's own R1 artifact) and replaces the bare
+# "LIVENESS ok n=<N>" with one of:
+#   LIVENESS degraded cause=<cause> streak=<n> last_ok_age=<s>   (streak_failed>=2)
+#   LIVENESS ok n=<N> last_ok_age=<s|unknown> streak_failed=<n>  (otherwise)
+# A missing/unreadable record reads streak_failed=0 (not evidence of a
+# streak either way) and last_ok_age=unknown, never the bare pre-this-PRD
+# "ok n=<N>" form (AC6) -- unit-level WARN behavior (bad>0) is untouched,
+# per this PRD's own Non-goal.
+tick_outcome_line() {
+  local n="$1"
+  local streak_failed=0 cause="" last_ok_ts=""
+  if [ -x "$JQ" ] && [ -r "$TICK_OUTCOME_FILE" ]; then
+    streak_failed="$("$JQ" -r '.streak_failed // 0' "$TICK_OUTCOME_FILE" 2>/dev/null)"
+    cause="$("$JQ" -r '.cause // empty' "$TICK_OUTCOME_FILE" 2>/dev/null)"
+    last_ok_ts="$("$JQ" -r '.last_ok_ts // empty' "$TICK_OUTCOME_FILE" 2>/dev/null)"
+  fi
+  case "$streak_failed" in ''|*[!0-9]*) streak_failed=0 ;; esac
+
+  local age="unknown"
+  if [ -n "$last_ok_ts" ]; then
+    local epoch
+    epoch="$(date -u -d "$last_ok_ts" +%s 2>/dev/null)"
+    [ -n "$epoch" ] && age=$(( $(date -u +%s) - epoch ))
+  fi
+
+  if [ "$streak_failed" -ge 2 ]; then
+    echo "LIVENESS degraded cause=${cause:-unknown} streak=$streak_failed last_ok_age=$age"
+  else
+    echo "LIVENESS ok n=$n last_ok_age=$age streak_failed=$streak_failed"
+  fi
+}
 
 # --- collect this host's declared units, in file order ------------------
 units=()
@@ -176,7 +223,7 @@ for u in "${units[@]}"; do
 done
 
 if [ "$bad" -eq 0 ]; then
-  echo "LIVENESS ok n=${#units[@]}"
+  tick_outcome_line "${#units[@]}"
   exit 0
 fi
 

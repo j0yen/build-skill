@@ -57,10 +57,15 @@ else
 fi
 
 # ------------------------------------------------------------- unitlive_ac2
-# All six active -> LIVENESS ok n=6, exit 0, no state file lines left.
+# All six active -> LIVENESS ok n=6 (plus PRD-buildloop-tick-outcome-
+# liveness R3's last_ok_age=/streak_failed= suffix -- no tick-outcome.json
+# exists in this fixture's isolated state dir, so last_ok_age=unknown
+# streak_failed=0; AC6 of that PRD retires the bare "LIVENESS ok n=<N>"
+# form with no suffix at all, so this is no longer an exact-line match),
+# exit 0, no state file lines left.
 reset_run
 out="$("$LIVENESS" 2>&1)"; rc=$?
-if [ "$rc" -eq 0 ] && grep -qxF 'LIVENESS ok n=6' <<<"$out" \
+if [ "$rc" -eq 0 ] && echo "$out" | grep -qE '^LIVENESS ok n=6 last_ok_age=(unknown|[0-9]+) streak_failed=[0-9]+$' \
    && [ ! -s "$STATE_DIR/loop-liveness.state" ]; then
   ok "unitlive_ac2: all active -> LIVENESS ok n=6, exit 0, empty state file"
 else
