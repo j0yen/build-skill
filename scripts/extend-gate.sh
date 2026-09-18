@@ -680,6 +680,44 @@ else
   echo "extend-gate: no canonical crate Cargo.toml at $AUTOBUILDER_CANONICAL_CARGO_TOML — skipping install-freshness guard" >&2
 fi
 
+# --- PATH-shadowed autobuilder preflight (P1 requirement 6, PRD-build-
+# cargo-shim-recursion-guard; evidence: ~/.cargo/bin/autobuilder 0.9.0
+# shadowing ~/.local/bin/autobuilder 0.9.1 under some PATH orders). This is
+# independent of the install-freshness guard above (which only checks the
+# FIRST `autobuilder` PATH resolves to against the canonical crate version)
+# — a second, differently-versioned binary further down PATH is invisible
+# to that guard entirely, and PATH order can silently flip which one a
+# later shell/producer actually runs. Warn-only, once per gate (this loop
+# runs exactly once, at preflight, and only emits its first mismatch): a
+# named pair of paths+versions is enough for a human to fix PATH or remove
+# the stale binary; this never blocks since the freshness guard above
+# already blocks on whichever one actually resolves.
+_ab_first_bin="" _ab_first_version="" _ab_seen="" _ab_warned=0
+IFS=: read -ra _ab_path_parts <<<"${PATH:-}"
+for _ab_dir in "${_ab_path_parts[@]}"; do
+  [ -n "$_ab_dir" ] || continue
+  _ab_bin="$_ab_dir/autobuilder"
+  [ -x "$_ab_bin" ] || continue
+  _ab_real="$(readlink -f "$_ab_bin" 2>/dev/null || printf '%s' "$_ab_bin")"
+  case " $_ab_seen " in
+    *" $_ab_real "*) continue ;;
+  esac
+  _ab_seen="$_ab_seen $_ab_real"
+  _ab_version="$("$_ab_bin" --version 2>/dev/null | awk '{print $NF}')"
+  if [ -z "$_ab_first_bin" ]; then
+    _ab_first_bin="$_ab_bin"; _ab_first_version="$_ab_version"
+  elif [ "$_ab_warned" -eq 0 ] && [ -n "$_ab_version" ] && [ "$_ab_version" != "$_ab_first_version" ]; then
+    _ab_warned=1
+    echo "extend-gate: PATH carries two autobuilder binaries with different versions: $_ab_first_bin ($_ab_first_version) vs $_ab_bin ($_ab_version) — PATH order silently picks one; align or remove the stale one" >&2
+    if declare -F journal_root >/dev/null 2>&1; then
+      journal_line --file "${EXTEND_GATE_JOURNAL:-$(journal_root)/$(date -u +%Y-%m-%d).md}" \
+        "$(printf '%s  gate  %s  autobuilder-path-shadow  (first=%s:%s second=%s:%s)' \
+          "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(basename "$repo")" "$_ab_first_bin" "$_ab_first_version" "$_ab_bin" "$_ab_version")"  # lint:basename-label
+    fi
+  fi
+done
+unset _ab_path_parts _ab_dir _ab_bin _ab_real _ab_version _ab_first_bin _ab_first_version _ab_seen _ab_warned
+
 # --- cargo project root resolution (PRD-build-extend-gate-nested-crate-project) ---
 # $repo itself wins immediately if it has a Cargo.toml (the common case,
 # and the edge case of a repo with both a root AND a nested Cargo.toml —

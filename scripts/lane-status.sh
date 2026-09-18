@@ -472,6 +472,30 @@ print("flow: prds_measured=%d lead_time_p50=%s p90=%s wait_p50=%s gate_p50=%s"
   else
     echo "(flow-ledger.sh not found at $FLOW_LEDGER)"
   fi
+
+  echo
+  echo "== shim recursion guard, last 24h (PRD-build-cargo-shim-recursion-guard) =="
+  # PRD-build-cargo-shim-recursion-guard P2 requirement 7 (AC8): counts
+  # `recursion-refused` journal lines (written by cargo-budget-bin/cargo's
+  # depth guard, and its companion rustbuild shim once that PRD lands)
+  # across today's and yesterday's journal files whose own timestamp
+  # (first field) falls in the last 24h -- ISO-8601 timestamps sort
+  # lexicographically, so a plain string compare against the 24h-ago
+  # cutoff is exact, same trick the burst-gate-parity section above uses
+  # via --since.
+  local since_24h_shim rr_count=0 rr_d rr_f rr_ts
+  since_24h_shim="$(date -u -d '-24 hours' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -v-24H +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)"
+  for rr_d in 0 1; do
+    rr_f="$journal_dir/$(date -u -d "-$rr_d day" +%F 2>/dev/null || date -u -v-"${rr_d}"d +%F).md"
+    [ -f "$rr_f" ] || continue
+    while IFS= read -r rr_ts; do
+      [ -n "$rr_ts" ] || continue
+      if [[ "$rr_ts" > "$since_24h_shim" || "$rr_ts" == "$since_24h_shim" ]]; then
+        rr_count=$((rr_count + 1))
+      fi
+    done < <(grep 'recursion-refused' "$rr_f" 2>/dev/null | awk '{print $1}')
+  done
+  echo "shim-recursion-refused=$rr_count"
 }
 
 # PRD-build-prd-superseded-by P2 requirement 10 / AC14.
