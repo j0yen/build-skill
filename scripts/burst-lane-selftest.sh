@@ -1535,7 +1535,7 @@ expect "gatebox AC3 (extend-gate.sh remote-aware): the folded journal was not le
 # lands in the journal (requirement 4).
 fresh_env
 FAKE_CRED="$T/fake-claude-creds.json"
-echo '{"token": "SENTINEL-GATEBOX-TOKEN-XYZ123"}' > "$FAKE_CRED"
+echo 'CLAUDE_CODE_OAUTH_TOKEN=SENTINEL-GATEBOX-TOKEN-XYZ123' > "$FAKE_CRED"
 export BURST_GATE_REVIEWER=1
 export BURST_CLAUDE_CRED_SRC="$FAKE_CRED"
 gatebox4_up_out="$("$BL" up)"; gatebox4_up_rc=$?
@@ -1553,6 +1553,39 @@ expect "gatebox AC4: down deletes cleanly with the reviewer credential in play" 
 expect "gatebox AC4: the credential is gone from the fake box after down" "[ ! -e \"$BURST_LANE_GATE_CRED_REMOTE_PATH\" ]"
 expect "gatebox AC4: journal has 'cred  shredded'" "grep -q 'burst-lane  down  cred  shredded' \"$BURST_LANE_JOURNAL\""
 expect "gatebox AC4: the sentinel token never appears in the journal" "! grep -q 'SENTINEL-GATEBOX-TOKEN-XYZ123' \"$BURST_LANE_JOURNAL\""
+
+# ---- revauth AC11 (PRD-build-reviewer-agent-auth-contract R9): placement
+# no longer rsyncs a raw credentials.json blob — it resolves the token by
+# the same named order (env -> REVIEWER_AUTH_FILE -> systemctl) as extend-
+# gate.sh's own resolve_reviewer_auth, then pushes ONLY an environment.d-
+# style `CLAUDE_CODE_OAUTH_TOKEN=...` file. Given no CLAUDE_CODE_OAUTH_TOKEN
+# in the environment and REVIEWER_AUTH_FILE (via BURST_CLAUDE_CRED_SRC)
+# holding the fixture token, the fake box receives exactly that KEY=value
+# line at the resolved remote path, and `down` shreds it.
+fresh_env
+REVAUTH11_AUTH_FILE="$T/90-claude-oauth.conf"
+echo 'CLAUDE_CODE_OAUTH_TOKEN=REVAUTH-AC11-FIXTURE-TOKEN' > "$REVAUTH11_AUTH_FILE"
+export BURST_GATE_REVIEWER=1
+export BURST_CLAUDE_CRED_SRC="$REVAUTH11_AUTH_FILE"
+unset CLAUDE_CODE_OAUTH_TOKEN
+revauth11_up_out="$("$BL" up)"; revauth11_up_rc=$?
+expect "revauth AC11: up succeeds resolving the token by the named order" "[ $revauth11_up_rc -eq 0 ]"
+expect "revauth AC11: the remote received exactly one KEY=value CLAUDE_CODE_OAUTH_TOKEN line" \
+  "[ \"\$(cat \"$BURST_LANE_GATE_CRED_REMOTE_PATH\")\" = 'CLAUDE_CODE_OAUTH_TOKEN=REVAUTH-AC11-FIXTURE-TOKEN' ]"
+expect "revauth AC11: the placed credential is mode 0600" \
+  "[ \"\$(stat -c '%a' \"$BURST_LANE_GATE_CRED_REMOTE_PATH\" 2>/dev/null)\" = 600 ]"
+expect "revauth AC11: journal records the placement with source=environment.d" \
+  "grep -qE 'burst-lane  up  cred  placed  \\(host=.*source=environment\\.d\\)' \"$BURST_LANE_JOURNAL\""
+
+boot_epoch11="$(grep -oE '"boot_epoch":[0-9]+' "$BURST_LANE_STATE_DIR/current/session.json" | cut -d: -f2)"
+export BURST_LANE_NOW=$((boot_epoch11 + 3600 - 60))
+revauth11_down_out="$("$BL" down)"; revauth11_down_rc=$?
+unset BURST_LANE_NOW
+expect "revauth AC11: down deletes cleanly" "[ \"$revauth11_down_out\" = 'decision=deleted' ]"
+expect "revauth AC11: the credential file is gone from the fake box after down" "[ ! -e \"$BURST_LANE_GATE_CRED_REMOTE_PATH\" ]"
+expect "revauth AC11: journal has 'cred  shredded'" "grep -q 'burst-lane  down  cred  shredded' \"$BURST_LANE_JOURNAL\""
+expect "revauth AC11: the fixture token never appears in the journal" "! grep -q 'REVAUTH-AC11-FIXTURE-TOKEN' \"$BURST_LANE_JOURNAL\""
+unset BURST_GATE_REVIEWER BURST_CLAUDE_CRED_SRC
 
 # ---- gatebox AC8: BURST_GATE_REMOTE=0 (the ships-dark default) keeps a
 # gate entirely local -- cmd_gate refuses before touching parity, ssh, or
@@ -2204,8 +2237,8 @@ expect "burstuser AC1: the literal default remote_root is /home/build/build" \
   "grep -qx 'remote_root=/home/build/build' <<<\"\$bu1b_out\""
 expect "burstuser AC1: the literal default gate_tools_bin is /home/build/.local/bin" \
   "grep -qx 'gate_tools_bin=/home/build/.local/bin' <<<\"\$bu1b_out\""
-expect "burstuser AC1: the literal default gate_cred_path is /home/build/.claude/.credentials.json" \
-  "grep -qx 'gate_cred_path=/home/build/.claude/.credentials.json' <<<\"\$bu1b_out\""
+expect "burstuser AC1: the literal default gate_cred_path is /home/build/.config/environment.d/90-claude-oauth.conf (PRD-build-reviewer-agent-auth-contract R9)" \
+  "grep -qx 'gate_cred_path=/home/build/.config/environment.d/90-claude-oauth.conf' <<<\"\$bu1b_out\""
 
 # ---- burstuser AC2: `verify`'s cargo/uv/python3/sandbox/gate-tools probes
 # all execute as build.
@@ -2257,7 +2290,7 @@ export FAKE_SSH_CALL_LOG="$T/ssh.calls"; : > "$FAKE_SSH_CALL_LOG"
 export FAKE_RSYNC_CALL_LOG="$T/rsync.calls"; : > "$FAKE_RSYNC_CALL_LOG"
 export BURST_GATE_REVIEWER=1
 export BURST_CLAUDE_CRED_SRC="$T/fake-credentials.json"
-echo '{"token":"fake-token-not-real"}' > "$BURST_CLAUDE_CRED_SRC"
+echo 'CLAUDE_CODE_OAUTH_TOKEN=fake-token-not-real' > "$BURST_CLAUDE_CRED_SRC"
 bu5_up_out="$("$BL" up 2>&1)"
 # fresh_env pins BURST_LANE_GATE_CRED_REMOTE_PATH to its own tmpdir (same
 # isolation reason as REMOTE_ROOT/GATE_TOOLS_REMOTE_BIN_DIR) — this IS the
@@ -4571,7 +4604,7 @@ chmod +x "$REEN_AB_SRC/autobuilder"
 export BURST_LANE_AUTOBUILDER_BIN="$REEN_AB_SRC/autobuilder"
 export BURST_GATE_REVIEWER=1
 export BURST_CLAUDE_CRED_SRC="$T/fake-cred-src.json"
-echo '{"fake":"cred"}' > "$BURST_CLAUDE_CRED_SRC"
+echo 'CLAUDE_CODE_OAUTH_TOKEN=fake-bake-token' > "$BURST_CLAUDE_CRED_SRC"
 "$BL" up >/dev/null 2>&1
 r1_gate_ready="$(grep -oE '"gate_ready":"[^"]*"' "$BURST_LANE_STATE_DIR/current/session.json" | cut -d'"' -f4)"
 r1_sandbox_ok="$(grep -oE '"sandbox_ok":"[^"]*"' "$BURST_LANE_STATE_DIR/current/session.json" | cut -d'"' -f4)"

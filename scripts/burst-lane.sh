@@ -461,8 +461,57 @@ GATE_TOOLS_AUTOBUILDER_BIN="${BURST_LANE_AUTOBUILDER_BIN:-$HOME/.cargo/bin/autob
 # further down, right after load_env resolves $REMOTE_USER (PRD-build-burst-
 # unprivileged-user requirement 1) — their defaults key off which user's
 # home they land in, so they can't be pinned until $REMOTE_USER is known.
-# PRD-build-gate-on-casper requirement 4: reviewer credential placement.
-GATE_CRED_SRC="${BURST_CLAUDE_CRED_SRC:-$HOME/.claude/.credentials.json}"
+# PRD-build-reviewer-agent-auth-contract R9: placement no longer rsyncs
+# ~/.claude/.credentials.json byte-for-byte (that file is the dead fallback
+# this PRD exists for — burst-lane.sh pushing it meant the authorized
+# casper session for live-parity would fail its reviewer the exact same way
+# extend-gate.sh's own nested `claude -p` did before R1). Instead the token
+# is resolved LOCALLY (on RedBaron, before any ssh/rsync call) by the SAME
+# named order extend-gate.sh's resolve_reviewer_auth uses: (a) env
+# CLAUDE_CODE_OAUTH_TOKEN, (b) REVIEWER_AUTH_FILE parsed for
+# `CLAUDE_CODE_OAUTH_TOKEN=...`, (c) `systemctl --user show-environment`.
+# BURST_CLAUDE_CRED_SRC keeps working exactly as it did pre-this-PRD as an
+# override — just of the local environment.d-style file checked in step
+# (b) now, not of a raw credentials.json blob to copy verbatim.
+REVIEWER_AUTH_FILE="${BURST_CLAUDE_CRED_SRC:-${REVIEWER_AUTH_FILE:-$HOME/.config/environment.d/90-claude-oauth.conf}}"
+
+resolve_reviewer_cred() {  # sets reviewer_cred_token/source/checked_csv
+  local checked=() tok=""
+  reviewer_cred_token=""
+  reviewer_cred_source=""
+  checked+=("env")
+  if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
+    reviewer_cred_token="$CLAUDE_CODE_OAUTH_TOKEN"
+    reviewer_cred_source="env"
+    reviewer_cred_checked_csv="$(IFS=','; echo "${checked[*]}")"
+    return 0
+  fi
+  checked+=("environment.d:$REVIEWER_AUTH_FILE")
+  if [ -f "$REVIEWER_AUTH_FILE" ]; then
+    tok="$(sed -n 's/^CLAUDE_CODE_OAUTH_TOKEN=//p' "$REVIEWER_AUTH_FILE" 2>/dev/null | tail -n1)"
+    if [ -n "$tok" ]; then
+      reviewer_cred_token="$tok"
+      reviewer_cred_source="environment.d"
+      reviewer_cred_checked_csv="$(IFS=','; echo "${checked[*]}")"
+      return 0
+    fi
+  fi
+  checked+=("systemctl")
+  if command -v systemctl >/dev/null 2>&1; then
+    tok="$(systemctl --user show-environment 2>/dev/null | sed -n 's/^CLAUDE_CODE_OAUTH_TOKEN=//p' | tail -n1)"
+    if [ -n "$tok" ]; then
+      reviewer_cred_token="$tok"
+      reviewer_cred_source="systemctl"
+      reviewer_cred_checked_csv="$(IFS=','; echo "${checked[*]}")"
+      return 0
+    fi
+  fi
+  # None yielded a token: never fall through to the dead credentials.json
+  # fallback silently — reviewer_cred_token stays empty, place_gate_
+  # credential's caller treats this the same as "no file" (cred-absent).
+  reviewer_cred_checked_csv="$(IFS=','; echo "${checked[*]}")"
+  return 1
+}
 
 HCLOUD="${BURST_LANE_HCLOUD_BIN:-hcloud}"
 SSH_BIN="${BURST_LANE_SSH_BIN:-ssh}"
@@ -1136,7 +1185,13 @@ OLD_ROOT_REMOTE_ROOT="${BURST_LANE_OLD_ROOT_REMOTE_ROOT:-/root/build}"
 GATE_TOOLS_REMOTE_BIN_DIR="${BURST_LANE_GATE_TOOLS_REMOTE_BIN_DIR:-$GATE_TOOLS_REMOTE_BIN_DIR_DEFAULT}"
 # PRD-build-gate-on-casper requirement 4 / PRD-build-burst-unprivileged-user
 # requirement 5: reviewer credential placement, now under $REMOTE_HOME.
-GATE_CRED_REMOTE_PATH="${BURST_LANE_GATE_CRED_REMOTE_PATH:-$REMOTE_HOME/.claude/.credentials.json}"
+# PRD-build-reviewer-agent-auth-contract R9: the default moved off
+# .claude/.credentials.json to an environment.d-style path so the remote
+# extend-gate.sh's own resolve_reviewer_auth finds it unprompted via its R1
+# step (b) default ($HOME/.config/environment.d/90-claude-oauth.conf is the
+# same path on the remote box, same user) — no need to pass it an explicit
+# REVIEWER_AUTH_FILE override for the common case.
+GATE_CRED_REMOTE_PATH="${BURST_LANE_GATE_CRED_REMOTE_PATH:-$REMOTE_HOME/.config/environment.d/90-claude-oauth.conf}"
 REMOTE_SCCACHE_DIR="${BURST_LANE_REMOTE_SCCACHE_DIR:-$REMOTE_SCCACHE_DIR_DEFAULT}"
 
 # PRD-build-burst-path-deps requirement 5: the build user's OWN cargo home
@@ -2394,12 +2449,15 @@ prune_failed_gate_tool_logs() {
 }
 
 # ---- reviewer credential placement/shred (PRD-build-gate-on-casper --------
-# requirement 4) -------------------------------------------------------------
+# requirement 4, PRD-build-reviewer-agent-auth-contract R9) ------------------
 # Opt-in (BURST_GATE_REVIEWER=1 — the snapshot and every other box never
-# see this file otherwise): `up` pushes the operator's Claude OAuth
-# credential file to the box at $GATE_CRED_REMOTE_PATH, mode 0600, and
-# journals ONLY that it did so — never the file's own content or even its
-# byte count, which could leak a token length. `down`/`watchdog` call
+# see this file otherwise): `up` resolves the reviewer token locally (see
+# resolve_reviewer_cred above) and pushes ONLY that resolved token, as a
+# throwaway environment.d-style `CLAUDE_CODE_OAUTH_TOKEN=...` file, to the
+# box at $GATE_CRED_REMOTE_PATH, mode 0600 — never the source credentials
+# file itself, never as credentials.json. Journals ONLY that placement
+# happened and which source won — never the token's own content or even
+# its byte count, which could leak a token length. `down`/`watchdog` call
 # shred_gate_credential unconditionally (cheap, idempotent — `shred -u` on
 # a path that was never placed just fails silently and journals nothing);
 # the journal line is gated on the shred call's own exit code, so
@@ -2407,21 +2465,24 @@ prune_failed_gate_tool_logs() {
 # destroyed, with no separate "was it placed" state to keep in sync.
 place_gate_credential() {  # $1=ip
   [ "${BURST_GATE_REVIEWER:-0}" = "1" ] || return 0
-  local ip="$1"
-  if [ ! -f "$GATE_CRED_SRC" ]; then
-    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  up  cred-absent  (BURST_GATE_REVIEWER=1 but no credential file at $GATE_CRED_SRC — reviewer will not run)"
+  local ip="$1" tmp
+  if ! resolve_reviewer_cred; then
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  up  cred-absent  (BURST_GATE_REVIEWER=1 but no token resolved from $reviewer_cred_checked_csv — reviewer will not run)"
     return 0
   fi
+  tmp="$(mktemp)"
+  printf 'CLAUDE_CODE_OAUTH_TOKEN=%s\n' "$reviewer_cred_token" > "$tmp"
   "$SSH_BIN" $(ssh_kh_args) -o ConnectTimeout=8 -i "$SSH_KEY" "$REMOTE_USER@$ip" \
     "mkdir -p '$(dirname "$GATE_CRED_REMOTE_PATH")'" >/dev/null 2>&1 || true
   if "$RSYNC_BIN" -az -e "$SSH_BIN $(ssh_kh_args) -i $SSH_KEY" \
-       "$GATE_CRED_SRC" "$REMOTE_USER@$ip:$GATE_CRED_REMOTE_PATH" >/dev/null 2>&1; then
+       "$tmp" "$REMOTE_USER@$ip:$GATE_CRED_REMOTE_PATH" >/dev/null 2>&1; then
     "$SSH_BIN" $(ssh_kh_args) -o ConnectTimeout=8 -i "$SSH_KEY" "$REMOTE_USER@$ip" \
       "chmod 600 '$GATE_CRED_REMOTE_PATH'" >/dev/null 2>&1 || true
-    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  up  cred  placed  (host=$ip)"
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  up  cred  placed  (host=$ip source=$reviewer_cred_source)"
   else
     journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  up  cred-place-failed  (host=$ip — rsync push failed, reviewer will not run)"
   fi
+  shred -u -f "$tmp" >/dev/null 2>&1 || rm -f "$tmp"
 }
 
 shred_gate_credential() {  # $1=ip $2=caller(down|watchdog)
