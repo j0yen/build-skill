@@ -171,6 +171,39 @@ while IFS= read -r n; do
   esac
 done < <("$JQ" -r '.[]?' <<<"$deferred")
 
+# PRD-build-prd-superseded-by requirement 5: a `Superseded-by:`+
+# `transferred_acs:` predecessor's transferred ACs are a third valid state
+# alongside paired/deferred -- the p->s map lives on the successor's own
+# `Absorbs:` line (same cross-read verified-completed.sh's classification
+# now does), so it's read here too rather than trusted from this file's
+# own frontmatter alone.
+declare -A is_transferred=() transferred_target=()
+superseded_by="$("$JQ" -r --arg s "$slug" '.[] | select(.slug==$s) | .superseded_by // empty' <<<"$json")"
+transferred_raw="$("$JQ" -c --arg s "$slug" '.[] | select(.slug==$s) | .transferred_acs // []' <<<"$json")"
+[ -n "$transferred_raw" ] || transferred_raw="[]"
+if [ -n "$superseded_by" ] && [ "$transferred_raw" != "[]" ]; then
+  succ_dir=""
+  for d in "$prd_dir" "$prd_dir/../build-queue" "$prd_dir/../built-prds"; do
+    [ -f "$d/$superseded_by" ] && { succ_dir="$(cd "$d" && pwd)"; break; }
+  done
+  if [ -n "$succ_dir" ]; then
+    succ_json="$(PRD_DIR="$succ_dir" "$SCAN" 2>/dev/null)"
+    succ_slug="${superseded_by#PRD-}"; succ_slug="${succ_slug%.md}"
+    absorbs_map="$("$JQ" -c --arg s "$succ_slug" '.[] | select(.slug==$s) | .absorbs.map // []' <<<"$succ_json" 2>/dev/null)"
+    [ -n "$absorbs_map" ] || absorbs_map="[]"
+    while IFS=$'\t' read -r p s; do
+      [ -n "$p" ] || continue
+      transferred_target[$p]="$s"
+    done < <("$JQ" -r '.[]? | "\(.[0])\t\(.[1])"' <<<"$absorbs_map" 2>/dev/null)
+  fi
+  while IFS= read -r n; do
+    case "$n" in
+      ''|*[!0-9]*) continue ;;
+      *) [ -n "${transferred_target[$n]:-}" ] && is_transferred[$n]=1 ;;
+    esac
+  done < <("$JQ" -r '.[]?' <<<"$transferred_raw")
+fi
+
 while IFS=$'\t' read -r k v; do
   [ -n "$k" ] || continue
   reason_for[$k]="$v"
@@ -184,9 +217,12 @@ done < <("$JQ" -r 'to_entries[] | "\(.key)\t\(.value)"' <<<"$paired_merged" 2>/d
 paired_lines=()
 deferred_lines=()
 missing=()
+transferred_nums=()
 for ((i=1; i<=num_acs; i++)); do
   if [ -n "${paired_evidence[$i]:-}" ]; then
     paired_lines+=("  AC$i — paired with ${paired_evidence[$i]}")
+  elif [ -n "${is_transferred[$i]:-}" ]; then
+    transferred_nums+=("$i")
   elif [ -n "${is_deferred[$i]:-}" ]; then
     r="${reason_for[$i]:-}"
     [ -n "$r" ] || r="(no reason given)"
@@ -216,6 +252,21 @@ if [ "${#deferred_lines[@]}" -gt 0 ]; then
   done
 fi
 
+# PRD-build-prd-superseded-by AC8: one line, never a per-AC block like
+# Deferred above -- "Transferred: <n> ACs → PRD-<succ> [p→s, ...]", the
+# successor named WITHOUT its .md suffix (User story 3's own example).
+if [ "${#transferred_nums[@]}" -gt 0 ]; then
+  pairs=()
+  for n in "${transferred_nums[@]}"; do
+    pairs+=("${n}→${transferred_target[$n]}")
+  done
+  succ_display="${superseded_by%.md}"
+  joined="$(IFS=,; echo "${pairs[*]}")"
+  joined="${joined//,/, }"
+  echo
+  printf 'Transferred: %d ACs → %s [%s]\n' "${#transferred_nums[@]}" "$succ_display" "$joined"
+fi
+
 if [ -n "$inherited_blocks" ]; then
   echo
   echo "inherited_blocks=[${inherited_blocks//,/, }]"
@@ -226,13 +277,23 @@ fi
 # was resolvable (auto from build_into's last gate, above), independent of
 # whether inherited_blocks itself is empty (a plain `pass` ship still gets
 # `Receipts: verdict=pass inherited=0`).
-if [ -n "$verdict_val" ]; then
+if [ -n "$verdict_val" ] || [ "${#transferred_nums[@]}" -gt 0 ]; then
   n_inherited=0
   if [ -n "$inherited_blocks" ]; then
     n_inherited="$("$JQ" -rn --arg s "$inherited_blocks" '$s | split(",") | length')"
   fi
   echo
-  echo "Receipts: verdict=$verdict_val inherited=$n_inherited"
+  if [ -n "$verdict_val" ]; then
+    receipts_line="Receipts: verdict=$verdict_val inherited=$n_inherited"
+  else
+    receipts_line="Receipts:"
+  fi
+  # PRD-build-prd-superseded-by AC8: `Receipts:` carries `transferred=<n>`
+  # whenever this predecessor transferred any ACs, alongside (or, on a
+  # non-rust-extend PRD with no verdict at all, instead of) the existing
+  # verdict/inherited fields.
+  [ "${#transferred_nums[@]}" -gt 0 ] && receipts_line="$receipts_line transferred=${#transferred_nums[@]}"
+  echo "$receipts_line"
 fi
 
 exit 0
