@@ -155,6 +155,22 @@ second PRD. Stop reasons: `excluded-kernel-extend`,
 `continue: archive-incomplete` is not a stop — retry the `archive` action
 once more in the same dispatch. See history.md#in-tick-chaining.
 
+## 7a. Long-running commands (never wait on a background task)
+
+A Bash tool call that runs past ~120 s is auto-backgrounded by the harness,
+and in `claude -p` ending your turn ends the process — nothing "picks it
+back up". (2026-09-18 14:50Z build-reviewer-agent-auth-contract: 10m39s,
+last output "Waiting for the background selftest to finish — I'll pick this
+back up automatically", exit 0, no journal line, R9 left uncommitted.) So:
+run any selftest, gate or build that may exceed ~100 s with stdout/stderr
+redirected to a file under `state/logs/` (or `$TMPDIR`), started in the
+background from that same Bash call, and then poll it in separate Bash
+calls of at most 100 s each (`timeout 100 tail --pid=<pid> -f /dev/null;
+tail -n 20 <log>`), until it exits. Never write "I'll wait for the
+background task" as your last line; if the work cannot finish in this
+dispatch, commit what is done on the branch, write the manifest patch and
+the journal line, and stop with `needs-user` naming what is still running.
+
 ## 8. Journal line
 
 Append one line to `~/brain/journal/build/YYYY-MM-DD.md`:
