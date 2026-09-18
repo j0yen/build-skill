@@ -45,7 +45,11 @@
 #
 # Exit: whatever gate-launch.sh returns | 1 usage | 2 missing dependency |
 #   3 <build_into> not a resolvable git repo | 4 push_via_branch=true, no
-#   landing record, and reconstruction failed (no merged loop/<slug> PR)
+#   landing record, and reconstruction failed (no merged loop/<slug> PR) |
+#   5 the pinned-landing gate passed but main-health (PRD-build-diff-
+#     scoped-gate requirement 4, AC4) has a FRESH in-scope block for this
+#     repo — a landing that passed its own re-gate but broke something
+#     the continuously-scheduled main-health probe already caught.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
@@ -147,4 +151,35 @@ printf ' %q' "${launch_args[@]}"
 printf '\n'
 jlog "$slug" "launch ($(printf '%s ' "${launch_args[@]}"))"
 "$GATE_LAUNCH" "${launch_args[@]}"
-exit $?
+gate_rc=$?
+[ "$gate_rc" -eq 0 ] || exit "$gate_rc"
+
+# PRD-build-diff-scoped-gate requirement 4 (P0, AC4): the pinned-landing
+# gate above only re-runs history-infra AT THIS LANDING'S OWN SHA (branch-
+# gate-scope-artifacts territory); main-health (requirement 3/8) is a
+# SEPARATE, continuously-scheduled probe of the repo's actual current
+# state. Consulted here, additively, after the existing gate already
+# passed: a FRESH (age <= its own declared max_age_s) main-health record
+# naming an in-scope block refuses archive; everything else (no record
+# yet, a stale record, an inherited-only block, or jq/date failure) is "no
+# opinion" and falls through to the pre-existing exit 0 below — fail OPEN,
+# never fail-closed on absent data, because requirement 8's scheduler is a
+# separate, not-yet-landed step and a fail-closed read here would refuse
+# every archive fleet-wide today (no repo has main-health data yet).
+mh_file="$STATE_DIR/main-health/${repo_slug}.json"
+if [ -f "$mh_file" ] && mh_json="$(cat "$mh_file" 2>/dev/null)" && [ -n "$mh_json" ]; then
+  mh_ts="$(printf '%s' "$mh_json" | jq -r '.ts // empty' 2>/dev/null)"
+  mh_epoch="$(date -u -d "$mh_ts" +%s 2>/dev/null || true)"
+  if [ -n "$mh_epoch" ]; then
+    mh_age_s=$(( $(date -u +%s) - mh_epoch ))
+    mh_max_age_s="$(printf '%s' "$mh_json" | jq -r '.max_age_s // 21600' 2>/dev/null || echo 21600)"
+    if [ "$mh_age_s" -ge 0 ] && [ "$mh_age_s" -le "$mh_max_age_s" ]; then
+      mh_in_scope_n="$(printf '%s' "$mh_json" | jq -r '[.receipts[]? | select(.scope == "in-scope")] | length' 2>/dev/null || echo 0)"
+      if [ "${mh_in_scope_n:-0}" -gt 0 ]; then
+        jlog "$slug" "refused (main-health in-scope block: repo=$repo_slug sha=$(printf '%s' "$mh_json" | jq -r '.sha // "?"') age=${mh_age_s}s)"
+        die 5 "main-health for $repo_slug has $mh_in_scope_n in-scope block(s) (age=${mh_age_s}s, see $mh_file)"
+      fi
+    fi
+  fi
+fi
+exit 0

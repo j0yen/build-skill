@@ -3901,9 +3901,16 @@ if $main_health; then
   _mh_repo_slug="$(repo_slug_for_ci "$repo")"
   _mh_file="$STATE_DIR/main-health/${_mh_repo_slug}.json"
   mkdir -p "$(dirname "$_mh_file")" 2>/dev/null
+  # Technical Considerations: "declares max_age: 6h (PRD-build-state-
+  # freshness-contract)" -- that PRD has no shared lib to source yet, so
+  # this is a self-contained declaration a reader can act on today
+  # (archive-gate.sh's requirement 4 consumer does) without waiting on it;
+  # $MAIN_HEALTH_MAX_AGE_S lets that consumer's own selftests use a
+  # shorter window.
   jq -n --arg sha "$head_now" --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-        --arg verdict "$outcome" --argjson receipts "$attribution_for_cache" '
-    {sha: $sha, ts: $ts, verdict: $verdict, receipts: $receipts.blocks}
+        --arg verdict "$outcome" --argjson receipts "$attribution_for_cache" \
+        --argjson max_age_s "${MAIN_HEALTH_MAX_AGE_S:-21600}" '
+    {sha: $sha, ts: $ts, verdict: $verdict, receipts: $receipts.blocks, max_age_s: $max_age_s}
   ' > "$_mh_file" 2>/dev/null || true
 fi
 
