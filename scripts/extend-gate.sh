@@ -402,42 +402,59 @@ EOF
 # so "what does branch scope do to producer X" is one command, not a
 # read of this file's own comments (requirement 1/2/3/5's inline notes at
 # the rollback-plan, ci-checks, reviewer-agent, and land call sites).
+#
+# PRD-build-diff-scoped-gate requirement 1 (P0, AC1/AC3): the `class`
+# column is the producer-class table — `tree` (hermetic, keyed only by
+# the branch tree: risk-gate, intake, proof-receipt, vti-plan [assumed
+# tree per the PRD's open question — its inputs are the worktree], and
+# reviewer-agent) vs `history-infra` (reads repo history, tags, remote,
+# or box state: rollback-plan, ci-checks). `extended-receipts` is NOT a
+# single class — each of its 17 producers declares its own class in
+# extended-receipts.sh's producer list (cross-repo: rustbuild's
+# scripts/extended-receipts.sh, not this file); a producer with no
+# declaration there is `history-infra` by construction (fail safe: an
+# undeclared producer must never block a branch gate). `gate` and `land`
+# are not producers and carry no class. This column names the class but
+# does not yet change which receipts block --scope branch verdicts —
+# that is AC2/AC5, a later step.
 explain_scope() {
   cat <<'EOF'
-producer          branch-scope policy
-----------------  -----------------------------------------------------
-risk-gate         unchanged (runs identically at any scope, if scripts/audit.sh exists)
-intake            unchanged
-proof-receipt     unchanged (autobuilder loop --iteration 0 --trace)
-vti-plan          unchanged
-rollback-plan     a head-untagged block on THIS run's own fresh HEAD is
-                  post-classified scope-deferred (never blocking) — a
-                  branch HEAD never carries a release tag; any other
-                  block_reason still blocks. land re-runs this producer
-                  at --scope main before tagging.
-reviewer-agent    always runs at branch scope (the quota-guard skip that
-                  suppresses a doomed main-scope gate does not apply
-                  here — a branch's reviewer finding is wanted whether
-                  the branch passes or blocks); at --scope main,
-                  unchanged (skipped when any in-scope block exists).
-ci-checks         BRANCH_GATE_PUSH=1 (default): pushes the branch to
-                  origin under its own ref, waits up to
-                  CI_CHECKS_BRANCH_WAIT (default 900s) for a run to
-                  appear; run_count==0 after the wait -> scope-deferred
-                  (no-runs-on-ref). BRANCH_GATE_PUSH=0: never invoked,
-                  scope-deferred (push-disabled). A push failure ->
-                  scope-deferred (push-failed). Any OTHER outcome
-                  (a real run that failed/is pending) still blocks.
-                  land re-runs this producer at --scope main.
-extended-receipts unchanged (17 producers, run in parallel)
-gate              unchanged (autobuilder gate reads all receipts fresh
-                  off disk; a scope-deferred receipt was already
-                  rewritten to pass before this runs, so it never sees
-                  the deferral as a block)
-land              (not a gate producer) re-runs every scope-deferred
-                  producer named above at --scope main on the landed
-                  head before cutting a tag; a block there is a normal
-                  main-scope block (branch stays merged, main untagged).
+producer          class           branch-scope policy
+----------------  --------------  -----------------------------------------------------
+risk-gate         tree            unchanged (runs identically at any scope, if scripts/audit.sh exists)
+intake            tree            unchanged
+proof-receipt     tree            unchanged (autobuilder loop --iteration 0 --trace)
+vti-plan          tree            unchanged
+rollback-plan     history-infra   a head-untagged block on THIS run's own fresh HEAD is
+                                  post-classified scope-deferred (never blocking) — a
+                                  branch HEAD never carries a release tag; any other
+                                  block_reason still blocks. land re-runs this producer
+                                  at --scope main before tagging.
+reviewer-agent    tree            always runs at branch scope (the quota-guard skip that
+                                  suppresses a doomed main-scope gate does not apply
+                                  here — a branch's reviewer finding is wanted whether
+                                  the branch passes or blocks); at --scope main,
+                                  unchanged (skipped when any in-scope block exists).
+ci-checks         history-infra   BRANCH_GATE_PUSH=1 (default): pushes the branch to
+                                  origin under its own ref, waits up to
+                                  CI_CHECKS_BRANCH_WAIT (default 900s) for a run to
+                                  appear; run_count==0 after the wait -> scope-deferred
+                                  (no-runs-on-ref). BRANCH_GATE_PUSH=0: never invoked,
+                                  scope-deferred (push-disabled). A push failure ->
+                                  scope-deferred (push-failed). Any OTHER outcome
+                                  (a real run that failed/is pending) still blocks.
+                                  land re-runs this producer at --scope main.
+extended-receipts per-producer    unchanged (17 producers, run in parallel); each
+                                  declares its own class in extended-receipts.sh —
+                                  undeclared -> history-infra (fail safe)
+gate              n/a             unchanged (autobuilder gate reads all receipts fresh
+                                  off disk; a scope-deferred receipt was already
+                                  rewritten to pass before this runs, so it never sees
+                                  the deferral as a block)
+land              n/a             (not a gate producer) re-runs every scope-deferred
+                                  producer named above at --scope main on the landed
+                                  head before cutting a tag; a block there is a normal
+                                  main-scope block (branch stays merged, main untagged).
 EOF
 }
 
