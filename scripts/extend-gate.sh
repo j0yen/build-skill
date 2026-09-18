@@ -444,9 +444,16 @@ ci-checks         history-infra   BRANCH_GATE_PUSH=1 (default): pushes the branc
                                   scope-deferred (push-failed). Any OTHER outcome
                                   (a real run that failed/is pending) still blocks.
                                   land re-runs this producer at --scope main.
-extended-receipts per-producer    unchanged (17 producers, run in parallel); each
-                                  declares its own class in extended-receipts.sh —
-                                  undeclared -> history-infra (fail safe)
+extended-receipts per-producer    all 17 still run, in parallel, at any scope; each
+                                  producer's own receipt is stamped with the class it
+                                  declares in extended-receipts.sh (undeclared ->
+                                  history-infra, fail safe). At --scope branch, a
+                                  non-pass|skipped history-infra-class receipt is
+                                  rewritten to pass and reported not-run (never
+                                  blocking); a tree-class one still blocks. A
+                                  missing/unreadable receipt always blocks (never
+                                  deferred) — a producer writing nothing is an infra
+                                  problem, not a class-based defer.
 gate              n/a             unchanged (autobuilder gate reads all receipts fresh
                                   off disk; a scope-deferred receipt was already
                                   rewritten to pass before this runs, so it never sees
@@ -2862,8 +2869,64 @@ _phase_t0=$(date +%s)
 if ( run_unslotted_producer extended-receipts "$RUSTBUILD_SCRIPTS/extended-receipts.sh" "$project_abs" "$parallelism" ) 9>&-; then
   record_phase receipts $(( $(date +%s) - _phase_t0 )) ok
 else
-  note_block "extended-receipts — one or more extended producers did not pass|skip (see output above)"
-  record_phase receipts $(( $(date +%s) - _phase_t0 )) fail
+  # PRD-build-diff-scoped-gate requirement 1/2/3 (P0, AC1/AC2/AC3): extended-
+  # receipts.sh's own nonzero exit (we're in its `else`) mixes `tree` and
+  # `history-infra` producers into one bit -- exactly what this PRD splits.
+  # Re-read each of the 17 receipts extended-receipts.sh just wrote (each
+  # stamped with its own `.class`, cross-repo: rustbuild's
+  # scripts/extended-receipts.sh). At --scope branch: a history-infra-class
+  # block (or an undeclared producer -- extended-receipts.sh's own fail-safe
+  # default already wrote it as class=history-infra) is rewritten to pass ON
+  # DISK and reported "not-run" (AC2's own wording), same
+  # rewrite-then-note_defer shape the rollback-plan/ci-checks blocks above
+  # use (same `.scope_deferred = true | .class = "history-infra"` filter,
+  # so extend-gate-history-infra-class-selftest.sh's verbatim-string guard
+  # also covers this site), because `autobuilder gate` below reads receipts
+  # fresh off disk and has no other notion of "deferred"; a tree-class
+  # block is left exactly as extended-receipts.sh wrote it, so it still
+  # blocks. A missing/unreadable receipt is never deferred at any scope --
+  # matches extended-receipts.sh's own "no-receipt" always counting as its
+  # `fail=1` (a producer that wrote nothing is an infra problem, not a
+  # class-based defer). At --scope main nothing here defers anything
+  # (Non-goals: main-scope semantics untouched) -- every receipt is read as
+  # extended-receipts.sh wrote it.
+  _extended_producers="supply-audit license-audit secrets-scan sbom msrv-verify binary-size semver-check cli-surface schema-compat ac-traceability flake-audit hermetic-build determinism cold-build-time bench-delta mutation-kill experiment"
+  _extended_block=false
+  for _ep in $_extended_producers; do
+    _ep_receipt="$project_abs/target/autobuilder/receipts/$_ep-receipt.json"
+    if [ ! -f "$_ep_receipt" ] || ! jq -e . "$_ep_receipt" >/dev/null 2>&1; then
+      _extended_block=true
+      continue
+    fi
+    _ep_verdict="$(jq -r '.verdict // empty' "$_ep_receipt" 2>/dev/null)"
+    case "$_ep_verdict" in pass|skipped) continue ;; esac
+    if [ "$scope" = branch ]; then
+      _ep_class="$(jq -r '.class // "history-infra"' "$_ep_receipt" 2>/dev/null)"
+      if [ "$_ep_class" != "tree" ]; then
+        _ep_declared=yes
+        jq -e 'has("class")' "$_ep_receipt" >/dev/null 2>&1 || _ep_declared=no
+        _tmp_ep="$(mktemp "${TMPDIR:-/tmp}/extend-gate-extreceipt-defer.XXXXXX")"
+        if jq '.verdict = "pass" | .scope_deferred = true | .class = "history-infra"' "$_ep_receipt" > "$_tmp_ep" 2>/dev/null; then
+          mv "$_tmp_ep" "$_ep_receipt"
+        else
+          rm -f "$_tmp_ep" 2>/dev/null || true
+        fi
+        if [ "$_ep_declared" = yes ]; then
+          note_defer "$_ep — not-run class=history-infra — reads history/registry/box state, not just the branch tree; land re-runs this at main scope"
+        else
+          note_defer "$_ep — not-run class=history-infra (undeclared) — no class declaration in extended-receipts.sh; branch scope never blocks on an undeclared producer"
+        fi
+        continue
+      fi
+    fi
+    _extended_block=true
+  done
+  if $_extended_block; then
+    note_block "extended-receipts — one or more tree-class extended producers did not pass|skip (see output above)"
+    record_phase receipts $(( $(date +%s) - _phase_t0 )) fail
+  else
+    record_phase receipts $(( $(date +%s) - _phase_t0 )) defer
+  fi
 fi
 
 # PRD-build-burst-canary-live-parity R6: session-trace is one of the 17
