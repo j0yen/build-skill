@@ -73,6 +73,13 @@ export LANDING_RESUME_BRANCH_PROTECTION="$ROOT/fake-bp.sh"
 export LANDING_RESUME_ALERT_DELIVER="$ROOT/fake-alert-deliver.sh"
 export LANDING_RESUME_DECISIONS="$ROOT/fake-decisions.sh"
 export LANDING_RESUME_JOURNAL="$ROOT/journal.md"
+# reconcile_main_after_pr_merge (lib/push-via-branch.sh) journals via the
+# shared journal_line() (lib/journal.sh), which does not know the
+# LANDING_RESUME_JOURNAL name above -- route it into the fixture root too
+# so its "main-diverged-trees" line lands somewhere assertable instead of
+# being silently refused as fixture-shaped content aimed at the real
+# $HOME/brain journal (journal_line's own production tripwire).
+export BUILD_JOURNAL_ROOT="$ROOT/journal-root"
 
 # =========================================================================
 # Scenario 1 (AC8) — merged + sync ok -> last_step cleared, record
@@ -102,21 +109,37 @@ prpath_expect "AC8: sidecar last_step cleared" \
 prpath_expect "AC8: journal has landing-resolved" "grep -q landing-resolved \"$LANDING_RESUME_JOURNAL\""
 
 # =========================================================================
-# Scenario 2 (AC8) — merged, but sync refused -> exit 2, no sidecar
-# mutation beyond what already existed (last_step untouched).
+# Scenario 2 (AC8) — merged, but reconcile_main_after_pr_merge finds the
+# trees genuinely diverged -> exit 2, no sidecar mutation beyond what
+# already existed (last_step untouched).
+#
+# reconcile_main_after_pr_merge (lib/push-via-branch.sh) inspects REAL git
+# state now, not a mocked `branch-protection.sh sync` exit code -- give
+# $REPO's local main a commit that never reached origin/main so the trees
+# genuinely differ (the function's own header: "a genuinely different
+# landing interleaved, or a not-yet-fetched sibling"), which is what
+# should defer a resume.
 # =========================================================================
-echo "=== Scenario 2: merged, sync refused ==="
+echo "=== Scenario 2: merged, trees genuinely diverged ==="
 export BUILD_STATE_DIR="$ROOT/state2"; mkdir -p "$BUILD_STATE_DIR"
 mk_landing_record "$BUILD_STATE_DIR" "$REPO_SLUG" "$SLUG" "2026-09-16T22:00:00Z"
 "$PRPATH_SCRIPTS/manifest-sidecar.sh" write "$SLUG" "status=in_progress" "last_step=landing-pending" >/dev/null
 
+(
+  cd "$REPO"
+  echo "local-only, never pushed" > diverge-ac8.txt
+  git add diverge-ac8.txt
+  git commit -qm "local-only divergence (not on origin) — fixture for AC8 Scenario 2"
+)
+
 FAKE_BP_LANDING_CHECK_OUT="merged cafef00dcafef00dcafef00dcafef00dcafef00d" FAKE_BP_LANDING_CHECK_RC=0 \
-  FAKE_BP_SYNC_OUT="branch-protection: refused" FAKE_BP_SYNC_RC=6 \
   run_lr >/dev/null
 rc2=$?
-prpath_expect "AC8: merged+sync-refused exits 2" "[ $rc2 -eq 2 ]"
-prpath_expect "AC8: landing record survives a sync refusal" "[ -f \"$BUILD_STATE_DIR/landings/$REPO_SLUG/$SLUG.json\" ]"
+prpath_expect "AC8: merged+trees-diverged exits 2" "[ $rc2 -eq 2 ]"
+prpath_expect "AC8: landing record survives a diverged reconcile" "[ -f \"$BUILD_STATE_DIR/landings/$REPO_SLUG/$SLUG.json\" ]"
 prpath_expect "AC8: journal has landing-sync-deferred" "grep -q landing-sync-deferred \"$LANDING_RESUME_JOURNAL\""
+reconcile_journal="$BUILD_JOURNAL_ROOT/$(date -u +%F).md"
+prpath_expect "AC8: reconcile journal has main-diverged-trees" "grep -q main-diverged-trees \"$reconcile_journal\""
 
 # =========================================================================
 # Scenario 3 (AC8) — pending, under the bound -> exit 3, one journal

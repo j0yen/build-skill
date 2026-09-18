@@ -39,10 +39,11 @@
 #   0  merged + sync ok — `last_step` cleared, synced sha printed on
 #      stdout. Caller resumes the ordinary post-land steps from here.
 #   1  usage error
-#   2  merged, but `sync` refused or failed (tree-diff / dirty /
-#      not-on-main / infra) — `last_step=landing-pending` is left AS IS
-#      for a retry next tick (this PRD's non-goals exclude auto-merging
-#      a diverged tree; `sync`'s own journal line already names why).
+#   2  merged, but `reconcile_main_after_pr_merge` found the trees
+#      genuinely diverged (or hit an infra failure — fetch/git) —
+#      `last_step=landing-pending` is left AS IS for a retry next tick
+#      (this PRD's non-goals exclude auto-merging a diverged tree;
+#      reconcile_main_after_pr_merge's own journal line already names why).
 #   3  pending, under the bound — no state change, journaled.
 #   4  pending, at/over the bound — PRD `blocked`,
 #      `last_error=pr-checks-timeout`, a decision opened naming the PR.
@@ -130,10 +131,17 @@ check_rc=$?
 case "$check_rc" in
   0)
     merged_sha="$(printf '%s' "$check_out" | awk '{print $2}')"
-    sync_out="$("$BRANCH_PROTECTION" sync "$repo" 2>&1)"
-    sync_rc=$?
-    echo "$sync_out" >&2
-    if [ "$sync_rc" -eq 0 ]; then
+    # DEFECT (observed twice 2026-09-18): `branch-protection.sh sync`
+    # alone left local main carrying the pre-squash merge commit(s) even
+    # when `origin/main`'s squash sha has the SAME tree -- this is the
+    # confirmed-merge hook point (landing-check just returned `merged`),
+    # so reconcile local main against the squash the same way, but with a
+    # named backup ref and a divergence check `sync` itself does not make
+    # (see reconcile_main_after_pr_merge's own header, lib/push-via-branch.sh).
+    reconcile_out="$(reconcile_main_after_pr_merge "$repo" "$slug" 2>&1)"
+    reconcile_rc=$?
+    echo "$reconcile_out" >&2
+    if [ "$reconcile_rc" -eq 0 ]; then
       [ -x "$SIDECAR" ] && "$SIDECAR" write "$slug" "last_step=" \
         "outcome=landing-synced merged=$merged_sha" >&2 || true
       rm -f "$record"
@@ -141,13 +149,13 @@ case "$check_rc" in
       printf '%s\n' "$merged_sha"
       exit 0
     fi
-    # sync refused/failed (exit 6 refused, or any other infra rc) — its
-    # OWN main-sync-refused/journal line already explains why (cmd_sync
-    # journals that itself); `last_step` is left untouched so the next
-    # tick's resume tries `sync` again (requirement: "this PRD does not
-    # attempt to merge" a genuinely diverged tree — Technical
-    # considerations, "Squash sha vs local sha").
-    jlog "landing-sync-deferred merged=$merged_sha rc=$sync_rc"
+    # reconcile refused/failed (exit 2 trees-diverged, or exit 1 infra) —
+    # its OWN main-diverged-trees/journal line already explains why
+    # (reconcile_main_after_pr_merge journals that itself); `last_step` is
+    # left untouched so the next tick's resume tries again (requirement:
+    # "this PRD does not attempt to merge" a genuinely diverged tree —
+    # Technical considerations, "Squash sha vs local sha").
+    jlog "landing-sync-deferred merged=$merged_sha rc=$reconcile_rc"
     exit 2
     ;;
   3)
