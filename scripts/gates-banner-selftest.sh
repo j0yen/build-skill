@@ -108,9 +108,14 @@ if [ -x "$HH" ]; then
   D="$T/ac11"; mkdir -p "$D/state"
   printf '2026-09-16T15:00:00Z GATES(3h): green=1 red=2 blockers: x x1 oldest-red=2026-09-16T10:00:00Z red_slugs: a b\n' \
     > "$D/state/gate-red.summary"
-  out11="$(BUILD_STATE_DIR="$D/state" "$HH")"
-  expect "AC11 prints the summary line without the write-ts" \
-    "[ \"\$out11\" = 'GATES(3h): green=1 red=2 blockers: x x1 oldest-red=2026-09-16T10:00:00Z red_slugs: a b' ]"
+  # PRD-build-gate-red-render-age: handoff-header.sh now appends a
+  # trailing age/STALE note (lib/gate-red-age.sh) so a handoff read hours
+  # later can't mistake a resolved gate-red for a current one -- pin
+  # GATE_RED_NOW 5 minutes after the fixture's write-ts so the note is
+  # deterministic instead of drifting with wall-clock test-run time.
+  out11="$(BUILD_STATE_DIR="$D/state" GATE_RED_NOW="$(date -u -d '2026-09-16T15:05:00Z' +%s)" "$HH")"
+  expect "AC11 prints the summary line without the write-ts, plus the age note" \
+    "[ \"\$out11\" = 'GATES(3h): green=1 red=2 blockers: x x1 oldest-red=2026-09-16T10:00:00Z red_slugs: a b  [age 5m]' ]"
   out11_empty="$(BUILD_STATE_DIR="$T/ac11-nofile" "$HH")"
   rc11_empty=$?
   expect "AC11 exit 0 with no summary file yet" "[ $rc11_empty -eq 0 ]"

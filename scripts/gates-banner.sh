@@ -31,6 +31,16 @@
 #   GATES_BANNER_CACHE          override ~/.cache/gate-red.summary path
 #   GATES_BANNER_CACHE_TTL      cache freshness window, seconds (default: 600)
 #   GATES_BANNER_SSH_BIN        override the `ssh` binary (fake ssh in tests)
+#   GATES_BANNER_NO_AGE         set (any value) to suppress the age/STALE
+#                                suffix and STALE line below — for a
+#                                machine caller (day-ledger.sh) that parses
+#                                this script's own summary line back apart
+#                                (green=/red=/red_slugs:) and would have
+#                                the age note's tokens land in its
+#                                red_slugs split otherwise.
+#
+# gate-red-age.sh's note/threshold env (GATE_RED_NOW, GATE_RED_STALE_AFTER_S)
+# apply here too -- see lib/gate-red-age.sh.
 #
 # Exit: always 0.
 set -uo pipefail
@@ -39,6 +49,8 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SKILL_DIR="$(cd "$HERE/.." && pwd)"
 STATE_DIR="${BUILD_STATE_DIR:-$SKILL_DIR/state}"
 SUMMARY_FILE="${GATE_RED_SUMMARY_FILE:-$STATE_DIR/gate-red.summary}"
+# shellcheck source=lib/gate-red-age.sh
+source "$HERE/lib/gate-red-age.sh"
 
 HOSTNAME_VAL="${GATES_BANNER_HOSTNAME:-$(hostname 2>/dev/null || echo unknown)}"
 REDBARON_HOST="${GATES_BANNER_REDBARON_HOST:-redbaron}"
@@ -63,11 +75,15 @@ cache_fresh() {
 
 summary_line=""
 shipped_n=""
+age_file=""
 
 landing_pending_lines=""
 
 if is_redbaron "$HOSTNAME_VAL"; then
-  [ -r "$SUMMARY_FILE" ] && summary_line="$(sed -n '1p' "$SUMMARY_FILE" | cut -d' ' -f2-)"
+  if [ -r "$SUMMARY_FILE" ]; then
+    summary_line="$(sed -n '1p' "$SUMMARY_FILE" | cut -d' ' -f2-)"
+    age_file="$SUMMARY_FILE"
+  fi
   shipped_n="$("$HERE/shipped-count.sh" 2>/dev/null || echo 0)"
   # PRD-build-main-push-gate-pr-path requirement 9 (P1, AC12): the
   # landing-pending data only exists as real state ON the machine that
@@ -80,6 +96,7 @@ else
   if cache_fresh; then
     summary_line="$(sed -n '1p' "$CACHE_FILE" 2>/dev/null | cut -d' ' -f2-)"
     shipped_n="$(sed -n '2p' "$CACHE_FILE" 2>/dev/null)"
+    age_file="$CACHE_FILE"
   else
     tmp="$(mktemp "${TMPDIR:-/tmp}/gates-banner-remote.XXXXXX")"
     remote_cmd="cat \$HOME/.claude/skills/build/state/gate-red.summary 2>/dev/null; echo; \$HOME/$SHIPPED_SCRIPT_REL 2>/dev/null || echo 0"
@@ -96,6 +113,7 @@ else
           printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$summary_line"
           printf '%s\n' "${shipped_n:-0}"
         } > "$CACHE_FILE" 2>/dev/null || true
+        age_file="$CACHE_FILE"
       fi
     fi
     rm -f "$tmp"
@@ -107,7 +125,17 @@ if [ -z "$summary_line" ]; then
   exit 0
 fi
 
-echo "$summary_line"
+if [ -n "${GATES_BANNER_NO_AGE:-}" ]; then
+  echo "$summary_line"
+else
+  age_note="$(gate_red_age_note "$age_file")"
+  echo "${summary_line}  [${age_note}]"
+  if gate_red_is_stale "$age_file"; then
+    written_ts="$(gate_red_written_ts "$age_file")"
+    [ -n "$written_ts" ] || written_ts="unknown"
+    echo "STALE gate-red state: written ${written_ts}, ${age_note} — do not report these counts as current"
+  fi
+fi
 echo "PRDs shipped last 24h: ${shipped_n:-0}"
 red_n="$(printf '%s' "$summary_line" | grep -oE 'red=[0-9]+' | head -1 | cut -d= -f2)"
 if [ -n "$red_n" ] && [ "$red_n" -gt 0 ] 2>/dev/null; then

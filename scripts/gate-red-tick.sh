@@ -17,7 +17,13 @@
 #   3. Track the persistent-red escalation streak in
 #      state/gate-red.streak (R4): consecutive ticks with red>0 AND an
 #      unchanged red-slug set. At streak 3 and every 6 after, journal
-#      `ALARM gate-red-persistent ticks=<n> slugs=<csv>`.
+#      `ALARM gate-red-persistent ticks=<n> slugs=<csv> summary_age=<n>s`
+#      (PRD-build-gate-red-render-age: summary_age is this tick's own
+#      gate-red.json age at write time via lib/gate-red-age.sh, normally
+#      ~0s -- a non-zero value here means the write itself raced/fell
+#      back to mtime). The `gate-red-tick resolved summary_age=<n>s`
+#      journal line on the red>0 -> red==0 transition below carries the
+#      same field.
 #   4. Alarm delivery (R3):
 #      - red==0 and the previous run had red>0 -> alert-deliver.sh
 #        resolve gate-red build-loop.
@@ -63,6 +69,8 @@ EVIDENCE_FILE="${GATE_RED_EVIDENCE_FILE:-$STATE_DIR/gate-red.evidence}"
 source "$HERE/lib/journal.sh"
 # shellcheck source=lib/alert-marker.sh
 source "$HERE/lib/alert-marker.sh"
+# shellcheck source=lib/gate-red-age.sh
+source "$HERE/lib/gate-red-age.sh"
 
 # GATE_RED_TICK_JOURNAL pins the exact file this script's own journal_line
 # calls append to — set by select-tick.sh to its own $JOURNAL so the
@@ -94,6 +102,12 @@ if [ "$grs_rc" -ne 0 ]; then
   journal_line --file "$GRT_JOURNAL" "$now_ts  gate-red-tick  summary-failed  rc=$grs_rc"
   exit 0
 fi
+
+# PRD-build-gate-red-render-age: how old the state THIS tick just wrote
+# is, at the moment of writing -- normally ~0s, but keeps ALARM/resolve
+# journal lines honest if $JSON_FILE's write raced or fell back to a
+# stale mtime (lib/gate-red-age.sh handles both).
+summary_age_s="$(gate_red_age_s "$JSON_FILE")"
 
 red="$("$JQ" -r '.red // 0' "$JSON_FILE" 2>/dev/null || echo 0)"
 green="$("$JQ" -r '.green // 0' "$JSON_FILE" 2>/dev/null || echo 0)"
@@ -127,7 +141,7 @@ if [ "$red" -gt 0 ]; then
   if [ "$streak" -ge 3 ] && [ $(( (streak - 3) % 6 )) -eq 0 ]; then
     escalate_now=true
     slug_names_csv="$("$JQ" -r '. | join(",")' <<<"$slugs_sorted" 2>/dev/null)"
-    journal_line --file "$GRT_JOURNAL" "$now_ts  ALARM  gate-red-persistent  ticks=$streak slugs=${slug_names_csv}"
+    journal_line --file "$GRT_JOURNAL" "$now_ts  ALARM  gate-red-persistent  ticks=$streak slugs=${slug_names_csv} summary_age=${summary_age_s}s"
   fi
 else
   rm -f "$STREAK_FILE" 2>/dev/null || true
@@ -136,8 +150,11 @@ fi
 # ---- 4. alarm delivery / resolve (R3) ----
 if [ "$red" -eq 0 ]; then
   if [ "$prev_red" -gt 0 ]; then
-    "$ALERT_DELIVER" resolve gate-red build-loop >/dev/null 2>&1 || \
+    if "$ALERT_DELIVER" resolve gate-red build-loop >/dev/null 2>&1; then
+      journal_line --file "$GRT_JOURNAL" "$now_ts  gate-red-tick  resolved  summary_age=${summary_age_s}s"
+    else
       journal_line --file "$GRT_JOURNAL" "$now_ts  gate-red-tick  resolve-failed  rc=$?"
+    fi
   fi
   exit 0
 fi

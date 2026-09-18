@@ -81,8 +81,8 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SKILL_DIR="$(cd "$HERE/.." && pwd)"
 export BUILD_STATE_DIR="${BUILD_STATE_DIR:-$SKILL_DIR/state}"
 STATE_DIR="$BUILD_STATE_DIR"
-SUMMARY_FILE="${GATE_RED_SUMMARY_FILE:-$STATE_DIR/gate-red.summary}"
-JSON_FILE="${GATE_RED_JSON_FILE:-$STATE_DIR/gate-red.json}"
+SUMMARY_FILE="${GATE_RED_SUMMARY_FILE:-$STATE_DIR/gate-red.summary}"  # lint:gate-red-not-rendered -- producer: writes fresh state at write_ts, always current at write time
+JSON_FILE="${GATE_RED_JSON_FILE:-$STATE_DIR/gate-red.json}"  # lint:gate-red-not-rendered -- producer: writes fresh state at write_ts, always current at write time
 JQ="${JQ:-jq}"
 
 # shellcheck source=lib/journal.sh
@@ -404,11 +404,11 @@ write_ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
 mkdir -p "$STATE_DIR"
 
-tmp_summary="$(mktemp "$STATE_DIR/.gate-red.summary.XXXXXX")"
+tmp_summary="$(mktemp "$STATE_DIR/.gate-red.summary.XXXXXX")"  # lint:gate-red-not-rendered -- producer: writes fresh state at write_ts, always current at write time
 printf '%s %s\n' "$write_ts" "$summary_line" > "$tmp_summary"
 mv -f "$tmp_summary" "$SUMMARY_FILE"
 
-tmp_json="$(mktemp "$STATE_DIR/.gate-red.json.XXXXXX")"
+tmp_json="$(mktemp "$STATE_DIR/.gate-red.json.XXXXXX")"  # lint:gate-red-not-rendered -- producer: writes fresh state at write_ts, always current at write time
 "$JQ" -n \
   --arg ts "$write_ts" \
   --argjson window_h "$window_h" \

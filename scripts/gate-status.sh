@@ -62,7 +62,7 @@ SYSTEMCTL="${GATE_STATUS_SYSTEMCTL:-systemctl}"
 JQ="${JQ:-jq}"
 
 if [ "${1:-}" = "--red" ]; then
-  json_file="${GATE_RED_JSON_FILE:-$STATE_DIR/gate-red.json}"
+  json_file="${GATE_RED_JSON_FILE:-$STATE_DIR/gate-red.json}"  # lint:gate-red-not-rendered -- --red is a verbatim JSON passthrough for scripts/jq, never a human-rendered line
   if [ -r "$json_file" ]; then
     cat "$json_file"
   else

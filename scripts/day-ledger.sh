@@ -188,10 +188,17 @@ gates_sha=""
 {
   banner_out=""
   gbanner="${DAY_LEDGER_GATES_BANNER_BIN:-$HERE/gates-banner.sh}"
+  # Machine ledger record (day-ledger.json), not a human-facing render:
+  # parses green=/red=/red_slugs: back out of gates-banner.sh's summary
+  # line below, so GATES_BANNER_NO_AGE=1 keeps its PRD-build-gate-red-
+  # render-age age note out of that split (the note's tokens would
+  # otherwise land inside gates_red_slugs_json).
+  gate_summary_path="${GATE_RED_SUMMARY_FILE:-$PROD_SKILL_DIR/state/gate-red.summary}"  # lint:gate-red-not-rendered -- machine ledger, never rendered to a human as current gate state
   if [ -x "$gbanner" ]; then
     banner_out="$(env -u BUILD_STATE_DIR \
       GATES_BANNER_HOSTNAME="${GATES_BANNER_HOSTNAME:-redbaron}" \
-      GATE_RED_SUMMARY_FILE="${GATE_RED_SUMMARY_FILE:-$PROD_SKILL_DIR/state/gate-red.summary}" \
+      GATE_RED_SUMMARY_FILE="$gate_summary_path" \
+      GATES_BANNER_NO_AGE=1 \
       "$gbanner" 2>/dev/null || true)"
   fi
   gates_sha="$(sha_of "$banner_out")"
