@@ -72,14 +72,30 @@
 #         inherited debt just because nobody wired its inputs yet. Such a
 #         block also carries `"attribution":"unknown-inputs"` and the
 #         summary line below gains an `attribution=unknown-inputs` token.
+#       - ...UNLESS that same receipt is NAMED IN THE COMMITTED BASELINE
+#         (`HEAD:agent/gate-baseline.json`), in which case it is
+#         `inherited` and tagged `"attribution":"baseline-witness"` (AC11).
+#         The baseline is the operator's own hand-written witness that this
+#         receipt was ALREADY blocking at the recorded head — i.e. before
+#         this branch existed — so it is exactly the evidence the
+#         fail-closed rule is missing. Fail-closed only applies where there
+#         is no evidence; here there is. This rescue is deliberately narrow:
+#         it fires ONLY on the unknown-inputs path, never on a finding with
+#         a path/test token and never on one attributed by commit range, so
+#         it can never turn a real in-scope defect into inherited debt.
+#         Reading is committed-only (`git show HEAD:...`, the same read
+#         gate-delta.sh's legacy path does) — an uncommitted working-tree
+#         baseline is not a witness. A missing, unreadable, or invalid
+#         baseline is simply no witness: behaviour falls back to the plain
+#         unknown-inputs rule above.
 #
 #     Prints ONE line of JSON to stdout:
 #       {"blocks":[{"receipt":"...","finding":"...","path":"...",
 #                   "scope":"in-scope"|"inherited"
-#                   [,"attribution":"unknown-inputs"|"commit-range"]
+#                   [,"attribution":"unknown-inputs"|"commit-range"|"baseline-witness"]
 #                   [,"commits":"<sha>,<sha>"]}, ...],
 #        "in_scope":<N>, "inherited":<M>, "unknown_inputs":<K>,
-#        "commit_range":<R>}
+#        "commit_range":<R>, "baseline_witness":<W>}
 #     and a human summary to stderr: "gate-attribution: inherited=M in-scope=N"
 #     (the exact token order extend-gate.sh's journal gate line reuses,
 #     AC1: "the journal gate line reads inherited=1 in-scope=1"), with an
@@ -98,7 +114,7 @@ set -uo pipefail
 die() { echo "gate-attribution: $*" >&2; exit "${2:-2}"; }
 
 usage() {
-  echo "usage: gate-attribution.sh compute <repo> <diff_base> <diff_head> <notes-file> [--producer-inputs <spec>]" >&2
+  echo "usage: gate-attribution.sh compute <repo> <diff_base> <diff_head> <notes-file> [--producer-inputs <spec>] [--baseline <file>]" >&2
   exit 2
 }
 
@@ -106,10 +122,14 @@ cmd_compute() {
   local repo="${1:-}" base="${2:-}" head="${3:-}" notes_file="${4:-}"
   [ -n "$repo" ] && [ -n "$base" ] && [ -n "$head" ] && [ -n "$notes_file" ] || usage
   shift 4
-  local producer_inputs=""
+  local producer_inputs="" baseline_override=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --producer-inputs) producer_inputs="${2:-}"; shift 2 ;;
+      # AC11: test/caller override for the committed-baseline read below.
+      # Unset in production — extend-gate.sh passes nothing and the
+      # committed HEAD copy is used, which is the only real witness.
+      --baseline) baseline_override="${2:-}"; shift 2 ;;
       *) shift ;;
     esac
   done
@@ -121,11 +141,38 @@ cmd_compute() {
   diff_file="$(mktemp "${TMPDIR:-/tmp}/gate-attribution-diff.XXXXXX")"
   git -C "$repo" diff --name-only "${base}..${head}" > "$diff_file" 2>/dev/null || true
 
-  python3 - "$notes_file" "$producer_inputs" "$diff_file" "$repo" "$base" <<'PY'
+  # AC11: the operator-written witness. Read the COMMITTED copy only (same
+  # read gate-delta.sh's legacy path performs) — a working-tree edit is not
+  # a witness to anything. Any failure leaves the file empty, which the
+  # python block treats as "no baseline" and falls back to fail-closed.
+  local baseline_file
+  baseline_file="$(mktemp "${TMPDIR:-/tmp}/gate-attribution-baseline.XXXXXX")"
+  if [ -n "$baseline_override" ]; then
+    cat "$baseline_override" > "$baseline_file" 2>/dev/null || : > "$baseline_file"
+  else
+    git -C "$repo" show HEAD:agent/gate-baseline.json > "$baseline_file" 2>/dev/null \
+      || : > "$baseline_file"
+  fi
+
+  python3 - "$notes_file" "$producer_inputs" "$diff_file" "$repo" "$base" "$baseline_file" <<'PY'
 import json, re, subprocess, sys
 
 notes_file, producer_inputs_spec, diff_file = sys.argv[1], sys.argv[2], sys.argv[3]
-repo, diff_base = sys.argv[4], sys.argv[5]
+repo, diff_base, baseline_file = sys.argv[4], sys.argv[5], sys.argv[6]
+
+# AC11: names the operator hand-recorded as already blocking. Empty set on
+# any read/parse failure -> no witness -> the fail-closed rule stands.
+baseline_names = set()
+try:
+    with open(baseline_file) as fh:
+        _bl = json.load(fh)
+    for _entry in (_bl.get("receipts") or []):
+        if isinstance(_entry, dict) and _entry.get("name"):
+            baseline_names.add(_entry["name"])
+        elif isinstance(_entry, str) and _entry:
+            baseline_names.add(_entry)
+except Exception:
+    baseline_names = set()
 with open(diff_file) as fh:
     diff_files = set(l.strip() for l in fh if l.strip())
 
@@ -180,6 +227,7 @@ in_scope = 0
 inherited = 0
 unknown_inputs = 0
 commit_range = 0
+baseline_witness = 0
 
 with open(notes_file) as fh:
     for line in fh:
@@ -193,6 +241,7 @@ with open(notes_file) as fh:
         cm = commits_re.search(note)
         m = path_re.search(note) or test_re.search(note)
         unknown = False
+        witnessed = False
         by_commit_range = False
         commits_field = ""
         if cm:
@@ -218,8 +267,16 @@ with open(notes_file) as fh:
             # simply weren't touched (still legitimately inherited).
             inputs = producer_inputs.get(receipt)
             if not inputs:
-                scope = "in-scope"
-                unknown = True
+                # AC11: fail-closed only where there is NO evidence. A
+                # receipt the operator already recorded in the committed
+                # baseline HAS evidence: it was blocking at the recorded
+                # head, before this branch existed. Witness beats guess.
+                if receipt in baseline_names:
+                    scope = "inherited"
+                    witnessed = True
+                else:
+                    scope = "in-scope"
+                    unknown = True
             else:
                 touched = any(f in diff_files for f in inputs)
                 scope = "in-scope" if touched else "inherited"
@@ -229,6 +286,9 @@ with open(notes_file) as fh:
         if unknown:
             block["attribution"] = "unknown-inputs"
             unknown_inputs += 1
+        if witnessed:
+            block["attribution"] = "baseline-witness"
+            baseline_witness += 1
         if by_commit_range:
             block["attribution"] = "commit-range"
             block["commits"] = commits_field
@@ -240,16 +300,19 @@ with open(notes_file) as fh:
             inherited += 1
 
 print(json.dumps({"blocks": blocks, "in_scope": in_scope, "inherited": inherited,
-                  "unknown_inputs": unknown_inputs, "commit_range": commit_range}))
+                  "unknown_inputs": unknown_inputs, "commit_range": commit_range,
+                  "baseline_witness": baseline_witness}))
 summary = f"gate-attribution: inherited={inherited} in-scope={in_scope}"
 if unknown_inputs:
     summary += " attribution=unknown-inputs"
 if commit_range:
     summary += " attribution=commit-range"
+if baseline_witness:
+    summary += " attribution=baseline-witness"
 print(summary, file=sys.stderr)
 PY
   local py_rc=$?
-  rm -f "$diff_file"
+  rm -f "$diff_file" "$baseline_file"
   return "$py_rc"
 }
 

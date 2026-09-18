@@ -2665,6 +2665,7 @@ attribution_json=""
 attribution_inherited=0
 attribution_in_scope=0
 attribution_unknown_inputs=0
+attribution_baseline_witness=0
 # Which rule chose attr_diff_base below. Only ever set to a non-empty value
 # by the --pinned-landing branch (requirement 2's main-scope clause); the
 # empty default means "the pre-existing base_ref/merge-base/merge-parent
@@ -2739,6 +2740,7 @@ print(d.get("merge_sha") or d.get("head_sha") or "")' "$_attr_landing_rec" 2>/de
     attribution_in_scope="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("in_scope",0))' "$attribution_json" 2>/dev/null || echo 0)"
     attribution_inherited="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("inherited",0))' "$attribution_json" 2>/dev/null || echo 0)"
     attribution_unknown_inputs="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("unknown_inputs",0))' "$attribution_json" 2>/dev/null || echo 0)"
+    attribution_baseline_witness="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("baseline_witness",0))' "$attribution_json" 2>/dev/null || echo 0)"
   fi
   rm -f "$attr_notes_file"
 fi
@@ -2845,6 +2847,14 @@ fi
 # reads as an ordinary in-scope finding in the journal.
 if [ "${attribution_unknown_inputs:-0}" -gt 0 ]; then
   journal_suffix="$journal_suffix attribution=unknown-inputs"
+fi
+# AC11: a block rescued from the fail-closed unknown-inputs rule by the
+# committed baseline is inherited on the OPERATOR'S witness, not on
+# anything this gate derived. Say so on the line — an operator reading a
+# delta-pass is entitled to know which blocks passed on their own say-so
+# rather than on a diff or a commit range.
+if [ "${attribution_baseline_witness:-0}" -gt 0 ]; then
+  journal_suffix="$journal_suffix attribution=baseline-witness"
 fi
 # requirement 2 (main-scope clause): when the landing record pinned the
 # attribution range, say so on the line, so a main-scope inherited=/in-scope=

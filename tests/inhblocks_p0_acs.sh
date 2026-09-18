@@ -193,7 +193,7 @@ expect "AC9: journal carries the same inherited-debt line"       "grep -q 'inher
 # already uses), so this proves the code that actually runs rather than a
 # transcription of it.
 TR2="$(mktemp -d "${TMPDIR:-/tmp}/inhblocks-r2.XXXXXX")"
-trap 'rm -rf "$T" "$T7" "$T9" "$TR2" "${T10:-}"' EXIT
+trap 'rm -rf "$T" "$T7" "$T9" "$TR2" "${T10:-}" "${T11:-}"' EXIT
 (
   cd "$TR2" && git init -q repo && cd repo
   git config user.email t@t && git config user.name t
@@ -366,5 +366,100 @@ printf 'rollback-plan\tnot all revert-clean commits=%s\n' "${ac10_e2e_csv%%,*}" 
 "$GATE_ATTRIBUTION" compute "$T10/repo" "$C_BASE" "$C_HEAD" "$T10/notes.tsv" >"$T10/e2e.json" 2>&1
 expect "AC10: receipt -> note -> attribution yields inherited=1 in-scope=0" \
   "grep -q 'inherited=1 in-scope=0' \"$T10/e2e.json\""
+
+# --- AC11: the committed baseline is the operator's WITNESS ------------
+# Second half of Joe's 2026-09-18T12:15Z operator note. AC3 made an
+# unmapped pathless receipt fail closed to in-scope, which is right when
+# there is NO evidence — but agent/gate-baseline.json IS evidence: the
+# operator hand-recorded that this receipt was already blocking at the
+# recorded head, before this branch existed. So an unknown-inputs receipt
+# named in the COMMITTED baseline is inherited, never in-scope.
+#
+# The rescue must stay narrow: unknown-inputs path only. A finding with a
+# path token that the diff touched, or one attributed in-scope by commit
+# range (AC10), must stay in-scope even when its receipt is baselined --
+# otherwise one stale baseline entry would launder every future real
+# defect from that producer into free inherited debt.
+T11="$(mktemp -d "${TMPDIR:-/tmp}/inhblocks-ac11.XXXXXX")"
+(
+  cd "$T11" && git init -q repo && cd repo
+  git config user.email t@t && git config user.name t
+  echo pre > pre.txt && git add -A && git commit -qm pre
+  echo touched > touched.txt && git add -A && git commit -qm touched
+) >/dev/null 2>&1
+AC11_PRE="$(git -C "$T11/repo" rev-parse HEAD~1)"
+AC11_HEAD="$(git -C "$T11/repo" rev-parse HEAD)"
+
+cat > "$T11/baseline.json" <<'EOF'
+{"schema":"autobuilder.gate_baseline.v1","recorded_at":"2026-09-12T00:00:00Z",
+ "receipts":[{"name":"rollback-plan"},{"name":"reviewer-agent"}]}
+EOF
+
+# $1 = notes line body for receipt $2; $3 = extra args. echoes "scope|attribution"
+ac11_run() { # $1 = receipt  $2 = note body  $3... = extra args
+  local receipt="$1" body="$2"; shift 2
+  printf '%s\t%s\n' "$receipt" "$body" > "$T11/notes.tsv"
+  "$GATE_ATTRIBUTION" compute "$T11/repo" "$AC11_PRE" "$AC11_HEAD" "$T11/notes.tsv" "$@" 2>"$T11/stderr" \
+    | python3 -c 'import json,sys; b=json.load(sys.stdin)["blocks"][0]; print(b["scope"], b.get("attribution",""), sep="|")'
+}
+
+ac11_hit="$(ac11_run rollback-plan 'not all revert-clean' --baseline "$T11/baseline.json")"
+expect "AC11: a baselined unknown-inputs receipt is inherited, not in-scope" \
+  "[ \"\${ac11_hit%%|*}\" = inherited ]"
+expect "AC11: the rescued block is tagged attribution=baseline-witness" \
+  "[ \"\${ac11_hit##*|}\" = baseline-witness ]"
+expect "AC11: stderr summary carries attribution=baseline-witness" \
+  "grep -q 'attribution=baseline-witness' \"$T11/stderr\""
+expect "AC11: a rescued block is NOT counted as unknown-inputs" \
+  "! grep -q 'attribution=unknown-inputs' \"$T11/stderr\""
+expect "AC11: the rescued block reads inherited=1 in-scope=0" \
+  "grep -q 'inherited=1 in-scope=0' \"$T11/stderr\""
+
+# A receipt NOT in the baseline keeps AC3's fail-closed behaviour exactly.
+ac11_miss="$(ac11_run mystery-receipt 'no path token' --baseline "$T11/baseline.json")"
+expect "AC11: an unbaselined receipt still fails closed to in-scope" \
+  "[ \"\$ac11_miss\" = 'in-scope|unknown-inputs' ]"
+
+# Narrowness 1: a path token the diff TOUCHED stays in-scope even though
+# the receipt is baselined -- a real defect must never be laundered.
+ac11_path="$(ac11_run rollback-plan 'broke path=touched.txt' --baseline "$T11/baseline.json")"
+expect "AC11: a baselined receipt with a TOUCHED path stays in-scope" \
+  "[ \"\${ac11_path%%|*}\" = in-scope ]"
+
+# Narrowness 2: commit-range attribution (AC10) still decides on its own.
+ac11_range="$(ac11_run rollback-plan "not revert-clean commits=$AC11_HEAD" --baseline "$T11/baseline.json")"
+expect "AC11: a baselined receipt with an in-range guilty sha stays in-scope" \
+  "[ \"\$ac11_range\" = 'in-scope|commit-range' ]"
+
+# Fail-safe: a malformed / empty / absent baseline is simply no witness.
+printf 'not json\n' > "$T11/broken.json"
+expect "AC11: an unparseable baseline falls back to fail-closed" \
+  "[ \"\$(ac11_run rollback-plan 'not all revert-clean' --baseline \"$T11/broken.json\")\" = 'in-scope|unknown-inputs' ]"
+printf '{"schema":"autobuilder.gate_baseline.v1","receipts":[]}\n' > "$T11/empty.json"
+expect "AC11: an EMPTY baseline (the 2026-09-12 mcphost state) rescues nothing" \
+  "[ \"\$(ac11_run rollback-plan 'not all revert-clean' --baseline \"$T11/empty.json\")\" = 'in-scope|unknown-inputs' ]"
+expect "AC11: an absent baseline file falls back to fail-closed" \
+  "[ \"\$(ac11_run rollback-plan 'not all revert-clean' --baseline \"$T11/nope.json\")\" = 'in-scope|unknown-inputs' ]"
+
+# Default (no --baseline) reads the COMMITTED copy, not the working tree:
+# an uncommitted baseline is not a witness.
+mkdir -p "$T11/repo/agent"
+cp "$T11/baseline.json" "$T11/repo/agent/gate-baseline.json"
+expect "AC11: an UNCOMMITTED working-tree baseline is not a witness" \
+  "[ \"\$(ac11_run rollback-plan 'not all revert-clean')\" = 'in-scope|unknown-inputs' ]"
+git -C "$T11/repo" add -A >/dev/null 2>&1
+git -C "$T11/repo" -c user.name=t -c user.email=t@t commit -qm baseline >/dev/null 2>&1
+AC11_HEAD2="$(git -C "$T11/repo" rev-parse HEAD)"
+printf 'rollback-plan\tnot all revert-clean\n' > "$T11/notes.tsv"
+ac11_committed="$("$GATE_ATTRIBUTION" compute "$T11/repo" "$AC11_PRE" "$AC11_HEAD2" "$T11/notes.tsv" 2>/dev/null \
+  | python3 -c 'import json,sys; b=json.load(sys.stdin)["blocks"][0]; print(b["scope"], b.get("attribution",""), sep="|")')"
+expect "AC11: once COMMITTED, the baseline rescues by default (no flag)" \
+  "[ \"\$ac11_committed\" = 'inherited|baseline-witness' ]"
+
+# Journal token: the SHIPPED extend-gate.sh must surface the witness.
+expect "AC11: extend-gate.sh journals attribution=baseline-witness" \
+  "grep -q 'journal_suffix attribution=baseline-witness' \"$HERE/../scripts/extend-gate.sh\""
+expect "AC11: extend-gate.sh reads the baseline_witness counter" \
+  "grep -q 'attribution_baseline_witness=' \"$HERE/../scripts/extend-gate.sh\""
 
 exit $fail
