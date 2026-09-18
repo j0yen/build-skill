@@ -231,23 +231,37 @@ check_unit_env_inheritance() {
 }
 
 check_lock_protocol() {
-  local bad=() lockfile pid holders comm ccomm child_pid child_ok
+  # fuser reports BOTH the flock wrapper and its exec'd claude child as
+  # holders (the child inherits the lock fd across fork/exec) — that
+  # claude pid is the expected, protocol-conforming holder, not a second
+  # violation. Cover it via its flock parent before flagging any
+  # non-flock holder, or every in-flight branch trips this key on every
+  # tick (2026-09-18: 3 concurrent branches, all flagged, would have
+  # made select-tick.sh refuse all dispatch under normal load).
+  local bad=() lockfile pid holders comm ccomm child_pid child_ok covered flock_pids
   shopt -s nullglob
   for lockfile in "$STATE_DIR"/prd-*.lock; do
     holders="$("$FUSER" "$lockfile" 2>/dev/null)"
+    covered=""; flock_pids=""
     for pid in $holders; do
       case "$pid" in ''|*[!0-9]*) continue ;; esac
       comm="$(ps -o comm= -p "$pid" 2>/dev/null)"
-      if [ "$comm" != "flock" ]; then
-        bad+=("$(basename "$lockfile"):pid=$pid:comm=${comm:-none}")
-        continue
-      fi
+      [ "$comm" = "flock" ] && flock_pids="$flock_pids $pid"
+    done
+    for pid in $flock_pids; do
       child_ok=false
       for child_pid in $(pgrep -P "$pid" 2>/dev/null); do
         ccomm="$(ps -o comm= -p "$child_pid" 2>/dev/null)"
-        case "$ccomm" in claude*) child_ok=true ;; esac
+        case "$ccomm" in claude*) child_ok=true; covered="$covered $child_pid" ;; esac
       done
       $child_ok || bad+=("$(basename "$lockfile"):pid=$pid:no-live-claude-child")
+    done
+    for pid in $holders; do
+      case "$pid" in ''|*[!0-9]*) continue ;; esac
+      comm="$(ps -o comm= -p "$pid" 2>/dev/null)"
+      [ "$comm" = "flock" ] && continue
+      case " $covered " in *" $pid "*) continue ;; esac
+      bad+=("$(basename "$lockfile"):pid=$pid:comm=${comm:-none}")
     done
   done
   shopt -u nullglob
