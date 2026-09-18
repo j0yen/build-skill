@@ -174,7 +174,16 @@
 #           proof.json` (`routed=true`, `bytes>0`, younger than 7 days —
 #           the identical freshness window `enable` enforces) naming the
 #           image `status --json` reports as what `up` would boot RIGHT
-#           NOW. This is a live re-check, not a memo of a past run: once
+#           NOW, AND (PRD-build-burst-gate-canary-invariant R6, added
+#           2026-09-18) a `canary.json` for that same image, inside that
+#           same window, whose `diverged[]` is empty and whose every
+#           non-skipped variant reads `pass`. R6 made `enable` itself
+#           refuse on `canary-missing`/`canary-diverged`, so a rule that
+#           still accepted `proof_routed` alone had stopped agreeing with
+#           `enable` — and did in fact pair six real-box ACs of that PRD
+#           to a cargo proof from a box deleted two days earlier that
+#           never ran a passing canary. This is a live re-check, not a
+#           memo of a past run: once
 #           the proof goes stale or a new bake supersedes the image
 #           without a fresh `prove`, the AC reverts to MISSING on the next
 #           run — same "testable claim, not prose to trust" posture as
@@ -808,11 +817,33 @@ check_real_box_evidence() {
   shopt -u nullglob
   [ "${#candidates[@]}" -gt 0 ] || return 1
 
+  # PRD-build-burst-gate-canary-invariant R6: `enable` no longer gates on
+  # `proof_routed` alone — it requires a PASSING CANARY for the image it is
+  # about to route to. This function's whole contract is that "a PAIRED
+  # real-box AC and a passing `enable` always agree", so the canary receipt
+  # is pooled and required here on exactly the same terms as proof.json
+  # (image match + the same 168h window `enable` enforces). Without this,
+  # `verified-completed.sh --derive` paired this very PRD's own real-box
+  # ACs (1/5/6/8/14/18) to boxes/166121325/proof.json — a CARGO proof from
+  # a box deleted 2026-09-16 that never ran a passing canary — while the
+  # same `status --json` call above reported `canary.verdict=missing`. That
+  # is a real-box claim backed by evidence about something else.
+  local -a canary_candidates=()
+  [ -f "$repo/state/burst-lane/canary.json" ] && canary_candidates+=("$repo/state/burst-lane/canary.json")
+  shopt -s nullglob
+  local box_canary
+  for box_canary in "$repo"/state/burst-lane/boxes/*/canary.json; do
+    canary_candidates+=("$box_canary")
+  done
+  shopt -u nullglob
+
   python3 -c '
 import calendar, json, sys, time
 
 repo, boot_image = sys.argv[1], sys.argv[2]
-paths = sys.argv[3:]
+sep = sys.argv.index("--canary")
+paths = sys.argv[3:sep]
+canary_paths = sys.argv[sep + 1:]
 
 best = None  # (epoch, relpath, proof)
 for proof_path in paths:
@@ -844,10 +875,52 @@ for proof_path in paths:
 if best is None:
     sys.exit(1)
 
+
+def canary_ok(path):
+    """R6: a canary receipt for THIS boot image, inside the same 168h
+    window, whose every non-skipped variant passed and whose diverged[] is
+    empty. Returns (epoch, relpath, summary) or None."""
+    try:
+        c = json.load(open(path))
+    except Exception:
+        return None
+    if c.get("image_id") != boot_image:
+        return None
+    if c.get("diverged"):
+        return None
+    variants = c.get("variants") or {}
+    if not isinstance(variants, dict):
+        return None
+    judged = {k: v for k, v in variants.items() if v not in ("skipped", None, "")}
+    if not judged:
+        return None
+    if any(v != "pass" for v in judged.values()):
+        return None
+    ts = c.get("ts", "")
+    try:
+        epoch = calendar.timegm(time.strptime(ts, "%Y-%m-%dT%H:%M:%SZ"))
+    except Exception:
+        return None
+    if (time.time() - epoch) / 3600.0 > 168:
+        return None
+    rel = path[len(repo) + 1:] if path.startswith(repo + "/") else path
+    return (epoch, rel, "%s ts=%s" % (",".join("%s=%s" % kv for kv in sorted(judged.items())), ts))
+
+
+best_canary = None
+for canary_path in canary_paths:
+    got = canary_ok(canary_path)
+    if got is not None and (best_canary is None or got[0] > best_canary[0]):
+        best_canary = got
+
+if best_canary is None:
+    sys.exit(1)
+
 _, rel, proof = best
-print("%s (routed=true image=%s bytes=%s ts=%s)" % (
-    rel, proof.get("image_id"), proof.get("bytes"), proof.get("ts", "")))
-' "$repo" "$boot_image" "${candidates[@]}"
+print("%s (routed=true image=%s bytes=%s ts=%s) canary:%s (%s)" % (
+    rel, proof.get("image_id"), proof.get("bytes"), proof.get("ts", ""),
+    best_canary[1], best_canary[2]))
+' "$repo" "$boot_image" "${candidates[@]}" --canary "${canary_candidates[@]}"
 }
 
 # check_live_evidence <spec> — stdout: one evidence line, rc 0, when the

@@ -331,6 +331,14 @@ fi
 EOF
 chmod +x "$T/realbox-repo/scripts/burst-lane.sh"
 
+# PRD-build-burst-gate-canary-invariant R6: real-box evidence now needs a
+# passing canary for the same image alongside the proof (see
+# check_real_box_evidence). These AC11/AC12 cases are about PROOF
+# selection, so the canary half is held constant and valid here — each
+# case still turns entirely on the proof.json the case itself writes.
+printf '{"image_id":"img-current","ts":"%s","diverged":[],"variants":{"main":"pass","branch":"pass","delta":"pass"}}\n' \
+  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$T/realbox-repo/state/burst-lane/canary.json"
+
 cat > "$T/prds/PRD-realbox-fixture.md" <<EOF
 # PRD: real-box fixture
 Status: Draft v0.1

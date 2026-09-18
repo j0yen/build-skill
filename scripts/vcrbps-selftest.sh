@@ -60,6 +60,16 @@ now_ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 older_valid_ts="$(date -u -d '2 days ago' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ)"
 stale_ts="2020-01-01T00:00:00Z"
 
+# PRD-build-burst-gate-canary-invariant R6: check_real_box_evidence now
+# requires a passing canary for the same image alongside the proof. This
+# PRD's ACs are about PROOF pooling/freshness/priority, so the canary half
+# is held constant and valid across every case below — each assertion
+# still turns entirely on the proof.json that case writes. The canary
+# requirement itself is exercised by
+# tests/canary_acx_realbox_evidence_requires_canary_pass.sh.
+printf '{"image_id":"img-current","ts":"%s","diverged":[],"variants":{"main":"pass","branch":"pass","delta":"pass"}}\n' \
+  "$now_ts" > "$T/repo/state/burst-lane/canary.json"
+
 # =========================================================================
 # AC1 — per-server-only proof (flat absent) pairs like the flat path did.
 # =========================================================================
@@ -108,7 +118,7 @@ echo '{"routed":true,"bytes":123,"image_id":"img-current","ts":"'"$older_valid_t
   > "$T/repo/state/burst-lane/boxes/165656705/proof.json"
 out="$("$VC" "$T/prds/PRD-vcrbps-fixture.md" --derive --format table 2>/dev/null)"
 ck "AC2b both valid, flat fresher -> flat proof wins (never shadowed by a source-order rule)" \
-  'printf "%s\n" "$out" | awk -F"\t" "\$1==2{print \$3}" | grep -qx "state/burst-lane/proof.json (routed=true image=img-current bytes=99 ts='"$now_ts"')"'
+  'printf "%s\n" "$out" | awk -F"\t" "\$1==2{print \$3}" | grep -qx "state/burst-lane/proof.json (routed=true image=img-current bytes=99 ts='"$now_ts"') canary:state/burst-lane/canary.json (branch=pass,delta=pass,main=pass ts='"$now_ts"')"'
 
 # 2c: flat is STALE (>168h), per-server is valid -> per-server wins, stale
 # flat never shadows it (the literal defect this PRD's R2 names).

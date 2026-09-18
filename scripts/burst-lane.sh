@@ -4397,7 +4397,20 @@ _canary_core() {
   CANARY_CORE_HEAD_SOURCE="$head_source"
 
   local server_id; server_id="$(state_read server_id)"
+  # R5: canary.json's schema names `image_id` — a canary verdict that does
+  # not say WHICH image it judged cannot be joined to anything downstream
+  # (`enable`'s R6 check, or the archive-time real-box evidence rule, both
+  # of which key a canary to the image `up` would boot). The session state
+  # file does not always carry image_id (the 2026-09-18T04:57Z run on box
+  # 166412876 wrote `"image_id": "unknown"` for exactly this reason), so
+  # fall back to resolve_boot_image() — the same session-INDEPENDENT
+  # resolver `status --json` reports image_id from — before giving up.
   local image_id; image_id="$(state_read image_id)"
+  if [ -z "${image_id:-}" ] || [ "$image_id" = "unknown" ]; then
+    local _boot_img _boot_src
+    read -r _boot_img _boot_src <<<"$(resolve_boot_image)"
+    [ -n "${_boot_img:-}" ] && image_id="$_boot_img"
+  fi
   local box_dir; box_dir="$(box_path_for "$server_id" "")"; box_dir="${box_dir%/}"
   mkdir -p "$box_dir"
   CANARY_CORE_SERVER_ID="$server_id"
