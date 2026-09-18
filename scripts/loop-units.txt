@@ -32,3 +32,14 @@ RedBaron ci-status.timer
 # once daily at 23:55 America/New_York. Unit source:
 # systemd/day-ledger.{service,timer} in this repo.
 RedBaron day-ledger.timer
+# PRD-build-burst-gate-canary-invariant R7: runs `burst-lane.sh
+# canary-daily` — the once-per-box-day canary plus its confirm-twice
+# divergence / auto-disable / auto-re-enable state machine. Unit source:
+# systemd/claude-burst-canary.{service,timer} in this repo. Declared here
+# (2026-09-18) because the units shipped with the PRD but nothing ever
+# installed or armed them, so R7's cadence was a mechanism that could
+# never fire — the same "gate that never runs" shape this PRD exists to
+# close. Hourly wakeup with no live box is a silent no-op: canary-daily's
+# first check is `state_read server_id`, which skips with
+# cause=no-active-session before any gate, box or euro is touched.
+RedBaron claude-burst-canary.timer
