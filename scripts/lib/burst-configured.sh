@@ -41,6 +41,12 @@ burst_configured() {
 
   local env_file="${BURST_LANE_ENV_FILE:-$HOME/.config/wm-burst/.env}"
   [ -r "$env_file" ] || return 1
+  # 2026-09-18: `burst-lane.sh enable` writes BUILD_BURST_ENABLED=1 into the
+  # env file; gate processes never export it, so the file value must count
+  # (first mcphost gate through an enabled box: routed=0/27, cause=not-configured).
+  if [ "$(bash -c 'source "$1" >/dev/null 2>&1; printf "%s" "$BUILD_BURST_ENABLED"' _ "$env_file" 2>/dev/null)" = "1" ]; then
+    return 0
+  fi
 
   local ip id
   { read -r ip; read -r id; } < <(
