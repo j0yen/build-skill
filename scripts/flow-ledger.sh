@@ -15,7 +15,7 @@
 #       Thin CLI wrapper over flow_ledger_append. Always exits 0
 #       (Requirement 2 — a ledger write never fails the caller).
 #
-#   flow-ledger.sh report [--slug <s>] [--since <dur>] [--format text|json]
+#   flow-ledger.sh report [--slug <s>] [--since <dur>] [--by-target] [--format text|json]
 #       With --slug: one PRD's lead_time_h (queued->archived), wait_time_s
 #       (queued->claimed + blocked->unblocked + gate_verdict->landed gaps),
 #       gate_time_s (sum gate_start->gate_verdict), gate_runs, blocks
@@ -26,6 +26,11 @@
 #       slowest slugs by lead_time with the wait segment that dominated
 #       (Requirement 3, user story "five slowest slugs with where they
 #       waited"). `prds_measured` is always the count behind the medians.
+#       --by-target (P2 requirement 8, AC9): the same aggregate, computed
+#       once per `build_into` group instead of once overall -- each
+#       slug's build_into comes from state/manifest.json
+#       (FLOW_LEDGER_MANIFEST_FILE overrides); a slug missing from the
+#       manifest, or with no build_into recorded, groups under "unknown".
 #
 #   flow-ledger.sh backfill [--since <dur>] [--prd-dir <dir>]
 #       Requirement 6 (P1): for every PRD archived within --since (default
@@ -47,6 +52,10 @@
 # Env:
 #   FLOW_LEDGER_FILE   override the ledger path (default: see lib/flow-ledger.sh).
 #   FLOW_LEDGER_JQ     override `jq`.
+#   FLOW_LEDGER_MANIFEST_FILE  override state/manifest.json path (--by-target's
+#                      only source for a slug's build_into; a slug missing
+#                      from the manifest, or with no build_into, groups
+#                      under "unknown").
 #
 # Exit: 0 on a normal report (including zero PRDs measured, per day-ledger.sh's
 # own "never throws on an empty source" convention) or a successful append;
@@ -55,6 +64,8 @@ set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 JQ="${FLOW_LEDGER_JQ:-jq}"
+SKILL_DIR="$(cd "$HERE/.." && pwd)"
+MANIFEST_FILE="${FLOW_LEDGER_MANIFEST_FILE:-${BUILD_STATE_DIR:-$SKILL_DIR/state}/manifest.json}"
 
 # shellcheck source=lib/flow-ledger.sh
 source "$HERE/lib/flow-ledger.sh"
@@ -142,7 +153,7 @@ cmd_append() {
 }
 
 cmd_report() {
-  local slug="" since="" format="text" since_epoch="" until_epoch=""
+  local slug="" since="" format="text" since_epoch="" until_epoch="" by_target=0
   while [ $# -gt 0 ]; do
     case "$1" in
       --slug) slug="${2:?--slug needs a value}"; shift 2 ;;
@@ -155,6 +166,8 @@ cmd_report() {
       # the usage header above on purpose -- CLI users get --since.
       --since-epoch) since_epoch="${2:?--since-epoch needs an epoch seconds value}"; shift 2 ;;
       --until-epoch) until_epoch="${2:?--until-epoch needs an epoch seconds value}"; shift 2 ;;
+      # P2 requirement 8 / AC9: group the aggregate report by build_into.
+      --by-target) by_target=1; shift ;;
       *) die "report: unknown argument: $1" 2 ;;
     esac
   done
@@ -212,8 +225,7 @@ cmd_report() {
     rows="$(printf '%s' "$rows" | "$JQ" --argjson r "$row" '. + [$r]')"
   done <<< "$slugs"
 
-  local summary
-  summary="$(printf '%s' "$rows" | "$JQ" "$percentile_filter"'
+  local summary_program='
     {
       prds_measured: length,
       lead_time_p50_h: pct([.[] | select(.lead_time_h != null) | .lead_time_h]; 0.5),
@@ -228,7 +240,47 @@ cmd_report() {
           waited_at: (.wait_breakdown | to_entries | max_by(.value) | .key)
         })
       )
-    }')"
+    }'
+
+  if [ "$by_target" -eq 1 ]; then
+    # P2 requirement 8 / AC9: attach each row's build_into from the
+    # manifest (a slug missing from the manifest, or with no build_into
+    # recorded, groups under "unknown" rather than being dropped), then
+    # compute the same per-target percentile summary the plain aggregate
+    # above computes overall, once per group.
+    local manifest_json="{}"
+    if [ -r "$MANIFEST_FILE" ]; then
+      manifest_json="$("$JQ" -c '.' "$MANIFEST_FILE" 2>/dev/null)"
+      [ -n "$manifest_json" ] || manifest_json="{}"
+    fi
+    local targets_json
+    targets_json="$("$JQ" -n --argjson m "$manifest_json" '
+      ($m.prds // {}) as $p |
+      (if ($p | type) == "array" then $p else ($p | to_entries | map(.value)) end)
+      | map({key: .slug, value: (.build_into // "unknown")}) | from_entries')"
+    local by_target_json
+    by_target_json="$(printf '%s' "$rows" | "$JQ" --argjson targets "$targets_json" "$percentile_filter"'
+      map(. + {build_into: ($targets[.slug] // "unknown")})
+      | group_by(.build_into)
+      | map({
+          key: .[0].build_into,
+          value: ('"$summary_program"')
+        })
+      | from_entries')"
+    if [ "$format" = "json" ]; then
+      printf '%s\n' "$by_target_json"
+    else
+      printf '%s' "$by_target_json" | "$JQ" -r '
+        to_entries[] |
+        "== \(.key) (prds_measured=\(.value.prds_measured)) ==",
+        "  lead_time p50=\(.value.lead_time_p50_h // "n/a")h p90=\(.value.lead_time_p90_h // "n/a")h"
+      '
+    fi
+    exit 0
+  fi
+
+  local summary
+  summary="$(printf '%s' "$rows" | "$JQ" "$percentile_filter$summary_program")"
 
   if [ "$format" = "json" ]; then
     printf '%s\n' "$summary"

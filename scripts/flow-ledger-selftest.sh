@@ -294,4 +294,48 @@ echo "$bf_out2" | grep -qE 'archived=0 ' || fail "AC7 idempotency: second run: $
 rm -rf "$BF_ROOT"
 echo ok
 
+# =======================================================================
+# AC9 (P2) — report --by-target groups rows by build_into (looked up per
+# slug from state/manifest.json); a slug missing from the manifest, or
+# with no build_into recorded, groups under "unknown" rather than being
+# silently dropped. The plain (non-grouped) report is unaffected.
+# =======================================================================
+echo "== AC9: report --by-target groups rows by build_into =="
+BT_STATE=$(mktemp -d /tmp/flow-ledger-bt-state.XXXXXX)
+BT_LEDGER="$BT_STATE/flow-ledger.jsonl"
+BT_MANIFEST="$BT_STATE/manifest.json"
+BT_NOW="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+python3 - "$BT_LEDGER" "$BT_NOW" <<'PY'
+import json, sys, datetime
+path, now_iso = sys.argv[1], sys.argv[2]
+now = datetime.datetime.strptime(now_iso, "%Y-%m-%dT%H:%M:%SZ")
+def ts(mins):
+    return (now - datetime.timedelta(minutes=mins)).strftime("%Y-%m-%dT%H:%M:%SZ")
+events = []
+for slug, lead_min in [("bt-a", 120), ("bt-b", 240), ("bt-c", 60), ("bt-d", 30)]:
+    events += [
+      {"ts": ts(lead_min + 10), "slug": slug, "stage": "queued", "lane": "redbaron"},
+      {"ts": ts(5), "slug": slug, "stage": "archived", "lane": "redbaron"},
+    ]
+with open(path, "w") as f:
+    for e in events:
+        f.write(json.dumps(e) + "\n")
+PY
+cat > "$BT_MANIFEST" <<'EOF'
+{"prds":[
+  {"slug":"bt-a","build_into":"/repo/one"},
+  {"slug":"bt-b","build_into":"/repo/one"},
+  {"slug":"bt-c","build_into":"/repo/two"},
+  {"slug":"bt-d"}
+]}
+EOF
+bt_json="$(FLOW_LEDGER_FILE="$BT_LEDGER" FLOW_LEDGER_MANIFEST_FILE="$BT_MANIFEST" "$FL" report --by-target --format json)"
+jq -e '(."/repo/one".prds_measured == 2) and (."/repo/two".prds_measured == 1) and (.unknown.prds_measured == 1)' <<<"$bt_json" >/dev/null \
+  || fail "AC9 grouping: $bt_json"
+# plain (non-grouped) report over the same fixture is unaffected
+plain_measured="$(FLOW_LEDGER_FILE="$BT_LEDGER" "$FL" report --format json | jq -r '.prds_measured')"
+[ "$plain_measured" = "4" ] || fail "AC9: plain report regressed, prds_measured=$plain_measured want 4"
+rm -rf "$BT_STATE"
+echo ok
+
 echo "flow-ledger-selftest: PASS"
