@@ -44,6 +44,13 @@ fi
 receipt_head="${FAKE_REVIEWER_RECEIPT_HEAD:-$(git rev-parse HEAD 2>/dev/null || echo fake)}"
 receipt_reviewed_at="${FAKE_REVIEWER_RECEIPT_REVIEWED_AT:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
 receipt_decision="${FAKE_REVIEWER_RECEIPT_DECISION:-pass}"
+# FAKE_REVIEWER_RECEIPT_INTENT_CARD_SHA — PRD-build-gate-finalize-verdict-
+# split: overrides the literal "fake" intent_card_sha every other rvrcpt
+# test relies on (additive only — unset behaves byte-identical to before
+# this PRD). A gateinfra_ac* test proving a finalize VERDICT exit (not a
+# refusal) needs a receipt whose digest actually matches a real
+# agent/intent-card.json the test itself writes into the fixture repo.
+receipt_intent_card_sha="${FAKE_REVIEWER_RECEIPT_INTENT_CARD_SHA:-fake}"
 if [ -n "${FAKE_REVIEWER_RECEIPT_REASONS+x}" ]; then
   receipt_reasons="$FAKE_REVIEWER_RECEIPT_REASONS"
 elif [ "$receipt_decision" = block ]; then
@@ -60,8 +67,8 @@ json_reasons_array() {  # $1=csv -> ["a","b"] or []
 
 receipt_json() {
   local head="$1" reviewed_at="$2" decision="$3" reasons_csv="$4"
-  printf '{"schema":"autobuilder.reviewer_agent_receipt.v1","head_sha":"%s","intent_card_sha":"fake","decision":"%s","block_reasons":%s,"concern_reasons":[],"falsification":{"test_audit":"ok","panic_audit":"ok","unsafe_audit":"ok","public_api_audit":"ok","deps_audit":"ok","drift_audit":"ok","counter_attack":{"description":"n/a","test_skeleton":"n/a"}},"reviewed_at":"%s"}\n' \
-    "$head" "$decision" "$(json_reasons_array "$reasons_csv")" "$reviewed_at"
+  printf '{"schema":"autobuilder.reviewer_agent_receipt.v1","head_sha":"%s","intent_card_sha":"%s","decision":"%s","block_reasons":%s,"concern_reasons":[],"falsification":{"test_audit":"ok","panic_audit":"ok","unsafe_audit":"ok","public_api_audit":"ok","deps_audit":"ok","drift_audit":"ok","counter_attack":{"description":"n/a","test_skeleton":"n/a"}},"reviewed_at":"%s"}\n' \
+    "$head" "$receipt_intent_card_sha" "$decision" "$(json_reasons_array "$reasons_csv")" "$reviewed_at"
 }
 
 if [ -n "${FAKE_REVIEWER_RECEIPT_FIXTURE:-}" ]; then

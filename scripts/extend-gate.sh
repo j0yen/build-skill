@@ -1734,6 +1734,89 @@ _reviewer_infra_kind=""
 _reviewer_rejected_verdict='{}'
 _reviewer_verdict="ok"          # ok | block | infra
 _reviewer_block_reasons_csv=""
+
+# classify_finalize_exit <input-file> <head-sha> — PRD-build-gate-finalize-
+# verdict-split R1/R6: after `autobuilder reviewer-agent finalize` exits
+# non-zero, re-reads the exact file it was given (never calls finalize a
+# second time, Technical considerations) and decides whether the exit was
+# a VERDICT (every check finalize runs before writing the canonical
+# receipt already passed — reviewer.rs:269-346 — and it only failed
+# because decision=="block", :355-361) or a REFUSAL (schema, decision
+# enum, head_sha, or the intent_card_sha digest — Goals: "digest mismatch"
+# — failed first). ONE call site for both run_reviewer() branches (R6/AC6)
+# — never touches the file itself, so a verdict classification leaves its
+# sha unchanged (AC1). Sets _fx_kind (verdict|refusal), _fx_decision,
+# _fx_reasons_csv.
+_fx_kind=""
+_fx_decision=""
+_fx_reasons_csv=""
+classify_finalize_exit() {
+  local file="$1" head="$2"
+  _fx_kind="refusal"
+  _fx_decision=""
+  _fx_reasons_csv=""
+  [ -f "$file" ] || return 0
+  jq -e 'type == "object"' "$file" >/dev/null 2>&1 || return 0
+  local schema decision head_sha
+  schema="$(jq -r '.schema // empty' "$file" 2>/dev/null)"
+  [ "$schema" = "autobuilder.reviewer_agent_receipt.v1" ] || return 0
+  decision="$(jq -r '.decision // empty' "$file" 2>/dev/null)"
+  case "$decision" in pass|block) ;; *) return 0 ;; esac
+  head_sha="$(jq -r '.head_sha // empty' "$file" 2>/dev/null)"
+  [ "$head_sha" = "$head" ] || return 0
+  # equality-check: intent_card_sha (reviewer.rs:336-346, normalize_card_sha)
+  # — a digest mismatch is a refusal (Goals), never a verdict, so this is
+  # reproduced here rather than trusted from the input alone.
+  local card_file="$project_abs/agent/intent-card.json"
+  [ -f "$card_file" ] || return 0
+  local given norm_given actual
+  given="$(jq -r '.intent_card_sha // empty' "$file" 2>/dev/null)"
+  norm_given="$(printf '%s' "$given" | tr '[:upper:]' '[:lower:]' | sed 's/^sha256://')"
+  [[ "$norm_given" =~ ^[0-9a-f]{64}$ ]] || return 0
+  actual="$(sha256sum "$card_file" 2>/dev/null | awk '{print $1}')"
+  [ -n "$actual" ] && [ "$norm_given" = "$actual" ] || return 0
+  _fx_kind="verdict"
+  _fx_decision="$decision"
+  _fx_reasons_csv="$(jq -r '(.block_reasons // []) | join(",")' "$file" 2>/dev/null)"
+}
+
+# _mark_finalize_refusal <fail-note> <err-file> <decision> <reasons-csv> —
+# AC6: the ONE place the finalize-rejected infra-kind gets assigned to
+# _reviewer_infra_kind; both finalize call sites in run_reviewer() route
+# through this. Byte-for-byte the same outcome the two call sites used to
+# set inline (AC3: today's refusal behaviour, unchanged).
+_mark_finalize_refusal() {
+  local note="$1" errfile="$2" decision="$3" reasons_csv="$4"
+  _reviewer_fail_note="$note"
+  _reviewer_infra_kind="finalize-rejected"
+  _reviewer_infra_detail="$(tail -n 20 "$errfile" | tr '\n' ' ' | cut -c1-2000)"
+  _reviewer_rejected_verdict="$(jq -n --arg d "$decision" --arg r "$reasons_csv" \
+    '{decision: $d, block_reasons: ($r | if . == "" then [] else split(",") end)}')"
+  _reviewer_verdict="infra"
+}
+
+# _mark_reviewer_block <reasons-csv> — the one place a genuine reviewer
+# block verdict is recorded, whether finalize exited 0 (legacy path) or
+# non-zero (R1/R2: a verdict exit classified by classify_finalize_exit).
+_mark_reviewer_block() {
+  _reviewer_block_reasons_csv="$1"
+  _reviewer_fail_note="reviewer-agent — decision=block reasons=${_reviewer_block_reasons_csv}"
+  _reviewer_verdict="block"
+}
+
+# _write_finalize_kind_receipt <rc> <kind> — P1 AC8: a verdict exit's gate
+# receipt carries finalize_rc/finalize_kind=verdict, a refusal exit's
+# carries finalize_kind=refusal. Written as its own sidecar file (never
+# reviewer-agent.json itself, which AC1 requires unchanged on a verdict
+# exit) so both this PRD's AC1 and its AC8 hold at once.
+_write_finalize_kind_receipt() {
+  local rc="$1" kind="$2"
+  local dest="$project_abs/target/autobuilder/receipts/reviewer-agent-finalize.json"
+  mkdir -p "$(dirname "$dest")" 2>/dev/null || true
+  jq -n --arg rc "$rc" --arg kind "$kind" \
+    '{finalize_rc: ($rc | tonumber? // $rc), finalize_kind: $kind}' > "$dest" 2>/dev/null
+}
+
 run_reviewer() {
   _reviewer_fail_note=""
   _reviewer_infra_detail=""
@@ -1803,14 +1886,20 @@ do not recompute it yourself:
     receipt_reasons_csv="$(printf '%s' "$resolve_json" | jq -r '(.receipt_reasons // []) | join(",")')"
     local _finalize_err
     _finalize_err="$(mktemp "${TMPDIR:-/tmp}/extend-gate-finalize-err.XXXXXX")"
-    if ! ( cd "$repo" && autobuilder reviewer-agent finalize --project "$project_rel" --input "$receipt" ) 9>&- 2>"$_finalize_err"; then
-      _reviewer_fail_note="reviewer-agent — finalize rejected the subagent's receipt"
-      _reviewer_infra_kind="finalize-rejected"
-      _reviewer_infra_detail="$(tail -n 20 "$_finalize_err" | tr '\n' ' ' | cut -c1-2000)"
-      _reviewer_rejected_verdict="$(jq -n --arg d "$receipt_decision" --arg r "$receipt_reasons_csv" \
-        '{decision: $d, block_reasons: ($r | if . == "" then [] else split(",") end)}')"
+    local _rf_rc=0
+    ( cd "$repo" && autobuilder reviewer-agent finalize --project "$project_rel" --input "$receipt" ) 9>&- 2>"$_finalize_err" || _rf_rc=$?
+    if [ "$_rf_rc" -ne 0 ]; then
+      classify_finalize_exit "$receipt" "$head_now"
+      if [ "$_fx_kind" = "verdict" ] && [ "$_fx_decision" = "block" ]; then
+        rm -f "$_finalize_err"
+        _mark_reviewer_block "$_fx_reasons_csv"
+        _write_finalize_kind_receipt "$_rf_rc" verdict
+        journal_line --file "$journal" "$(date -u +%FT%TZ)  gate  ${repo##*/}  reviewer-agent verdict=block reasons=[${_fx_reasons_csv}] finalize_rc=${_rf_rc}"
+        return 1
+      fi
+      _mark_finalize_refusal "reviewer-agent — finalize rejected the subagent's receipt" "$_finalize_err" "$receipt_decision" "$receipt_reasons_csv"
+      _write_finalize_kind_receipt "$_rf_rc" refusal
       rm -f "$_finalize_err"
-      _reviewer_verdict="infra"
       return 1
     fi
     rm -f "$_finalize_err"
@@ -1824,9 +1913,7 @@ do not recompute it yourself:
       fi
     fi
     if [ "$receipt_decision" = "block" ]; then
-      _reviewer_block_reasons_csv="$receipt_reasons_csv"
-      _reviewer_fail_note="reviewer-agent — decision=block reasons=${_reviewer_block_reasons_csv}"
-      _reviewer_verdict="block"
+      _mark_reviewer_block "$receipt_reasons_csv"
       return 1
     fi
     _reviewer_verdict="ok"
@@ -1847,21 +1934,25 @@ do not recompute it yourself:
     stdout_reasons_csv="$(printf '%s' "$resolve_json" | jq -r '(.stdout_reasons // []) | join(",")')"
     local _finalize_err2
     _finalize_err2="$(mktemp "${TMPDIR:-/tmp}/extend-gate-finalize-err.XXXXXX")"
-    if ! ( cd "$repo" && autobuilder reviewer-agent finalize --project "$project_rel" --input "$out" ) 9>&- 2>"$_finalize_err2"; then
-      _reviewer_fail_note="reviewer-agent — finalize rejected the subagent's output"
-      _reviewer_infra_kind="finalize-rejected"
-      _reviewer_infra_detail="$(tail -n 20 "$_finalize_err2" | tr '\n' ' ' | cut -c1-2000)"
-      _reviewer_rejected_verdict="$(jq -n --arg d "$stdout_decision" --arg r "$stdout_reasons_csv" \
-        '{decision: $d, block_reasons: ($r | if . == "" then [] else split(",") end)}')"
+    local _rf_rc2=0
+    ( cd "$repo" && autobuilder reviewer-agent finalize --project "$project_rel" --input "$out" ) 9>&- 2>"$_finalize_err2" || _rf_rc2=$?
+    if [ "$_rf_rc2" -ne 0 ]; then
+      classify_finalize_exit "$out" "$head_now"
+      if [ "$_fx_kind" = "verdict" ] && [ "$_fx_decision" = "block" ]; then
+        rm -f "$_finalize_err2"
+        _mark_reviewer_block "$_fx_reasons_csv"
+        _write_finalize_kind_receipt "$_rf_rc2" verdict
+        journal_line --file "$journal" "$(date -u +%FT%TZ)  gate  ${repo##*/}  reviewer-agent verdict=block reasons=[${_fx_reasons_csv}] finalize_rc=${_rf_rc2}"
+        return 1
+      fi
+      _mark_finalize_refusal "reviewer-agent — finalize rejected the subagent's output" "$_finalize_err2" "$stdout_decision" "$stdout_reasons_csv"
+      _write_finalize_kind_receipt "$_rf_rc2" refusal
       rm -f "$_finalize_err2"
-      _reviewer_verdict="infra"
       return 1
     fi
     rm -f "$_finalize_err2"
     if [ "$stdout_decision" = "block" ]; then
-      _reviewer_block_reasons_csv="$stdout_reasons_csv"
-      _reviewer_fail_note="reviewer-agent — decision=block reasons=${_reviewer_block_reasons_csv}"
-      _reviewer_verdict="block"
+      _mark_reviewer_block "$stdout_reasons_csv"
       return 1
     fi
     _reviewer_verdict="ok"
