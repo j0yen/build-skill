@@ -100,6 +100,8 @@ points here instead of listing scripts inline).
 - `scripts/gate-wedge.sh` — per-step wall-clock budget + progress-aware wedge probe for
 - `scripts/handoff-header.sh` — R8 of PRD-build-gate-red-alarm-invariant.
 - `scripts/handwritten-fixture-lint.sh` — scripts/handwritten-fixture-lint.sh — PRD-build-burst-gate-canary-
+- `scripts/host-contract-selftest.sh` — PRD-build-host-contract AC1, AC2, AC4, AC5,
+- `scripts/host-contract.sh` — probe + self-heal for docs/host-contract.md
 - `scripts/inhblocks-selftest.sh` — PRD-build-inherited-blocks-delta-pass whole-suite
 - `scripts/install-hcloud-selftest.sh` — offline proof for install-hcloud.sh
 - `scripts/install-hcloud.sh` — pinned-version, sha256-checked install of the Hetzner

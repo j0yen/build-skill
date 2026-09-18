@@ -350,3 +350,39 @@ override, no regression. Separately, the receipt name folded into
 reviewer reason without a blanket `reviewer-agent` entry excusing every
 future one — gate-attribution.sh's own witness check still honors a
 blanket entry's pre-existing meaning as a prefix fallback.
+
+## host-contract — 2026-09-18, PRD-build-host-contract
+
+Six outages on 2026-09-18 shared one shape: a component relied on an
+ambient default of the RedBaron host and the default silently changed or
+ran out — the reviewer's auth token living only in `environment.d` and
+never reaching the manager env (7:51–10:24am, 4 wasted gates), the
+dispatch lock protocol itself (see `docs/branch-contract.md` §1),
+`tick-run.sh:665`'s `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0` export that
+a `systemd-run --user` branch unit never inherits (two dispatches killed
+at 600s), `TMPDIR` unset until 11:40am (`/tmp` at 100%, 51/68 selftest
+failures), two `autobuilder` binaries and two cargo shims racing on
+`$PATH`. Each was hand-fixed where it hurt; none of the six was declared
+anywhere first, so no probe existed to catch the next one before a
+branch died on it. `docs/host-contract.md` now names every one of these
+as a row (key, expected value/predicate, why, severity, owner) and
+`scripts/host-contract.sh check` evaluates the whole table in one pass:
+one `<key>=ok` or `<key>=drift(<observed>) severity=... owner=...` line
+per key, exit 0/1/2 by worst severity seen. Every ok<->drift transition
+journals exactly once (`state/host-contract/last-status.json` tracks the
+previous run so an unchanged key is never re-journaled — this is what
+this PRD's AC6 calls out explicitly, after the gate-red-alarm-invariant
+PRD hit the same "silently missing aggregate" shape once already).
+`host-contract.sh apply <key>` fixes only the rows the table marks
+`self-heal` (env vars via `environment.d` + `systemctl --user set-
+environment`, the reaper timer, `TMPDIR`); an `operator`-owned key prints
+the exact command and changes nothing, on principle — the auth token
+value and PATH binary removal are not things a probe should ever mutate
+on its own. `--fast` skips the one row that spends a real `claude -p`
+call (the auth-file probe, cached 6h in `state/host-contract/auth.json`)
+so a gate-start probe stays cheap; that wiring (`extend-gate.sh check
+--fast`, `select-tick.sh`'s dispatch refusal, `lane-health.sh`'s tick
+line) is a later step of this same PRD, not this one — this step lands
+the contract file and the probe/apply/history core only
+(`scripts/host-contract.sh`, `scripts/host-contract-selftest.sh`,
+AC1/AC2/AC4/AC5 and AC6's journal-dedup half).
