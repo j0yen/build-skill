@@ -143,7 +143,7 @@ expect "AC7b: post-land main gate exits 0 (cached pass)" "[ $rc -eq 0 ]"
 expect "AC7b: stdout reports (cached)" "grep -q '(cached)' \"$out\""
 expect "AC7b: NO producer output (proof of no real run — audit/intake/etc never printed)" \
   "! grep -qE 'autobuilder (intake|loop|vti-plan|rollback-plan|reviewer-agent|ci-checks)' \"$out\""
-journal_line="$(grep -m1 "  gate  " "$JOURNAL" 2>/dev/null || true)"
+journal_line="$(grep -m1 '(cached tree=' "$JOURNAL" 2>/dev/null || true)"
 expect "AC7b: a cache-hit journal line was written" "[ -n \"$journal_line\" ]"
 expect "AC7b: journal line reads (cached tree=$WT_TREE from=branch slug=$SLUG)" \
   "printf '%s' \"$journal_line\" | grep -qF '(cached tree=$WT_TREE from=branch slug=$SLUG)'"

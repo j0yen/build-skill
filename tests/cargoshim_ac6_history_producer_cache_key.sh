@@ -52,7 +52,7 @@ license = "MIT"
 EOF
 mkdir -p "$REPO/src"
 printf 'pub fn add(a: i32, b: i32) -> i32 { a + b }\n' > "$REPO/src/lib.rs"
-printf '/target\n/.cargo\n' > "$REPO/.gitignore"
+printf '/target\n/.cargo\n/Cargo.lock\n' > "$REPO/.gitignore"
 ( cd "$REPO" && cargo generate-lockfile >/dev/null 2>&1 ) || true
 git -C "$REPO" "${GIT_ID[@]}" add -A
 git -C "$REPO" "${GIT_ID[@]}" commit -q -m "initial message"
