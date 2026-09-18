@@ -91,6 +91,15 @@ TICK_OUTCOME_FILE="${TICK_OUTCOME_FILE:-$STATE_DIR/tick-outcome.json}"
 ALARM_LAST_FILE="${TICK_RUN_ALARM_LAST_FILE:-$SELECT_TICK_STATE_DIR/alarm-last-$LANE.json}"
 STREAK_FILE="${TICK_RUN_STREAK_FILE:-$SELECT_TICK_STATE_DIR/streak-$LANE.json}"
 ALERT_DELIVER="${TICK_RUN_ALERT_DELIVER:-$SKILL_DIR/scripts/alert-deliver.sh}"
+# PRD-buildloop-tick-outcome-liveness R5: the one knob, same override
+# convention as GATE_RED_WINDOW_H.
+LOOP_TICK_FAIL_ALARM_STREAK="${LOOP_TICK_FAIL_ALARM_STREAK:-3}"
+# "Delivered for the CURRENT failure episode" -- deliberately NOT
+# alert-deliver.sh's own per-UTC-day marker (scripts/lib/alert-marker.sh):
+# that marker would either suppress a same-day resolve after a same-day
+# delivery, or suppress a brand-new episode's first alarm later the same
+# day. This sentinel is created on delivery and removed on resolve.
+TICK_ALARM_MARKER="${TICK_ALARM_MARKER:-$STATE_DIR/tick-outcome-alarm-delivered}"
 
 now_iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 now_epoch() { date -u +%s; }
@@ -246,6 +255,55 @@ write_tick_outcome() {
       "$ts" "$n" "$rc" "$outcome" "$cause" "$esc_evidence" "$streak_failed" "$last_ok_ts" "$LANE")"
   fi
   atomic_write_json "$TICK_OUTCOME_FILE" "$json"
+}
+
+# maybe_deliver_loop_tick_failed <cause> <streak_failed> <last_ok_ts>
+# <evidence> — PRD-buildloop-tick-outcome-liveness R4/R5. Fires
+# `alert-deliver.sh loop-tick-failed` exactly AT $LOOP_TICK_FAIL_ALARM_STREAK
+# (default 3, plain call), and again at 2x/4x that threshold (6/12 by
+# default, `--comment` re-delivery — AC10); silent everywhere else,
+# including every streak `cause=quota-saturated` (AC8 — that branch
+# already has its own alarm and must never be double-paged). Journals its
+# own `ALARM  loop-tick-failed  ...` line (alert-deliver.sh itself only
+# journals notify/notify-send, never an ALARM line — same convention as
+# gate-red-tick.sh's `ALARM  gate-red-persistent  ...`).
+maybe_deliver_loop_tick_failed() {
+  local cause="$1" streak="$2" last_ok_ts="$3" evidence="$4"
+  [ "$cause" != "quota-saturated" ] || return 0
+  local base="$LOOP_TICK_FAIL_ALARM_STREAK"
+  case "$base" in ''|*[!0-9]*) base=3 ;; esac
+  local comment_flag=()
+  if [ "$streak" -eq "$base" ] 2>/dev/null; then
+    :
+  elif [ "$streak" -eq $((base * 2)) ] 2>/dev/null || [ "$streak" -eq $((base * 4)) ] 2>/dev/null; then
+    comment_flag=(--comment)
+  else
+    return 0
+  fi
+
+  journal "ALARM  loop-tick-failed  cause=$cause streak=$streak last_ok=${last_ok_ts:-unknown}"
+
+  local ev
+  ev="$(mktemp 2>/dev/null)" || return 0
+  printf 'cause=%s streak=%s last_ok=%s\n%s\n' "$cause" "$streak" "${last_ok_ts:-unknown}" "$evidence" > "$ev"
+  if [ -x "$ALERT_DELIVER" ]; then
+    "$ALERT_DELIVER" loop-tick-failed build-loop "$ev" --value "$streak" "${comment_flag[@]}" >/dev/null 2>&1 || true
+  fi
+  rm -f "$ev" 2>/dev/null
+  mkdir -p "$(dirname "$TICK_ALARM_MARKER")" 2>/dev/null || true
+  : > "$TICK_ALARM_MARKER" 2>/dev/null || true
+}
+
+# maybe_resolve_loop_tick_failed — called on an `ok` outcome. Resolves
+# exactly once per delivered episode (AC9), gated on our own sentinel
+# (not alert-deliver.sh's per-UTC-day marker, which must not suppress a
+# same-day resolve).
+maybe_resolve_loop_tick_failed() {
+  [ -f "$TICK_ALARM_MARKER" ] || return 0
+  if [ -x "$ALERT_DELIVER" ]; then
+    "$ALERT_DELIVER" resolve loop-tick-failed build-loop >/dev/null 2>&1 || true
+  fi
+  rm -f "$TICK_ALARM_MARKER" 2>/dev/null || true
 }
 
 # maybe_alarm <admitted> <dispatched> <missing-csv> — requirement 4.
@@ -530,12 +588,23 @@ main() {
 
   if [ "$rc" -eq 0 ]; then
     write_tick_outcome "$rc" ok "" ""
+    maybe_resolve_loop_tick_failed
   else
     local cause="other" evidence=""
     if [ -n "$capture_file" ]; then
       IFS=$'\t' read -r cause evidence < <(tick_cause_classify "$capture_file")
     fi
     write_tick_outcome "$rc" failed "$cause" "$evidence"
+    # Re-read the record just written for its authoritative streak_failed/
+    # last_ok_ts rather than re-deriving them here (write_tick_outcome
+    # already did the prev-record RMW; one source of truth).
+    local streak_failed=0 last_ok_ts=""
+    if [ -x "$JQ" ] && [ -r "$TICK_OUTCOME_FILE" ]; then
+      streak_failed="$("$JQ" -r '.streak_failed // 0' "$TICK_OUTCOME_FILE" 2>/dev/null)"
+      last_ok_ts="$("$JQ" -r '.last_ok_ts // empty' "$TICK_OUTCOME_FILE" 2>/dev/null)"
+    fi
+    case "$streak_failed" in ''|*[!0-9]*) streak_failed=0 ;; esac
+    maybe_deliver_loop_tick_failed "$cause" "$streak_failed" "$last_ok_ts" "$evidence"
   fi
   [ -n "$capture_file" ] && rm -f "$capture_file" 2>/dev/null
 
