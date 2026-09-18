@@ -38,6 +38,11 @@ LOCK_DIR="$STATE_DIR/manifest.lock.d"
 PRD_DIR="${PRD_DIR:-$HOME/Documents/PRDs}"
 JOURNAL="${JOURNAL:-$HOME/brain/journal/build/$(date -u +%F).md}"
 SLUG_COLLISIONS_PY="${SLUG_COLLISIONS_PY:-$SKILL_DIR/scripts/slug-collisions.py}"
+# PRD-build-flow-ledger requirement 1/5: the append-only stage-event ledger
+# every lifecycle script writes to. ticks_invested is DERIVED from it (see
+# rewrite_ticks_invested_delta below), never trusted from a model-written
+# Phase 7 delta.
+LEDGER_FILE="${FLOW_LEDGER_FILE:-$STATE_DIR/flow-ledger.jsonl}"
 
 LOCK_RETRY_INTERVAL="${MANIFEST_LOCK_RETRY:-0.2}"
 LOCK_CEILING_SECS="${MANIFEST_LOCK_CEILING:-60}"
@@ -216,6 +221,66 @@ print("|".join(c[0]["paths"]) if c else "")' 2>/dev/null)"
     "$(utc_now)" "$slug" "$paths" "$(hostname)" >> "$JOURNAL" 2>/dev/null || true
 }
 
+# PRD-build-flow-ledger requirement 5: the ledger's own `claimed` event
+# count for <slug> — the derived value ticks_invested is always set to.
+# Never fails: a missing/unreadable/corrupt ledger reads as 0 claims, the
+# same "degrade, never throw" convention day-ledger.sh's sources use.
+ticks_invested_count() {
+  local slug="$1"
+  python3 -c 'import json, sys
+path, slug = sys.argv[1], sys.argv[2]
+n = 0
+try:
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                e = json.loads(line)
+            except Exception:
+                continue
+            if e.get("slug") == slug and e.get("stage") == "claimed":
+                n += 1
+except FileNotFoundError:
+    pass
+print(n)' "$LEDGER_FILE" "$slug"
+}
+
+# AC4: a patch carrying `ticks_invested_delta` is accepted-and-ignored (Open
+# question default) rather than refused — the key is dropped and
+# `ticks_invested` is set/overwritten to the ledger's derived count, with
+# one journal line recording that the delta was ignored. Prints the patch
+# path cmd_set should use from here on: unchanged (the original path) when
+# no delta key was present, or a fresh scratch tmp file (caller's to clean
+# up) when a rewrite happened.
+rewrite_ticks_invested_delta() {
+  local slug="$1" patch_path="$2"
+  if ! python3 -c 'import json, sys
+d = json.load(open(sys.argv[1]))
+sys.exit(0 if isinstance(d, dict) and "ticks_invested_delta" in d else 1)' "$patch_path" 2>/dev/null; then
+    printf '%s\n' "$patch_path"
+    return 0
+  fi
+  local n; n="$(ticks_invested_count "$slug")"
+  [ -n "$n" ] || n=0
+  local tmp; tmp="$(mktemp "$STATE_DIR/.manifest-patch.XXXXXX" 2>/dev/null)" || { printf '%s\n' "$patch_path"; return 0; }
+  if ! python3 -c 'import json, sys
+d = json.load(open(sys.argv[1]))
+d.pop("ticks_invested_delta", None)
+d["ticks_invested"] = int(sys.argv[2])
+with open(sys.argv[3], "w") as f:
+    json.dump(d, f)' "$patch_path" "$n" "$tmp" 2>/dev/null; then
+    rm -f "$tmp"
+    printf '%s\n' "$patch_path"
+    return 0
+  fi
+  mkdir -p "$(dirname "$JOURNAL")" 2>/dev/null || true
+  printf '%s  manifest-set  ticks-invested-delta-ignored (slug=%s ticks_invested=%s)  (host=%s)\n' \
+    "$(utc_now)" "$slug" "$n" "$(hostname)" >> "$JOURNAL" 2>/dev/null || true
+  printf '%s\n' "$tmp"
+}
+
 cmd_set() {
   local slug="$1" patch_path="$2"
   if [ -z "$slug" ] || [ -z "$patch_path" ]; then
@@ -234,27 +299,43 @@ cmd_set() {
     fi
   fi
 
+  # PRD-build-flow-ledger AC4: rewrite ticks_invested_delta (if present)
+  # into a ledger-derived ticks_invested BEFORE the intent is written, so
+  # the durable intent already carries the derived value and a later
+  # --replay-orphans is idempotent (it re-applies the same derived number,
+  # never re-derives). effective_patch differs from patch_path only when a
+  # rewrite happened, in which case it is a scratch tmp file this call
+  # owns and must clean up on every exit path below.
+  local effective_patch; effective_patch="$(rewrite_ticks_invested_delta "$slug" "$patch_path")"
+  local cleanup_effective=0
+  [ "$effective_patch" = "$patch_path" ] || cleanup_effective=1
+
   # 1. Write-ahead intent BEFORE the lock.
-  if ! write_intent "$slug" "$patch_path"; then
-    log "manifest-set: failed to write intent for $slug"; return 4
+  if ! write_intent "$slug" "$effective_patch"; then
+    log "manifest-set: failed to write intent for $slug"
+    [ "$cleanup_effective" -eq 0 ] || rm -f "$effective_patch"
+    return 4
   fi
 
   # 2. Acquire the lock with a hard 60s ceiling.
   if ! acquire_lock; then
     log "manifest-set: lock ceiling (${LOCK_CEILING_SECS}s) exceeded for $slug; intent kept for replay"
+    [ "$cleanup_effective" -eq 0 ] || rm -f "$effective_patch"
     return 3
   fi
 
   # 3. RMW only prds.<slug>.
-  if ! apply_patch_locked "$slug" "$patch_path" "file"; then
+  if ! apply_patch_locked "$slug" "$effective_patch" "file"; then
     release_lock
     log "manifest-set: RMW failed for $slug; intent kept for replay"
+    [ "$cleanup_effective" -eq 0 ] || rm -f "$effective_patch"
     return 4
   fi
 
   # 4. Success: drop the intent, release the lock.
   rm -f "$INTENT_DIR/$slug.json"
   release_lock
+  [ "$cleanup_effective" -eq 0 ] || rm -f "$effective_patch"
   return 0
 }
 
