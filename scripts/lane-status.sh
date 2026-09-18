@@ -31,6 +31,8 @@ DECISIONS="${DECISIONS:-$HERE/decisions.sh}"
 SKILL_DIR="${BUILD_SKILL_DIR:-$(cd "$HERE/.." && pwd)}"
 STATE_DIR="${BUILD_STATE_DIR:-$SKILL_DIR/state}"
 GATE_STATUS="${GATE_STATUS:-$HERE/gate-status.sh}"
+# PRD-build-flow-ledger P1 requirement 7 / AC8: the last-24h flow medians line.
+FLOW_LEDGER="${FLOW_LEDGER:-$HERE/flow-ledger.sh}"
 
 die() { echo "lane-status: $*" >&2; exit "${2:-4}"; }
 usage() { echo "usage: lane-status.sh {tick-summary|report} ..." >&2; exit 4; }
@@ -422,6 +424,30 @@ else:
     echo "${burst_line:-burst gate parity: unavailable (gate-status --parity failed)}"
   else
     echo "(gate-status.sh not found at $GATE_STATUS)"
+  fi
+
+  echo
+  echo "== flow: last 24h medians (PRD-build-flow-ledger) =="
+  if [ -x "$FLOW_LEDGER" ]; then
+    local flow_json flow_line
+    flow_json="$("$FLOW_LEDGER" report --since 24h --format json 2>/dev/null)"
+    flow_line="$(printf '%s' "${flow_json:-}" | python3 -c '
+import json, sys
+try:
+    r = json.load(sys.stdin)
+except Exception:
+    r = {}
+def h(v):
+    return "n/a" if v is None else ("%.1fh" % v)
+def s(v):
+    return "n/a" if v is None else ("%.0fs" % v)
+print("flow: prds_measured=%d lead_time_p50=%s p90=%s wait_p50=%s gate_p50=%s"
+      % (r.get("prds_measured", 0), h(r.get("lead_time_p50_h")), h(r.get("lead_time_p90_h")),
+         s(r.get("wait_time_p50_s")), s(r.get("gate_time_p50_s"))))
+' 2>/dev/null)"
+    echo "${flow_line:-flow: unavailable (flow-ledger.sh report failed)}"
+  else
+    echo "(flow-ledger.sh not found at $FLOW_LEDGER)"
   fi
 }
 

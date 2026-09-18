@@ -9,6 +9,13 @@ LC="$HERE/lane-claim.sh"
 ROOT=$(mktemp -d /tmp/lane-status-selftest.XXXXXX)
 trap 'rm -rf "$ROOT"' EXIT
 
+# PRD-build-flow-ledger requirement 7 / AC8: lane-status.sh report's new
+# flow{} section shells out to flow-ledger.sh, which defaults to the REAL
+# production ledger when FLOW_LEDGER_FILE/BUILD_STATE_DIR are unset --
+# pin it to a scratch path so every `report` call below is isolated
+# (never reads production state) and deterministic.
+export FLOW_LEDGER_FILE="$ROOT/flow-ledger.jsonl"
+
 JOURNAL_DIR="$ROOT/journal"
 mkdir -p "$JOURNAL_DIR"
 TODAY=$(date -u +%F)
@@ -46,6 +53,29 @@ out=$("$LS" report --prd-dir "$ROOT/clone" --journal-dir "$JOURNAL_DIR" --days 1
 echo "$out" | grep -q 'RedBaron: .*claimed=3 skipped=1' || { echo "FAIL RedBaron line missing:"; echo "$out"; exit 1; }
 echo "$out" | grep -q 'carbon: .*claimed=2 skipped=0' || { echo "FAIL carbon line missing:"; echo "$out"; exit 1; }
 echo "$out" | grep -q '^PRD-smoke: RedBaron ' || { echo "FAIL live claim missing:"; echo "$out"; exit 1; }
+echo ok
+
+echo "== AC8: report prints the last-24h flow medians line =="
+NOW_ISO="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+python3 - "$FLOW_LEDGER_FILE" "$NOW_ISO" <<'PY'
+import json, sys, datetime
+path, now_iso = sys.argv[1], sys.argv[2]
+now = datetime.datetime.strptime(now_iso, "%Y-%m-%dT%H:%M:%SZ")
+def ts(mins):
+    return (now - datetime.timedelta(minutes=mins)).strftime("%Y-%m-%dT%H:%M:%SZ")
+events = [
+  {"ts": ts(300), "slug": "ls-flow-smoke", "stage": "queued", "lane": "redbaron"},
+  {"ts": ts(240), "slug": "ls-flow-smoke", "stage": "claimed", "lane": "redbaron"},
+  {"ts": ts(60),  "slug": "ls-flow-smoke", "stage": "landed", "lane": "redbaron"},
+  {"ts": ts(30),  "slug": "ls-flow-smoke", "stage": "archived", "lane": "redbaron"},
+]
+with open(path, "w") as f:
+    for e in events:
+        f.write(json.dumps(e) + "\n")
+PY
+out2=$("$LS" report --prd-dir "$ROOT/clone" --journal-dir "$JOURNAL_DIR" --days 1)
+echo "$out2" | grep -qE '^flow: prds_measured=1 lead_time_p50=[0-9.]+h p90=[0-9.]+h wait_p50=[0-9]+s gate_p50=[0-9]+s$' \
+  || { echo "FAIL: no flow medians line:"; echo "$out2"; exit 1; }
 echo ok
 
 echo "ALL PASS"
