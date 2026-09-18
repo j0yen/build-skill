@@ -3885,6 +3885,28 @@ jq -n --arg head "$head_now" --arg tree "$tree_now" --arg hash "$self_hash" --ar
   } + (if $over then {unattributed_s: $unattr} else {} end)
 ' > "$cache_file" 2>/dev/null || true
 
+# PRD-build-diff-scoped-gate requirement 3 (P0, AC8): a --main-health run's
+# result, written to state/main-health/<repo>.json as {sha, ts, receipts,
+# verdict} — gates-banner.sh's future consumer (requirement 8, a separate
+# step) reads this for its own `main-health:` line. `receipts` reuses the
+# same attribution blocks array already computed above for the cache file
+# (each entry already carries in_scope/inherited scope, cross-repo:
+# requirement 4's archive-gate/verified-completed consumer, also a separate
+# step, reads that same tag to tell an in-scope main-health block from an
+# inherited one) rather than re-deriving a second summary of the same run.
+# $STATE_DIR already resolves through $BUILD_STATE_DIR (worktree isolation,
+# PRD-build-shell-worktree-isolation requirement 4) so a worktree selftest
+# never writes the running skill's production state/.
+if $main_health; then
+  _mh_repo_slug="$(repo_slug_for_ci "$repo")"
+  _mh_file="$STATE_DIR/main-health/${_mh_repo_slug}.json"
+  mkdir -p "$(dirname "$_mh_file")" 2>/dev/null
+  jq -n --arg sha "$head_now" --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        --arg verdict "$outcome" --argjson receipts "$attribution_for_cache" '
+    {sha: $sha, ts: $ts, verdict: $verdict, receipts: $receipts.blocks}
+  ' > "$_mh_file" 2>/dev/null || true
+fi
+
 # R4 persist-out: a fresh run (producers actually ran) writes cache_file
 # above — mirror it out too, same as the cache-hit replay path does,
 # so a pinned-landing caller's NEXT question for this slug (a brand new
