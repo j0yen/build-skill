@@ -651,6 +651,48 @@ admitted_json="$(printf '%s' "$admitted_json" | "$JQ" -c '
 admitted_count="$(printf '%s' "$admitted_json" | "$JQ" 'length')"
 skipped_count="$(printf '%s' "$skipped_json" | "$JQ" 'length')"
 
+# --- Host-drift refusal (PRD-build-host-contract requirement 3): a
+# critical docs/host-contract.md drift on this lane blocks every new
+# admission for the whole tick, without touching whatever is already
+# running -- this script only decides what to admit, it never manages a
+# running unit. Probed only for lane=redbaron (Migration: carbon/ryzen7
+# are disabled) and skipped for --explain (a read-only diagnostic query,
+# never a real dispatch attempt) and --dry-run (build-has-work.sh's own
+# "would a real tick admit anything" query must see the SAME refusal a
+# live tick would apply, so it is not exempted the way --explain is).
+#
+# Under BUILD_TEST=1 this probe is skipped UNLESS the caller explicitly
+# set $HOST_CONTRACT_SH itself (this selftest's own host-contract-tick-
+# selftest.sh does, pointed at a fixture double) -- the wide pre-existing
+# select-tick-selftest.sh suite has no idea this gate exists and calls no
+# fixture host-contract.sh, so without this guard every one of its cases
+# would silently probe the REAL RedBaron host's actual live drift state
+# (verified: it did, and failed schema validation on this box's real
+# critical drift the first time this landed).
+_host_contract_sh_explicit=false
+[ -n "${HOST_CONTRACT_SH:-}" ] && _host_contract_sh_explicit=true
+HOST_CONTRACT_SH="${HOST_CONTRACT_SH:-$HERE/host-contract.sh}"
+host_drift_csv=""
+if [ -z "$EXPLAIN_SLUG" ] && [ "$LANE_ARG" = "redbaron" ] && [ -x "$HOST_CONTRACT_SH" ] \
+   && { [ "${BUILD_TEST:-0}" != "1" ] || [ "$_host_contract_sh_explicit" = true ]; }; then
+  hc_out="$("$HOST_CONTRACT_SH" check 2>/dev/null)"
+  hc_rc=$?
+  if [ "$hc_rc" -eq 2 ]; then
+    host_drift_csv="$(printf '%s\n' "$hc_out" | grep 'severity=critical' | sed -E 's/=drift.*$//' | paste -sd, -)"
+  fi
+fi
+if [ -n "$host_drift_csv" ]; then
+  moved_json="$(printf '%s' "$admitted_json" | "$JQ" -c --arg keys "$host_drift_csv" \
+    'map({slug, reason:"host-drift", detail:$keys})')"
+  skipped_json="$(printf '%s\n%s\n' "$skipped_json" "$moved_json" | "$JQ" -sc 'add')"
+  admitted_json="[]"
+  admitted_count=0
+  skipped_count="$(printf '%s' "$skipped_json" | "$JQ" 'length')"
+  if [ "$DRY_RUN" = false ]; then
+    journal_line --file "$JOURNAL" "$(date -u +%Y-%m-%dT%H:%M:%SZ)  dispatch  host-drift  $host_drift_csv"
+  fi
+fi
+
 # --- Pin stamping + outcome journaling (PRD-build-select-tick-run-pin
 # requirements 1, 3, 4, 5). Runs unconditionally (pin_slugs_json is "[]"
 # when no --pin/SELECT_TICK_PIN was given) so every admitted/skipped entry

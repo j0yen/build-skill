@@ -386,3 +386,42 @@ line) is a later step of this same PRD, not this one — this step lands
 the contract file and the probe/apply/history core only
 (`scripts/host-contract.sh`, `scripts/host-contract-selftest.sh`,
 AC1/AC2/AC4/AC5 and AC6's journal-dedup half).
+
+## host-contract-tick-integration — 2026-09-18, PRD-build-host-contract
+
+Step 2: the two tick-facing pieces of requirement 3. `scripts/lane-
+health.sh` is the one new tick health line — it runs `host-contract.sh
+check` and prints/journals exactly one line ending `host=ok` or
+`host=drift:<csv>` (every drifted key, both severities, so a warn-only
+drift is still visible on the line select-tick.sh's own critical-only
+gate would silently pass through). `select-tick.sh` gained a host-drift
+refusal: right after `admitted_json`/`skipped_json` are computed (before
+the pin-stamping block, so pins are refused too — this is a whole-tick
+gate, not a per-candidate one), a critical `host-contract.sh check` drift
+on `lane=redbaron` moves every admitted entry into `skipped` with
+`reason:"host-drift"`, journals one `dispatch  host-drift  <keys>` line,
+and never touches a unit already running (select-tick.sh only ever
+decided what to admit — it manages no running process, so there was
+nothing to preserve here beyond not adding a first pgrep/systemctl call,
+which AC5 of PRD-build-select-tick-deterministic already forbids
+statically). Non-redbaron lanes and `--explain` are exempt outright;
+`--dry-run` is NOT exempt (build-has-work.sh's "would a real tick admit
+anything" query must see the same refusal a live tick would apply) but
+still never journals, matching that flag's pre-existing contract.
+
+Caught by the regression pass, not written in from the start: the first
+version of this gate ran host-contract.sh unconditionally whenever
+`lane=redbaron`, with no test-isolation awareness. Running the pre-
+existing `select-tick-selftest.sh` suite against it (none of those cases
+know this new gate exists, and none point `$HOST_CONTRACT_SH` at a
+fixture) made the gate call the REAL host-contract.sh against RedBaron's
+actual live state — which really was critically drifted at the time —
+and AC6 there failed schema validation on the unexpected `host-drift`
+skip entries. Fixed two ways: (1) the moved-to-skipped entries no longer
+carry a stray `path` field the schema's `additionalProperties: false`
+rejects; (2) the probe is now skipped under `BUILD_TEST=1` UNLESS the
+caller explicitly set `$HOST_CONTRACT_SH` itself (captured before this
+script's own `:-` default is applied) — exactly what this PRD's own new
+`host-contract-tick-selftest.sh` does, pointed at a small fixture double,
+so the new behavior is still exercised deterministically without every
+untouched selftest in the tree silently starting to probe the real host.
