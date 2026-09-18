@@ -4249,17 +4249,7 @@ canary_build_baseline() {
 
   mkdir -p "$baseline_dir"
   rm -f "$baseline_dir"/*.json 2>/dev/null || true
-  local f mtime receipts_n=0
-  if [ -d "$src_dir" ]; then
-    for f in "$src_dir"/*.json; do
-      [ -e "$f" ] || continue
-      mtime="$(stat -c %Y "$f" 2>/dev/null || stat -f %m "$f" 2>/dev/null || echo 0)"
-      if [ "$mtime" -ge "$ts" ]; then
-        cp -f "$f" "$baseline_dir"/
-        receipts_n=$((receipts_n + 1))
-      fi
-    done
-  fi
+  local receipts_n; receipts_n="$(canary_copy_fresh_receipts "$src_dir" "$baseline_dir" "$ts")"
 
   local state cause=""
   if [ "$receipts_n" -ge 1 ]; then
@@ -4286,6 +4276,30 @@ canary_build_baseline() {
   fi
 }
 
+# canary_copy_fresh_receipts <src_dir> <dest_dir> <launch_ts> -> stdout
+# receipts_n. R3: a variant's receipts_n counts exactly the receipts whose
+# mtime is >= its own launch_ts, copied from its own worktree's
+# target/autobuilder/receipts/ -- never whatever else happens to be
+# sitting in that directory (same fail-closed filter R2 gives the
+# baseline, applied to every variant so gate-receipt-diff.sh only ever
+# sees run-scoped files on both sides).
+canary_copy_fresh_receipts() {
+  local src_dir="$1" dest_dir="$2" launch_ts="$3"
+  mkdir -p "$dest_dir"
+  local f mtime n=0
+  if [ -d "$src_dir" ]; then
+    for f in "$src_dir"/*.json; do
+      [ -e "$f" ] || continue
+      mtime="$(stat -c %Y "$f" 2>/dev/null || stat -f %m "$f" 2>/dev/null || echo 0)"
+      if [ "$mtime" -ge "$launch_ts" ]; then
+        cp -f "$f" "$dest_dir"/
+        n=$((n + 1))
+      fi
+    done
+  fi
+  printf '%s' "$n"
+}
+
 # canary_run_variant_main <head_sha> <baseline_dir> <baseline_state> <server_id> <repo_path>
 # -> stdout verdict (pass|block|diverged); writes $CANARY_DIVERGED_LINES_FILE.
 # R1: repo_path is the pinned canary worktree, never CANARY_REPO directly.
@@ -4296,8 +4310,7 @@ canary_run_variant_main() {
   BURST_LANE=1 "$CANARY_GATE_LAUNCH" "$repo_path" --head "$head_sha" --scope main \
     --slug "canary-main-$ts" --wait >/dev/null 2>&1 || rc=$?
   local run_dir="$CANARY_RUNS_ROOT/$ts-main/receipts"
-  mkdir -p "$run_dir"
-  cp -f "$repo_path"/target/autobuilder/receipts/*.json "$run_dir"/ 2>/dev/null || true
+  canary_copy_fresh_receipts "$repo_path/target/autobuilder/receipts" "$run_dir" "$ts" >/dev/null
   [ "$rc" -eq 0 ] || verdict="block"
   local diverged_lines=""
   if [ "$baseline_state" = "present" ]; then
@@ -4331,8 +4344,7 @@ canary_run_variant_branch() {
   BURST_LANE=1 "$CANARY_GATE_LAUNCH" "$wt" --head "$branch_head" --scope branch \
     --slug "canary-branch-$ts" --wait >/dev/null 2>&1 || rc=$?
   local run_dir="$CANARY_RUNS_ROOT/$ts-branch/receipts"
-  mkdir -p "$run_dir"
-  cp -f "$wt"/target/autobuilder/receipts/*.json "$run_dir"/ 2>/dev/null || true
+  canary_copy_fresh_receipts "$wt/target/autobuilder/receipts" "$run_dir" "$ts" >/dev/null
   [ "$rc" -eq 0 ] || verdict="block"
   local diverged_lines=""
   if [ "$baseline_state" = "present" ]; then
