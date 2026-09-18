@@ -1,6 +1,6 @@
 {
   "generated": [
-    {"path": "agent/intent-card.json", "regen": "scripts/intent-card-refresh.sh {slug}"},
+    {"path": "agent/intent-card.json", "regen": "scripts/intent-card-refresh.sh . PRD-{slug}.md"},
     {"path": "tests/suite_*.rs", "regen": "scripts/gen-test-suites.sh"}
   ],
   "append_only": [

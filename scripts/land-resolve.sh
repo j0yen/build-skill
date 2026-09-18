@@ -418,7 +418,29 @@ cmd_resolve() {
           continue
         fi
         if [ -n "$regen_cmd" ]; then
-          if ! ( cd "$repo" && eval "$regen_cmd" ) >&2 2>&1; then
+          # landres_ac_intent_card_refresh_path: a regen command's
+          # leading `scripts/<name>` token names a script relative to
+          # whichever repo owns it — the target repo for a repo-owned
+          # generator (e.g. mcphost's own scripts/gen-test-suites.sh),
+          # but a build-skill-owned generator (e.g.
+          # scripts/intent-card-refresh.sh) lives under $SKILL_DIR, not
+          # under $repo. Evaluating the raw string with cwd=$repo below
+          # silently mis-resolved the latter kind ("No such file or
+          # directory", land-resolve.sh:421 — LIVE DEFECT 2026-09-18,
+          # mcphost-test-suite-consolidation dispatch
+          # 20260918T193320Z-3339733, hit twice in a row on the
+          # agent/intent-card.json rebase conflict). Fall back to
+          # $SKILL_DIR only when the repo itself has no such script, so
+          # every existing repo-owned regen command is unaffected.
+          local regen_bin="${regen_cmd%% *}" regen_exec="$regen_cmd"
+          case "$regen_bin" in
+            scripts/*)
+              if [ ! -e "$repo/$regen_bin" ] && [ -e "$SKILL_DIR/$regen_bin" ]; then
+                regen_exec="$SKILL_DIR/$regen_bin${regen_cmd#"$regen_bin"}"
+              fi
+              ;;
+          esac
+          if ! ( cd "$repo" && eval "$regen_exec" ) >&2 2>&1; then
             echo "land-resolve: regen command failed for $f ($regen_cmd) — leaving as source conflict" >&2
             source_files+=("$f")
             continue

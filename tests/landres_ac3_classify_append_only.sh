@@ -56,7 +56,7 @@ if [ -f "$mcphost_policy" ]; then
     fail=1
   fi
   out4="$(BUILD_STATE_DIR="$SKILL_STATE_DIR" "$RESOLVE" classify "/wherever/mcphost" "agent/intent-card.json")"
-  if [ "$out4" = "class=generated regen=scripts/intent-card-refresh.sh " ]; then
+  if [ "$out4" = "class=generated regen=scripts/intent-card-refresh.sh . PRD-.md" ]; then
     echo "ok  AC3: mcphost's shipped policy classifies agent/intent-card.json as generated"
   else
     echo "FAIL: expected generated classification for mcphost's intent-card.json, got '$out4'" >&2
