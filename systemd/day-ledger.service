@@ -1,0 +1,9 @@
+[Unit]
+Description=Write the day's build.day_ledger.v1 JSON record and push it (PRD-build-day-ledger)
+
+[Service]
+Type=oneshot
+Environment=HOME=/home/jsy
+Environment=PATH=/home/jsy/.local/bin:/home/jsy/.cargo/bin:/home/jsy/.npm-global/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/home/jsy/.claude/skills/build/scripts/day-ledger.sh
+TimeoutStartSec=60

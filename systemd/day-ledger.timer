@@ -1,0 +1,11 @@
+[Unit]
+Description=Run day-ledger.sh once daily at 23:55 America/New_York (PRD-build-day-ledger)
+
+[Timer]
+OnCalendar=*-*-* 23:55:00 America/New_York
+AccuracySec=1min
+Persistent=true
+Unit=day-ledger.service
+
+[Install]
+WantedBy=timers.target

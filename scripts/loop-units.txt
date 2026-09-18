@@ -28,3 +28,7 @@ RedBaron agorabus-reap.timer
 # rule reads a file, never `gh` directly. Unit source:
 # systemd/ci-status.{service,timer} in this repo.
 RedBaron ci-status.timer
+# PRD-build-day-ledger requirement 8: writes notes/day-ledger/<date>.json
+# once daily at 23:55 America/New_York. Unit source:
+# systemd/day-ledger.{service,timer} in this repo.
+RedBaron day-ledger.timer

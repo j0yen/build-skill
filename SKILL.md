@@ -3574,3 +3574,26 @@ computed every tick by `scripts/gate-red-summary.sh` and journaled by
 `scripts/gate-red-tick.sh`). `handoff-header.sh` prints nothing (exit 0)
 if no tick has run yet on this host — in that case, note the gate state
 as unknown rather than omitting the line entirely.
+
+**Day ledger (`day-ledger.sh`, PRD-build-day-ledger).** The loop's
+per-phase reporters (`gates-banner.sh`, `gate-red-summary.sh`,
+`decisions-banner.sh`, `gate-phase-digest.sh`, `lane-status.sh`,
+`serialization-digest.sh`, `tick-selftest-summary.sh`, …) each answer one
+narrow question in the moment; `scripts/day-ledger.sh [--date
+YYYY-MM-DD] [--out <path>] [--no-push] [--format text]` is the one
+factual, no-model, schema-fixed (`build.day_ledger.v1`) record of a whole
+America/New_York calendar day — ticks, gates, shipped[], landings[],
+decisions{opened,closed}, and burst state, each source degrading to an
+empty field plus a `notes: ["source-missing: <name>"]` line rather than
+failing the write. It reads the same reporters above rather than
+re-deriving their logic, writes `$PRD_DIR/notes/day-ledger/<date>.json`,
+and pushes it through the identical `pull --rebase --autostash` path
+`archive-commit.sh` uses, so carbon (and any other node) picks it up on
+its next `git pull` with no new transport. `day-ledger.timer` (RedBaron
+only, 23:55 America/New_York, declared in `scripts/loop-units.txt`)
+drives it daily; `--format text` gives a 10-line human answer to "what
+happened today" without a scout. `scripts/day-ledger-selftest.sh` replays
+its own fixtures (including the missing-source, unwritable-output-dir,
+and identifier-closure-violation negative cases) before a live pass
+against today's real sources — run it to validate a change here before
+trusting the timer.
