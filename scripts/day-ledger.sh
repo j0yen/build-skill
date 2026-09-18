@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # day-ledger.sh — PRD-build-day-ledger. One factual JSON record of the
-# loop's day (build.day_ledger.v1), no model call, written to
+# loop's day (build.day_ledger.v2 — bumped by PRD-build-flow-ledger req 4,
+# which added the flow{} block; v1 readers are unaffected), no model call, written to
 # $PRD_DIR/notes/day-ledger/<date>.json and pushed through the same
 # `pull --rebase --autostash` path archive-commit.sh already uses.
 #
@@ -51,6 +52,12 @@
 #                                (PRD-buildloop-tick-outcome-liveness R8 --
 #                                source for ticks_failed/causes/
 #                                longest_failed_streak)
+#   DAY_LEDGER_FLOW_LEDGER_FILE  override state/flow-ledger.jsonl path
+#                                (PRD-build-flow-ledger R4 -- source for the
+#                                flow{} block: lead_time/gate_wall/wait p50/p90
+#                                over PRDs archived THIS day)
+#   DAY_LEDGER_FLOW_LEDGER_BIN   override scripts/flow-ledger.sh path
+#                                (fake/failing binary in tests)
 #   DAY_LEDGER_PROD_SKILL_DIR   override the assumed production
 #                                ~/.claude/skills/build root all the
 #                                state-file defaults above are anchored to
@@ -405,6 +412,47 @@ burst_sha=""
 }
 
 # =======================================================================
+# source: flow (PRD-build-flow-ledger req 4, AC5) — lead_time/gate_wall/
+# wait p50 over every PRD ARCHIVED this America/New_York day, read from
+# flow-ledger.sh's own report (the same reducer AC1/AC2 exercise), never
+# re-derived here. --since-epoch/--until-epoch match this script's own
+# [day_start_epoch, day_end_epoch) window exactly, so a --date backfill
+# ledger call lines up with the calendar day day-ledger.sh itself is
+# building, not "the last N hours from now".
+# =======================================================================
+flow_lead_p50="null" flow_lead_p90="null" flow_gate_wall_p50="null" flow_wait_p50="null" flow_prds_measured=0
+flow_sha=""
+{
+  flbin="${DAY_LEDGER_FLOW_LEDGER_BIN:-$HERE/flow-ledger.sh}"
+  flfile="${DAY_LEDGER_FLOW_LEDGER_FILE:-$PROD_SKILL_DIR/state/flow-ledger.jsonl}"
+  flow_out=""
+  if [ -x "$flbin" ] && [ -r "$flfile" ]; then
+    flow_out="$(FLOW_LEDGER_FILE="$flfile" "$flbin" report \
+      --since-epoch "$day_start_epoch" --until-epoch "$day_end_epoch" --format json 2>/dev/null || true)"
+  fi
+  flow_sha="$(sha_of "$flow_out")"
+  if [ -z "$flow_out" ]; then
+    add_note "source-missing: flow-ledger"
+  else
+    flow_lead_p50="$(printf '%s' "$flow_out" | "$JQ" -c '.lead_time_p50_h // null' 2>/dev/null)"
+    flow_lead_p90="$(printf '%s' "$flow_out" | "$JQ" -c '.lead_time_p90_h // null' 2>/dev/null)"
+    flow_gate_wall_p50="$(printf '%s' "$flow_out" | "$JQ" -c '.gate_time_p50_s // null' 2>/dev/null)"
+    flow_wait_p50="$(printf '%s' "$flow_out" | "$JQ" -c '.wait_time_p50_s // null' 2>/dev/null)"
+    flow_prds_measured="$(printf '%s' "$flow_out" | "$JQ" -r '.prds_measured // 0' 2>/dev/null)"
+    [ -n "$flow_lead_p50" ] || flow_lead_p50="null"
+    [ -n "$flow_lead_p90" ] || flow_lead_p90="null"
+    [ -n "$flow_gate_wall_p50" ] || flow_gate_wall_p50="null"
+    [ -n "$flow_wait_p50" ] || flow_wait_p50="null"
+    [ -n "$flow_prds_measured" ] || flow_prds_measured=0
+  fi
+}
+flow_json="$("$JQ" -n \
+  --argjson lead_p50 "$flow_lead_p50" --argjson lead_p90 "$flow_lead_p90" \
+  --argjson gate_wall_p50 "$flow_gate_wall_p50" --argjson wait_p50 "$flow_wait_p50" \
+  --argjson prds_measured "$flow_prds_measured" \
+  '{lead_time_p50_h: $lead_p50, lead_time_p90_h: $lead_p90, gate_wall_p50_s: $gate_wall_p50, wait_p50_s: $wait_p50, prds_measured: $prds_measured}')"
+
+# =======================================================================
 # P1 req 10: operator-landed note — a merged loop/<slug> PR that day with
 # no landing-pending journal line for that slug that day.
 # =======================================================================
@@ -467,12 +515,13 @@ sources_sha256_json="$("$JQ" -n \
   --arg decisions "${decisions_sha:-$(sha_of "")}" \
   --arg burst "${burst_sha:-$(sha_of "")}" \
   --arg tick_outcomes "${tick_outcomes_sha:-$(sha_of "")}" \
-  '{ticks:$ticks, gates:$gates, shipped:$shipped, landings:$landings, decisions:$decisions, burst:$burst, tick_outcomes:$tick_outcomes}')"
+  --arg flow "${flow_sha:-$(sha_of "")}" \
+  '{ticks:$ticks, gates:$gates, shipped:$shipped, landings:$landings, decisions:$decisions, burst:$burst, tick_outcomes:$tick_outcomes, flow:$flow}')"
 
 produced_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
 doc="$("$JQ" -n \
-  --arg schema "build.day_ledger.v1" \
+  --arg schema "build.day_ledger.v2" \
   --arg date "$target_date" \
   --arg tz "$TZ_NAME" \
   --arg host "$host" \
@@ -496,6 +545,7 @@ doc="$("$JQ" -n \
   --argjson ticks_failed "${ticks_failed:-0}" \
   --argjson causes "$causes_json" \
   --argjson longest_failed_streak "${longest_failed_streak:-0}" \
+  --argjson flow "$flow_json" \
   '{
     schema: $schema, date: $date, tz: $tz, host: $host,
     ticks: {started: $ticks_started, dispatched_prds: $dispatched_prds},
@@ -504,6 +554,7 @@ doc="$("$JQ" -n \
     shipped: $shipped, landings: $landings,
     decisions: {opened: $decisions_opened, closed: $decisions_closed},
     burst: {box_exists: $burst_box_exists, routing_enabled: $burst_routing_enabled},
+    flow: $flow,
     notes: $notes, identifiers: $identifiers,
     produced_by: $produced_by, produced_at: $produced_at,
     sources_sha256: $sources_sha256
@@ -519,7 +570,9 @@ if [ "$format" = "text" ]; then
     "shipped(" + (.shipped|length|tostring) + "): " + (.shipped|join(", ")),
     ( .landings[] | "landing: " + .repo + "#" + (.pr|tostring) + " (" + .slug + ")" ),
     "decisions: opened=" + (.decisions.opened|length|tostring) + " closed=" + (.decisions.closed|length|tostring),
-    "burst: box_exists=" + (.burst.box_exists|tostring) + " routing_enabled=" + (.burst.routing_enabled|tostring)
+    "burst: box_exists=" + (.burst.box_exists|tostring) + " routing_enabled=" + (.burst.routing_enabled|tostring),
+    "flow: lead_p50=" + (.flow.lead_time_p50_h|tostring) + "h wait_p50=" + (.flow.wait_p50_s|tostring) +
+      "s gate_wall_p50=" + (.flow.gate_wall_p50_s|tostring) + "s prds_measured=" + (.flow.prds_measured|tostring)
   ' 2>/dev/null | head -10
   exit 0
 fi

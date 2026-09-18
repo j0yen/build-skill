@@ -149,6 +149,10 @@ common_env=(
   DAY_LEDGER_BURST_LANE_BIN="$BURST_STUB"
   DAY_LEDGER_SERVICE_ENV_BIN="$SVCENV_STUB"
   DAY_LEDGER_MANIFEST_FILE="$WORK/nonexistent-manifest.json"
+  # PRD-build-flow-ledger req 4: point at a fixture path (not production
+  # state/flow-ledger.jsonl) so AC2's determinism check can never flake on
+  # a sibling PRD appending a real event between the two runs below.
+  DAY_LEDGER_FLOW_LEDGER_FILE="$WORK/nonexistent-flow-ledger.jsonl"
   BUILD_JOURNAL_ROOT="$WORK/brain-journal"
   BUILD_STATE_DIR="$WORK/state"
 )
@@ -174,6 +178,11 @@ check_schema() {
     (.shipped|type=="array") and (.landings|type=="array") and
     (.decisions.opened|type=="array") and (.decisions.closed|type=="array") and
     (.burst.box_exists|type=="boolean") and (.burst.routing_enabled|type=="boolean") and
+    (.flow.prds_measured|type=="number") and
+    (.flow.lead_time_p50_h|type=="number" or .flow.lead_time_p50_h==null) and
+    (.flow.lead_time_p90_h|type=="number" or .flow.lead_time_p90_h==null) and
+    (.flow.gate_wall_p50_s|type=="number" or .flow.gate_wall_p50_s==null) and
+    (.flow.wait_p50_s|type=="number" or .flow.wait_p50_s==null) and
     (.notes|type=="array") and (.identifiers|type=="array") and
     (.produced_by|type=="string") and (.produced_at|type=="string") and
     (.sources_sha256|type=="object")
@@ -184,7 +193,8 @@ if [ -f "$AC1_OUT" ] && check_schema "$AC1_OUT"; then
 else
   bad "AC1: schema check failed"
 fi
-[ -f "$AC1_OUT" ] && assert "AC1: schema" "$("$JQ" -r .schema "$AC1_OUT")" "build.day_ledger.v1"
+[ -f "$AC1_OUT" ] && assert "AC1: schema" "$("$JQ" -r .schema "$AC1_OUT")" "build.day_ledger.v2"
+[ -f "$AC1_OUT" ] && assert "AC1: flow.prds_measured (no fixture ledger)" "$("$JQ" -r .flow.prds_measured "$AC1_OUT")" "0"
 [ -f "$AC1_OUT" ] && assert "AC1: ticks.started" "$("$JQ" -r .ticks.started "$AC1_OUT")" "2"
 [ -f "$AC1_OUT" ] && assert "AC1: gates.red_slugs" "$("$JQ" -c -S .gates.red_slugs "$AC1_OUT")" '["fixture-slug-c"]'
 [ -f "$AC1_OUT" ] && assert "AC1: shipped" "$("$JQ" -c -S '.shipped|sort' "$AC1_OUT")" '["fixture-slug-a","fixture-slug-b"]'

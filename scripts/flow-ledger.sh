@@ -125,12 +125,19 @@ cmd_append() {
 }
 
 cmd_report() {
-  local slug="" since="" format="text"
+  local slug="" since="" format="text" since_epoch="" until_epoch=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --slug) slug="${2:?--slug needs a value}"; shift 2 ;;
       --since) since="${2:?--since needs a value like 7d}"; shift 2 ;;
       --format) format="${2:?--format needs text|json}"; shift 2 ;;
+      # day-ledger.sh's own day-window call (Requirement 4, AC5): an exact
+      # [since_epoch, until_epoch) range instead of a --since duration
+      # relative to now, so a --date backfill matches day-ledger's own
+      # America/New_York day boundary exactly. Internal, undocumented in
+      # the usage header above on purpose -- CLI users get --since.
+      --since-epoch) since_epoch="${2:?--since-epoch needs an epoch seconds value}"; shift 2 ;;
+      --until-epoch) until_epoch="${2:?--until-epoch needs an epoch seconds value}"; shift 2 ;;
       *) die "report: unknown argument: $1" 2 ;;
     esac
   done
@@ -162,11 +169,13 @@ cmd_report() {
   fi
 
   # aggregate: one row per slug that has ever appeared, filter to those with
-  # an archived event (optionally within --since), then p50/p90 + top-5 slowest.
+  # an archived event (optionally within --since, or the exact
+  # [--since-epoch, --until-epoch) window day-ledger.sh uses), then p50/p90
+  # + top-5 slowest.
   local slugs; slugs="$(printf '%s' "$events" | "$JQ" -r '[.[].slug] | unique | .[]')"
   local now_ep; now_ep="$(date -u +%s)"
-  local cutoff_ep=""
-  if [ -n "$since" ]; then
+  local cutoff_ep="$since_epoch"
+  if [ -z "$cutoff_ep" ] && [ -n "$since" ]; then
     cutoff_ep="$(since_to_epoch "$now_ep" "$since")" || die "bad --since value: $since (want <n>d|<n>h|<n>m)" 2
   fi
 
@@ -177,9 +186,10 @@ cmd_report() {
     slug_events="$(printf '%s' "$events" | "$JQ" -c --arg s "$s" '[.[] | select(.slug == $s)]')"
     archived_ts="$(printf '%s' "$slug_events" | "$JQ" -r '[.[] | select(.stage == "archived") | .ts] | last // empty')"
     [ -n "$archived_ts" ] || continue
-    if [ -n "$cutoff_ep" ]; then
+    if [ -n "$cutoff_ep" ] || [ -n "$until_epoch" ]; then
       local arch_ep; arch_ep="$(date -u -d "$archived_ts" +%s 2>/dev/null || echo 0)"
-      [ "$arch_ep" -ge "$cutoff_ep" ] || continue
+      [ -z "$cutoff_ep" ] || [ "$arch_ep" -ge "$cutoff_ep" ] || continue
+      [ -z "$until_epoch" ] || [ "$arch_ep" -lt "$until_epoch" ] || continue
     fi
     row="$(printf '%s' "$slug_events" | "$JQ" --arg slug "$s" "$FLOW_REDUCE_PROGRAM"' + {slug: $slug}')"
     rows="$(printf '%s' "$rows" | "$JQ" --argjson r "$row" '. + [$r]')"
