@@ -96,4 +96,33 @@ grep -rq 'flow-ledger append-failed' "$JOURNAL_SCRATCH" 2>/dev/null \
   || fail "no journal line naming the ledger failure ($JOURNAL_SCRATCH)"
 echo ok
 
+# =======================================================================
+# AC4 — manifest-set.sh receives ticks_invested_delta: 1; ticks_invested
+# ends up equal to the ledger's own claimed-count for the slug, and one
+# journal line says the delta was ignored.
+# =======================================================================
+echo "== AC4: ticks_invested_delta is ignored, ticks_invested derived from the ledger =="
+MS="$HERE/manifest-set.sh"
+AC4_STATE=$(mktemp -d /tmp/flow-ledger-ac4-state.XXXXXX)
+AC4_LEDGER="$AC4_STATE/flow-ledger.jsonl"
+AC4_JOURNAL="$AC4_STATE/journal/$(date -u +%F).md"
+for i in 1 2 3; do
+  printf '{"ts":"2026-09-18T00:0%s:00Z","slug":"ac4-slug","stage":"claimed","lane":"redbaron"}\n' "$i" >> "$AC4_LEDGER"
+done
+
+patch_file="$AC4_STATE/patch.json"
+echo '{"ticks_invested_delta": 1}' > "$patch_file"
+
+BUILD_STATE_DIR="$AC4_STATE" FLOW_LEDGER_FILE="$AC4_LEDGER" JOURNAL="$AC4_JOURNAL" \
+  "$MS" ac4-slug "$patch_file"
+rc=$?
+[ "$rc" -eq 0 ] || fail "manifest-set exited $rc"
+ticks="$(jq -r '.prds[] | select(.slug=="ac4-slug") | .ticks_invested' "$AC4_STATE/manifest.json")"
+[ "$ticks" = "3" ] || fail "ticks_invested: got '$ticks', want 3 (ledger's claimed count)"
+jq -e 'has("ticks_invested_delta") | not' <(jq '.prds[] | select(.slug=="ac4-slug")' "$AC4_STATE/manifest.json") >/dev/null \
+  || fail "ticks_invested_delta leaked into the manifest entry"
+grep -q 'ticks-invested-delta-ignored' "$AC4_JOURNAL" || fail "no journal line saying the delta was ignored"
+rm -rf "$AC4_STATE"
+echo ok
+
 echo "flow-ledger-selftest: PASS"
