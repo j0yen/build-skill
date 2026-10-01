@@ -92,6 +92,15 @@ line, a receipt path, or a live command's exit code — never a fixture.
 `scan-prds.sh` emits `live_acs: [N, …]` per PRD (the AC numbers carrying the
 marker, read-only diagnostics; it never itself refuses anything).
 
+For wm-build's own PRD corpus, `wm-build lint` (PRD-wm-build-prd-live-marker-lint)
+is the authority on this exact grammar: the accepted form is `(Live;
+evidence: <text>)` ending the AC line, nothing else — a lowercase `(live`,
+a trailing `.` after the `)`, or text after the `)` is a `live-marker-near-miss`
+lint error (not a silent parse to "offline"), and `wm-build lint --fix`
+rewrites the unambiguous cases (lowercase, trailing period) in place. A
+PRD with zero live ACs whose `publish`/`build_into` implies a deployed
+artifact fails `no-live-ac` at lint and at admission.
+
 Scope: a PRD whose `build_into` is under `/home/jsy/wintermute/build-skill`,
 `/home/jsy/wintermute/rustbuild`, or `/home/jsy/wintermute/autobuilder`
 (the shared list in `scripts/loop-tooling-repos.txt`, read by every check
