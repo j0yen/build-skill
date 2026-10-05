@@ -1016,6 +1016,17 @@ def lint_file(path):
             if m:
                 own_ac_nums.add(int(m.group(1)))
 
+        # -- AC count cap (Joe 2026-10-05): more than 8 numbered ACs in one
+        # PRD is a split-it-up smell, not a hard contract violation -- warn
+        # only, never fail a file over it.
+        if len(own_ac_nums) > 8:
+            warn(
+                "ac-count-over-8",
+                f"ac-count-over-8: {len(own_ac_nums)} numbered ACs; Joe "
+                f"2026-10-05: cap is 8 — split by ship-independent seams "
+                f"with Depends-on",
+            )
+
         transferred_raw = fm.get("transferred_acs")
         transferred_nums = []
         if transferred_raw:
