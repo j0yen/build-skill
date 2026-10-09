@@ -1076,6 +1076,39 @@ cat > "$b/PRD-clean-built.md" <<'EOF'
 EOF
 expect_ok "$b/PRD-clean-built.md" "clean-from-built-prds"
 
+# ======================================================================== ac-text-over-intent-card-cap
+pad() { head -c "$1" /dev/zero | tr '\0' 'x'; }
+mk_cap_prd() { # $1=file $2=pad length (Then clause carries the padding)
+  cat > "$1" <<EOF2
+- Status: queued
+- build_target: shell
+- Vision: visions/plain.md
+
+## Acceptance criteria
+
+1. P0 — Given a fixture, When linted, Then $(pad "$2").
+EOF2
+}
+mk_cap_prd "$q/PRD-cap-over.md" 520
+mk_cap_prd "$q/PRD-cap-under.md" 400
+expect_fail "$q/PRD-cap-over.md" ac-text-over-intent-card-cap "ac-text-over-intent-card-cap/520-fail"
+expect_clean_no_id "$q/PRD-cap-under.md" failures ac-text-over-intent-card-cap "ac-text-over-intent-card-cap/400-pass"
+total=$((total+1))
+o="$(PRD_LINT_INTENT_CARD_CAP=300 "$LINT" --format json "$q/PRD-cap-under.md" 2>/dev/null)"
+if grep -q ac-text-over-intent-card-cap <<<"$o"; then
+  echo "ok: ac-text-over-intent-card-cap/env-override-300 -> FAIL on 400"
+else echo "FAIL: env override 300 did not flag 400-char AC"; fails=$((fails+1)); fi
+total=$((total+1))
+o="$(PRD_LINT_INTENT_CARD_CAP=900 "$LINT" --format json "$q/PRD-cap-over.md" 2>/dev/null)"
+if grep -q ac-text-over-intent-card-cap <<<"$o"; then
+  echo "FAIL: env override 900 still flagged 520-char AC"; fails=$((fails+1))
+else echo "ok: ac-text-over-intent-card-cap/env-override-900 -> clean"; fi
+total=$((total+1))
+o="$(WM_BUILD_SRC=/nonexistent "$LINT" --format json "$q/PRD-cap-over.md" 2>/dev/null)"
+if grep -q intent-card-cap-source-missing <<<"$o"; then
+  echo "ok: intent-card-cap-source-missing/warn"
+else echo "FAIL: missing source did not warn"; fails=$((fails+1)); fi
+
 # --------------------------------------------------------------------------
 if [ "$fails" -ne 0 ]; then
   echo "SELFTEST FAILED ($fails/$total checks)"

@@ -133,6 +133,17 @@ justification under ONE of these two keys (either one satisfies the rule):
 EXPLAIN
       exit 0
       ;;
+    ac-text-over-intent-card-cap)
+      cat <<'EXPLAIN'
+ac-text-over-intent-card-cap: one AC's text (UTF-8 bytes, after the daemon's
+own condense_ac_text) is over wm-build's INTENT_CARD_AC_TEXT_CAP, so the run
+ends `infra cause=intent-card ac=N` in ~1 s. The cap is read from
+$WM_BUILD_SRC/src/inner/contract.rs (default /home/jsy/wintermute/wm-build),
+overridable with PRD_LINT_INTENT_CARD_CAP; fallback 500 emits the WARN
+intent-card-cap-source-missing. Fix: shorten the AC or split it.
+EXPLAIN
+      exit 0
+      ;;
     *)
       echo "prd-lint: no --explain text for check id: $explain_id" >&2
       exit 2
@@ -633,6 +644,54 @@ def read_ac_numbers_and_live(fpath):
     return nums, live
 
 
+# -- intake cap on one AC's text (generated contract, not prose) ----------
+# Mirrors wm-build's own measurement: src/inner/contract.rs:18
+# `INTENT_CARD_AC_TEXT_CAP`; src/prd.rs parse_ac_item (text = the AC's lines
+# trimmed + joined with " ", minus the `N.` and `P<d> —` prefix, whitespace
+# NOT condensed); src/inner/mod.rs:~2852 applies contract.rs:35
+# `condense_ac_text` (only when len > cap; needs a `Then `: first clause up
+# to the first `,`/`.` + U+2026 + text from the LAST `Then `); then
+# src/inner/mod.rs:84 ends the run `infra cause=intent-card ac=<n>` when the
+# (possibly condensed) text `.len()` -- UTF-8 BYTES, not chars -- is still
+# over the cap. The cap VALUE is read from that source: env
+# PRD_LINT_INTENT_CARD_CAP, else $WM_BUILD_SRC/src/inner/contract.rs, else 500.
+def intent_card_cap():
+    """Returns (cap, source_ok)."""
+    ev = os.environ.get("PRD_LINT_INTENT_CARD_CAP", "").strip()
+    if ev.isdigit():
+        return int(ev), True
+    src = os.path.join(os.environ.get("WM_BUILD_SRC", "/home/jsy/wintermute/wm-build"),
+                       "src", "inner", "contract.rs")
+    try:
+        with open(src, encoding="utf-8") as fh:
+            m = re.search(r"pub\s+const\s+INTENT_CARD_AC_TEXT_CAP\s*:\s*usize\s*=\s*(\d+)\s*;", fh.read())
+        if m:
+            return int(m.group(1)), True
+    except OSError:
+        pass
+    return 500, False
+
+
+def intent_card_len(text):
+    """Byte length the daemon compares to the cap, after its own condense."""
+    cap = INTENT_CARD_CAP[0]
+    b = text.encode("utf-8")
+    if len(b) <= cap:
+        return len(b)
+    ti = text.rfind("Then ")
+    if ti < 0:
+        return len(b)
+    first = len(text)
+    for i, c in enumerate(text):
+        if c in ",.":
+            first = i
+            break
+    first = min(first, ti)
+    cond = text[:first].rstrip() + "\u2026" + text[ti:]
+    return len(cond.encode("utf-8"))
+
+INTENT_CARD_CAP = intent_card_cap()
+
 def lint_file(path):
     fails = []
     warns = []
@@ -976,6 +1035,25 @@ def lint_file(path):
                 s = " ".join(it)
                 if SHA40_RE.search(s) or BASE_SHA_RE.search(s):
                     warn("pinned-sha-in-ac", f"pin to a tag or a relative base, not a fixed SHA: {it[0]!r}")
+
+        # FAIL: an AC whose text exceeds the daemon's intent-card intake cap
+        # (see intent_card_len); the run would end infra intent-card in 1 s.
+        if not INTENT_CARD_CAP[1]:
+            warn("intent-card-cap-source-missing",
+                 "could not read INTENT_CARD_AC_TEXT_CAP from wm-build src/inner/contract.rs "
+                 "(set WM_BUILD_SRC or PRD_LINT_INTENT_CARD_CAP); using fallback 500")
+        for it in leveled_items:
+            full = " ".join(it)
+            m = re.match(r"^(\d+)\.\s+P[0-2]\s*[\u2014\u2013-]\s*", full)
+            if not m:
+                continue
+            body = full[m.end():]
+            n = m.group(1)
+            if intent_card_len(body) > INTENT_CARD_CAP[0]:
+                fail("ac-text-over-intent-card-cap",
+                     f"AC {n} text is {len(body.encode('utf-8'))} chars, daemon intake cap is {INTENT_CARD_CAP[0]} "
+                     "(INTENT_CARD_AC_TEXT_CAP, wm-build src/inner/contract.rs); "
+                     "the run would end infra intent-card in 1 s \u2014 shorten the AC")
 
         # pattern check: a /home/ path in an AC
         for it in leveled_items:
