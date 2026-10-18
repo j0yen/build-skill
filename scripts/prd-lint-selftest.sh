@@ -1003,7 +1003,7 @@ SCAN_PRDS="$HERE/scan-prds.sh"
 # with prd-lint.sh's own fm.get("...")/"..." in fm checks, same
 # duplicate-and-comment convention prd-lint.sh itself uses for
 # RUST_SUBSTRATE_TARGETS mirroring substrate-probe.sh.
-KNOWN_LINT_KEYS="status build_target build_into deferred_acs mock_justifications deferred_ac_reasons depends_on vision loop operator_authorization grounding superseded_by transferred_acs absorbs"
+KNOWN_LINT_KEYS="status build_target build_into deferred_acs mock_justifications deferred_ac_reasons depends_on vision loop operator_authorization grounding superseded_by transferred_acs absorbs foreign_surface_ok foreign_surface_reasons"
 
 # scan-prds.sh-only fields with no lint shape to check -- one reason each.
 declare -A PARITY_ALLOWLIST=(
@@ -1023,6 +1023,7 @@ declare -A PARITY_ALLOWLIST=(
   [gate_stale]="computed diagnostic, not frontmatter"
   [transferred_acs_unparsed]="a derived flag from parsing transferred_acs, not itself a frontmatter key"
   [absorbs_unparsed]="a derived flag from parsing Absorbs, not itself a frontmatter key"
+  [live_acs]="derived list of the AC numbers carrying (Live, computed from the AC block, not a frontmatter key; prd-lint.sh enforces (Live through its live-ac-* checks"
 )
 
 scan_keys="$(python3 -c '
@@ -1108,6 +1109,212 @@ o="$(WM_BUILD_SRC=/nonexistent "$LINT" --format json "$q/PRD-cap-over.md" 2>/dev
 if grep -q intent-card-cap-source-missing <<<"$o"; then
   echo "ok: intent-card-cap-source-missing/warn"
 else echo "FAIL: missing source did not warn"; fails=$((fails+1)); fi
+
+# ======================================================================== ac-names-foreign-surface
+# PRD-build-prd-lint-cross-repo-ac. Fixture repos: A (pyproject script `alpha`,
+# module alpha/digest.py), B (script `beta`), C (Cargo package/bin/src/bin),
+# S (shell scripts/ + bin/); `shared-cli` is a script of both A and B. The
+# corpus is $q/built-prds/parked: its build_into values are the fleet map.
+SURF="$HERE/repo-surface.sh"
+xa="$tmp/xrepo-A"; xb="$tmp/xrepo-B"; xc="$tmp/xrepo-C"; xs="$tmp/xrepo-S"; xe="$tmp/xrepo-empty"
+mkdir -p "$xa/alpha" "$xb/src/beta" "$xc/src/bin/tool-dir" "$xs/scripts" "$xs/bin" "$xe/docs"
+cat > "$xa/pyproject.toml" <<'EOF2'
+[project]
+name = "alpha-dist"
+
+[project.scripts]
+alpha = "alpha.cli:main"
+shared-cli = "alpha.cli:shared"
+
+[tool.other]
+notascript = "x"
+EOF2
+: > "$xa/alpha/__init__.py"; : > "$xa/alpha/digest.py"; : > "$xa/alpha/_private.py"
+mkdir -p "$xa/tests"; : > "$xa/tests/test_alpha.py"
+cat > "$xb/pyproject.toml" <<'EOF2'
+[project.scripts]
+beta = "beta.cli:main"
+"shared-cli" = "beta.cli:shared"
+EOF2
+: > "$xb/src/beta/__init__.py"; : > "$xb/src/beta/render.py"
+cat > "$xc/Cargo.toml" <<'EOF2'
+[package]
+name = "gamma"
+version = "0.1.0"
+
+[[bin]]
+name = "gamma-tool"
+path = "src/main.rs"
+
+[dependencies]
+name = "not-a-bin"
+EOF2
+: > "$xc/src/main.rs"; : > "$xc/src/bin/delta.rs"; : > "$xc/src/bin/tool-dir/main.rs"
+: > "$xs/scripts/sigma.sh"; : > "$xs/scripts/notes.txt"; : > "$xs/bin/omega"
+
+# -- repo-surface.sh (AC 5): generated, nothing typed
+total=$((total+1))
+out_a="$("$SURF" "$xa")"
+if [ "$out_a" = "$(printf 'alpha\ndigest\nshared-cli')" ]; then
+  echo "ok: repo-surface/python -> scripts + root-package modules, no __init__/_private/tests, no [project] name"
+else echo "FAIL: repo-surface/python got: $out_a"; fails=$((fails+1)); fi
+total=$((total+1))
+out_b="$("$SURF" "$xb" | tr '\n' ' ')"
+if [ "$out_b" = "beta render shared-cli " ]; then
+  echo "ok: repo-surface/python-src-layout -> quoted script key + src/<pkg> module"
+else echo "FAIL: repo-surface/src-layout got: $out_b"; fails=$((fails+1)); fi
+total=$((total+1))
+out_c="$("$SURF" "$xc" | tr '\n' ' ')"
+if [ "$out_c" = "delta gamma gamma-tool tool-dir " ]; then
+  echo "ok: repo-surface/cargo -> package, [[bin]], src/bin stems and dirs"
+else echo "FAIL: repo-surface/cargo got: $out_c"; fails=$((fails+1)); fi
+total=$((total+1))
+out_s="$("$SURF" "$xs" | tr '\n' ' ')"
+if [ "$out_s" = "omega sigma " ]; then
+  echo "ok: repo-surface/shell -> scripts/*.sh stems + bin/* names"
+else echo "FAIL: repo-surface/shell got: $out_s"; fails=$((fails+1)); fi
+total=$((total+1))
+out_e="$("$SURF" "$xe")"; rc_e=$?
+if [ -z "$out_e" ] && [ "$rc_e" -eq 0 ] && [ -z "$("$SURF" "$tmp/no-such-dir")" ]; then
+  echo "ok: repo-surface/no markers (and a missing dir) -> empty output, exit 0"
+else echo "FAIL: repo-surface/empty got rc=$rc_e out=$out_e"; fails=$((fails+1)); fi
+total=$((total+1))
+if ! grep -qE 'mtproof|synthorg|mcphost|alpha|beta' "$SURF"; then
+  echo "ok: repo-surface.sh types no repo or token (generated, not a list)"
+else echo "FAIL: repo-surface.sh names a repo/token literally"; fails=$((fails+1)); fi
+# cache: a git checkout is cached by path+HEAD and a second read is identical
+total=$((total+1))
+xg="$tmp/xrepo-git"; mkdir -p "$xg"; cp -r "$xb/." "$xg/"
+git -C "$xg" init -q 2>/dev/null && git -C "$xg" add -A && git -C "$xg" -c user.email=t@t -c user.name=t commit -qm init 2>/dev/null
+cache_t="$tmp/xcache"
+g1="$(PRD_LINT_CACHE="$cache_t" "$SURF" "$xg")"; g2="$(PRD_LINT_CACHE="$cache_t" "$SURF" "$xg")"
+if [ -n "$g1" ] && [ "$g1" = "$g2" ] && [ "$(ls "$cache_t/surface" | wc -l)" -eq 1 ]; then
+  echo "ok: repo-surface/cache -> one HEAD-keyed file, second read identical"
+else echo "FAIL: repo-surface/cache g1=$g1 g2=$g2 files=$(ls "$cache_t/surface" 2>&1)"; fails=$((fails+1)); fi
+
+# -- corpus naming A, B and C as build_into (the fleet map)
+# (its own corpus tree, so an unrelated fixture's build_into cannot reach it)
+xq="$tmp/xc1/build-queue"; xbp="$tmp/xc1/built-prds"; xpk="$tmp/xc1/parked"
+mkdir -p "$xq" "$xbp" "$xpk" "$tmp/xc1/visions"
+cp "$v/plain.md" "$tmp/xc1/visions/plain.md"
+cat > "$xbp/PRD-xrepo-corpus-b.md" <<EOF2
+- Status: built
+- build_target: python-cli
+- build_into: $xb
+- Vision: visions/plain.md
+EOF2
+cat > "$xpk/PRD-xrepo-corpus-c.md" <<EOF2
+- Status: parked
+- build_target: rust-cli
+- build_into: $xc
+- Vision: visions/plain.md
+EOF2
+mk_xrepo_prd() { # $1=file $2=AC 2 body (after "P0 — ") $3=extra frontmatter lines (optional)
+  cat > "$1" <<EOF2
+- Status: queued
+- build_target: python-cli
+- build_into: $xa
+- Vision: visions/plain.md
+- Grounding: failure-derived — run 614 (fixture)
+${3:-}
+
+## Acceptance criteria
+
+1. P0 — Given a fixture, When \`alpha run\` is invoked, Then it exits 0.
+2. P0 — $2
+EOF2
+}
+mk_xrepo_prd "$xq/PRD-xrepo-foreign.md" 'Given a digest, When `beta render` runs, Then it prints the table.'
+mk_xrepo_prd "$xq/PRD-xrepo-own.md" 'Given a digest, When `alpha render` runs, Then it prints the table.'
+expect_fail "$xq/PRD-xrepo-foreign.md" ac-names-foreign-surface "ac-names-foreign-surface/beta-in-A-prd-fail"
+expect_ok "$xq/PRD-xrepo-own.md" "ac-names-foreign-surface/alpha-in-A-prd-pass"
+total=$((total+1))
+o="$("$LINT" --format pass-fail "$xq/PRD-xrepo-foreign.md" 2>/dev/null)"
+if grep -q "ac-names-foreign-surface: AC 2 names 'beta' (surface of $xb)" <<<"$o" && ! grep -q "AC 1 names" <<<"$o"; then
+  echo "ok: ac-names-foreign-surface/message names AC 2, beta, and the owning repo B"
+else echo "FAIL: ac-names-foreign-surface message got: $o"; fails=$((fails+1)); fi
+
+# module stems, .py-stripped: `render.py` is B's module; `digest.py` is A's own
+mk_xrepo_prd "$xq/PRD-xrepo-stem-foreign.md" 'Given a table, When `render.py --json` runs, Then it prints JSON.'
+mk_xrepo_prd "$xq/PRD-xrepo-stem-own.md" 'Given a table, When `digest.py --json` runs, Then it prints JSON.'
+expect_fail "$xq/PRD-xrepo-stem-foreign.md" ac-names-foreign-surface "ac-names-foreign-surface/foreign-module-stem-fail"
+expect_ok "$xq/PRD-xrepo-stem-own.md" "ac-names-foreign-surface/own-module-stem-pass"
+# Cargo and shell surfaces are foreign too
+mk_xrepo_prd "$xq/PRD-xrepo-cargo-foreign.md" 'Given a build, When `gamma-tool --check` runs, Then it exits 0.'
+expect_fail "$xq/PRD-xrepo-cargo-foreign.md" ac-names-foreign-surface "ac-names-foreign-surface/cargo-bin-in-python-prd-fail"
+# a token in BOTH surfaces never fails (shared-cli is a script of A and of B)
+mk_xrepo_prd "$xq/PRD-xrepo-shared.md" 'Given a fixture, When `shared-cli sync` runs, Then it exits 0.'
+expect_ok "$xq/PRD-xrepo-shared.md" "ac-names-foreign-surface/token-in-both-surfaces-pass"
+
+# (Live; evidence: ...) is exempt (AC 3): live probes run anything
+mk_xrepo_prd "$xq/PRD-xrepo-live.md" 'Given the deployed host, When the digest renders, Then it lists every row (Live; evidence: `ssh orch '"'"'beta render'"'"'` prints the table)'
+expect_ok "$xq/PRD-xrepo-live.md" "ac-names-foreign-surface/foreign-token-only-in-Live-evidence-pass"
+mk_xrepo_prd "$xq/PRD-xrepo-live-prefix.md" 'Given a digest, When `beta render` runs, Then it prints the table (Live; evidence: `ssh orch alpha` prints it)'
+expect_fail "$xq/PRD-xrepo-live-prefix.md" ac-names-foreign-surface "ac-names-foreign-surface/foreign-token-BEFORE-Live-tail-fail"
+
+# foreign_surface_ok + foreign_surface_reasons (AC 4)
+mk_xrepo_prd "$xq/PRD-xrepo-ok-reason.md" 'Given a digest, When `beta render` runs, Then it prints the table.' \
+'- foreign_surface_ok: [2]
+- foreign_surface_reasons: {"2": "fixture CLI, not subject"}'
+mk_xrepo_prd "$xq/PRD-xrepo-ok-noreason.md" 'Given a digest, When `beta render` runs, Then it prints the table.' \
+'- foreign_surface_ok: [2]'
+mk_xrepo_prd "$xq/PRD-xrepo-ok-prose.md" 'Given a digest, When `beta render` runs, Then it prints the table.' \
+'- foreign_surface_ok: see below'
+expect_ok "$xq/PRD-xrepo-ok-reason.md" "foreign-surface-ok/list+reason-pass"
+expect_fail "$xq/PRD-xrepo-ok-noreason.md" foreign-surface-reason-missing "foreign-surface-reason-missing/fail"
+expect_clean_no_id "$xq/PRD-xrepo-ok-reason.md" failures foreign-surface-reason-missing "foreign-surface-reason-missing/pass"
+expect_fail "$xq/PRD-xrepo-ok-prose.md" foreign-surface-ok-prose "foreign-surface-ok-prose/fail"
+expect_clean_no_id "$xq/PRD-xrepo-ok-reason.md" failures foreign-surface-ok-prose "foreign-surface-ok-prose/pass"
+# an exemption names only its own AC: a second foreign AC still fails
+mk_xrepo_prd "$xq/PRD-xrepo-ok-other.md" 'Given a digest, When `beta render` runs, Then it prints the table.' \
+'- foreign_surface_ok: [1]
+- foreign_surface_reasons: {"1": "unrelated"}'
+expect_fail "$xq/PRD-xrepo-ok-other.md" ac-names-foreign-surface "foreign-surface-ok/exempts-only-the-listed-AC"
+
+# WARN foreign-surface-repo-missing: a corpus build_into absent on this host
+# is never a fail, and is reported once per run (own corpus tree, so the
+# warning cannot reach the OK fixtures above)
+mkdir -p "$tmp/xc2/build-queue" "$tmp/xc2/visions"
+cp "$v/plain.md" "$tmp/xc2/visions/plain.md"
+cat > "$tmp/xc2/build-queue/PRD-xrepo-gone.md" <<EOF2
+- Status: queued
+- build_target: python-cli
+- build_into: $tmp/xrepo-gone-not-on-this-host
+- Vision: visions/plain.md
+EOF2
+mk_xrepo_prd "$tmp/xc2/build-queue/PRD-xrepo-missing.md" 'Given a digest, When `beta render` runs, Then it prints the table.'
+expect_warn "$tmp/xc2/build-queue/PRD-xrepo-missing.md" foreign-surface-repo-missing "foreign-surface-repo-missing/warn"
+expect_clean_no_id "$tmp/xc2/build-queue/PRD-xrepo-missing.md" failures ac-names-foreign-surface "foreign-surface-repo-missing/never-a-fail (B unknown here)"
+expect_clean_no_id "$xq/PRD-xrepo-own.md" warnings foreign-surface-repo-missing "foreign-surface-repo-missing/pass (no absent repo)"
+# WARN foreign-surface-source-missing: the generator cannot run -> warn, not a fail
+total=$((total+1))
+o="$(REPO_SURFACE_SH=/nonexistent "$LINT" --format json "$xq/PRD-xrepo-foreign.md" 2>/dev/null)"
+if has_id "$o" warnings foreign-surface-source-missing && ! has_id "$o" failures ac-names-foreign-surface; then
+  echo "ok: foreign-surface-source-missing/warn (check skipped, not failed)"
+else echo "FAIL: missing repo-surface.sh got: $o"; fails=$((fails+1)); fi
+
+# --explain (R5)
+total=$((total+1))
+o="$("$LINT" --explain ac-names-foreign-surface 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ] && grep -q 'foreign_surface_ok: \[3\]' <<<"$o" && grep -q 'foreign_surface_reasons: {' <<<"$o" \
+   && grep -q '614' <<<"$o" && grep -q 'mtproof' <<<"$o"; then
+  echo "ok: --explain ac-names-foreign-surface -> rule, exemption example, run 614"
+else echo "FAIL: --explain ac-names-foreign-surface rc=$rc: $o"; fails=$((fails+1)); fi
+
+# scan-prds.sh emits both keys (R4); absent -> [] / {}
+total=$((total+1))
+mkdir -p "$tmp/xscan/build-queue"
+cp "$xq/PRD-xrepo-ok-reason.md" "$xq/PRD-xrepo-own.md" "$tmp/xscan/build-queue/"
+sj="$(PRD_DIR="$tmp/xscan" BUILD_STATE_DIR="$tmp/xscan/state" "$HERE/scan-prds.sh" 2>/dev/null)"
+got="$(printf '%s' "$sj" | python3 -c '
+import json, sys
+d = {p["slug"]: p for p in json.load(sys.stdin)}
+a, b = d["xrepo-ok-reason"], d["xrepo-own"]
+print(a["foreign_surface_ok"], a["foreign_surface_reasons"], b["foreign_surface_ok"], b["foreign_surface_reasons"])
+' 2>&1)"
+if [ "$got" = "[2] {'2': 'fixture CLI, not subject'} [] {}" ]; then
+  echo "ok: scan-prds.sh emits foreign_surface_ok / foreign_surface_reasons"
+else echo "FAIL: scan-prds.sh foreign_surface keys got: $got"; fails=$((fails+1)); fi
 
 # --------------------------------------------------------------------------
 if [ "$fails" -ne 0 ]; then

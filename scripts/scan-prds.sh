@@ -252,7 +252,7 @@ JQ="${JQ:-$(command -v jq 2>/dev/null || echo /usr/bin/jq)}"
 [ -x "$JQ" ] || { echo "jq not at $JQ" >&2; exit 1; }
 
 emit_one() {
-  local path="$1" slug status_line build_auto build_target build_priority build_into build_version_bump deferred_acs deferred_ac_reasons publish test_prefix deferred_acs_unparsed operator_authorization operator_authorization_unparsed superseded_by transferred_acs transferred_acs_unparsed absorbs absorbs_unparsed
+  local path="$1" slug status_line build_auto build_target build_priority build_into build_version_bump deferred_acs deferred_ac_reasons publish test_prefix deferred_acs_unparsed operator_authorization operator_authorization_unparsed superseded_by transferred_acs transferred_acs_unparsed absorbs absorbs_unparsed foreign_surface_ok foreign_surface_reasons
   slug="$(basename "$path" .md)"
   slug="${slug#PRD-}"
 
@@ -301,6 +301,13 @@ emit_one() {
   transferred_acs_unparsed=false
   absorbs="null"
   absorbs_unparsed=false
+  # Per PRD-build-prd-lint-cross-repo-ac R4: `foreign_surface_ok: [N, ...]`
+  # (inline integer list, the deferred_acs parser) lists ACs that may name
+  # another repo's CLI; `foreign_surface_reasons: {"N": "..."}` is the inline
+  # JSON object of one reason per number. [] / {} when absent or malformed --
+  # prd-lint.sh (foreign-surface-ok-prose / -reason-missing) is the enforcer.
+  foreign_surface_ok="[]"
+  foreign_surface_reasons="{}"
   status_line=""
   gate_stale=false
 
@@ -310,7 +317,7 @@ emit_one() {
   # the parse. First-match-wins for build_* keys so real frontmatter
   # always beats later in-doc examples.
   local in_fence=false
-  local seen_target=false seen_priority=false seen_into=false seen_bump=false seen_deferred=false seen_test_prefix=false seen_operator_authorization=false seen_superseded_by=false seen_transferred_acs=false seen_absorbs=false
+  local seen_target=false seen_priority=false seen_into=false seen_bump=false seen_deferred=false seen_test_prefix=false seen_operator_authorization=false seen_superseded_by=false seen_transferred_acs=false seen_absorbs=false seen_foreign_ok=false seen_foreign_reasons=false
   # strip leading ws, trailing ws, trailing inline-comment (` #...`), surrounding quotes
   strip_val() {
     printf '%s' "$1" | sed -E 's/^[[:space:]]*//;s/[[:space:]]+#.*$//;s/[[:space:]]*$//;s/^"//;s/"$//'
@@ -527,6 +534,36 @@ emit_one() {
         esac
         seen_test_prefix=true
         ;;
+      "foreign_surface_ok:"*)
+        # Inline-list form only (same reading as deferred_acs above); prose or
+        # a block list leaves [] and is diagnosed by prd-lint.sh.
+        [ "$seen_foreign_ok" = true ] && continue
+        v="$(strip_val "$(printf '%s' "$kline" | sed -E 's/^foreign_surface_ok[[:space:]]*:[[:space:]]*//')")"
+        case "$v" in
+          '['*']')
+            inner="${v#\[}"; inner="${inner%\]}"
+            csv=""
+            IFS=',' read -ra toks <<<"$inner"
+            for t in "${toks[@]}"; do
+              tt="$(printf '%s' "$t" | sed -E 's/^[[:space:]]+//;s/[[:space:]]+$//')"
+              case "$tt" in
+                ''|*[!0-9]*) continue ;;
+                *) csv+="${csv:+,}$tt" ;;
+              esac
+            done
+            foreign_surface_ok="[$csv]"
+            ;;
+        esac
+        seen_foreign_ok=true
+        ;;
+      "foreign_surface_reasons:"*)
+        [ "$seen_foreign_reasons" = true ] && continue
+        v="$(printf '%s' "$kline" | sed -E 's/^foreign_surface_reasons[[:space:]]*:[[:space:]]*//; s/[[:space:]]+$//')"
+        if [ -n "$v" ] && printf '%s' "$v" | "$JQ" -e 'type == "object"' >/dev/null 2>&1; then
+          foreign_surface_reasons="$(printf '%s' "$v" | "$JQ" -c .)"
+        fi
+        seen_foreign_reasons=true
+        ;;
       "**Status:**"*|"Status:"*|"**Status**"*|"## Status"*|"- Status:"*|"- **Status:**"*|"* Status:"*|"* **Status:**"*)
         # Strip a leading markdown list marker (`- ` / `* `) first, then the
         # `*`/`#` decoration, then trim — so `- Status: Draft v0.1` parses the
@@ -646,7 +683,9 @@ except Exception:
     --argjson transferred_acs_unparsed "$transferred_acs_unparsed" \
     --argjson absorbs "$absorbs" \
     --argjson absorbs_unparsed "$absorbs_unparsed" \
-    '{slug:$slug, path:$path, build_auto:$build_auto, build_target:$build_target, build_priority:$build_priority, build_into:$build_into, build_version_bump:$build_version_bump, publish:$publish, deferred_acs:$deferred_acs, deferred_acs_unparsed:$deferred_acs_unparsed, deferred_ac_reasons:$deferred_ac_reasons, operator_authorization:$operator_authorization, operator_authorization_unparsed:$operator_authorization_unparsed, test_prefix:$test_prefix, status_line:$status_line, size_bytes:$size, mtime_iso:$mtime, gate_stale:$gate_stale, substrate:$substrate, live_acs:$live_acs, superseded_by:$superseded_by, transferred_acs:$transferred_acs, transferred_acs_unparsed:$transferred_acs_unparsed, absorbs:$absorbs, absorbs_unparsed:$absorbs_unparsed}'
+    --argjson foreign_surface_ok "$foreign_surface_ok" \
+    --argjson foreign_surface_reasons "$foreign_surface_reasons" \
+    '{slug:$slug, path:$path, build_auto:$build_auto, build_target:$build_target, build_priority:$build_priority, build_into:$build_into, build_version_bump:$build_version_bump, publish:$publish, deferred_acs:$deferred_acs, deferred_acs_unparsed:$deferred_acs_unparsed, deferred_ac_reasons:$deferred_ac_reasons, operator_authorization:$operator_authorization, operator_authorization_unparsed:$operator_authorization_unparsed, test_prefix:$test_prefix, status_line:$status_line, size_bytes:$size, mtime_iso:$mtime, gate_stale:$gate_stale, substrate:$substrate, live_acs:$live_acs, superseded_by:$superseded_by, transferred_acs:$transferred_acs, transferred_acs_unparsed:$transferred_acs_unparsed, absorbs:$absorbs, absorbs_unparsed:$absorbs_unparsed, foreign_surface_ok:$foreign_surface_ok, foreign_surface_reasons:$foreign_surface_reasons}'
 }
 
 # Emit top-level PRDs (buildable) AND ARCHIVE/ PRDs (already done).
