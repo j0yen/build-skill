@@ -59,6 +59,8 @@ inside fenced code blocks are ignored; first match wins.
 | `Deletes` | list of repo-relative paths | no | files the PRD is allowed to delete; read by wm-build (`prd.rs` `Deletes`) |
 | `Cited-tree` | `<repo>@<sha>` | no | one line per repo Phase −1 found `behind`; written by `/dream` |
 | `live_acs` | `[N, …]` or prose | no | scan-prds-derived diagnostic echoed into some PRDs; never authoritative |
+| `Drafted` | `YYYY-MM-DD` | recommended | the date `/dream` drafted the PRD; read by wm-build (`prd.rs` `Drafted`) and by `prd-lint.sh`, whose shift-left FAILs apply only when it is on or after the enforcement cutoff (below `## Lint rules (fleet)`) |
+| `PM` / `Owner` / `Date` / `Relates` / `Engineering target` / `Jira` / `Epic` / `Author` / `Tracker` / `Absorbed scope` / `Ruling` / `Depends` / `Successor context` / `Shipped` / `Parked` / `Receipts` | free text | no | display-only: human-facing header lines nothing parses (the same list as the paragraph below) |
 
 Keys `PM`, `Drafted`, `Owner`, `Date`, `Relates`, `Engineering target`, `Jira`,
 `Epic`, `Author`, `Tracker`, `Absorbed scope`, `Ruling`, `Depends`, `Successor context`,
