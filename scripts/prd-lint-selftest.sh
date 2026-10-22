@@ -1483,6 +1483,8 @@ mk_sl "$sl/q/PRD-sl-key-fail.md" $NEW "$SEED" "- Frobnicator: yes" "$GOODAC"
 expect_warn "$sl/q/PRD-sl-key-fail.md" unknown-frontmatter-key "unknown-frontmatter-key/fail"
 mk_sl "$sl/q/PRD-sl-key-ok.md" $NEW "$SEED" "- Falsifier: none\n- Absorbs: nothing" "$GOODAC"
 expect_clean_no_id "$sl/q/PRD-sl-key-ok.md" warnings unknown-frontmatter-key "unknown-frontmatter-key/known-keys-pass"
+mk_sl "$sl/q/PRD-sl-key-families.md" $NEW "$SEED" "- Seed families: a:b:c, d-e" "$GOODAC"
+expect_clean_no_id "$sl/q/PRD-sl-key-families.md" warnings unknown-frontmatter-key "unknown-frontmatter-key/seed-families-known"
 
 # fleet rule: ssh-evidence-no-path-prefix
 mk_sl "$sl/q/PRD-sl-ssh-fail.md" $NEW "$SEED" "" \
