@@ -30,7 +30,7 @@ total=0
 
 # Findings added by the dream shift-left checks; WARN-level on any fixture that
 # predates them (no `Drafted:` >= 2026-10-23), so expect_ok tolerates them.
-SHIFT_IDS="seed-missing|unknown-frontmatter-key|premise-ac-not-live|live-evidence-referent-missing|live-evidence-referent-unchecked|shared-counter-preassigned|cross-repo-path-in-ac|later-event-without-blocked-on|ssh-evidence-no-path-prefix|mcp-curl-no-accept|signup-without-offboard|generator-set-member"
+SHIFT_IDS="seed-missing|unknown-frontmatter-key|premise-ac-not-live|live-evidence-referent-missing|live-evidence-referent-unchecked|shared-counter-preassigned|cross-repo-path-in-ac|later-event-without-blocked-on|ssh-evidence-no-path-prefix|mcp-curl-no-accept|signup-without-offboard|generator-set-member|hand-built-marker-missing|build-priority-default"
 
 json_of() { "$LINT" --format json "$1" 2>/dev/null; }
 
@@ -1426,6 +1426,50 @@ mk_sl "$sl/q/PRD-sl-xrepo-ok.md" $NEW "$SEED" "" \
   "P0 — Given a fixture, When linted, Then it edits src/lib.rs under $SLR/src."
 expect_clean_no_id "$sl/q/PRD-sl-xrepo-ok.md" warnings cross-repo-path-in-ac "cross-repo-path-in-ac/own-repo-pass"
 
+# hand-built-marker-missing: build_into basename wm-build needs `Direct-build: hand`
+HBM='- Direct-build: hand (permanent rule 2026-10-05; wm-build never builds wm-build)'
+mk_sl "$sl/q/PRD-sl-hand-fail.md" $NEW "$SEED" "" "$GOODAC"
+sed -i "s#^- build_into: .*#- build_into: $sl/wm-build#" "$sl/q/PRD-sl-hand-fail.md"
+expect_fail "$sl/q/PRD-sl-hand-fail.md" hand-built-marker-missing "hand-built-marker-missing/new-PRD-fail"
+mk_sl "$sl/q/PRD-sl-hand-old.md" $OLD "$SEED" "" "$GOODAC"
+sed -i "s#^- build_into: .*#- build_into: $sl/wm-build#" "$sl/q/PRD-sl-hand-old.md"
+expect_warn "$sl/q/PRD-sl-hand-old.md" hand-built-marker-missing "hand-built-marker-missing/old-PRD-warn-only"
+expect_clean_no_id "$sl/q/PRD-sl-hand-old.md" failures hand-built-marker-missing "hand-built-marker-missing/old-PRD-not-fail"
+mk_sl "$sl/q/PRD-sl-hand-ok.md" $NEW "$SEED" "$HBM" "$GOODAC"
+sed -i "s#^- build_into: .*#- build_into: $sl/wm-build#" "$sl/q/PRD-sl-hand-ok.md"
+expect_clean_no_id "$sl/q/PRD-sl-hand-ok.md" failures hand-built-marker-missing "hand-built-marker-missing/marker-pass"
+expect_clean_no_id "$sl/q/PRD-sl-hand-ok.md" warnings hand-built-marker-missing "hand-built-marker-missing/marker-pass-warn"
+mk_sl "$sl/q/PRD-sl-hand-other.md" $NEW "$SEED" "" "$GOODAC"
+expect_clean_no_id "$sl/q/PRD-sl-hand-other.md" failures hand-built-marker-missing "hand-built-marker-missing/other-repo-pass"
+# fixture shaped like the queued wm-build PRDs (landing-train, box-per-run: real build_into + marker, Drafted 2026-10-10)
+mk_sl "$sl/q/PRD-sl-hand-real.md" 2026-10-10 - "$HBM\n- build_priority: high" "$GOODAC"
+sed -i "s#^- build_into: .*#- build_into: /home/jsy/wintermute/wm-build#" "$sl/q/PRD-sl-hand-real.md"
+expect_clean_no_id "$sl/q/PRD-sl-hand-real.md" failures hand-built-marker-missing "hand-built-marker-missing/real-queued-wm-build-shape-no-fail"
+sed -i '/^- Direct-build:/d' "$sl/q/PRD-sl-hand-real.md"
+expect_clean_no_id "$sl/q/PRD-sl-hand-real.md" failures hand-built-marker-missing "hand-built-marker-missing/real-shape-unmarked-still-only-warn"
+
+# build-priority-default (WARN): queued grounded wants high; creative must not be high
+mk_sl "$sl/q/PRD-sl-bp-fail.md" $NEW "$SEED" "" "$GOODAC"
+expect_warn "$sl/q/PRD-sl-bp-fail.md" build-priority-default "build-priority-default/queued-no-priority-warns"
+mk_sl "$sl/q/PRD-sl-bp-normal.md" $NEW "$SEED" "- build_priority: normal" "$GOODAC"
+expect_warn "$sl/q/PRD-sl-bp-normal.md" build-priority-default "build-priority-default/queued-normal-warns"
+mk_sl "$sl/q/PRD-sl-bp-creative.md" $NEW "$SEED" "- build_priority: high" "$GOODAC"
+sed -i 's/^- Grounding: .*/- Grounding: creative/' "$sl/q/PRD-sl-bp-creative.md"
+expect_warn "$sl/q/PRD-sl-bp-creative.md" build-priority-default "build-priority-default/creative-high-warns"
+mk_sl "$sl/q/PRD-sl-bp-ok.md" $NEW "$SEED" "- build_priority: high" "$GOODAC"
+expect_clean_no_id "$sl/q/PRD-sl-bp-ok.md" warnings build-priority-default "build-priority-default/queued-high-pass"
+mk_sl "$sl/q/PRD-sl-bp-creative-low.md" $NEW "$SEED" "- build_priority: low" "$GOODAC"
+sed -i 's/^- Grounding: .*/- Grounding: creative/' "$sl/q/PRD-sl-bp-creative-low.md"
+expect_clean_no_id "$sl/q/PRD-sl-bp-creative-low.md" warnings build-priority-default "build-priority-default/creative-low-pass"
+for st in blocked building parked built; do
+  mk_sl "$sl/q/PRD-sl-bp-$st.md" $NEW "$SEED" "" "$GOODAC"
+  sed -i "s/^- Status: queued/- Status: $st/" "$sl/q/PRD-sl-bp-$st.md"
+  expect_clean_no_id "$sl/q/PRD-sl-bp-$st.md" warnings build-priority-default "build-priority-default/status-$st-never-warns"
+done
+mk_sl "$sl/q/PRD-sl-bp-caps.md" $NEW "$SEED" "" "$GOODAC"
+sed -i "s/^- Status: queued/- Status: Queued/" "$sl/q/PRD-sl-bp-caps.md"
+expect_warn "$sl/q/PRD-sl-bp-caps.md" build-priority-default "build-priority-default/status-case-insensitive"
+
 # later-event-without-blocked-on (WARN)
 mk_sl "$sl/q/PRD-sl-later-fail.md" $NEW "$SEED" "" \
   "P0 — Given a fixture, When linted, Then it passes after the next chain run. (Live; evidence: echo ok)"
@@ -1488,6 +1532,13 @@ expect_clean_no_id "$sl/q/PRD-sl-gen-ok.md" warnings generator-set-member "gener
 total=$((total+1))
 o="$("$LINT" --explain premise-ac-not-live 2>&1)"; rc=$?
 if [ "$rc" -eq 0 ] && grep -q '966' <<<"$o"; then echo "ok: --explain premise-ac-not-live"; else echo "FAIL: --explain premise-ac-not-live rc=$rc: $o"; fails=$((fails+1)); fi
+
+total=$((total+1))
+o="$("$LINT" --explain hand-built-marker-missing 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ] && grep -q 'Direct-build: hand' <<<"$o"; then echo "ok: --explain hand-built-marker-missing"; else echo "FAIL: --explain hand-built-marker-missing rc=$rc: $o"; fails=$((fails+1)); fi
+total=$((total+1))
+o="$("$LINT" --explain build-priority-default 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ] && grep -q 'creative' <<<"$o"; then echo "ok: --explain build-priority-default"; else echo "FAIL: --explain build-priority-default rc=$rc: $o"; fails=$((fails+1)); fi
 
 # --------------------------------------------------------------------------
 if [ "$fails" -ne 0 ]; then

@@ -47,6 +47,10 @@
 # that build_into does not provide fails at intake; see
 # `--explain ac-names-foreign-surface`.
 #
+# `hand-built-marker-missing` / `build-priority-default` (/dream persist guards):
+# a wm-build-repo PRD must carry `Direct-build: hand`; a queued PRD's
+# build_priority must match its grounding; see `--explain <id>`.
+#
 # Exit: 0 = every file clean (warnings allowed), 1 = at least one FAIL
 #       anywhere, 2 = usage error.
 #
@@ -210,6 +214,21 @@ enforcement cutoff in build-contract.md (`## Lint rules (fleet)`), WARN before.
   unknown-frontmatter-key (WARN): a header key not in the contract's Frontmatter table.
 The fleet rules (ssh-evidence-no-path-prefix, mcp-curl-no-accept, signup-without-offboard,
 generator-set-member) are read from the contract's table; see its `message` column.
+EXPLAIN
+      exit 0
+      ;;
+    hand-built-marker-missing|build-priority-default)
+      cat <<'EXPLAIN'
+Queue-hygiene checks (/dream persist guards).
+  hand-built-marker-missing: a PRD whose `build_into` is the wm-build repo (matched on the repo
+    basename `wm-build`, e.g. /home/jsy/wintermute/wm-build) must carry `- Direct-build: hand`
+    (free text may follow, e.g. `hand (permanent rule 2026-10-05; wm-build never builds wm-build)`).
+    The daemon never builds wm-build; without the marker admission could claim the PRD. FAIL for a
+    PRD `Drafted:` on or after the enforcement cutoff in build-contract.md (`## Lint rules (fleet)`),
+    WARN before.
+  build-priority-default (WARN): a `Status: queued` PRD that is not `Grounding: creative` should carry
+    `build_priority: high` (missing or any other value warns); a `Grounding: creative` PRD must not
+    carry `build_priority: high` (creative queues at `low`). Parked, blocked and building PRDs never warn.
 EXPLAIN
       exit 0
       ;;
@@ -1218,6 +1237,31 @@ def lint_file(path):
 
     # -- build_into ------------------------------------------------------------
     build_into = fm.get("build_into")
+
+    # hand-built-marker-missing: a PRD that builds into the wm-build repo is
+    # hand-built, never daemon-built ("wm-build NEVER builds wm-build"); the
+    # `Direct-build: hand ...` line is how the daemon's admission knows. Matched
+    # on the build_into repo basename (real corpus: /home/jsy/wintermute/wm-build).
+    if build_into and os.path.basename(build_into.rstrip("/")) == "wm-build":
+        if not re.match(r"hand\b", fm.get("direct-build", ""), re.I):
+            shift("hand-built-marker-missing",
+                  "build_into is the wm-build repo, which the daemon never builds: add "
+                  "`- Direct-build: hand` (see --explain hand-built-marker-missing)")
+
+    # build-priority-default (WARN): queued grounded PRDs carry `build_priority: high`,
+    # creative PRDs `low`; a creative PRD must never be `high`.
+    _st = re.sub(r"[^a-z]", "", (fm.get("status", "").split() or [""])[0].lower())
+    _bp = (fm.get("build_priority", "").split() or [""])[0].lower()
+    _creative = fm.get("grounding", "").strip().lower().startswith("creative")
+    if _creative and _bp == "high":
+        warn("build-priority-default",
+             "Grounding: creative with `build_priority: high`: creative PRDs queue at `low` "
+             "(see --explain build-priority-default)")
+    elif not _creative and _st == "queued" and _bp != "high":
+        warn("build-priority-default",
+             f"queued grounded PRD has build_priority {_bp or 'unset'!r}: grounded queued PRDs carry "
+             "`build_priority: high` (see --explain build-priority-default)")
+
     if build_target in EXTEND_TARGETS and not build_into:
         fail("build-into-missing", f"build_target {build_target!r} requires a `build_into:` path")
     if build_into and not os.path.isdir(build_into):

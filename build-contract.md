@@ -29,7 +29,7 @@ inside fenced code blocks are ignored; first match wins.
 | `Status` | `queued` (dream) → `building` / `built` / `blocked` (build) | yes | display + lifecycle; **every change after `queued` is daemon-owned** |
 | `build_target` | `rust-cli` `rust-lib` `rust-extend` `kernel-extend` `shell` `hooks` `config` `notebook` `mixed` `python-cli` `python-lib` `python-agent` (routes to `/pybuild`; C1–C5 substitutions defined in SKILL.md's Verified-completed checklist, python-* path) — `product` is skipped, not built | yes | anything else → `needs_classification` |
 | `build_into` | absolute path of the repo to mutate | for `rust-extend`, `kernel-extend`, and any `python-*` that extends an existing repo | must exist locally at build time |
-| `build_priority` | `high` `normal` `low` | no | queue order; default `normal` |
+| `build_priority` | `high` `normal` `low` | no | queue order; default `normal`. Queued grounded PRDs carry `high`, creative `low`: `prd-lint.sh` WARN `build-priority-default` otherwise |
 | `build_version_bump` | `patch` `minor` `major` | no | `rust-extend` only; default `minor` |
 | `deferred_acs` | inline list of bare integers, e.g. `[3, 4]` | no | block-list form parses to `[]` silently (no key at all reads the same way); a PROSE value (e.g. `deferred_acs: see note below`) is flagged — `scan-prds.sh` emits `deferred_acs_unparsed: true` and `verified-completed.sh --derive` prints `deferred_acs: unparsed — use [N, N]` instead of silently treating it as "none declared" |
 | `test_prefix` | bare scalar (`test_prefix: http`) or inline list (`test_prefix: [http, https]`) | no | names the test-file prefix an extend PRD's ACs use on a shared crate, e.g. `mcphost`'s `http_ac01_*.rs` / `python_ac01_*.rs`. Read by `verified-completed.sh --derive`'s AC-pairing derivation (see SKILL.md "archive" / Verified-completed checklist). Without it, derivation guesses a prefix from the slug, which is often wrong for a crate whose PRDs don't name themselves after their test convention |
@@ -55,7 +55,7 @@ inside fenced code blocks are ignored; first match wins.
 | `iter_log` | dispatch / amend lines, one per event | no | **daemon-owned** dispatch lines (never written by hand); `/dream` may append only an `amended by /dream (...)` line, and only through `dream.amend` |
 | `Built` | `<ISO ts> <tag/sha>` style stamp | no | **daemon-owned**: written by wm-build's archive step on land (`BUILT_KEY` in wm-build `src/land/archive.rs`) |
 | `Blocked` | free text | no | **daemon-owned**: wm-build's block reason (`prd.rs` `Blocked`) |
-| `Direct-build` | `hand` | no | wm-build PRDs only: built by hand, never by the daemon |
+| `Direct-build` | `hand` (free text may follow, e.g. `hand (permanent rule 2026-10-05; wm-build never builds wm-build)`) | when `build_into` is the wm-build repo (matched on the repo basename `wm-build`) | wm-build PRDs only: built by hand, never by the daemon. `prd-lint.sh` `hand-built-marker-missing`: FAIL for `Drafted >= 2026-10-23`, WARN before |
 | `Deletes` | list of repo-relative paths | no | files the PRD is allowed to delete; read by wm-build (`prd.rs` `Deletes`) |
 | `Cited-tree` | `<repo>@<sha>` | no | one line per repo Phase −1 found `behind`; written by `/dream` |
 | `live_acs` | `[N, …]` or prose | no | scan-prds-derived diagnostic echoed into some PRDs; never authoritative |
@@ -280,7 +280,8 @@ cutoff below; an older (or undated) PRD gets the same finding as a WARN, so
 nothing already queued goes ineligible. The `prd-lint.sh` built-in shift-left
 ids are `seed-missing`, `premise-ac-not-live`, `live-evidence-referent-missing`,
 `shared-counter-preassigned`, `cross-repo-path-in-ac`,
-`later-event-without-blocked-on`, `unknown-frontmatter-key` (see
+`later-event-without-blocked-on`, `unknown-frontmatter-key`,
+`hand-built-marker-missing`, `build-priority-default` (see
 `prd-lint.sh --explain <id>`); the table below is READ by `prd-lint.sh`
 (never duplicated in code), so a fleet rule is added here and nowhere else.
 
@@ -326,8 +327,9 @@ parentheses has not shipped; `/dream` skips it.
 | `dream.seeds` | `scripts/dream-seeds.sh` | (none) | Phase 0 |
 | `dream.lint` | `scripts/dream-lint.sh` | `<PRD file>...` | end of Phase 3, every PRD |
 | `dream.amend` | `scripts/dream-amend.sh` | `<slug> <comma-keys>` | before any amend |
-| `dream.persist` | `scripts/dream-persist.sh` | `<PRD file>...` | Phase 4, per batch ≤ 4 |
+| `dream.persist` | `scripts/dream-persist.sh` | `[--review <file>] <PRD file>...` | Phase 4, per batch ≤ 4 |
 | `dream.dryrun` | `(stage 2)` | | |
+| `dream.premise` | `(stage 2)` | | |
 | `dream.scorecard` | `(stage 4)` | | |
 
 ## Branch message trust (PRD-build-coordinator-message-distrust, 2026-09-08)
