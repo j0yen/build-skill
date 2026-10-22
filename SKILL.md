@@ -2,6 +2,10 @@
 name: build
 description: Continuously implement queued PRDs end-to-end — scan for new PRDs, build them (delegating to /rustbuild for Rust — cargo runs on RedBaron, locally there and remotely from every other node), wire them into the system, publish them as GitHub repos per the PRD's `publish:` key (default `j0yen/private`; the joeyen-atscale route was retired 2026-08-27), update Abouts (per-repo READMEs + wintermute REPOS.md), and draft follow-on PRDs that expand Claude's own capabilities. Rust routes to /rustbuild, Python (`python-*`) to /pybuild. The parsed PRD contract is documented in build-contract.md. Runs on manual invocation or systemd-user timer when enabled; up to `BUILD_MAX_BRANCHES` PRDs (default 30, env-overridable per host since 2026-09-11) advanced in parallel per tick, one ATOMIC step at a time per PRD, chained while green with no default cap (2026-09-09). Use when the user says /build, when the SessionStart hook reports a queued PRD, or when the user asks Claude to "make progress on the queue" or "build the next thing."
 model: sonnet
+# Retired 2026-10-22 (Joe "unlist it"): the wm-build daemon builds the queue; this
+# folder stays as its contract + lint home. Hidden so no session starts a second builder.
+user-invocable: false
+disable-model-invocation: true
 ---
 
 # /build — continuous PRD implementation loop (index)
