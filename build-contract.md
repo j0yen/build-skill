@@ -26,7 +26,7 @@ inside fenced code blocks are ignored; first match wins.
 
 | key | values | required | notes |
 |---|---|---|---|
-| `Status` | `queued` (dream) → `building` / `built` / `blocked` (build) | yes | display + lifecycle |
+| `Status` | `queued` (dream) → `building` / `built` / `blocked` (build) | yes | display + lifecycle; **every change after `queued` is daemon-owned** |
 | `build_target` | `rust-cli` `rust-lib` `rust-extend` `kernel-extend` `shell` `hooks` `config` `notebook` `mixed` `python-cli` `python-lib` `python-agent` (routes to `/pybuild`; C1–C5 substitutions defined in SKILL.md's Verified-completed checklist, python-* path) — `product` is skipped, not built | yes | anything else → `needs_classification` |
 | `build_into` | absolute path of the repo to mutate | for `rust-extend`, `kernel-extend`, and any `python-*` that extends an existing repo | must exist locally at build time |
 | `build_priority` | `high` `normal` `low` | no | queue order; default `normal` |
@@ -41,14 +41,38 @@ inside fenced code blocks are ignored; first match wins.
 | `Vision` | `visions/<slug>.md` | yes | |
 | `Depends-on` | `PRD-<slug>.md`, comma-separated | no | reconciler resolves against git |
 | `Loop` | `<loop-name>: <metric it moves>` | for loop-ready fleets | read by the buildloop's digest/dream phases, ignored here |
-| `Lane` | `<hostname> <ISO-ts>` | no | PRD-build-second-lane-carbon claim-protocol field, written by `scripts/lane-claim.sh claim` when a build lane (RedBaron/carbon) takes a PRD for this tick; a claim older than 3h with no subsequent commit is stale and reclaimable. Read by Phase 2's lane predicate (`scripts/lane-predicate.sh select`, 2026-09-06) for the cargo-free filter and target-repo exclusivity — see SKILL.md's "Lane predicate" section |
+| `Lane` | `<hostname> <ISO-ts>` | no | PRD-build-second-lane-carbon claim-protocol field, written by `scripts/lane-claim.sh claim` when a build lane (RedBaron/carbon) takes a PRD for this tick; **daemon-owned** (never hand-edited while a run is open); a claim older than 3h with no subsequent commit is stale and reclaimable. Read by Phase 2's lane predicate (`scripts/lane-predicate.sh select`, 2026-09-06) for the cargo-free filter and target-repo exclusivity — see SKILL.md's "Lane predicate" section |
 | `Operator-authorization` | `<who> <ISO-8601 ts> "<verbatim words>" scope: <what it permits>` | no | binding within the stated scope only (PRD-build-operator-authorization-contract) — parsed by `scan-prds.sh` into a structured `operator_authorization` manifest field, injected verbatim into the branch-agent prompt by Dispatch, and checked by `verdict-receipts.sh`: an in-scope AC is executed, not deferred, and a deferral inside scope must name the scope mismatch or it's flagged as a bad claim |
 | `Superseded-by` | `PRD-<slug>.md` | no | predecessor-only (PRD-build-prd-superseded-by): names the successor a set of this PRD's remaining ACs was handed to. Paired with `transferred_acs:`. Lint refuses a target missing from both `build-queue/` and `built-prds/` (`superseded-by-target-missing`), a `parked/` target (`superseded-by-target-parked`), and an A→B→A cycle (`superseded-by-cycle`) |
 | `transferred_acs` | inline list of bare integers, e.g. `[9, 10]` | with `Superseded-by` | same inline-list-only parser as `deferred_acs`; a prose value is flagged `transferred_acs_unparsed: true` by `scan-prds.sh`. `verified-completed.sh` marks each as `TRANSFERRED → PRD-<succ>#<s>` — counted separately from PAIRED/DEFERRED, never green. Every entry must appear in the successor's `Absorbs:` map (`transferred-ac-unmapped` otherwise), and a `(Live` transferred AC must map to a `(Live` successor AC (`transferred-live-ac-not-live` otherwise) |
 | `Absorbs` | `PRD-<slug>.md [p:s, p:s, …]` | no | successor-only: maps predecessor AC `p` to this PRD's own AC `s`. Every mapped `s` must be a numbered AC line in this PRD (`absorbs-ac-missing` otherwise); a mapped successor AC can never also appear in this PRD's own `deferred_acs:` (`absorbed-ac-cannot-defer`) |
+| `Grounding` | `grounded` \| `creative` | recommended (WARN `grounding-missing`) | written by `/dream`; a `creative` PRD also carries `Falsifier` and an AC 1 that proves the premise cheaply |
+| `Falsifier` | one sentence | with `Grounding: creative` | the observation that would show the PRD's premise is wrong; written by `/dream` |
+| `Premise` | a runnable command (shell, one line) the carbon premise-check timer runs pre-admission | no | NEVER a builder AC: the premise is proven before admission, not by the run. Legacy PRDs carry a result stamp `Premise: pass\|fail\|unclear (<date>)` written by that same timer; both forms parse as the same key |
+| `Seed` | `chain:<chain-id>:<family-id>` \| `traffic:<id>` \| `joe:<YYYY-MM-DD>` | yes for PRDs `Drafted:` on or after 2026-10-23 (`prd-lint.sh` `seed-missing`; WARN before) | where the PRD came from: a discovery-chain family, real traffic, or a dated Joe instruction. Written by `/dream` from `dream.seeds` output |
+| `Seed-verdict` | a `--kind verdict` row id | no | set when the seed came from a failure disposition (a no-fix / chain-watch / not-a-dream verdict row that Fable re-grades) |
+| `Blocked-on` | one sentence naming the later event (a deploy, a chain run, a Joe decision) | when a Live AC waits on a later event | lets `prd-lint.sh` accept "after the next deploy" wording (`later-event-without-blocked-on`); distinct from the wm-build-written `Blocked` |
+| `iter_log` | dispatch / amend lines, one per event | no | **daemon-owned** dispatch lines (never written by hand); `/dream` may append only an `amended by /dream (...)` line, and only through `dream.amend` |
+| `Built` | `<ISO ts> <tag/sha>` style stamp | no | **daemon-owned**: written by wm-build's archive step on land (`BUILT_KEY` in wm-build `src/land/archive.rs`) |
+| `Blocked` | free text | no | **daemon-owned**: wm-build's block reason (`prd.rs` `Blocked`) |
+| `Direct-build` | `hand` | no | wm-build PRDs only: built by hand, never by the daemon |
+| `Deletes` | list of repo-relative paths | no | files the PRD is allowed to delete; read by wm-build (`prd.rs` `Deletes`) |
+| `Cited-tree` | `<repo>@<sha>` | no | one line per repo Phase −1 found `behind`; written by `/dream` |
+| `live_acs` | `[N, …]` or prose | no | scan-prds-derived diagnostic echoed into some PRDs; never authoritative |
+| `Drafted` | `YYYY-MM-DD` | recommended | the date `/dream` drafted the PRD; read by wm-build (`prd.rs` `Drafted`) and by `prd-lint.sh`, whose shift-left FAILs apply only when it is on or after the enforcement cutoff (below `## Lint rules (fleet)`) |
+| `PM` / `Owner` / `Date` / `Relates` / `Engineering target` / `Jira` / `Epic` / `Author` / `Tracker` / `Absorbed scope` / `Ruling` / `Depends` / `Successor context` / `Shipped` / `Parked` / `Receipts` | free text | no | display-only: human-facing header lines nothing parses (the same list as the paragraph below) |
 
 Keys `PM`, `Drafted`, `Owner`, `Date`, `Relates`, `Engineering target`, `Jira`,
-`Epic` are display-only.
+`Epic`, `Author`, `Tracker`, `Absorbed scope`, `Ruling`, `Depends`, `Successor context`,
+`Shipped`, `Parked`, `Receipts` are display-only.
+
+**Daemon-owned keys** (marked above): `Lane`, the dispatch lines of `iter_log`,
+`Built`, `Blocked`, and any `Status` change after `queued`. `/dream` and humans
+never write them while a run is open; `dream.amend` (below) is the gate.
+`prd-lint.sh` reads the key column of this table (and the display-only list)
+for `unknown-frontmatter-key`, and `scripts/dream-contract-drift-selftest.sh`
+fails when `/dream`'s frontmatter guidance, wm-build's `prd.rs` parser, or a
+key used in ≥ 10 corpus PRDs names a key this table lacks.
 
 **Autobuilder-crate routing (PRD-autobuilder-source-unify, 2026-09-08):** an
 autobuilder-crate PRD (one that changes the `autobuilder` companion binary
@@ -247,6 +271,64 @@ every in-repo PRD writer (e.g. `gate-debt.sh`) calls before minting a new
 proposed free suffix (`-v2`, `-followup`) when the slug is already taken.
 `scripts/manifest-invariants.sh --report` folds any standing collision
 into its alarms list as `class: slug-collision`.
+
+## Lint rules (fleet)
+
+Shift-left rules (2026-10-22, `/dream` Stage 1) added to `prd-lint.sh`. Every
+rule's FAIL applies only to a PRD `Drafted:` on or after the enforcement
+cutoff below; an older (or undated) PRD gets the same finding as a WARN, so
+nothing already queued goes ineligible. The `prd-lint.sh` built-in shift-left
+ids are `seed-missing`, `premise-ac-not-live`, `live-evidence-referent-missing`,
+`shared-counter-preassigned`, `cross-repo-path-in-ac`,
+`later-event-without-blocked-on`, `unknown-frontmatter-key` (see
+`prd-lint.sh --explain <id>`); the table below is READ by `prd-lint.sh`
+(never duplicated in code), so a fleet rule is added here and nowhere else.
+
+Enforcement cutoff: `Drafted >= 2026-10-23`
+
+Each condition cell is a list of backticked `name=value` clauses (a literal `|`
+is written `\|`): `scope=evidence` tests each `(Live; evidence: …)` string (plus
+the `## Live evidence commands` section when the evidence points at it),
+`scope=ac` tests the AC text; `match=<regex>` must hit for the rule to apply;
+`absent=<regex>` must NOT hit (in the whole scope text, or in capture group
+`absent-in=<name>` of `match`) or the rule fires; `kind=generator-set` selects
+the sub-table below.
+
+| rule id | level | regex / condition | message |
+|---|---|---|---|
+| `ssh-evidence-no-path-prefix` | FAIL | `scope=evidence` `match=ssh\s+\S+\s+'(?P<cmd>[^']*)'` `absent-in=cmd` `absent=^\s*export PATH=\$HOME/\.local/bin:\$HOME/\.cargo/bin:\$PATH;` | a non-login `ssh <host> '…'` has no `~/.cargo/bin` or `~/.local/bin` on PATH: start the quoted command with `export PATH=$HOME/.local/bin:$HOME/.cargo/bin:$PATH;` |
+| `mcp-curl-no-accept` | FAIL | `scope=evidence` `match=curl\b[^\n]*?/mcp\b` `absent=Accept:\s*application/json,\s*text/event-stream` | a curl to a `/mcp` URL without `Accept: application/json, text/event-stream` gets 406 from the streamable-HTTP transport (run 1004) |
+| `signup-without-offboard` | FAIL | `scope=evidence` `match=\bsignup\b` `absent=offboard` | evidence that calls signup must also call `self_offboard`/`offboard` (in a `finally`) so the live proof leaves no tenant behind |
+| `generator-set-member` | WARN | `scope=ac` `kind=generator-set` | the AC adds a member to a set the repo generates from one source; name the generator in the AC (see `generator_sets` below) instead of hand-listing the member |
+
+### generator_sets
+
+Per-repo sets whose members come from one generator. `repo` is the basename of
+`build_into`; `set` is the token an AC uses; `generator` is a regex that must
+appear in the AC text for the AC to count as naming the generator. The repo
+owners extend this table.
+
+<!-- generator_sets: repo owners extend this table; the first two rows are seeds. -->
+
+| repo | set | generator |
+|---|---|---|
+| `mcphost` | `ERROR_CODES` | `error_registry\|errors\.json` |
+| `mcphost` | `host_tool_descriptors` | `host-tools\.v1\.json\|gendocs\|api_contract` |
+
+## Dream hooks
+
+`/dream` reads this table (it never hard-codes wm-build) and calls each hook at
+its phase. `script` is relative to this contract's directory. A script in
+parentheses has not shipped; `/dream` skips it.
+
+| hook | script | args | phase |
+|---|---|---|---|
+| `dream.seeds` | `scripts/dream-seeds.sh` | (none) | Phase 0 |
+| `dream.lint` | `scripts/dream-lint.sh` | `<PRD file>...` | end of Phase 3, every PRD |
+| `dream.amend` | `scripts/dream-amend.sh` | `<slug> <comma-keys>` | before any amend |
+| `dream.persist` | `scripts/dream-persist.sh` | `<PRD file>...` | Phase 4, per batch ≤ 4 |
+| `dream.dryrun` | `(stage 2)` | | |
+| `dream.scorecard` | `(stage 4)` | | |
 
 ## Branch message trust (PRD-build-coordinator-message-distrust, 2026-09-08)
 

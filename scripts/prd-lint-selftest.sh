@@ -28,6 +28,10 @@ EOF
 fails=0
 total=0
 
+# Findings added by the dream shift-left checks; WARN-level on any fixture that
+# predates them (no `Drafted:` >= 2026-10-23), so expect_ok tolerates them.
+SHIFT_IDS="seed-missing|unknown-frontmatter-key|premise-ac-not-live|live-evidence-referent-missing|live-evidence-referent-unchecked|shared-counter-preassigned|cross-repo-path-in-ac|later-event-without-blocked-on|ssh-evidence-no-path-prefix|mcp-curl-no-accept|signup-without-offboard|generator-set-member"
+
 json_of() { "$LINT" --format json "$1" 2>/dev/null; }
 
 has_id() { # $1=json $2=field(failures|warnings) $3=id
@@ -65,7 +69,9 @@ expect_ok() { # $1=path $2=label
   total=$((total+1))
   "$LINT" "$1" >/tmp/prd-lint-selftest.out 2>&1
   local rc=$?
-  if [ "$rc" -eq 0 ] && grep -q '^OK$' /tmp/prd-lint-selftest.out; then
+  # shift-left WARNs (seed-missing etc.) on old-style fixtures do not make a file "not OK"
+  local rest; rest="$(grep -Ev "^[0-9]+\. WARN ($SHIFT_IDS):|^OK$|^$" /tmp/prd-lint-selftest.out)"
+  if [ "$rc" -eq 0 ] && [ -z "$rest" ]; then
     echo "ok: $2 -> OK"
   else
     echo "FAIL: $2 expected OK/exit0, got exit=$rc: $(cat /tmp/prd-lint-selftest.out)"
@@ -958,7 +964,7 @@ fi
 
 total=$((total+1))
 out="$("$LINT" --format pass-fail "$dirtest/PRD-dir-ok.md" 2>/dev/null)"
-if [ "$out" = "PASS $dirtest/PRD-dir-ok.md" ]; then
+if [ "${out%%: *}" = "PASS $dirtest/PRD-dir-ok.md" ] || [ "$out" = "PASS $dirtest/PRD-dir-ok.md" ]; then
   echo "ok: format pass-fail -> 'PASS <file>' on a clean file"
 else
   echo "FAIL: format pass-fail expected 'PASS <file>', got: $out"
@@ -1315,6 +1321,173 @@ print(a["foreign_surface_ok"], a["foreign_surface_reasons"], b["foreign_surface_
 if [ "$got" = "[2] {'2': 'fixture CLI, not subject'} [] {}" ]; then
   echo "ok: scan-prds.sh emits foreign_surface_ok / foreign_surface_reasons"
 else echo "FAIL: scan-prds.sh foreign_surface keys got: $got"; fails=$((fails+1)); fi
+
+# ================================================================ shift-left (/dream Stage 1)
+# Every new FAIL applies only to Drafted >= the contract cutoff (2026-10-23);
+# the same finding on an older PRD is a WARN. One fail + one pass fixture per id,
+# plus fixtures shaped like runs 798, 966, 1004 and migration 0131.
+sl="$tmp/shiftleft"; mkdir -p "$sl/q"
+git init -q --bare -b main "$sl/origin.git"
+git clone -q "$sl/origin.git" "$sl/repo" 2>/dev/null
+( cd "$sl/repo" && git checkout -q -b main 2>/dev/null; mkdir -p scripts && echo ok > scripts/real-proof.sh \
+  && git add -A && git -c user.email=t@t -c user.name=t commit -q -m init && git push -q origin main ) >/dev/null 2>&1
+SLR="$sl/repo"
+
+# mk_sl <file> <drafted|-> <seed|-> <extra header lines> <AC lines...>
+mk_sl() {
+  local f="$1" dr="$2" seed="$3" extra="$4"; shift 4
+  {
+    echo "- Status: queued"; echo "- build_target: shell"; echo "- build_into: $SLR"
+    echo "- Vision: visions/plain.md"; echo "- Grounding: wwhtbt — visions/plain.md leaf 1 (fixture)"
+    [ "$dr" != "-" ] && echo "- Drafted: $dr"
+    [ "$seed" != "-" ] && echo "- Seed: $seed"
+    [ -n "$extra" ] && printf '%b\n' "$extra"
+    echo; echo "## Acceptance criteria"; echo
+    local n=1; for ac in "$@"; do echo "$n. $ac"; n=$((n+1)); done
+  } > "$f"
+}
+NEW=2026-10-23; OLD=2026-10-01; SEED="chain:2026-10-22-a:fam-1"
+GOODAC="P0 — Given a fixture, When linted, Then it passes."
+
+# seed-missing
+mk_sl "$sl/q/PRD-sl-seed-fail.md" $NEW - "" "$GOODAC"
+expect_fail "$sl/q/PRD-sl-seed-fail.md" seed-missing "seed-missing/new-PRD-fail"
+mk_sl "$sl/q/PRD-sl-seed-old.md" $OLD - "" "$GOODAC"
+expect_warn "$sl/q/PRD-sl-seed-old.md" seed-missing "seed-missing/old-PRD-warn-only"
+expect_clean_no_id "$sl/q/PRD-sl-seed-old.md" failures seed-missing "seed-missing/old-PRD-not-fail"
+mk_sl "$sl/q/PRD-sl-seed-bad.md" $NEW "somewhere:else" "" "$GOODAC"
+expect_fail "$sl/q/PRD-sl-seed-bad.md" seed-missing "seed-missing/bad-form-fail"
+for s in "$SEED" "traffic:abc123" "joe:2026-10-22"; do
+  mk_sl "$sl/q/PRD-sl-seed-ok.md" $NEW "$s" "" "$GOODAC"
+  expect_clean_no_id "$sl/q/PRD-sl-seed-ok.md" failures seed-missing "seed-missing/pass ($s)"
+  expect_clean_no_id "$sl/q/PRD-sl-seed-ok.md" warnings seed-missing "seed-missing/pass-warn ($s)"
+done
+
+# premise-ac-not-live (run 966: a precondition only a human produces)
+mk_sl "$sl/q/PRD-sl-premise-fail.md" $NEW "$SEED" "" \
+  "P0 — Given a human has pushed a commit to prod and orch has run the chain, When linted, Then the digest names it."
+expect_fail "$sl/q/PRD-sl-premise-fail.md" premise-ac-not-live "premise-ac-not-live/run-966-shape-fail"
+mk_sl "$sl/q/PRD-sl-premise-ssh.md" $NEW "$SEED" "" \
+  "P0 — Given the box answers on ssh orch, When linted, Then it passes."
+expect_fail "$sl/q/PRD-sl-premise-ssh.md" premise-ac-not-live "premise-ac-not-live/ssh-fail"
+mk_sl "$sl/q/PRD-sl-premise-url.md" $NEW "$SEED" "" \
+  "P0 — Given https://mcphost.dev/health is up, When linted, Then it passes."
+expect_fail "$sl/q/PRD-sl-premise-url.md" premise-ac-not-live "premise-ac-not-live/public-https-fail"
+mk_sl "$sl/q/PRD-sl-premise-old.md" $OLD "$SEED" "" \
+  "P0 — Given a human has pushed a commit to prod, When linted, Then it passes."
+expect_warn "$sl/q/PRD-sl-premise-old.md" premise-ac-not-live "premise-ac-not-live/old-PRD-warn-only"
+mk_sl "$sl/q/PRD-sl-premise-live.md" $NEW "$SEED" "" \
+  "P0 — Given prod is serving, When linted, Then it passes. (Live; evidence: curl -s https://mcphost.dev/health)"
+expect_clean_no_id "$sl/q/PRD-sl-premise-live.md" failures premise-ac-not-live "premise-ac-not-live/live-tail-pass"
+mk_sl "$sl/q/PRD-sl-premise-local.md" $NEW "$SEED" "" \
+  "P0 — Given a server on http://localhost:8080 and http://127.0.0.1:1, When linted, Then it passes."
+expect_clean_no_id "$sl/q/PRD-sl-premise-local.md" failures premise-ac-not-live "premise-ac-not-live/localhost-pass"
+
+# live-evidence-referent-missing (run 798: proof.sh named in the evidence, no AC writes it)
+mk_sl "$sl/q/PRD-sl-referent-fail.md" $NEW "$SEED" "" \
+  "P0 — Given a fixture, When linted, Then it passes. (Live; evidence: bash scripts/proof.sh --live)"
+expect_fail "$sl/q/PRD-sl-referent-fail.md" live-evidence-referent-missing "referent-missing/run-798-shape-fail"
+mk_sl "$sl/q/PRD-sl-referent-old.md" $OLD "$SEED" "" \
+  "P0 — Given a fixture, When linted, Then it passes. (Live; evidence: bash scripts/proof.sh --live)"
+expect_warn "$sl/q/PRD-sl-referent-old.md" live-evidence-referent-missing "referent-missing/old-PRD-warn-only"
+mk_sl "$sl/q/PRD-sl-referent-exists.md" $NEW "$SEED" "" \
+  "P0 — Given a fixture, When linted, Then it passes. (Live; evidence: bash scripts/real-proof.sh)"
+expect_clean_no_id "$sl/q/PRD-sl-referent-exists.md" failures live-evidence-referent-missing "referent-missing/exists-at-origin-pass"
+mk_sl "$sl/q/PRD-sl-referent-deliv.md" $NEW "$SEED" "" \
+  "P0 — Given a fixture, When linted, Then it writes scripts/proof.sh as a new script." \
+  "P0 — Given a fixture, When linted, Then it passes. (Live; evidence: bash scripts/proof.sh --live)"
+expect_clean_no_id "$sl/q/PRD-sl-referent-deliv.md" failures live-evidence-referent-missing "referent-missing/other-AC-deliverable-pass"
+# working-tree-only file must NOT count (never read the local working tree)
+echo x > "$SLR/scripts/untracked-only.sh"
+mk_sl "$sl/q/PRD-sl-referent-wt.md" $NEW "$SEED" "" \
+  "P0 — Given a fixture, When linted, Then it passes. (Live; evidence: bash scripts/untracked-only.sh)"
+expect_fail "$sl/q/PRD-sl-referent-wt.md" live-evidence-referent-missing "referent-missing/working-tree-only-fail"
+# build_into absent -> unchecked WARN, no FAIL
+sed "s#^- build_into: .*#- build_into: /no/such/dir/anywhere#" "$sl/q/PRD-sl-referent-fail.md" > "$sl/q/PRD-sl-referent-nobi.md"
+expect_warn "$sl/q/PRD-sl-referent-nobi.md" live-evidence-referent-unchecked "referent-unchecked/build_into-absent-warn"
+expect_clean_no_id "$sl/q/PRD-sl-referent-nobi.md" failures live-evidence-referent-missing "referent-unchecked/no-fail"
+
+# shared-counter-preassigned (migration 0131 collision)
+for txt in "adds migration 0131 for the new table" "creates 0131_add_table.sql" "ships m0131" "ships V131__add_table.sql"; do
+  mk_sl "$sl/q/PRD-sl-mig-fail.md" $NEW "$SEED" "" "P0 — Given a fixture, When linted, Then it $txt."
+  expect_fail "$sl/q/PRD-sl-mig-fail.md" shared-counter-preassigned "shared-counter-preassigned/fail ($txt)"
+done
+mk_sl "$sl/q/PRD-sl-mig-old.md" $OLD "$SEED" "" "P0 — Given a fixture, When linted, Then it adds migration 0131."
+expect_warn "$sl/q/PRD-sl-mig-old.md" shared-counter-preassigned "shared-counter-preassigned/old-PRD-warn-only"
+mk_sl "$sl/q/PRD-sl-mig-ok.md" $NEW "$SEED" "" \
+  "P0 — Given a fixture, When linted, Then it adds a migration using the next free migration number at land time."
+expect_clean_no_id "$sl/q/PRD-sl-mig-ok.md" failures shared-counter-preassigned "shared-counter-preassigned/next-free-pass"
+
+# cross-repo-path-in-ac (WARN)
+mk_sl "$sl/q/PRD-sl-xrepo-fail.md" $NEW "$SEED" "" \
+  "P0 — Given a fixture, When linted, Then it edits /home/jsy/wintermute/otherrepo/src/lib.rs."
+expect_warn "$sl/q/PRD-sl-xrepo-fail.md" cross-repo-path-in-ac "cross-repo-path-in-ac/fail"
+mk_sl "$sl/q/PRD-sl-xrepo-ok.md" $NEW "$SEED" "" \
+  "P0 — Given a fixture, When linted, Then it edits src/lib.rs under $SLR/src."
+expect_clean_no_id "$sl/q/PRD-sl-xrepo-ok.md" warnings cross-repo-path-in-ac "cross-repo-path-in-ac/own-repo-pass"
+
+# later-event-without-blocked-on (WARN)
+mk_sl "$sl/q/PRD-sl-later-fail.md" $NEW "$SEED" "" \
+  "P0 — Given a fixture, When linted, Then it passes after the next chain run. (Live; evidence: echo ok)"
+expect_warn "$sl/q/PRD-sl-later-fail.md" later-event-without-blocked-on "later-event-without-blocked-on/fail"
+mk_sl "$sl/q/PRD-sl-later-ok.md" $NEW "$SEED" "- Blocked-on: chain run after merge" \
+  "P0 — Given a fixture, When linted, Then it passes after the next chain run. (Live; evidence: echo ok)"
+expect_clean_no_id "$sl/q/PRD-sl-later-ok.md" warnings later-event-without-blocked-on "later-event-without-blocked-on/blocked-on-pass"
+
+# unknown-frontmatter-key (WARN)
+mk_sl "$sl/q/PRD-sl-key-fail.md" $NEW "$SEED" "- Frobnicator: yes" "$GOODAC"
+expect_warn "$sl/q/PRD-sl-key-fail.md" unknown-frontmatter-key "unknown-frontmatter-key/fail"
+mk_sl "$sl/q/PRD-sl-key-ok.md" $NEW "$SEED" "- Falsifier: none\n- Absorbs: nothing" "$GOODAC"
+expect_clean_no_id "$sl/q/PRD-sl-key-ok.md" warnings unknown-frontmatter-key "unknown-frontmatter-key/known-keys-pass"
+
+# fleet rule: ssh-evidence-no-path-prefix
+mk_sl "$sl/q/PRD-sl-ssh-fail.md" $NEW "$SEED" "" \
+  "P0 — Given a fixture, When linted, Then it passes. (Live; evidence: ssh redbaron 'wm-build explain foo')"
+expect_fail "$sl/q/PRD-sl-ssh-fail.md" ssh-evidence-no-path-prefix "ssh-evidence-no-path-prefix/fail"
+mk_sl "$sl/q/PRD-sl-ssh-old.md" $OLD "$SEED" "" \
+  "P0 — Given a fixture, When linted, Then it passes. (Live; evidence: ssh redbaron 'wm-build explain foo')"
+expect_warn "$sl/q/PRD-sl-ssh-old.md" ssh-evidence-no-path-prefix "ssh-evidence-no-path-prefix/old-PRD-warn-only"
+mk_sl "$sl/q/PRD-sl-ssh-ok.md" $NEW "$SEED" "" \
+  "P0 — Given a fixture, When linted, Then it passes. (Live; evidence: ssh redbaron 'export PATH=\$HOME/.local/bin:\$HOME/.cargo/bin:\$PATH; wm-build explain foo')"
+expect_clean_no_id "$sl/q/PRD-sl-ssh-ok.md" failures ssh-evidence-no-path-prefix "ssh-evidence-no-path-prefix/prefixed-pass"
+
+# fleet rule: mcp-curl-no-accept (run 1004: prod /mcp curl without the Accept pair)
+mk_sl "$sl/q/PRD-sl-mcp-fail.md" $NEW "$SEED" "" \
+  "P0 — Given a fixture, When linted, Then it passes. (Live; evidence: curl -s -X POST https://mcphost.dev/mcp -d '{}')"
+expect_fail "$sl/q/PRD-sl-mcp-fail.md" mcp-curl-no-accept "mcp-curl-no-accept/run-1004-shape-fail"
+mk_sl "$sl/q/PRD-sl-mcp-old.md" $OLD "$SEED" "" \
+  "P0 — Given a fixture, When linted, Then it passes. (Live; evidence: curl -s -X POST https://mcphost.dev/mcp -d '{}')"
+expect_warn "$sl/q/PRD-sl-mcp-old.md" mcp-curl-no-accept "mcp-curl-no-accept/old-PRD-warn-only"
+mk_sl "$sl/q/PRD-sl-mcp-ok.md" $NEW "$SEED" "" \
+  "P0 — Given a fixture, When linted, Then it passes. (Live; evidence: curl -s -H 'Accept: application/json, text/event-stream' https://mcphost.dev/mcp -d '{}')"
+expect_clean_no_id "$sl/q/PRD-sl-mcp-ok.md" failures mcp-curl-no-accept "mcp-curl-no-accept/accept-pair-pass"
+
+# fleet rule: signup-without-offboard
+mk_sl "$sl/q/PRD-sl-signup-fail.md" $NEW "$SEED" "" \
+  "P0 — Given a fixture, When linted, Then it passes. (Live; evidence: python3 probe.py signup then call a tool)"
+expect_fail "$sl/q/PRD-sl-signup-fail.md" signup-without-offboard "signup-without-offboard/fail"
+mk_sl "$sl/q/PRD-sl-signup-old.md" $OLD "$SEED" "" \
+  "P0 — Given a fixture, When linted, Then it passes. (Live; evidence: python3 probe.py signup then call a tool)"
+expect_warn "$sl/q/PRD-sl-signup-old.md" signup-without-offboard "signup-without-offboard/old-PRD-warn-only"
+mk_sl "$sl/q/PRD-sl-signup-ok.md" $NEW "$SEED" "" \
+  "P0 — Given a fixture, When linted, Then it passes. (Live; evidence: python3 probe.py signup then self_offboard in finally)"
+expect_clean_no_id "$sl/q/PRD-sl-signup-ok.md" failures signup-without-offboard "signup-without-offboard/offboard-pass"
+
+# fleet rule: generator-set-member (WARN; build_into basename must be the repo in generator_sets)
+mkdir -p "$sl/mcphost"; ( cd "$sl/mcphost" && git init -q -b main . && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m i ) >/dev/null 2>&1
+mk_sl "$sl/q/PRD-sl-gen-fail.md" $NEW "$SEED" "" \
+  "P0 — Given a fixture, When linted, Then it adds a new member to ERROR_CODES by hand."
+sed -i "s#^- build_into: .*#- build_into: $sl/mcphost#" "$sl/q/PRD-sl-gen-fail.md"
+expect_warn "$sl/q/PRD-sl-gen-fail.md" generator-set-member "generator-set-member/fail"
+mk_sl "$sl/q/PRD-sl-gen-ok.md" $NEW "$SEED" "" \
+  "P0 — Given a fixture, When linted, Then it adds a new member to ERROR_CODES via the error_registry generator."
+sed -i "s#^- build_into: .*#- build_into: $sl/mcphost#" "$sl/q/PRD-sl-gen-ok.md"
+expect_clean_no_id "$sl/q/PRD-sl-gen-ok.md" warnings generator-set-member "generator-set-member/names-generator-pass"
+
+# --explain covers the new ids; contract rows are the source (no strings in code)
+total=$((total+1))
+o="$("$LINT" --explain premise-ac-not-live 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ] && grep -q '966' <<<"$o"; then echo "ok: --explain premise-ac-not-live"; else echo "FAIL: --explain premise-ac-not-live rc=$rc: $o"; fails=$((fails+1)); fi
 
 # --------------------------------------------------------------------------
 if [ "$fails" -ne 0 ]; then

@@ -78,6 +78,7 @@ SELFTEST_REGISTRY=(
   scripts/lane-predicate-selftest.sh
   scripts/manifest-reconcile-selftest.sh
   scripts/prd-lint-selftest.sh
+  scripts/dream-contract-drift-selftest.sh
   scripts/lint-contract-size-selftest.sh
   scripts/lint-contract-size.sh
   scripts/scripts-index-gen-selftest.sh
