@@ -57,6 +57,8 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # PRD-build-tenant-secret-continuity: exported so the python heredoc below
 # can resolve state/secrets/<slug>/ without re-deriving SKILL_DIR itself.
 export LINT_STATE_DIR="${BUILD_STATE_DIR:-$HERE/../state}"
+# /dream shift-left: contract tables (fleet lint rules, frontmatter keys) are read from here.
+export LINT_HERE="$HERE"
 # PRD-build-live-ac-no-defer R2: the shared loop-tooling scope file, so the
 # python heredoc below and verified-completed.sh/archive-trailer.sh never
 # hardcode the build-skill/rustbuild/autobuilder list a second time.
@@ -188,6 +190,26 @@ AC or use foreign_surface_ok. WARN
 foreign-surface-repo-missing: a corpus build_into is absent on this host
 (its surface is unknown, never a fail). WARN foreign-surface-source-missing:
 repo-surface.sh could not be run (set REPO_SURFACE_SH).
+EXPLAIN
+      exit 0
+      ;;
+    seed-missing|premise-ac-not-live|live-evidence-referent-missing|live-evidence-referent-unchecked|shared-counter-preassigned|cross-repo-path-in-ac|later-event-without-blocked-on|unknown-frontmatter-key)
+      cat <<'EXPLAIN'
+Shift-left checks (/dream Stage 1). FAIL for a PRD `Drafted:` on or after the
+enforcement cutoff in build-contract.md (`## Lint rules (fleet)`), WARN before.
+  seed-missing: `Seed:` must be chain:<chain-id>:<family-id> | traffic:<id> | joe:<YYYY-MM-DD>.
+  premise-ac-not-live: an AC whose Given/When names prod, orch, mcphost-1, `ssh `, or a public
+    https host needs a `(Live; evidence: ...)` tail; a builder cannot run it otherwise (run 966).
+  live-evidence-referent-missing: a repo-relative path named in a Live evidence string must exist
+    at origin/main of build_into (never the working tree) or be another AC's deliverable (run 798).
+    WARN live-evidence-referent-unchecked when build_into is absent/unfetchable.
+  shared-counter-preassigned: no specific migration number ("migration 0124", 0124_, m0124, V124__);
+    say 'next free migration number at land time'.
+  cross-repo-path-in-ac (WARN): an AC names an absolute path under another repo than build_into.
+  later-event-without-blocked-on (WARN): a Live AC waits on a later event with no `Blocked-on:`.
+  unknown-frontmatter-key (WARN): a header key not in the contract's Frontmatter table.
+The fleet rules (ssh-evidence-no-path-prefix, mcp-curl-no-accept, signup-without-offboard,
+generator-set-member) are read from the contract's table; see its `message` column.
 EXPLAIN
       exit 0
       ;;
@@ -716,6 +738,17 @@ def intent_card_cap():
             return int(m.group(1)), True
     except OSError:
         pass
+    # The local checkout can be behind (or a bare clone): read the cap from
+    # origin/main instead of falling back to the constant.
+    try:
+        src_root = os.environ.get("WM_BUILD_SRC", "/home/jsy/wintermute/wm-build")
+        r = subprocess.run(["git", "-C", src_root, "show", "origin/main:src/inner/contract.rs"],
+                           capture_output=True, text=True, timeout=10)
+        m = re.search(r"pub\s+const\s+INTENT_CARD_AC_TEXT_CAP\s*:\s*usize\s*=\s*(\d+)\s*;", r.stdout)
+        if r.returncode == 0 and m:
+            return int(m.group(1)), True
+    except (OSError, subprocess.SubprocessError):
+        pass
     return 500, False
 
 
@@ -828,6 +861,224 @@ def command_tokens(text):
             out.append(tok)
     return out
 
+
+# -- shift-left rules (/dream Stage 1, 2026-10-22) ---------------------------
+# Every FAIL here applies only to a PRD Drafted on/after the cutoff read from
+# build-contract.md ("Enforcement cutoff:"); an older/undated PRD gets the
+# same finding as a WARN. The fleet rules (ssh PATH prefix, /mcp Accept pair,
+# signup-without-offboard, generator sets) are READ from the contract's
+# `## Lint rules (fleet)` table, never typed here.
+SHIFT_LEFT_CUTOFF_DEFAULT = "2026-10-23"
+LINT_HERE = os.environ.get("LINT_HERE", "")
+DEFAULT_CONTRACT = os.environ.get("PRD_LINT_CONTRACT") or os.path.join(LINT_HERE, "..", "build-contract.md")
+
+SEED_RE = re.compile(r"^(?:chain:[^:\s]+:[^:\s]+|traffic:\S+|joe:\d{4}-\d{2}-\d{2})$")
+PREMISE_NAMES_RE = re.compile(r"\b(?:prod|production|orch|mcphost-1)\b|\bssh\s", re.I)
+PREMISE_URL_RE = re.compile(r"https?://([\w.-]+)", re.I)
+NON_PUBLIC_HOST_RE = re.compile(r"^(?:localhost|127\..*|0\.0\.0\.0|.*example\..*|.*\.test|.*\.invalid|.*\.local)$", re.I)
+
+
+def premise_names(text):
+    """First production-side thing a Given/When names (prod, orch, mcphost-1,
+    `ssh `, or an https:// public host), else None."""
+    m = PREMISE_NAMES_RE.search(text)
+    if m:
+        return m.group(0).strip()
+    for u in PREMISE_URL_RE.finditer(text):
+        if not NON_PUBLIC_HOST_RE.match(u.group(1)):
+            return u.group(0)
+    return None
+MIGRATION_RES = [
+    re.compile(r"\bmigrations?\s+(?:number\s+|no\.?\s+|#)?0*\d{2,4}\b", re.I),
+    re.compile(r"(?<![\w.])0\d{3}_[a-z]"),
+    re.compile(r"\bm0\d{3}\b"),
+    re.compile(r"\bV\d{2,4}__"),
+]
+LATER_EVENT_RE = re.compile(r"after the next|once .* deploy|next chain run|after Joe", re.I)
+ONE_SHOT_RE = re.compile(r"one[- ]?shot", re.I)
+FOREIGN_REPO_PATH_RE = re.compile(r"(?:/home/[\w.-]+|~)/(?:wintermute|repos)/([\w.-]+)/")
+ADD_VERB_RE = re.compile(r"\b(?:add|adds|adding|added|new|register|registers|registering|extend|extends|append|appends)\b", re.I)
+EVIDENCE_PATH_TOKEN_RE = re.compile(r"^[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+$")
+_CONTRACT_CACHE = {}
+_ORIGIN_CACHE = {}
+
+
+def load_contract_tables(path):
+    """Parse the contract's tables once: frontmatter keys, display-only keys,
+    fleet lint rules, generator_sets, enforcement cutoff. Fail-open: an
+    unreadable contract yields empty sets (checks that need them skip)."""
+    path = os.path.abspath(path) if path else ""
+    if path in _CONTRACT_CACHE:
+        return _CONTRACT_CACHE[path]
+    out = {"keys": set(), "display": set(), "rules": [], "sets": [], "cutoff": SHIFT_LEFT_CUTOFF_DEFAULT}
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        _CONTRACT_CACHE[path] = out
+        return out
+
+    def norm(k):
+        return k.strip().lower().replace(" ", "_")
+
+    def cells(row):
+        return [c.strip() for c in re.split(r"(?<!\\)\|", row.strip())[1:-1]]
+
+    section = ""
+    sub = ""
+    for i, line in enumerate(lines):
+        if line.startswith("## "):
+            section, sub = line[3:].strip(), ""
+            continue
+        if line.startswith("### "):
+            sub = line[4:].strip()
+            continue
+        if section == "Frontmatter" and line.startswith("| `"):
+            c = cells(line)
+            if c:
+                for tok in re.findall(r"`([^`]+)`", c[0]):
+                    out["keys"].add(norm(tok))
+        elif section == "Frontmatter" and re.match(r"^Keys `", line):
+            para = line
+            j = i + 1
+            while j < len(lines) and lines[j].strip():
+                para += " " + lines[j]
+                j += 1
+            for tok in re.findall(r"`([^`]+)`", para):
+                out["display"].add(norm(tok))
+        elif section.startswith("Lint rules (fleet)"):
+            m = re.match(r"^Enforcement cutoff:\s*`Drafted >= (\d{4}-\d{2}-\d{2})`", line)
+            if m:
+                out["cutoff"] = m.group(1)
+            if line.startswith("| `") and sub == "":
+                c = cells(line)
+                if len(c) >= 4:
+                    rid = c[0].strip("` ")
+                    clauses = {}
+                    for span in re.findall(r"`([^`]*)`", c[2]):
+                        if "=" in span:
+                            k, v = span.split("=", 1)
+                            clauses[k.strip()] = v.replace("\\|", "|")
+                    out["rules"].append({"id": rid, "level": c[1].strip().upper(), "clauses": clauses,
+                                         "message": c[3].replace("\\|", "|")})
+            elif line.startswith("| `") and sub == "generator_sets":
+                c = cells(line)
+                if len(c) >= 3:
+                    out["sets"].append({"repo": c[0].strip("` "), "set": c[1].strip("` "),
+                                        "generator": c[2].strip("` ").replace("\\|", "|")})
+    _CONTRACT_CACHE[path] = out
+    return out
+
+
+def split_live(text):
+    """(body, evidence) -- evidence None when there is no real `(Live` marker;
+    a `(Live` inside backticks is prose. Evidence = the text after
+    `(Live; evidence:` (or `(Live`), trailing `)` removed."""
+    in_code = False
+    for i, c in enumerate(text):
+        if c == "`":
+            in_code = not in_code
+        elif not in_code and text.startswith("(Live", i):
+            ev = text[i + len("(Live"):]
+            ev = re.sub(r"^\s*;\s*evidence\s*:\s*", "", ev)
+            ev = ev.rstrip()
+            if ev.endswith(")"):
+                ev = ev[:-1]
+            return text[:i], ev
+    return text, None
+
+
+def live_evidence_section(all_lines):
+    """Text of the `## Live evidence commands` section (any heading level
+    2-4), or ''."""
+    out, level = [], None
+    for line in all_lines:
+        m = re.match(r"^(#{2,4})\s+(.*)$", line)
+        if level is None:
+            if m and m.group(2).strip().lower().startswith("live evidence commands"):
+                level = len(m.group(1))
+            continue
+        if m and len(m.group(1)) <= level:
+            break
+        out.append(line)
+    return "\n".join(out)
+
+
+def requirements_lines(all_lines):
+    out, on = [], False
+    for line in all_lines:
+        if line.startswith("## "):
+            on = line[3:].strip().lower().startswith("requirements")
+            continue
+        if on:
+            out.append(line)
+    return out
+
+
+def section_text(all_lines, title_prefix):
+    out, on = [], False
+    for line in all_lines:
+        if line.startswith("## "):
+            on = line[3:].strip().lower().startswith(title_prefix)
+            continue
+        if on:
+            out.append(line)
+    return "\n".join(out)
+
+
+def origin_main_has(build_into, path):
+    """True/False when origin/main of build_into (after a 10 s fetch) has
+    `path`; None when build_into is absent, not a git repo, or unfetchable.
+    Never reads the working tree. PRD_LINT_NO_FETCH=1 skips the fetch only."""
+    if build_into not in _ORIGIN_CACHE:
+        ok = None
+        if os.path.isdir(build_into):
+            try:
+                if os.environ.get("PRD_LINT_NO_FETCH") != "1":
+                    r = subprocess.run(["git", "-C", build_into, "fetch", "-q", "origin"],
+                                       capture_output=True, timeout=10)
+                    fetched = r.returncode == 0
+                else:
+                    fetched = True
+                v = subprocess.run(["git", "-C", build_into, "rev-parse", "--verify", "-q", "origin/main"],
+                                   capture_output=True, timeout=10)
+                ok = fetched and v.returncode == 0
+            except (OSError, subprocess.SubprocessError):
+                ok = False
+        _ORIGIN_CACHE[build_into] = bool(ok) if ok is not None else None
+    if not _ORIGIN_CACHE[build_into]:
+        return None
+    try:
+        r = subprocess.run(["git", "-C", build_into, "cat-file", "-e", "origin/main:" + path],
+                           capture_output=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return r.returncode == 0
+
+
+def evidence_path_tokens(ev):
+    """Repo-relative path tokens named inside a Live evidence string:
+    contain `/` and end in a file extension or start with scripts/,
+    examples/, tests/. Absolute, ~, URL, glob and template tokens are
+    runtime artifacts, not repo files."""
+    out = []
+    for tok in re.split(r"[\s`'\"(),;=<>|]+", ev):
+        tok = tok.strip().rstrip(".:,;)")
+        if not tok or tok[0] in "/~$.-" and not tok.startswith("./") or tok.startswith("http"):
+            continue
+        if tok.startswith("./"):
+            tok = tok[2:]
+        if any(ch in tok for ch in "*{}[]$"):
+            continue
+        if "/" not in tok or not EVIDENCE_PATH_TOKEN_RE.match(tok):
+            continue
+        if re.search(r"\.[A-Za-z0-9]{1,5}$", tok) or tok.startswith(("scripts/", "examples/", "tests/")):
+            if tok not in out:
+                out.append(tok)
+    return out
+
+
+
 def lint_file(path):
     fails = []
     warns = []
@@ -905,6 +1156,51 @@ def lint_file(path):
     # surfaces the gap to a human/drafter without blocking dispatch.
     if "grounding" not in fm:
         warn("grounding-missing", "no `- Grounding:` line found in the first 80 lines — every drafted PRD names its grounding chain (wwhtbt / five-whys / failure-derived / opportunity / ...)")
+
+    # -- shift-left (/dream Stage 1): FAIL only for a PRD Drafted on/after the
+    # contract's enforcement cutoff; older/undated PRDs get the same finding
+    # as a WARN so nothing already queued goes ineligible.
+    tables = load_contract_tables(contract_path or DEFAULT_CONTRACT)
+    dm = re.match(r"(\d{4}-\d{2}-\d{2})", fm.get("drafted", ""))
+    new_style = bool(dm) and dm.group(1) >= tables["cutoff"]
+
+    def shift(cid, msg):
+        if new_style:
+            fail(cid, msg)
+        else:
+            warn(cid, msg + f" (warning only: Drafted is before {tables['cutoff']} or unset)")
+
+    if not SEED_RE.match(fm.get("seed", "")):
+        shift("seed-missing",
+              "no valid `Seed:` line: write `Seed: chain:<chain-id>:<family-id>`, "
+              "`Seed: traffic:<id>`, or `Seed: joe:<YYYY-MM-DD>` (where this PRD came from)")
+
+    # unknown-frontmatter-key: only the header block (before the first `## `),
+    # keys checked against the contract's Frontmatter table + display-only list.
+    known = tables["keys"] | tables["display"]
+    if known:
+        unknown = []
+        in_f = False
+        for raw in all_lines[:80]:
+            if raw.startswith("## "):
+                break
+            if raw.strip().startswith("```"):
+                in_f = not in_f
+                continue
+            if in_f:
+                continue
+            k = re.sub(r"^[-*+]\s+", "", raw)
+            k = re.sub(r"^\s*\*\*([A-Za-z][A-Za-z _-]*):\*\*", r"\1:", k)
+            km = re.match(r"^\s*([A-Za-z][A-Za-z _-]*)\s*:\s*(.*)$", k)
+            if not km:
+                continue
+            kn = km.group(1).strip().lower().replace(" ", "_")
+            if kn not in known and km.group(1).strip() not in unknown:
+                unknown.append(km.group(1).strip())
+        if unknown:
+            warn("unknown-frontmatter-key",
+                 "frontmatter key(s) not in build-contract.md's Frontmatter table or display-only list: "
+                 + ", ".join(unknown))
 
     build_target = fm.get("build_target")
     if not build_target:
@@ -1271,6 +1567,148 @@ def lint_file(path):
                                  f"{build_into}'s surface, so this run cannot prove it; split the AC "
                                  f"into the owning repo, or accept it with foreign_surface_ok: [{n}] "
                                  f"+ foreign_surface_reasons (--explain ac-names-foreign-surface)")
+
+        # -- shift-left AC checks (/dream Stage 1) --------------------------
+        live_ev_section = live_evidence_section(all_lines)
+        ac_info = []  # (number, body before the Live tail, evidence or None, full text)
+        for it in items:
+            m = AC_NUM_RE.match(it[0])
+            if not m:
+                continue
+            full = " ".join(it)
+            body, ev = split_live(re.sub(r"^\d+\.\s+", "", full))
+            ac_info.append((int(m.group(1)), body, ev, full))
+
+        # premise-ac-not-live: Given/When names prod/orch/mcphost-1/ssh/a public
+        # https host, but the AC has no (Live; evidence: ...) tail -- the builder
+        # cannot run it, so it can only be proven live.
+        for n, body, ev, full in ac_info:
+            if ev is not None or "(Real-box" in full:
+                continue
+            gw = re.sub(r"^P[0-2]\s*[\u2014\u2013-]\s*", "", body)
+            ti = gw.find("Then ")
+            if ti >= 0:
+                gw = gw[:ti]
+            hit = premise_names(gw)
+            if hit:
+                shift("premise-ac-not-live",
+                      f"AC {n} names {hit!r} in its Given/When but has no "
+                      f"`(Live; evidence: ...)` tail: a builder cannot run it. Make it a Live AC, or move "
+                      f"the precondition to the PRD's `Premise:` command")
+
+        # live-evidence-referent-missing: repo-relative paths named inside a Live
+        # evidence string must exist at origin/main of build_into or be another
+        # AC's deliverable (run 798: proof.sh in the evidence, no AC writes it).
+        if any(ev for _n, _b, ev, _f in ac_info if ev):
+            unchecked_warned = False
+            for n, body, ev, full in ac_info:
+                if not ev:
+                    continue
+                for tok in evidence_path_tokens(ev):
+                    if any(tok in b2 for n2, b2, _e2, _f2 in ac_info if n2 != n):
+                        continue
+                    has = origin_main_has(build_into, tok) if build_into else None
+                    if has is None:
+                        if not unchecked_warned:
+                            unchecked_warned = True
+                            warn("live-evidence-referent-unchecked",
+                                 f"build_into {build_into!r} is absent or origin could not be fetched here; "
+                                 f"Live evidence paths were not checked against origin/main")
+                        break
+                    if not has:
+                        shift("live-evidence-referent-missing",
+                              f"AC {n}'s Live evidence names {tok!r}, which is not at origin/main of "
+                              f"build_into and is not another AC's deliverable: add an AC that writes it, "
+                              f"or name an existing script")
+
+        # shared-counter-preassigned: a pre-assigned migration number collides at
+        # land (migration 0131 collision).
+        req_lines = requirements_lines(all_lines)
+        for label, text in [(f"AC {n}", full) for n, _b, _e, full in ac_info] + \
+                           [("a requirement", l) for l in req_lines if l.strip()]:
+            if "next free" in text.lower():
+                continue
+            for rx in MIGRATION_RES:
+                hit = rx.search(text)
+                if hit:
+                    shift("shared-counter-preassigned",
+                          f"{label} names a specific migration number ({hit.group(0).strip()!r}); "
+                          f"say 'next free migration number at land time'")
+                    break
+
+        # cross-repo-path-in-ac (WARN): complements ac-names-foreign-surface,
+        # which checks CLI tokens; this one checks absolute repo paths. A Live
+        # tail is exempt (live probes run anywhere).
+        if build_into:
+            own_name = os.path.basename(build_into.rstrip("/"))
+            for n, body, ev, full in ac_info:
+                for hit in FOREIGN_REPO_PATH_RE.finditer(body):
+                    if hit.group(1) != own_name:
+                        warn("cross-repo-path-in-ac",
+                             f"AC {n} names a path under another repo ({hit.group(1)!r}) than "
+                             f"build_into ({own_name!r}); a run can only prove work inside build_into")
+                        break
+
+        # later-event-without-blocked-on (WARN)
+        if "blocked-on" not in fm and not ONE_SHOT_RE.search(section_text(all_lines, "technical considerations")):
+            for n, body, ev, full in ac_info:
+                if ev is not None and LATER_EVENT_RE.search(full):
+                    warn("later-event-without-blocked-on",
+                         f"Live AC {n} waits on a later event ({LATER_EVENT_RE.search(full).group(0)!r}) but the "
+                         f"PRD has no `Blocked-on:` line and Technical considerations names no one-shot")
+                    break
+
+        # fleet rules from the contract's `## Lint rules (fleet)` table
+        for rule in tables["rules"]:
+            cl, level = rule["clauses"], rule["level"]
+
+            def emit(cid, msg):
+                if level == "FAIL":
+                    shift(cid, msg)
+                else:
+                    warn(cid, msg)
+
+            if cl.get("kind") == "generator-set":
+                own = os.path.basename(build_into.rstrip("/")) if build_into else ""
+                for n, body, ev, full in ac_info:
+                    for srow in tables["sets"]:
+                        if srow["repo"] != own:
+                            continue
+                        if re.search(r"\b" + re.escape(srow["set"]) + r"\b", body) and ADD_VERB_RE.search(body) \
+                                and not re.search(srow["generator"], body):
+                            emit(rule["id"], f"AC {n} adds to {srow['set']!r} without naming its generator "
+                                             f"(/{srow['generator']}/): {rule['message']}")
+                continue
+            if "match" not in cl:
+                continue
+            try:
+                mrx = re.compile(cl["match"])
+                arx = re.compile(cl["absent"]) if "absent" in cl else None
+            except re.error:
+                continue
+            scope = cl.get("scope", "evidence")
+            for n, body, ev, full in ac_info:
+                if scope == "evidence":
+                    if not ev:
+                        continue
+                    text = ev
+                    if re.search(r"live evidence commands", ev, re.I) and live_ev_section:
+                        text += "\n" + live_ev_section
+                else:
+                    text = body
+                fired = False
+                for hit in mrx.finditer(text):
+                    target = text
+                    if "absent-in" in cl:
+                        try:
+                            target = hit.group(cl["absent-in"]) or ""
+                        except IndexError:
+                            target = ""
+                    if arx is None or not arx.search(target):
+                        fired = True
+                        break
+                if fired:
+                    emit(rule["id"], f"AC {n}: {rule['message']}")
 
         # pattern check: a /home/ path in an AC
         for it in leveled_items:
