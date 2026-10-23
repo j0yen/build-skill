@@ -330,11 +330,14 @@ generated / dummy / sample followed by argument(s) / args / values / inputs;
 R2 in the When clause, an id-shaped key (`run_id`, `tenant_id`, any `*_id`; `url` only when the value
 is a bare placeholder such as `"x"`, `"<url>"`, `"example"` or empty, a real
 `https://…` literal is a legitimate live input) is given a literal value.
-R3 (pass): the same AC creates the referent first, by tying the id to an earlier
-call's result ("captures the `run_id` it returns", "the `run_id` returned by
-`host_export`", "that `run_id`", "from the `host_export` result") or by naming a
-captured value from another AC ("the `run_id` captured in AC 5's evidence", "the
-`run_id` AC 5 recorded"). A bare "Given AC N" does NOT satisfy R3.
+R3 (pass), anchored: the same AC creates the referent first, by tying the id to an earlier
+call's result, and the phrase must name the SAME key as the flagged argument ("captures the `run_id`
+it returns", "the `run_id` returned by `host_export`", "that `run_id`", "the `run_id` from the
+`host_export` result"; a phrase about `tenant_id` does not clear a literal `run_id`), or by naming a
+captured value from another AC ("the `run_id` captured in AC 5's evidence", "the `run_id` AC 5
+recorded"). An R1 phrase finding is cleared only by such a phrase inside the same When clause. A
+bare "Given AC N" does NOT satisfy R3. `prd-lint.sh --print-builtin-ids` exports the built-in id
+list the paragraph above must equal (dream-contract-drift-selftest.sh compares the two as sets).
 Known-gap: a Live AC that hands a literal to a referent verb without an id-shaped
 key or a placeholder phrase (for example `tenant: "acme"`) is NOT caught.
 

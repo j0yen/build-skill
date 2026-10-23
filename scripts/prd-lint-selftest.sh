@@ -1681,6 +1681,23 @@ expect_clean_no_id "$sl/q/PRD-sl-lref-url.md" failures live-ac-referent-args "li
 mk_sl "$sl/q/PRD-sl-lref-urlph.md" $NEW "$SEED" "" \
   'P0 — Given prod /mcp, When it calls `host_import` with `url: "x"`, Then the call answers. (Live; evidence: `~/.local/state/mcphost-live/lref-i.jsonl` printing `ok=1`)'
 expect_fail "$sl/q/PRD-sl-lref-urlph.md" live-ac-referent-args "live-ac-referent-args/bare-placeholder-url-fail"
+mk_sl "$sl/q/PRD-sl-lref-urlangle.md" $NEW "$SEED" "" \
+  'P0 — Given prod /mcp, When it calls `host_import` with `url: "<url>"`, Then the call answers. (Live; evidence: `~/.local/state/mcphost-live/lref-j.jsonl` printing `ok=1`)'
+expect_fail "$sl/q/PRD-sl-lref-urlangle.md" live-ac-referent-args "live-ac-referent-args/url-angle-placeholder-fail"
+mk_sl "$sl/q/PRD-sl-lref-idangle.md" $NEW "$SEED" "" \
+  'P0 — Given prod /mcp, When it calls `host_import` with `run_id: <run_id>`, Then the call answers. (Live; evidence: `~/.local/state/mcphost-live/lref-k.jsonl` printing `ok=1`)'
+expect_clean_no_id "$sl/q/PRD-sl-lref-idangle.md" failures live-ac-referent-args "live-ac-referent-args/non-url-named-reference-pass"
+# R3 is anchored to the flagged key: a creates-phrase for another key does not clear a literal run_id
+mk_sl "$sl/q/PRD-sl-lref-otherkey.md" $NEW "$SEED" "" \
+  'P0 — Given prod /mcp, When it calls `host_import` with `run_id: "x"`, Then the call answers with the tenant_id returned by signup. (Live; evidence: `~/.local/state/mcphost-live/lref-l.jsonl` printing `ok=1`)'
+expect_fail "$sl/q/PRD-sl-lref-otherkey.md" live-ac-referent-args "live-ac-referent-args/r3-other-key-does-not-clear-fail"
+mk_sl "$sl/q/PRD-sl-lref-samekey.md" $NEW "$SEED" "" \
+  'P0 — Given prod /mcp, When it calls `host_import` with `run_id: "x"`, Then the call answers with the `run_id` returned by `host_export`. (Live; evidence: `~/.local/state/mcphost-live/lref-m.jsonl` printing `ok=1`)'
+expect_clean_no_id "$sl/q/PRD-sl-lref-samekey.md" failures live-ac-referent-args "live-ac-referent-args/r3-same-key-clears-pass"
+# R1 phrase finding is cleared only by a creates-phrase in the same When clause, not one in the Then
+mk_sl "$sl/q/PRD-sl-lref-r1then.md" $NEW "$SEED" "" \
+  'P0 — Given AC 1, When it calls `host_import` with AC 1'"'"'s synthesized required arguments, Then the call answers with the `run_id` returned by `host_export`. (Live; evidence: `~/.local/state/mcphost-live/lref-n.jsonl` printing `ok=1`)'
+expect_fail "$sl/q/PRD-sl-lref-r1then.md" live-ac-referent-args "live-ac-referent-args/r1-creates-phrase-in-Then-does-not-clear-fail"
 
 # --explain covers the new ids; contract rows are the source (no strings in code)
 total=$((total+1))

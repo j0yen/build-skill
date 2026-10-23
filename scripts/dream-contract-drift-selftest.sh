@@ -14,8 +14,12 @@
 #   (d) every fleet lint rule id (the contract's `## Lint rules (fleet)` table and
 #       the built-in shift-left ids it lists) has a failing/warning fixture AND a
 #       passing fixture in prd-lint-selftest.sh.
-#   (e) every one of those rule ids is named in prd-lint.sh (LINT_SRC), so the
-#       contract list and the lint list cannot drift apart.
+#   (e) the built-in shift-left ids of the contract paragraph and the list the lint
+#       EXPORTS (`prd-lint.sh --print-builtin-ids`, run, never grepped) are the same
+#       SET: an id in either and not the other FAILs; each exported id must also be
+#       emitted by a fail/warn/shift call in a non-comment line of prd-lint.sh and
+#       answer `--explain`. (Fleet-table ids are read from the contract at run time,
+#       never typed in the lint; (d) covers their fixtures.)
 #
 # Fix a failure by adding the missing key/id to the contract table (or its
 # fixture), never by weakening the check.
@@ -69,6 +73,17 @@ m = re.search(r"built-in shift-left\s+ids\s+are(.*?)\(see", text, re.S)
 if m:
     ids += re.findall(r"`([a-z0-9-]+)`", m.group(1))
 print("\n".join(dict.fromkeys(ids)))
+PY
+}
+
+# built-in shift-left ids only: the contract paragraph "The `prd-lint.sh` built-in shift-left ids are ..."
+contract_builtin_ids() {
+  python3 - "$CONTRACT" <<'PY'
+import re, sys
+text = open(sys.argv[1], encoding="utf-8").read()
+m = re.search(r"built-in shift-left\s+ids\s+are(.*?)\(see", text, re.S)
+if m:
+    print("\n".join(dict.fromkeys(re.findall(r"`([a-z0-9-]+)`", m.group(1)))))
 PY
 }
 
@@ -161,13 +176,26 @@ check() {
     done <<<"$ids"
     [ "$miss" -eq 0 ] && echo "ok (d): $(wc -l <<<"$ids") rule ids each have a fail/warn and a pass fixture" || fails=$((fails+miss))
   fi
-  # (e) every contract rule id is named in prd-lint.sh itself (contract list and lint list cannot drift apart)
+  # (e) built-in ids: contract paragraph == lint's exported list (set, both ways); table ids named in code
   if [ -n "$ids" ]; then
-    local lint_src="${LINT_SRC:-$HERE/prd-lint.sh}" lmiss=0
-    while IFS= read -r id; do
-      grep -qF -- "$id" "$lint_src" || { echo "FAIL (e): contract rule id '$id' is not named in $(basename "$lint_src")"; lmiss=$((lmiss+1)); }
-    done <<<"$ids"
-    [ "$lmiss" -eq 0 ] && echo "ok (e): $(wc -l <<<"$ids") contract rule ids all named in $(basename "$lint_src")" || fails=$((fails+lmiss))
+    local lint_src="${LINT_SRC:-$HERE/prd-lint.sh}" lmiss=0 cb lb
+    local code; code="$(grep -vE '^[[:space:]]*#' "$lint_src")"   # captured once: pipefail + grep -q would SIGPIPE
+    cb="$(contract_builtin_ids | sort -u)"
+    lb="$(bash "$lint_src" --print-builtin-ids 2>/dev/null | sort -u)"
+    if [ -z "$lb" ]; then
+      echo "FAIL (e): $(basename "$lint_src") --print-builtin-ids printed no ids"; lmiss=$((lmiss+1))
+    else
+      while IFS= read -r id; do
+        [ -n "$id" ] || continue
+        grep -qxF -- "$id" <<<"$lb" || { echo "FAIL (e): contract built-in id '$id' is not in the list $(basename "$lint_src") exports"; lmiss=$((lmiss+1)); }
+      done <<<"$cb"
+      while IFS= read -r id; do
+        grep -qxF -- "$id" <<<"$cb" || { echo "FAIL (e): $(basename "$lint_src") exports built-in id '$id' that the contract paragraph does not list"; lmiss=$((lmiss+1)); }
+        grep -qE "(fail|warn|shift)\(\s*\"$id\"" <<<"$code" || { echo "FAIL (e): exported id '$id' is never emitted by a fail/warn/shift call in $(basename "$lint_src")"; lmiss=$((lmiss+1)); }
+        bash "$lint_src" --explain "$id" >/dev/null 2>&1 || { echo "FAIL (e): exported id '$id' has no --explain text"; lmiss=$((lmiss+1)); }
+      done <<<"$lb"
+    fi
+    [ "$lmiss" -eq 0 ] && echo "ok (e): $(wc -l <<<"$cb") built-in ids equal the lint's exported list (set, both ways), each emitted + explained" || fails=$((fails+lmiss))
   fi
   [ "$fails" -eq 0 ]
 }
@@ -186,6 +214,24 @@ if [ "${1:-}" = "--selftest" ]; then
   total=$((total+1))
   if out="$(LINT_SELFTEST="$t/lint-selftest.sh" "$0" 2>&1)"; then echo "FAIL: drift test passed with seed-missing fixtures removed"; bad=$((bad+1)); else
     grep -q "FAIL (d): rule 'seed-missing'" <<<"$out" && echo "ok: missing fixture is caught by (d)" || { echo "FAIL: (d) did not name seed-missing: $out"; bad=$((bad+1)); }; fi
+  # (e) two-way: all three run on COPIES under $t (mktemp), never the real files
+  mkdir -p "$t/lint"
+  # (e1) id only in a comment does not count: remove it from the exported list, leave a comment naming it
+  sed 's/^  shared-counter-preassigned cross-repo-path-in-ac/  cross-repo-path-in-ac/' "$HERE/prd-lint.sh" > "$t/lint/e1.sh"
+  sed -i '1a # shared-counter-preassigned (comment only, not in the list)' "$t/lint/e1.sh"
+  total=$((total+1))
+  if out="$(LINT_SRC="$t/lint/e1.sh" "$0" 2>&1)"; then echo "FAIL: drift test passed with an id present only in a lint comment"; bad=$((bad+1)); else
+    grep -q "FAIL (e): contract built-in id 'shared-counter-preassigned' is not in the list" <<<"$out" && echo "ok: comment-only id is caught by (e)" || { echo "FAIL: (e1) did not name the comment-only id: $out"; bad=$((bad+1)); }; fi
+  # (e2) id in the lint's list but missing from the contract
+  sed 's/`hand-built-marker-missing`, //' "$CONTRACT" > "$t/e2-contract.md"
+  total=$((total+1))
+  if out="$(CONTRACT="$t/e2-contract.md" "$0" 2>&1)"; then echo "FAIL: drift test passed with an id in the lint but not the contract"; bad=$((bad+1)); else
+    grep -q "FAIL (e): .* exports built-in id 'hand-built-marker-missing'" <<<"$out" && echo "ok: lint-only id is caught by (e)" || { echo "FAIL: (e2) did not name the lint-only id: $out"; bad=$((bad+1)); }; fi
+  # (e3) id in the contract but missing from the lint's list
+  sed 's/^  unknown-frontmatter-key hand-built-marker-missing/  hand-built-marker-missing/' "$HERE/prd-lint.sh" > "$t/lint/e3.sh"
+  total=$((total+1))
+  if out="$(LINT_SRC="$t/lint/e3.sh" "$0" 2>&1)"; then echo "FAIL: drift test passed with an id in the contract but not the lint"; bad=$((bad+1)); else
+    grep -q "FAIL (e): contract built-in id 'unknown-frontmatter-key' is not in the list" <<<"$out" && echo "ok: contract-only id is caught by (e)" || { echo "FAIL: (e3) did not name the contract-only id: $out"; bad=$((bad+1)); }; fi
   # the real contract passes
   total=$((total+1))
   if out="$("$0" 2>&1)"; then echo "ok: real contract has no drift"; else echo "FAIL: real contract drifts: $out"; bad=$((bad+1)); fi

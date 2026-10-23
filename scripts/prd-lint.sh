@@ -76,6 +76,7 @@ usage() {
   echo "usage: prd-lint.sh <file|dir>... [--format text|json|pass-fail] [--quiet] [--contract <path>]" >&2
   echo "       prd-lint.sh --explain <check-id>" >&2
   echo "       prd-lint.sh --print-live-hosts [--contract <path>]" >&2
+  echo "       prd-lint.sh --print-builtin-ids" >&2
 }
 
 format="text"
@@ -83,7 +84,15 @@ quiet=0
 contract=""
 explain_id=""
 print_hosts=0
+print_builtin_ids=0
 files=()
+# The built-in shift-left rule ids this lint emits. ONE list: `--print-builtin-ids` exports it and
+# dream-contract-drift-selftest.sh compares it as a SET with build-contract.md's built-in ids (both
+# directions). Adding a built-in rule = add its id here AND to the contract paragraph AND its
+# `--explain` arm below.
+BUILTIN_RULE_IDS=(seed-missing premise-ac-not-live live-evidence-referent-missing
+  shared-counter-preassigned cross-repo-path-in-ac later-event-without-blocked-on
+  unknown-frontmatter-key hand-built-marker-missing build-priority-default live-ac-referent-args)
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --format)
@@ -124,6 +133,10 @@ while [ "$#" -gt 0 ]; do
       print_hosts=1
       shift
       ;;
+    --print-builtin-ids)
+      print_builtin_ids=1
+      shift
+      ;;
     -h|--help)
       usage; exit 0
       ;;
@@ -142,6 +155,11 @@ while [ "$#" -gt 0 ]; do
       ;;
   esac
 done
+
+if [ "$print_builtin_ids" -eq 1 ]; then
+  printf '%s\n' "${BUILTIN_RULE_IDS[@]}"
+  exit 0
+fi
 
 if [ -n "$explain_id" ]; then
   case "$explain_id" in
@@ -235,9 +253,10 @@ enforcement cutoff in build-contract.md (`## Lint rules (fleet)`), WARN before.
     PHRASE-DETECTED (no schema access): R1 a When clause describing its arguments as
     synthesized/placeholder/schema-valid/schema-derived/generated/dummy/sample arguments|args|
     values|inputs; R2 in the When clause, an id-shaped key (`*_id`, or `url` only with a bare placeholder) given a
-    literal value. R3 clears both: the same AC creates the referent ("captures the `run_id` it
-    returns", "the `run_id` returned by `host_export`", "that `run_id`", "from the `x` result",
-    "the `run_id` captured in AC 5's evidence"); a bare "Given AC N" does not.
+    literal value. R3 clears a finding only when anchored: a creates-phrase naming the SAME key as
+    the flagged argument ("captures the `run_id` it returns", "the `run_id` returned by `host_export`",
+    "that `run_id`", "the `run_id` from the `x` result", "the `run_id` captured in AC 5's evidence"),
+    or, for an R1 phrase finding, such a phrase inside the same When clause; a bare "Given AC N" does not.
     Known-gap: a literal handed to a referent verb under a non-id key with no placeholder phrase.
   shared-counter-preassigned: no specific migration number ("migration 0124", 0124_, m0124, V124__);
     say 'next free migration number at land time'.
@@ -956,15 +975,27 @@ REFARG_KEYVAL_RE = re.compile(
     r"[\"'`]?\b(?P<k>\w*_id|url)\b[\"'`]?\s*(?::|=)\s*"
     r"(?P<v>\"[^\"]*\"|'[^']*'|`[^`]*`|[^\s,;)}\]]*)", re.I)
 REFARG_BARE_PLACEHOLDER_RE = re.compile(r"^(?:|x|y|z|foo|bar|test|example|string|placeholder|dummy|sample|<[^>]*>)$", re.I)
+# A non-url id key given `<run_id from step 1>` / `$RUN_ID` / `{run_id}` / `...` names a reference to a
+# value bound elsewhere, not a literal, so R2 skips it. `url` never takes this pass: `url: "<url>"` is a
+# bare placeholder (the only `<...>` a url value can be), so it goes to REFARG_BARE_PLACEHOLDER_RE.
 REFARG_REFERENCE_RE = re.compile(r"^(?:<[^>]*>|\$\S*|\{\S*\}|\.\.\.)$")
+# R3 creates-phrases. Each names the id key it creates (group k), so a phrase for `tenant_id` cannot
+# clear a literal `run_id`. Key = `*_id`, `id` or `url`; "valid"/"error" never match.
+_RK = r"`?(?P<k>\w+_id|id|url)`?"
+_RCAP = r"(?:captured|recorded|saved|stored|printed|emitted|written|returned)"
 REFARG_CREATES_RES = [re.compile(r, re.I) for r in (
-    r"\bcaptur(?:e|es|ing)\s+(?:the\s+)?(?:`[^`]+`|\w*id\b)",            # captures the `run_id` it returns
-    r"`?\w+`?\s+returned\s+by\b",                                          # the `run_id` returned by `host_export`
-    r"\bthat\s+`?\w*id\b",                                                 # that `run_id`
-    r"\bfrom\s+(?:the\s+)?`?[\w.]+`?\s+(?:tool[_ ])?results?\b",           # from the `host_export` result
-    r"\w*id`?\s+(?:captured|recorded|saved|stored|printed|emitted|written|returned)\s+(?:in|by)\s+AC\s*\d+",  # the `run_id` captured in AC 5's evidence
-    r"\w*id`?\s+AC\s*\d+(?:'s)?\s+(?:recorded|captured|saved|stored|printed|emitted|wrote|returned)\b",      # the `run_id` AC 5 recorded
+    r"\bcaptur(?:e|es|ing)\s+(?:the\s+)?" + _RK + r"\b",                                 # captures the `run_id` it returns
+    _RK + r"\s+returned\s+by\b",                                                        # the `run_id` returned by `host_export`
+    r"\bthat\s+" + _RK + r"\b",                                                        # that `run_id`
+    _RK + r"\s+from\s+(?:the\s+)?`?[\w.]+`?\s+(?:tool[_ ])?results?\b",                  # the `run_id` from the `host_export` result
+    _RK + r"\s+" + _RCAP + r"\s+(?:in|by)\s+AC\s*\d+",                                  # the `run_id` captured in AC 5's evidence
+    _RK + r"\s+AC\s*\d+(?:'s)?\s+(?:recorded|captured|saved|stored|printed|emitted|wrote|returned)\b",  # the `run_id` AC 5 recorded
 )]
+
+
+def created_keys(text):
+    """Lower-cased id keys a creates-phrase in `text` ties to an earlier call's result."""
+    return {m.group("k").lower() for rx in REFARG_CREATES_RES for m in rx.finditer(text)}
 
 
 def when_clause(body):
@@ -975,19 +1006,22 @@ def when_clause(body):
 
 def live_ac_referent_args_reason(body):
     """Why a Live AC hands placeholder/literal ids to a lookup verb, else None.
-    R3 (the AC creates the referent itself) clears R1 and R2."""
-    if any(rx.search(body) for rx in REFARG_CREATES_RES):
-        return None
+    R3 clears a finding only when anchored: an R1 phrase finding needs a creates-phrase in the
+    same When clause; an R2 literal for key K needs a creates-phrase naming that same key K."""
     wc = when_clause(body)
     m = REFARG_PLACEHOLDER_RE.search(wc)
-    if m:
+    if m and not created_keys(wc):
         return f"placeholder-described arguments ({m.group(0).strip()!r})"
+    made = created_keys(body)
     for km in REFARG_KEYVAL_RE.finditer(wc):  # arguments live in the When; an id in a Then is an expected output
         k, v = km.group("k"), km.group("v").strip().strip("\"'`").strip()
-        if REFARG_REFERENCE_RE.match(v):
+        if k.lower() == "url":
+            if not REFARG_BARE_PLACEHOLDER_RE.match(v):
+                continue  # a real URL literal is a legitimate live input
+        elif REFARG_REFERENCE_RE.match(v):
             continue
-        if k.lower() == "url" and not REFARG_BARE_PLACEHOLDER_RE.match(v):
-            continue  # a real URL literal is a legitimate live input
+        if k.lower() in made:
+            continue
         return f"a literal value for the id-shaped argument `{k}` ({km.group(0).strip()!r})"
     return None
 ONE_SHOT_RE = re.compile(r"one[- ]?shot", re.I)
