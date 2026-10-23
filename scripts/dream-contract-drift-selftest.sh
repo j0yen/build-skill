@@ -14,6 +14,8 @@
 #   (d) every fleet lint rule id (the contract's `## Lint rules (fleet)` table and
 #       the built-in shift-left ids it lists) has a failing/warning fixture AND a
 #       passing fixture in prd-lint-selftest.sh.
+#   (e) every one of those rule ids is named in prd-lint.sh (LINT_SRC), so the
+#       contract list and the lint list cannot drift apart.
 #
 # Fix a failure by adding the missing key/id to the contract table (or its
 # fixture), never by weakening the check.
@@ -158,6 +160,14 @@ check() {
       grep -qE "^expect_clean_no_id .* $id " "$LINT_SELFTEST" || { echo "FAIL (d): rule '$id' has no passing (expect_clean_no_id) fixture in $(basename "$LINT_SELFTEST")"; miss=$((miss+1)); }
     done <<<"$ids"
     [ "$miss" -eq 0 ] && echo "ok (d): $(wc -l <<<"$ids") rule ids each have a fail/warn and a pass fixture" || fails=$((fails+miss))
+  fi
+  # (e) every contract rule id is named in prd-lint.sh itself (contract list and lint list cannot drift apart)
+  if [ -n "$ids" ]; then
+    local lint_src="${LINT_SRC:-$HERE/prd-lint.sh}" lmiss=0
+    while IFS= read -r id; do
+      grep -qF -- "$id" "$lint_src" || { echo "FAIL (e): contract rule id '$id' is not named in $(basename "$lint_src")"; lmiss=$((lmiss+1)); }
+    done <<<"$ids"
+    [ "$lmiss" -eq 0 ] && echo "ok (e): $(wc -l <<<"$ids") contract rule ids all named in $(basename "$lint_src")" || fails=$((fails+lmiss))
   fi
   [ "$fails" -eq 0 ]
 }

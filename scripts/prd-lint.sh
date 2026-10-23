@@ -197,7 +197,7 @@ repo-surface.sh could not be run (set REPO_SURFACE_SH).
 EXPLAIN
       exit 0
       ;;
-    seed-missing|premise-ac-not-live|live-evidence-referent-missing|live-evidence-referent-unchecked|shared-counter-preassigned|cross-repo-path-in-ac|later-event-without-blocked-on|unknown-frontmatter-key)
+    seed-missing|premise-ac-not-live|live-evidence-referent-missing|live-evidence-referent-unchecked|shared-counter-preassigned|cross-repo-path-in-ac|later-event-without-blocked-on|unknown-frontmatter-key|live-ac-referent-args)
       cat <<'EXPLAIN'
 Shift-left checks (/dream Stage 1). FAIL for a PRD `Drafted:` on or after the
 enforcement cutoff in build-contract.md (`## Lint rules (fleet)`), WARN before.
@@ -207,6 +207,16 @@ enforcement cutoff in build-contract.md (`## Lint rules (fleet)`), WARN before.
   live-evidence-referent-missing: a repo-relative path named in a Live evidence string must exist
     at origin/main of build_into (never the working tree) or be another AC's deliverable (run 798).
     WARN live-evidence-referent-unchecked when build_into is absent/unfetchable.
+  live-ac-referent-args (ERROR, any Drafted date; Live ACs only): a Live AC must not hand
+    placeholder/literal ids to a verb that looks them up (run 491 AC 6: host_import dry_run with
+    "AC 1's synthesized required arguments" -> "no completed host.export matches that run_id").
+    PHRASE-DETECTED (no schema access): R1 a When clause describing its arguments as
+    synthesized/placeholder/schema-valid/schema-derived/generated/dummy/sample arguments|args|
+    values|inputs; R2 in the When clause, an id-shaped key (`*_id`, or `url` only with a bare placeholder) given a
+    literal value. R3 clears both: the same AC creates the referent ("captures the `run_id` it
+    returns", "the `run_id` returned by `host_export`", "that `run_id`", "from the `x` result",
+    "the `run_id` captured in AC 5's evidence"); a bare "Given AC N" does not.
+    Known-gap: a literal handed to a referent verb under a non-id key with no placeholder phrase.
   shared-counter-preassigned: no specific migration number ("migration 0124", 0124_, m0124, V124__);
     say 'next free migration number at land time'.
   cross-repo-path-in-ac (WARN): an AC names an absolute path under another repo than build_into.
@@ -914,6 +924,49 @@ MIGRATION_RES = [
     re.compile(r"\bV\d{2,4}__"),
 ]
 LATER_EVENT_RE = re.compile(r"after the next|once .* deploy|next chain run|after Joe", re.I)
+# live-ac-referent-args (run 491 AC 6): a Live AC that hands placeholder/literal
+# ids to a verb that looks them up can never pass. Phrase heuristics, no schema access.
+REFARG_PLACEHOLDER_RE = re.compile(
+    r"\b(?:synthesi[sz]ed|placeholders?|schema-valid|schema-derived|generated|dummy|sample)\b"
+    r"[^\n]*?\b(?:arguments?|args|values?|inputs?)\b", re.I)
+REFARG_KEYVAL_RE = re.compile(
+    r"[\"'`]?\b(?P<k>\w*_id|url)\b[\"'`]?\s*(?::|=)\s*"
+    r"(?P<v>\"[^\"]*\"|'[^']*'|`[^`]*`|[^\s,;)}\]]*)", re.I)
+REFARG_BARE_PLACEHOLDER_RE = re.compile(r"^(?:|x|y|z|foo|bar|test|example|string|placeholder|dummy|sample|<[^>]*>)$", re.I)
+REFARG_REFERENCE_RE = re.compile(r"^(?:<[^>]*>|\$\S*|\{\S*\}|\.\.\.)$")
+REFARG_CREATES_RES = [re.compile(r, re.I) for r in (
+    r"\bcaptur(?:e|es|ing)\s+(?:the\s+)?(?:`[^`]+`|\w*id\b)",            # captures the `run_id` it returns
+    r"`?\w+`?\s+returned\s+by\b",                                          # the `run_id` returned by `host_export`
+    r"\bthat\s+`?\w*id\b",                                                 # that `run_id`
+    r"\bfrom\s+(?:the\s+)?`?[\w.]+`?\s+(?:tool[_ ])?results?\b",           # from the `host_export` result
+    r"\w*id`?\s+(?:captured|recorded|saved|stored|printed|emitted|written|returned)\s+(?:in|by)\s+AC\s*\d+",  # the `run_id` captured in AC 5's evidence
+    r"\w*id`?\s+AC\s*\d+(?:'s)?\s+(?:recorded|captured|saved|stored|printed|emitted|wrote|returned)\b",      # the `run_id` AC 5 recorded
+)]
+
+
+def when_clause(body):
+    """Text between `When` and the next `Then` of an AC body (whole body when no When)."""
+    m = re.search(r"\bWhen\b(.*?)(?=\bThen\b|$)", body, re.S)
+    return m.group(1) if m else body
+
+
+def live_ac_referent_args_reason(body):
+    """Why a Live AC hands placeholder/literal ids to a lookup verb, else None.
+    R3 (the AC creates the referent itself) clears R1 and R2."""
+    if any(rx.search(body) for rx in REFARG_CREATES_RES):
+        return None
+    wc = when_clause(body)
+    m = REFARG_PLACEHOLDER_RE.search(wc)
+    if m:
+        return f"placeholder-described arguments ({m.group(0).strip()!r})"
+    for km in REFARG_KEYVAL_RE.finditer(wc):  # arguments live in the When; an id in a Then is an expected output
+        k, v = km.group("k"), km.group("v").strip().strip("\"'`").strip()
+        if REFARG_REFERENCE_RE.match(v):
+            continue
+        if k.lower() == "url" and not REFARG_BARE_PLACEHOLDER_RE.match(v):
+            continue  # a real URL literal is a legitimate live input
+        return f"a literal value for the id-shaped argument `{k}` ({km.group(0).strip()!r})"
+    return None
 ONE_SHOT_RE = re.compile(r"one[- ]?shot", re.I)
 FOREIGN_REPO_PATH_RE = re.compile(r"(?:/home/[\w.-]+|~)/(?:wintermute|repos)/([\w.-]+)/")
 ADD_VERB_RE = re.compile(r"\b(?:add|adds|adding|added|new|register|registers|registering|extend|extends|append|appends)\b", re.I)
@@ -1664,6 +1717,18 @@ def lint_file(path):
                               f"AC {n}'s Live evidence names {tok!r}, which is not at origin/main of "
                               f"build_into and is not another AC's deliverable: add an AC that writes it, "
                               f"or name an existing script")
+
+        # live-ac-referent-args (ERROR, never WARN; Live ACs only; run 491 AC 6):
+        # phrase-detected, no schema access.
+        for n, body, ev, full in ac_info:
+            if ev is None:
+                continue
+            why = live_ac_referent_args_reason(body)
+            if why:
+                fail("live-ac-referent-args",
+                     f"AC {n} (Live) hands {why} to a verb that may look it up: a Live AC must not "
+                     f"hand placeholder/literal ids to a verb that looks them up; create the referent "
+                     f"in the same AC first (run 491 AC 6). phrase-detected (no schema access)")
 
         # shared-counter-preassigned: a pre-assigned migration number collides at
         # land (migration 0131 collision).

@@ -282,7 +282,7 @@ nothing already queued goes ineligible. The `prd-lint.sh` built-in shift-left
 ids are `seed-missing`, `premise-ac-not-live`, `live-evidence-referent-missing`,
 `shared-counter-preassigned`, `cross-repo-path-in-ac`,
 `later-event-without-blocked-on`, `unknown-frontmatter-key`,
-`hand-built-marker-missing`, `build-priority-default` (see
+`hand-built-marker-missing`, `build-priority-default`, `live-ac-referent-args` (see
 `prd-lint.sh --explain <id>`); the table below is READ by `prd-lint.sh`
 (never duplicated in code), so a fleet rule is added here and nowhere else.
 
@@ -302,6 +302,27 @@ the sub-table below.
 | `mcp-curl-no-accept` | FAIL | `scope=evidence` `match=curl\b[^\n]*?/mcp\b` `absent=Accept:\s*application/json,\s*text/event-stream` | a curl to a `/mcp` URL without `Accept: application/json, text/event-stream` gets 406 from the streamable-HTTP transport (run 1004) |
 | `signup-without-offboard` | FAIL | `scope=evidence` `match=\bsignup\b` `absent=offboard` | evidence that calls signup must also call `self_offboard`/`offboard` (in a `finally`) so the live proof leaves no tenant behind |
 | `generator-set-member` | WARN | `scope=ac` `kind=generator-set` | the AC adds a member to a set the repo generates from one source; name the generator in the AC (see `generator_sets` below) instead of hand-listing the member |
+
+`live-ac-referent-args` (ERROR on every Drafted date, never WARN; Live ACs only,
+those carrying the `(Live; evidence: …)` tail): a Live AC must not hand
+placeholder or literal ids to a verb that looks them up. Run 491 AC 6 told the
+live judge to call `host_import` with `dry_run: true` and "AC 1's synthesized
+required arguments"; the synthesizer emits schema-valid placeholders, prod
+answered `is_error` "no completed host.export matches that run_id", and the AC
+could never pass. Phrase-detected (no schema access):
+R1 the When clause (text between `When` and the next `Then`) describes its
+arguments as synthesized / placeholder / schema-valid / schema-derived /
+generated / dummy / sample followed by argument(s) / args / values / inputs;
+R2 in the When clause, an id-shaped key (`run_id`, `tenant_id`, any `*_id`; `url` only when the value
+is a bare placeholder such as `"x"`, `"<url>"`, `"example"` or empty, a real
+`https://…` literal is a legitimate live input) is given a literal value.
+R3 (pass): the same AC creates the referent first, by tying the id to an earlier
+call's result ("captures the `run_id` it returns", "the `run_id` returned by
+`host_export`", "that `run_id`", "from the `host_export` result") or by naming a
+captured value from another AC ("the `run_id` captured in AC 5's evidence", "the
+`run_id` AC 5 recorded"). A bare "Given AC N" does NOT satisfy R3.
+Known-gap: a Live AC that hands a literal to a referent verb without an id-shaped
+key or a placeholder phrase (for example `tenant: "acme"`) is NOT caught.
 
 ### generator_sets
 

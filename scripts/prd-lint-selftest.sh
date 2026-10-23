@@ -1530,6 +1530,47 @@ mk_sl "$sl/q/PRD-sl-gen-ok.md" $NEW "$SEED" "" \
 sed -i "s#^- build_into: .*#- build_into: $sl/mcphost#" "$sl/q/PRD-sl-gen-ok.md"
 expect_clean_no_id "$sl/q/PRD-sl-gen-ok.md" warnings generator-set-member "generator-set-member/names-generator-pass"
 
+# live-ac-referent-args (run 491 AC 6: placeholder run_id handed to host_import dry_run); ERROR on any Drafted date
+LREF_FAIL='P0 — Given AC 1 and AC 5, the pinned Claude Code on orch (2.1.293 as of 2026-10-22), prod /mcp and a disposable `synthorg` tenant, When it calls `host_import` with `dry_run: true` and AC 1'"'"'s synthesized required arguments, then `host_doctor`, Then 2 `tool_result` blocks, none "Structured content does not match" or `is_error` (Live; evidence: `~/.local/state/mcphost-live/osreach-ac06-results.jsonl` printing `tool_results=2 mismatch=0 is_error=0 unreached=<n> cap=<m>`)'
+LREF_PASS='P0 — Given the pinned Claude Code on orch, prod /mcp and a disposable `synthorg` tenant, When it calls `host_export` and captures the `run_id` it returns, then calls `host_import` with `dry_run: true` and that `run_id`, then `host_doctor`, Then 3 `tool_result` blocks, none "Structured content does not match", is_error=0 on all three (Live; evidence: `~/.local/state/mcphost-live/osreach-ac06b-results.jsonl` printing `tool_results=3 mismatch=0 is_error=0 export_run_id=<id> unreached=<n> cap=<m>`)'
+mk_sl "$sl/q/PRD-sl-lref-fail.md" $NEW "$SEED" "" "$GOODAC" "$GOODAC" "$GOODAC" "$GOODAC" "$GOODAC" "$LREF_FAIL"
+expect_fail "$sl/q/PRD-sl-lref-fail.md" live-ac-referent-args "live-ac-referent-args/case-a-run-491-ac6-fail"
+total=$((total+1))
+lref_json="$(json_of "$sl/q/PRD-sl-lref-fail.md")"
+if printf '%s' "$lref_json" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)[0]
+ok = [f for f in d['failures'] if f['id'] == 'live-ac-referent-args' and 'AC 6 ' in f['message'] and 'no schema access' in f['message']]
+sys.exit(0 if ok else 1)
+"; then
+  echo "ok: live-ac-referent-args/case-a names AC 6 and says phrase-detected"
+else echo "FAIL: live-ac-referent-args message does not name AC 6 / phrase-detected: $lref_json"; fails=$((fails+1)); fi
+mk_sl "$sl/q/PRD-sl-lref-old.md" $OLD "$SEED" "" "$LREF_FAIL"
+expect_fail "$sl/q/PRD-sl-lref-old.md" live-ac-referent-args "live-ac-referent-args/error-not-warn-on-old-PRD"
+mk_sl "$sl/q/PRD-sl-lref-pass.md" $NEW "$SEED" "" "$GOODAC" "$GOODAC" "$GOODAC" "$GOODAC" "$GOODAC" "$LREF_PASS"
+expect_clean_no_id "$sl/q/PRD-sl-lref-pass.md" failures live-ac-referent-args "live-ac-referent-args/case-b-successor-shape-pass"
+mk_sl "$sl/q/PRD-sl-lref-literal.md" $NEW "$SEED" "" \
+  'P0 — Given prod /mcp, When it calls `host_import` with `run_id: "x"`, Then the call answers. (Live; evidence: `~/.local/state/mcphost-live/lref-c.jsonl` printing `ok=1`)'
+expect_fail "$sl/q/PRD-sl-lref-literal.md" live-ac-referent-args "live-ac-referent-args/case-c-literal-run_id-fail"
+mk_sl "$sl/q/PRD-sl-lref-nonlive.md" $NEW "$SEED" "" \
+  'P0 — Given a fixture, When the lint is called with AC 1'"'"'s synthesized required arguments, Then it exits 0.'
+expect_clean_no_id "$sl/q/PRD-sl-lref-nonlive.md" failures live-ac-referent-args "live-ac-referent-args/case-d-non-Live-AC-pass"
+mk_sl "$sl/q/PRD-sl-lref-givenac.md" $NEW "$SEED" "" \
+  'P0 — Given AC 1, When it calls `host_import` with AC 1'"'"'s placeholder arguments, Then the call answers. (Live; evidence: `~/.local/state/mcphost-live/lref-e.jsonl` printing `ok=1`)'
+expect_fail "$sl/q/PRD-sl-lref-givenac.md" live-ac-referent-args "live-ac-referent-args/case-e-given-AC-N-alone-fail"
+mk_sl "$sl/q/PRD-sl-lref-gap.md" $NEW "$SEED" "" \
+  'P0 — Given prod /mcp, When it calls `host_import` with `tenant: "acme"`, Then the call answers. (Live; evidence: `~/.local/state/mcphost-live/lref-f.jsonl` printing `ok=1`)'
+expect_clean_no_id "$sl/q/PRD-sl-lref-gap.md" failures live-ac-referent-args "live-ac-referent-args/case-f-known-gap-non-id-key-not-caught"
+mk_sl "$sl/q/PRD-sl-lref-captured.md" $NEW "$SEED" "" "$GOODAC" "$GOODAC" "$GOODAC" "$GOODAC" \
+  'P0 — Given AC 5, prod /mcp, When it calls `host_import` with `dry_run: true` and the `run_id` captured in AC 5'"'"'s evidence, Then the call answers. (Live; evidence: `~/.local/state/mcphost-live/lref-g.jsonl` printing `ok=1`)'
+expect_clean_no_id "$sl/q/PRD-sl-lref-captured.md" failures live-ac-referent-args "live-ac-referent-args/case-g-captured-value-in-other-AC-pass"
+mk_sl "$sl/q/PRD-sl-lref-url.md" $NEW "$SEED" "" \
+  'P0 — Given prod /mcp, When it calls `host_import` with `url: "https://example.org/x.json"`, Then the call answers. (Live; evidence: `~/.local/state/mcphost-live/lref-h.jsonl` printing `ok=1`)'
+expect_clean_no_id "$sl/q/PRD-sl-lref-url.md" failures live-ac-referent-args "live-ac-referent-args/real-url-literal-pass"
+mk_sl "$sl/q/PRD-sl-lref-urlph.md" $NEW "$SEED" "" \
+  'P0 — Given prod /mcp, When it calls `host_import` with `url: "x"`, Then the call answers. (Live; evidence: `~/.local/state/mcphost-live/lref-i.jsonl` printing `ok=1`)'
+expect_fail "$sl/q/PRD-sl-lref-urlph.md" live-ac-referent-args "live-ac-referent-args/bare-placeholder-url-fail"
+
 # --explain covers the new ids; contract rows are the source (no strings in code)
 total=$((total+1))
 o="$("$LINT" --explain premise-ac-not-live 2>&1)"; rc=$?
