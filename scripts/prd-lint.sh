@@ -75,12 +75,14 @@ export REPO_SURFACE_SH="${REPO_SURFACE_SH:-$HERE/repo-surface.sh}"
 usage() {
   echo "usage: prd-lint.sh <file|dir>... [--format text|json|pass-fail] [--quiet] [--contract <path>]" >&2
   echo "       prd-lint.sh --explain <check-id>" >&2
+  echo "       prd-lint.sh --print-live-hosts [--contract <path>]" >&2
 }
 
 format="text"
 quiet=0
 contract=""
 explain_id=""
+print_hosts=0
 files=()
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -116,6 +118,10 @@ while [ "$#" -gt 0 ]; do
       ;;
     --explain=*)
       explain_id="${1#--explain=}"
+      shift
+      ;;
+    --print-live-hosts)
+      print_hosts=1
       shift
       ;;
     -h|--help)
@@ -197,6 +203,22 @@ repo-surface.sh could not be run (set REPO_SURFACE_SH).
 EXPLAIN
       exit 0
       ;;
+    live-evidence-off-host)
+      cat <<'EXPLAIN'
+live-evidence-off-host: a Live AC whose text names `on <host>` / `<host>'s` (host or alias,
+case-insensitive) for a fleet host the wm-build live judge does not read, and whose evidence
+names any filesystem path (`~/`, `$HOME`, `/home/`, `/var/`, `/mnt/`, any absolute path), fails:
+the judge runs on the build host and reads only the build host + prod (mcphost-1), so the file
+is produced nowhere it looks and the run ends live-ac-prd-defect (480 AC 7, 491 AC 6). FAIL for
+a PRD `Drafted:` on or after the enforcement cutoff, WARN before; a missing `Drafted:` FAILs.
+A named build host (redbaron/ryzen7) is WARN: the PRD cannot know which host judges it (no host
+pin key exists). Fix: move the probe to the build host or prod. A `ssh <host> ` prefix is
+accepted only if the contract row's `accepted_prefixes` lists it (initially empty). The host
+set, aliases and accepted_prefixes are the `live-evidence-off-host` row in build-contract.md
+`## Lint rules (fleet)`; `--print-live-hosts` prints the set the lint parsed from it.
+EXPLAIN
+      exit 0
+      ;;
     seed-missing|premise-ac-not-live|live-evidence-referent-missing|live-evidence-referent-unchecked|shared-counter-preassigned|cross-repo-path-in-ac|later-event-without-blocked-on|unknown-frontmatter-key|live-ac-referent-args)
       cat <<'EXPLAIN'
 Shift-left checks (/dream Stage 1). FAIL for a PRD `Drafted:` on or after the
@@ -249,10 +271,11 @@ EXPLAIN
   esac
 fi
 
-if [ "${#files[@]}" -eq 0 ]; then
+if [ "${#files[@]}" -eq 0 ] && [ "$print_hosts" -eq 0 ]; then
   usage
   exit 2
 fi
+export LINT_PRINT_LIVE_HOSTS="$print_hosts"
 case "$format" in
   text|json|pass-fail) ;;
   *) echo "prd-lint: --format must be text, json, or pass-fail" >&2; exit 2 ;;
@@ -975,6 +998,48 @@ _CONTRACT_CACHE = {}
 _ORIGIN_CACHE = {}
 
 
+def _csv(v):
+    return [x.strip() for x in v.split(",") if x.strip()]
+
+
+def parse_live_hosts(cell, level, message):
+    """The `live-evidence-off-host` row: off_host / build_host / judge_reads host
+    lists, alias=<host>:<alias> pairs and accepted_prefixes, in row order. `raw`
+    is the row's backticked clauses joined by a space, so `canon()` of the
+    parsed set must equal it byte for byte (the no-drift test)."""
+    spans = re.findall(r"`([^`]*)`", cell)
+    kv = {}
+    for span in spans:
+        if "=" in span:
+            k, v = span.split("=", 1)
+            kv[k.strip()] = v
+    aliases = []
+    for pair in _csv(kv.get("alias", "")):
+        if ":" in pair:
+            h, a = pair.split(":", 1)
+            aliases.append((h.strip().lower(), a.strip().lower()))
+    return {"level": level, "message": message,
+            "off_host": [h.lower() for h in _csv(kv.get("off_host", ""))],
+            "build_host": [h.lower() for h in _csv(kv.get("build_host", ""))],
+            "judge_reads": [h.lower() for h in _csv(kv.get("judge_reads", ""))],
+            "alias": aliases,
+            "accepted_prefixes": [x for x in kv.get("accepted_prefixes", "").split(";") if x.strip()]}
+
+
+def live_hosts_canon(lh):
+    """Serialise the in-memory set in the row's own clause syntax."""
+    if not lh:
+        return ""
+    return " ".join([
+        "kind=live-evidence-host",
+        "off_host=" + ",".join(lh["off_host"]),
+        "build_host=" + ",".join(lh["build_host"]),
+        "judge_reads=" + ",".join(lh["judge_reads"]),
+        "alias=" + ",".join(f"{h}:{a}" for h, a in lh["alias"]),
+        "accepted_prefixes=" + ";".join(lh["accepted_prefixes"]),
+    ])
+
+
 def load_contract_tables(path):
     """Parse the contract's tables once: frontmatter keys, display-only keys,
     fleet lint rules, generator_sets, enforcement cutoff. Fail-open: an
@@ -982,7 +1047,8 @@ def load_contract_tables(path):
     path = os.path.abspath(path) if path else ""
     if path in _CONTRACT_CACHE:
         return _CONTRACT_CACHE[path]
-    out = {"keys": set(), "display": set(), "rules": [], "sets": [], "cutoff": SHIFT_LEFT_CUTOFF_DEFAULT}
+    out = {"keys": set(), "display": set(), "rules": [], "sets": [], "cutoff": SHIFT_LEFT_CUTOFF_DEFAULT,
+           "live_hosts": None}
     try:
         with open(path, encoding="utf-8", errors="replace") as fh:
             lines = fh.read().splitlines()
@@ -1033,12 +1099,40 @@ def load_contract_tables(path):
                             clauses[k.strip()] = v.replace("\\|", "|")
                     out["rules"].append({"id": rid, "level": c[1].strip().upper(), "clauses": clauses,
                                          "message": c[3].replace("\\|", "|")})
+                    if clauses.get("kind") == "live-evidence-host":
+                        out["live_hosts"] = parse_live_hosts(c[2], c[1].strip().upper(), c[3].replace("\\|", "|"))
             elif line.startswith("| `") and sub == "generator_sets":
                 c = cells(line)
                 if len(c) >= 3:
                     out["sets"].append({"repo": c[0].strip("` "), "set": c[1].strip("` "),
                                         "generator": c[2].strip("` ").replace("\\|", "|")})
     _CONTRACT_CACHE[path] = out
+    return out
+
+
+# Any filesystem path in an evidence string: ~/, $HOME, ${HOME}, or an absolute path
+# (/home/, /var/, /mnt/, ...). A URL path is preceded by a host char, never whitespace/quote.
+EVIDENCE_ANYPATH_RE = re.compile(
+    r"(?:^|[\s'\"=(`<>;|])(?:~/|\$HOME\b|\$\{HOME\}|/(?!dev/null\b)[\w.@+-]+)")
+
+
+def live_hosts_named(lh, body):
+    """[(host, level)] for hosts the AC text names as `on <host>` / `<host>'s`
+    (host name or alias, case-insensitive) that the live judge does not read.
+    level is "off" (fleet host off the judge's read set) or "build"."""
+    names = {}
+    for h in lh["off_host"] + lh["build_host"] + lh["judge_reads"]:
+        names.setdefault(h, h)
+    for h, a in lh["alias"]:
+        names[a] = h
+    out = []
+    for name, host in names.items():
+        if host in lh["judge_reads"]:
+            continue
+        rx = re.compile(r"\bon\s+(?:the\s+)?" + re.escape(name) + r"(?![\w-])|(?<![\w-])" +
+                        re.escape(name) + r"'s\b", re.I)
+        if rx.search(body) and not any(host == o[0] for o in out):
+            out.append((host, "off" if host in lh["off_host"] else "build"))
     return out
 
 
@@ -1730,6 +1824,33 @@ def lint_file(path):
                      f"hand placeholder/literal ids to a verb that looks them up; create the referent "
                      f"in the same AC first (run 491 AC 6). phrase-detected (no schema access)")
 
+        # live-evidence-off-host: a Live AC that pins a client "on <host>" for a host
+        # the live judge does not read, with a filesystem path as evidence, is produced
+        # nowhere the judge looks (480 AC 7, 491 AC 6). The host set, aliases and
+        # accepted_prefixes come from the contract row, never from this file.
+        lh = tables.get("live_hosts")
+        if lh:
+            for n, body, ev, full in ac_info:
+                if not ev or not EVIDENCE_ANYPATH_RE.search(ev):
+                    continue
+                for host, level in live_hosts_named(lh, body):
+                    prefixes = [p.replace("<host>", host) for p in lh["accepted_prefixes"]]
+                    if any(ev.lstrip().startswith(p) for p in prefixes):
+                        continue
+                    msg = (f"live-evidence-off-host: AC {n} evidence path is on {host}, which the live "
+                           f"judge does not read; move the probe to the build host or prod "
+                           f"(accepted_prefixes: {lh['accepted_prefixes'] or 'none'})")
+                    if level == "build":
+                        warn("live-evidence-off-host", msg + " -- named build host: the PRD cannot know which host judges it")
+                    elif not dm:
+                        fail("live-evidence-off-host", msg + " (Drafted missing: fail closed)")
+                    elif new_style:
+                        fail("live-evidence-off-host", msg)
+                    else:
+                        warn("live-evidence-off-host",
+                             msg + f" (warning only: Drafted is before {tables['cutoff']})")
+                    break
+
         # shared-counter-preassigned: a pre-assigned migration number collides at
         # land (migration 0131 collision).
         req_lines = requirements_lines(all_lines)
@@ -2014,6 +2135,10 @@ def lint_file(path):
 
     return slug, fails, warns
 
+
+if os.environ.get("LINT_PRINT_LIVE_HOSTS") == "1":
+    print(live_hosts_canon(load_contract_tables(contract_path or DEFAULT_CONTRACT)["live_hosts"]))
+    sys.exit(0)
 
 results = []
 any_fail = False

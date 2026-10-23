@@ -30,7 +30,7 @@ total=0
 
 # Findings added by the dream shift-left checks; WARN-level on any fixture that
 # predates them (no `Drafted:` >= 2026-10-23), so expect_ok tolerates them.
-SHIFT_IDS="seed-missing|unknown-frontmatter-key|premise-ac-not-live|live-evidence-referent-missing|live-evidence-referent-unchecked|shared-counter-preassigned|cross-repo-path-in-ac|later-event-without-blocked-on|ssh-evidence-no-path-prefix|mcp-curl-no-accept|signup-without-offboard|generator-set-member|hand-built-marker-missing|build-priority-default"
+SHIFT_IDS="seed-missing|unknown-frontmatter-key|premise-ac-not-live|live-evidence-referent-missing|live-evidence-referent-unchecked|shared-counter-preassigned|cross-repo-path-in-ac|later-event-without-blocked-on|ssh-evidence-no-path-prefix|mcp-curl-no-accept|signup-without-offboard|generator-set-member|hand-built-marker-missing|build-priority-default|live-evidence-off-host"
 
 json_of() { "$LINT" --format json "$1" 2>/dev/null; }
 
@@ -1518,6 +1518,117 @@ expect_warn "$sl/q/PRD-sl-signup-old.md" signup-without-offboard "signup-without
 mk_sl "$sl/q/PRD-sl-signup-ok.md" $NEW "$SEED" "" \
   "P0 — Given a fixture, When linted, Then it passes. (Live; evidence: python3 probe.py signup then self_offboard in finally)"
 expect_clean_no_id "$sl/q/PRD-sl-signup-ok.md" failures signup-without-offboard "signup-without-offboard/offboard-pass"
+
+# fleet rule: live-evidence-off-host (480 AC 7 / 491 AC 6: a Live AC pins a client "on orch"
+# and its evidence is a home path on orch, which the live judge never reads)
+OHEV1='~/.local/state/mcphost-live/osreach-ac06-results.jsonl'
+OHEV2='~/.local/state/mcphost-live/osmatch-ac07-results.jsonl'
+OH6="P1 — Given the pinned Claude Code on orch, When it reaches the host over the OS-level path, Then every probe row is ok. (Live; evidence: cat $OHEV1)"
+OH7="P1 — Given the pinned Claude Code on orch, When it matches the OS-level tool, Then every probe row is ok. (Live; evidence: cat $OHEV2)"
+mk_sl "$sl/q/PRD-sl-oh-491.md" $NEW "$SEED" "" "$OH6"
+expect_fail "$sl/q/PRD-sl-oh-491.md" live-evidence-off-host "live-evidence-off-host/491-AC6-verbatim-fail"
+mk_sl "$sl/q/PRD-sl-oh-480.md" $NEW "$SEED" "" "$OH7"
+expect_fail "$sl/q/PRD-sl-oh-480.md" live-evidence-off-host "live-evidence-off-host/480-AC7-verbatim-fail"
+# the ssh escape is NOT accepted while accepted_prefixes is empty
+mk_sl "$sl/q/PRD-sl-oh-ssh.md" $NEW "$SEED" "" "${OH6/cat $OHEV1/ssh orch cat $OHEV1}"
+expect_fail "$sl/q/PRD-sl-oh-ssh.md" live-evidence-off-host "live-evidence-off-host/ssh-orch-prefix-still-fail (accepted_prefixes empty)"
+mk_sl "$sl/q/PRD-sl-oh-sshwrong.md" $NEW "$SEED" "" "${OH6/cat $OHEV1/ssh carbon cat $OHEV1}"
+expect_fail "$sl/q/PRD-sl-oh-sshwrong.md" live-evidence-off-host "live-evidence-off-host/ssh-other-host-fail"
+mk_sl "$sl/q/PRD-sl-oh-abs.md" $NEW "$SEED" "" "${OH6/cat $OHEV1/cat /var/lib/mcphost-live/osreach-ac06-results.jsonl}"
+expect_fail "$sl/q/PRD-sl-oh-abs.md" live-evidence-off-host "live-evidence-off-host/absolute-path-evidence-fail"
+mk_sl "$sl/q/PRD-sl-oh-home.md" $NEW "$SEED" "" "${OH6/cat $OHEV1/cat \$HOME/.local/state/x.jsonl}"
+expect_fail "$sl/q/PRD-sl-oh-home.md" live-evidence-off-host "live-evidence-off-host/HOME-var-evidence-fail"
+# aliases, case-insensitive, possessive
+mk_sl "$sl/q/PRD-sl-oh-alias.md" $NEW "$SEED" "" \
+  "P1 — Given the Hub's pinned client, When it runs, Then it logs. (Live; evidence: cat /home/jsy/log.jsonl)"
+expect_fail "$sl/q/PRD-sl-oh-alias.md" live-evidence-off-host "live-evidence-off-host/alias-hub-possessive-fail"
+mk_sl "$sl/q/PRD-sl-oh-alias2.md" $NEW "$SEED" "" \
+  "P1 — Given the pinned client on the Laptop, When it runs, Then it logs. (Live; evidence: cat ~/log.jsonl)"
+expect_fail "$sl/q/PRD-sl-oh-alias2.md" live-evidence-off-host "live-evidence-off-host/alias-laptop-on-the-fail"
+# passes: evidence on the build host (no host named), prod host, non-path evidence, URL evidence
+mk_sl "$sl/q/PRD-sl-oh-nohost.md" $NEW "$SEED" "" \
+  "P1 — Given a pinned client, When it runs, Then every probe row is ok. (Live; evidence: cat $OHEV1)"
+expect_clean_no_id "$sl/q/PRD-sl-oh-nohost.md" failures live-evidence-off-host "live-evidence-off-host/no-host-named-pass"
+expect_clean_no_id "$sl/q/PRD-sl-oh-nohost.md" warnings live-evidence-off-host "live-evidence-off-host/no-host-named-no-warn"
+mk_sl "$sl/q/PRD-sl-oh-prod.md" $NEW "$SEED" "" \
+  "P1 — Given the pinned client on prod, When it runs, Then every probe row is ok. (Live; evidence: cat $OHEV1)"
+expect_clean_no_id "$sl/q/PRD-sl-oh-prod.md" failures live-evidence-off-host "live-evidence-off-host/prod-host-pass"
+mk_sl "$sl/q/PRD-sl-oh-nopath.md" $NEW "$SEED" "" \
+  "P1 — Given the pinned Claude Code on orch, When it runs, Then it answers. (Live; evidence: wm-build live probe osreach --json)"
+expect_clean_no_id "$sl/q/PRD-sl-oh-nopath.md" failures live-evidence-off-host "live-evidence-off-host/no-path-evidence-pass"
+mk_sl "$sl/q/PRD-sl-oh-url.md" $NEW "$SEED" "" \
+  "P1 — Given the pinned client on orch, When it runs, Then prod answers. (Live; evidence: curl -s -H 'Accept: application/json, text/event-stream' https://mcphost.dev/mcp -d '{}')"
+expect_clean_no_id "$sl/q/PRD-sl-oh-url.md" failures live-evidence-off-host "live-evidence-off-host/url-path-not-a-file-pass"
+# a named build host is WARN only, even on a new PRD
+mk_sl "$sl/q/PRD-sl-oh-build.md" $NEW "$SEED" "" \
+  "P1 — Given the pinned client on ryzen7, When it runs, Then every probe row is ok. (Live; evidence: cat $OHEV1)"
+expect_warn "$sl/q/PRD-sl-oh-build.md" live-evidence-off-host "live-evidence-off-host/named-build-host-warn"
+expect_clean_no_id "$sl/q/PRD-sl-oh-build.md" failures live-evidence-off-host "live-evidence-off-host/named-build-host-never-fail"
+# rollout: Drafted before the cutoff -> WARN; no Drafted line -> FAIL (fail closed)
+mk_sl "$sl/q/PRD-sl-oh-old.md" 2026-10-20 "$SEED" "" "$OH6"
+expect_warn "$sl/q/PRD-sl-oh-old.md" live-evidence-off-host "live-evidence-off-host/Drafted-10-20-warn-only"
+expect_clean_no_id "$sl/q/PRD-sl-oh-old.md" failures live-evidence-off-host "live-evidence-off-host/Drafted-10-20-not-fail"
+mk_sl "$sl/q/PRD-sl-oh-nodraft.md" - "$SEED" "" "$OH6"
+expect_fail "$sl/q/PRD-sl-oh-nodraft.md" live-evidence-off-host "live-evidence-off-host/missing-Drafted-fails-closed"
+
+# live-evidence-off-host no-drift: the lint's in-memory set (--print-live-hosts) must equal the
+# contract row's clauses byte for byte; every file lives under a mktemp root this test created.
+oh_row() { # $1=contract -> the row's backticked clauses joined by one space
+  python3 - "$1" <<'PYR'
+import re, sys
+for line in open(sys.argv[1], encoding="utf-8"):
+    if line.startswith("| `live-evidence-off-host` |"):
+        cell = re.split(r"(?<!\\)\|", line.strip())[1:-1][2]
+        print(" ".join(re.findall(r"`([^`]*)`", cell)))
+        break
+PYR
+}
+oh_drift() { # $1=contract -> 0 when the lint's set equals the row, 1 on drift
+  [ -n "$(oh_row "$1")" ] && [ "$("$LINT" --print-live-hosts --contract "$1")" = "$(oh_row "$1")" ]
+}
+REAL_CONTRACT="$HERE/../build-contract.md"
+total=$((total+1))
+if oh_drift "$REAL_CONTRACT"; then echo "ok: live-evidence-off-host/no-drift (lint set == build-contract.md row)"
+else echo "FAIL: live-evidence-off-host no-drift: row='$(oh_row "$REAL_CONTRACT")' lint='$("$LINT" --print-live-hosts)'"; fails=$((fails+1)); fi
+total=$((total+1))
+if [ "$("$LINT" --print-live-hosts)" = "$(oh_row "$REAL_CONTRACT")" ] && grep -q 'accepted_prefixes=$' <<<"$(oh_row "$REAL_CONTRACT")"; then
+  echo "ok: live-evidence-off-host/accepted_prefixes starts empty"
+else echo "FAIL: accepted_prefixes not empty in the real contract row"; fails=$((fails+1)); fi
+# mutate a COPY: the lint follows the copy, so the copy drifts from the real row; the comparison must catch that
+ohd="$(mktemp -d)"
+sed 's/off_host=carbon,orch/off_host=carbon,orch,newhost/' "$REAL_CONTRACT" > "$ohd/contract.md"
+total=$((total+1))
+if oh_drift "$ohd/contract.md" && [ "$("$LINT" --print-live-hosts --contract "$ohd/contract.md")" != "$("$LINT" --print-live-hosts)" ] \
+   && ! [ "$("$LINT" --print-live-hosts)" = "$(oh_row "$ohd/contract.md")" ]; then
+  echo "ok: live-evidence-off-host/no-drift test fails when the row and the lint set differ"
+else echo "FAIL: live-evidence-off-host drift not detected"; fails=$((fails+1)); fi
+# a lint whose set is stale against the row (simulated: row edited after the set was captured)
+stale="$("$LINT" --print-live-hosts)"
+total=$((total+1))
+if [ "$stale" != "$(oh_row "$ohd/contract.md")" ]; then echo "ok: live-evidence-off-host/stale set != edited row"
+else echo "FAIL: stale set equals edited row"; fails=$((fails+1)); fi
+# a row edit really changes the verdict: with newhost off-host, an AC "on newhost" fails; against the real row it is clean
+mk_sl "$sl/q/PRD-sl-oh-newhost.md" $NEW "$SEED" "" \
+  "P1 — Given the pinned client on newhost, When it runs, Then it logs. (Live; evidence: cat $OHEV1)"
+total=$((total+1))
+o1="$("$LINT" --format json --contract "$ohd/contract.md" "$sl/q/PRD-sl-oh-newhost.md" 2>/dev/null)"
+if has_id "$o1" failures live-evidence-off-host; then echo "ok: live-evidence-off-host/contract row edit changes the verdict"
+else echo "FAIL: contract edit not honoured: $o1"; fails=$((fails+1)); fi
+expect_clean_no_id "$sl/q/PRD-sl-oh-newhost.md" failures live-evidence-off-host "live-evidence-off-host/unlisted-host-passes-against-real-row"
+# accepted_prefixes widening is the one-line contract change (on a copy): ssh orch then passes
+sed 's/`accepted_prefixes=`/`accepted_prefixes=ssh <host> `/' "$REAL_CONTRACT" > "$ohd/widened.md"
+total=$((total+1))
+o2="$("$LINT" --format json --contract "$ohd/widened.md" "$sl/q/PRD-sl-oh-ssh.md" 2>/dev/null)"
+if ! has_id "$o2" failures live-evidence-off-host; then echo "ok: live-evidence-off-host/widened accepted_prefixes admits ssh <host> (copy only)"
+else echo "FAIL: widened prefix not honoured: $o2"; fails=$((fails+1)); fi
+total=$((total+1))
+o3="$("$LINT" --format json --contract "$ohd/widened.md" "$sl/q/PRD-sl-oh-sshwrong.md" 2>/dev/null)"
+if has_id "$o3" failures live-evidence-off-host; then echo "ok: live-evidence-off-host/widened prefix is host-bound (ssh carbon for orch still fails)"
+else echo "FAIL: widened prefix not host-bound: $o3"; fails=$((fails+1)); fi
+rm -rf "$ohd"
+total=$((total+1))
+o="$("$LINT" --explain live-evidence-off-host 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ] && grep -q '491' <<<"$o" && grep -q 'accepted_prefixes' <<<"$o"; then echo "ok: --explain live-evidence-off-host"; else echo "FAIL: --explain live-evidence-off-host rc=$rc: $o"; fails=$((fails+1)); fi
 
 # fleet rule: generator-set-member (WARN; build_into basename must be the repo in generator_sets)
 mkdir -p "$sl/mcphost"; ( cd "$sl/mcphost" && git init -q -b main . && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m i ) >/dev/null 2>&1
