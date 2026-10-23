@@ -302,6 +302,20 @@ the sub-table below.
 | `mcp-curl-no-accept` | FAIL | `scope=evidence` `match=curl\b[^\n]*?/mcp\b` `absent=Accept:\s*application/json,\s*text/event-stream` | a curl to a `/mcp` URL without `Accept: application/json, text/event-stream` gets 406 from the streamable-HTTP transport (run 1004) |
 | `signup-without-offboard` | FAIL | `scope=evidence` `match=\bsignup\b` `absent=offboard` | evidence that calls signup must also call `self_offboard`/`offboard` (in a `finally`) so the live proof leaves no tenant behind |
 | `generator-set-member` | WARN | `scope=ac` `kind=generator-set` | the AC adds a member to a set the repo generates from one source; name the generator in the AC (see `generator_sets` below) instead of hand-listing the member |
+| `live-evidence-off-host` | FAIL | `kind=live-evidence-host` `off_host=carbon,orch` `build_host=redbaron,ryzen7` `judge_reads=mcphost-1` `alias=orch:hub,carbon:laptop,mcphost-1:prod` `accepted_prefixes=` | a Live AC that pins a client "on <host>" for a host the live judge does not read, with a filesystem path (`~/…`, `$HOME`, `/home/…`, any absolute path) as evidence, is produced nowhere the judge looks (480 AC 7, 491 AC 6): move the probe to the build host or prod |
+
+The `live-evidence-off-host` row is the single source of the live judge's host
+model (read by `prd-lint.sh`; `prd-lint.sh --print-live-hosts` prints the set it
+parsed, and `prd-lint-selftest.sh` asserts that equals this row byte for byte).
+The judge runs on the build host and reads only the build host plus prod, so:
+`judge_reads` are hosts it reads (prod = `mcphost-1`); `off_host` are fleet hosts
+it never reads (FAIL for `Drafted >= ` the cutoff, WARN before, FAIL when
+`Drafted:` is missing); `build_host` names are WARN only because a PRD cannot know
+which build host judges it (no host-pin key exists). `alias` is `<host>:<alias>`
+pairs, matched case-insensitively in `on <host>` / `<host>'s`. `accepted_prefixes`
+is a `;`-separated list of evidence prefixes the judge can run, `<host>` standing
+for the AC's host (e.g. `ssh <host> `); it starts EMPTY, and widening it needs rb's
+confirmation that the judge executes evidence over ssh.
 
 ### generator_sets
 
