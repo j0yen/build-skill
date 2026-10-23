@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# live-clone-guard-chain
+# scripts/repo-hooks/pre-commit — chain to the repo-local .git/hooks/pre-commit.
+# With core.hooksPath set (install-repo-hooks.sh points every build_into repo
+# at this shared directory) git never looks in <repo>/.git/hooks/, so a
+# repo-local hook — e.g. the refusing live-clone guard written by dotfiles'
+# live-clone-guard.sh — is silently inert. This file is the chain: it execs the
+# repo-local pre-commit when one exists and is executable, else passes. The
+# marker line above is what `live-clone-guard.sh check` looks for.
+#
+# A linked worktree shares the main repo's hooks, so the hook is looked up in
+# `git rev-parse --git-common-dir` (the main repo's .git), resolved against the
+# worktree top when relative.
+common="$(git rev-parse --git-common-dir 2>/dev/null)" || exit 0
+case "$common" in
+  /*) ;;
+  *) top="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0; common="$top/$common" ;;
+esac
+h="$common/hooks/pre-commit"
+[ -x "$h" ] && exec "$h" "$@"
+exit 0

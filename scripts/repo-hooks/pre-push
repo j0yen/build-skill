@@ -75,6 +75,22 @@ if ! command -v cargo >/dev/null 2>&1; then
   fi
 fi
 
+# Chain to the repo-local .git/hooks/pre-push (core.hooksPath hides it from git;
+# same chain as pre-commit's `live-clone-guard-chain`). git feeds the ref lines
+# on stdin once, so buffer them and replay to both. A local refusal refuses the
+# push before the gate runs.
+stdin_buf="$(mktemp "${TMPDIR:-/tmp}/pre-push-stdin.XXXXXX")" || exit 1
+trap 'rm -f "$stdin_buf"' EXIT
+cat >"$stdin_buf"
+common_dir="$(git rev-parse --git-common-dir 2>/dev/null)" || common_dir=""
+if [ -n "$common_dir" ]; then
+  case "$common_dir" in /*) ;; *) common_dir="$repo_root/$common_dir" ;; esac
+  local_hook="$common_dir/hooks/pre-push"
+  if [ -x "$local_hook" ]; then
+    "$local_hook" "$@" <"$stdin_buf" || exit $?
+  fi
+fi
+
 zero_sha="0000000000000000000000000000000000000000"
 refused=0
 
@@ -126,6 +142,6 @@ while read -r local_ref local_sha remote_ref remote_sha; do
     echo "pre-push: main-push-gate refused $local_ref -> $remote_ref (rc=$rc) — see $(journal_root)/$(date -u +%F).md" >&2
     refused=1
   fi
-done
+done <"$stdin_buf"
 
 exit "$refused"
