@@ -56,8 +56,13 @@ points here instead of listing scripts inline).
 - `scripts/dispatch-distrust-selftest.sh` — regression-proofs the coordinator-message
 - `scripts/dispatch-selftest.sh` — exercises dispatch.sh (PRD-build-programmatic-
 - `scripts/dispatch.sh` — the tick is a program; a model is spent only inside a
+- `scripts/dream-amend.sh` — /dream hook `dream.amend` (before any amend): may this PRD be
+- `scripts/dream-contract-drift-selftest.sh` — fails when build-contract.md's Frontmatter
 - `scripts/dream-governor-selftest.sh` — acceptance harness for dream-governor.sh
 - `scripts/dream-governor.sh` — fires /dream when the queue thins and the budget
+- `scripts/dream-lint.sh` — /dream hook `dream.lint` (end of Phase 3, every PRD): lint the
+- `scripts/dream-persist.sh` — /dream hook `dream.persist` (Phase 4, per batch of <= 4 PRDs):
+- `scripts/dream-seeds.sh` — /dream hook `dream.seeds` (Phase 0): find the newest chain
 - `scripts/extend-gate-branch-scope-realfixture-selftest.sh` — PRD-build-branch-gate-
 - `scripts/extend-gate-cargo-route-selftest.sh` — proves extend-gate.sh itself (not
 - `scripts/extend-gate-concurrent-selftest.sh` — regression coverage for the exact
@@ -171,6 +176,8 @@ points here instead of listing scripts inline).
 - `scripts/repo-health-seed-prd.sh` — seed one fix PRD per (rule, repo, day)
 - `scripts/repo-health-selftest.sh` — offline assertions for PRD-build-repo-health-
 - `scripts/repo-health.sh` — per-repo health counters + rule evaluation
+- `scripts/repo-hooks-selftest.sh` — fixture coverage for scripts/repo-hooks/{pre-commit,pre-push}: with core.hooksPath at the shared dir, a repo-local .git/hooks hook still runs (the `live-clone-guard-chain` marker).
+- `scripts/repo-surface.sh` — the CLI/module "surface" of a repo, GENERATED from the repo
 - `scripts/requeue-prd-selftest.sh` — acceptance harness for requeue-prd.sh
 - `scripts/requeue-prd.sh` — path-or-slug> <reason-text> — the durable inverse of
 - `scripts/resurrection-guard.sh` — after a stale-base recovery merge whose conflict
