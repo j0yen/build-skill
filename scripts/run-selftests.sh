@@ -8,7 +8,7 @@
 #   run-selftests.sh --all
 #
 # What it does:
-#   1. Creates BUILD_TEST_ROOT=$(mktemp -d /mnt/data/jsy/tmp/bs-test.XXXXXX)
+#   1. Creates BUILD_TEST_ROOT=$(mktemp -d $BS_TEST_TMP/bs-test.XXXXXX) — BS_TEST_TMP, else /mnt/data/jsy/tmp if present, else TMPDIR/tmp
 #      — never tmpfs /tmp (a 09-13 selftest-tmpfs incident: see
 #      self_selftest_tmpfs_disk_guard memory) — and exports BUILD_TEST=1.
 #   2. Sources scripts/lib/isolation.sh and calls isolation_apply, which
@@ -306,8 +306,13 @@ _porcelain_diff_ok() {
   [ "$leak" -eq 0 ]
 }
 
-BUILD_TEST_ROOT="$(mktemp -d /mnt/data/jsy/tmp/bs-test.XXXXXX)" \
-  || { echo "run-selftests: mktemp under /mnt/data/jsy/tmp failed" >&2; exit 3; }
+# Test root: BS_TEST_TMP if set, else /mnt/data/jsy/tmp when it exists (build hosts), else TMPDIR, else /tmp.
+_bs_tmp="${BS_TEST_TMP:-}"
+if [ -z "$_bs_tmp" ]; then
+  if [ -d /mnt/data/jsy/tmp ]; then _bs_tmp=/mnt/data/jsy/tmp; else _bs_tmp="${TMPDIR:-/tmp}"; fi
+fi
+BUILD_TEST_ROOT="$(mktemp -d "$_bs_tmp/bs-test.XXXXXX")" \
+  || { echo "run-selftests: mktemp under $_bs_tmp failed (set BS_TEST_TMP)" >&2; exit 3; }
 export BUILD_TEST=1
 export BUILD_TEST_ROOT
 isolation_apply || { echo "run-selftests: isolation_apply failed" >&2; exit 3; }
