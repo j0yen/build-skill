@@ -282,7 +282,7 @@ nothing already queued goes ineligible. The `prd-lint.sh` built-in shift-left
 ids are `seed-missing`, `premise-ac-not-live`, `live-evidence-referent-missing`,
 `shared-counter-preassigned`, `cross-repo-path-in-ac`,
 `later-event-without-blocked-on`, `unknown-frontmatter-key`,
-`hand-built-marker-missing`, `build-priority-default` (see
+`hand-built-marker-missing`, `build-priority-default`, `live-ac-referent-args` (see
 `prd-lint.sh --explain <id>`); the table below is READ by `prd-lint.sh`
 (never duplicated in code), so a fleet rule is added here and nowhere else.
 
@@ -316,6 +316,30 @@ pairs, matched case-insensitively in `on <host>` / `<host>'s`. `accepted_prefixe
 is a `;`-separated list of evidence prefixes the judge can run, `<host>` standing
 for the AC's host (e.g. `ssh <host> `); it starts EMPTY, and widening it needs rb's
 confirmation that the judge executes evidence over ssh.
+
+`live-ac-referent-args` (ERROR on every Drafted date, never WARN; Live ACs only,
+those carrying the `(Live; evidence: …)` tail): a Live AC must not hand
+placeholder or literal ids to a verb that looks them up. Run 491 AC 6 told the
+live judge to call `host_import` with `dry_run: true` and "AC 1's synthesized
+required arguments"; the synthesizer emits schema-valid placeholders, prod
+answered `is_error` "no completed host.export matches that run_id", and the AC
+could never pass. Phrase-detected (no schema access):
+R1 the When clause (text between `When` and the next `Then`) describes its
+arguments as synthesized / placeholder / schema-valid / schema-derived /
+generated / dummy / sample followed by argument(s) / args / values / inputs;
+R2 in the When clause, an id-shaped key (`run_id`, `tenant_id`, any `*_id`; `url` only when the value
+is a bare placeholder such as `"x"`, `"<url>"`, `"example"` or empty, a real
+`https://…` literal is a legitimate live input) is given a literal value.
+R3 (pass), anchored: the same AC creates the referent first, by tying the id to an earlier
+call's result, and the phrase must name the SAME key as the flagged argument ("captures the `run_id`
+it returns", "the `run_id` returned by `host_export`", "that `run_id`", "the `run_id` from the
+`host_export` result"; a phrase about `tenant_id` does not clear a literal `run_id`), or by naming a
+captured value from another AC ("the `run_id` captured in AC 5's evidence", "the `run_id` AC 5
+recorded"). An R1 phrase finding is cleared only by such a phrase inside the same When clause. A
+bare "Given AC N" does NOT satisfy R3. `prd-lint.sh --print-builtin-ids` exports the built-in id
+list the paragraph above must equal (dream-contract-drift-selftest.sh compares the two as sets).
+Known-gap: a Live AC that hands a literal to a referent verb without an id-shaped
+key or a placeholder phrase (for example `tenant: "acme"`) is NOT caught.
 
 ### generator_sets
 

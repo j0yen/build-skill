@@ -76,6 +76,7 @@ usage() {
   echo "usage: prd-lint.sh <file|dir>... [--format text|json|pass-fail] [--quiet] [--contract <path>]" >&2
   echo "       prd-lint.sh --explain <check-id>" >&2
   echo "       prd-lint.sh --print-live-hosts [--contract <path>]" >&2
+  echo "       prd-lint.sh --print-builtin-ids" >&2
 }
 
 format="text"
@@ -83,7 +84,15 @@ quiet=0
 contract=""
 explain_id=""
 print_hosts=0
+print_builtin_ids=0
 files=()
+# The built-in shift-left rule ids this lint emits. ONE list: `--print-builtin-ids` exports it and
+# dream-contract-drift-selftest.sh compares it as a SET with build-contract.md's built-in ids (both
+# directions). Adding a built-in rule = add its id here AND to the contract paragraph AND its
+# `--explain` arm below.
+BUILTIN_RULE_IDS=(seed-missing premise-ac-not-live live-evidence-referent-missing
+  shared-counter-preassigned cross-repo-path-in-ac later-event-without-blocked-on
+  unknown-frontmatter-key hand-built-marker-missing build-priority-default live-ac-referent-args)
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --format)
@@ -124,6 +133,10 @@ while [ "$#" -gt 0 ]; do
       print_hosts=1
       shift
       ;;
+    --print-builtin-ids)
+      print_builtin_ids=1
+      shift
+      ;;
     -h|--help)
       usage; exit 0
       ;;
@@ -142,6 +155,11 @@ while [ "$#" -gt 0 ]; do
       ;;
   esac
 done
+
+if [ "$print_builtin_ids" -eq 1 ]; then
+  printf '%s\n' "${BUILTIN_RULE_IDS[@]}"
+  exit 0
+fi
 
 if [ -n "$explain_id" ]; then
   case "$explain_id" in
@@ -219,7 +237,7 @@ set, aliases and accepted_prefixes are the `live-evidence-off-host` row in build
 EXPLAIN
       exit 0
       ;;
-    seed-missing|premise-ac-not-live|live-evidence-referent-missing|live-evidence-referent-unchecked|shared-counter-preassigned|cross-repo-path-in-ac|later-event-without-blocked-on|unknown-frontmatter-key)
+    seed-missing|premise-ac-not-live|live-evidence-referent-missing|live-evidence-referent-unchecked|shared-counter-preassigned|cross-repo-path-in-ac|later-event-without-blocked-on|unknown-frontmatter-key|live-ac-referent-args)
       cat <<'EXPLAIN'
 Shift-left checks (/dream Stage 1). FAIL for a PRD `Drafted:` on or after the
 enforcement cutoff in build-contract.md (`## Lint rules (fleet)`), WARN before.
@@ -229,6 +247,17 @@ enforcement cutoff in build-contract.md (`## Lint rules (fleet)`), WARN before.
   live-evidence-referent-missing: a repo-relative path named in a Live evidence string must exist
     at origin/main of build_into (never the working tree) or be another AC's deliverable (run 798).
     WARN live-evidence-referent-unchecked when build_into is absent/unfetchable.
+  live-ac-referent-args (ERROR, any Drafted date; Live ACs only): a Live AC must not hand
+    placeholder/literal ids to a verb that looks them up (run 491 AC 6: host_import dry_run with
+    "AC 1's synthesized required arguments" -> "no completed host.export matches that run_id").
+    PHRASE-DETECTED (no schema access): R1 a When clause describing its arguments as
+    synthesized/placeholder/schema-valid/schema-derived/generated/dummy/sample arguments|args|
+    values|inputs; R2 in the When clause, an id-shaped key (`*_id`, or `url` only with a bare placeholder) given a
+    literal value. R3 clears a finding only when anchored: a creates-phrase naming the SAME key as
+    the flagged argument ("captures the `run_id` it returns", "the `run_id` returned by `host_export`",
+    "that `run_id`", "the `run_id` from the `x` result", "the `run_id` captured in AC 5's evidence"),
+    or, for an R1 phrase finding, such a phrase inside the same When clause; a bare "Given AC N" does not.
+    Known-gap: a literal handed to a referent verb under a non-id key with no placeholder phrase.
   shared-counter-preassigned: no specific migration number ("migration 0124", 0124_, m0124, V124__);
     say 'next free migration number at land time'.
   cross-repo-path-in-ac (WARN): an AC names an absolute path under another repo than build_into.
@@ -937,6 +966,64 @@ MIGRATION_RES = [
     re.compile(r"\bV\d{2,4}__"),
 ]
 LATER_EVENT_RE = re.compile(r"after the next|once .* deploy|next chain run|after Joe", re.I)
+# live-ac-referent-args (run 491 AC 6): a Live AC that hands placeholder/literal
+# ids to a verb that looks them up can never pass. Phrase heuristics, no schema access.
+REFARG_PLACEHOLDER_RE = re.compile(
+    r"\b(?:synthesi[sz]ed|placeholders?|schema-valid|schema-derived|generated|dummy|sample)\b"
+    r"[^\n]*?\b(?:arguments?|args|values?|inputs?)\b", re.I)
+REFARG_KEYVAL_RE = re.compile(
+    r"[\"'`]?\b(?P<k>\w*_id|url)\b[\"'`]?\s*(?::|=)\s*"
+    r"(?P<v>\"[^\"]*\"|'[^']*'|`[^`]*`|[^\s,;)}\]]*)", re.I)
+REFARG_BARE_PLACEHOLDER_RE = re.compile(r"^(?:|x|y|z|foo|bar|test|example|string|placeholder|dummy|sample|<[^>]*>)$", re.I)
+# A non-url id key given `<run_id from step 1>` / `$RUN_ID` / `{run_id}` / `...` names a reference to a
+# value bound elsewhere, not a literal, so R2 skips it. `url` never takes this pass: `url: "<url>"` is a
+# bare placeholder (the only `<...>` a url value can be), so it goes to REFARG_BARE_PLACEHOLDER_RE.
+REFARG_REFERENCE_RE = re.compile(r"^(?:<[^>]*>|\$\S*|\{\S*\}|\.\.\.)$")
+# R3 creates-phrases. Each names the id key it creates (group k), so a phrase for `tenant_id` cannot
+# clear a literal `run_id`. Key = `*_id`, `id` or `url`; "valid"/"error" never match.
+_RK = r"`?(?P<k>\w+_id|id|url)`?"
+_RCAP = r"(?:captured|recorded|saved|stored|printed|emitted|written|returned)"
+REFARG_CREATES_RES = [re.compile(r, re.I) for r in (
+    r"\bcaptur(?:e|es|ing)\s+(?:the\s+)?" + _RK + r"\b",                                 # captures the `run_id` it returns
+    _RK + r"\s+returned\s+by\b",                                                        # the `run_id` returned by `host_export`
+    r"\bthat\s+" + _RK + r"\b",                                                        # that `run_id`
+    _RK + r"\s+from\s+(?:the\s+)?`?[\w.]+`?\s+(?:tool[_ ])?results?\b",                  # the `run_id` from the `host_export` result
+    _RK + r"\s+" + _RCAP + r"\s+(?:in|by)\s+AC\s*\d+",                                  # the `run_id` captured in AC 5's evidence
+    _RK + r"\s+AC\s*\d+(?:'s)?\s+(?:recorded|captured|saved|stored|printed|emitted|wrote|returned)\b",  # the `run_id` AC 5 recorded
+)]
+
+
+def created_keys(text):
+    """Lower-cased id keys a creates-phrase in `text` ties to an earlier call's result."""
+    return {m.group("k").lower() for rx in REFARG_CREATES_RES for m in rx.finditer(text)}
+
+
+def when_clause(body):
+    """Text between `When` and the next `Then` of an AC body (whole body when no When)."""
+    m = re.search(r"\bWhen\b(.*?)(?=\bThen\b|$)", body, re.S)
+    return m.group(1) if m else body
+
+
+def live_ac_referent_args_reason(body):
+    """Why a Live AC hands placeholder/literal ids to a lookup verb, else None.
+    R3 clears a finding only when anchored: an R1 phrase finding needs a creates-phrase in the
+    same When clause; an R2 literal for key K needs a creates-phrase naming that same key K."""
+    wc = when_clause(body)
+    m = REFARG_PLACEHOLDER_RE.search(wc)
+    if m and not created_keys(wc):
+        return f"placeholder-described arguments ({m.group(0).strip()!r})"
+    made = created_keys(body)
+    for km in REFARG_KEYVAL_RE.finditer(wc):  # arguments live in the When; an id in a Then is an expected output
+        k, v = km.group("k"), km.group("v").strip().strip("\"'`").strip()
+        if k.lower() == "url":
+            if not REFARG_BARE_PLACEHOLDER_RE.match(v):
+                continue  # a real URL literal is a legitimate live input
+        elif REFARG_REFERENCE_RE.match(v):
+            continue
+        if k.lower() in made:
+            continue
+        return f"a literal value for the id-shaped argument `{k}` ({km.group(0).strip()!r})"
+    return None
 ONE_SHOT_RE = re.compile(r"one[- ]?shot", re.I)
 FOREIGN_REPO_PATH_RE = re.compile(r"(?:/home/[\w.-]+|~)/(?:wintermute|repos)/([\w.-]+)/")
 ADD_VERB_RE = re.compile(r"\b(?:add|adds|adding|added|new|register|registers|registering|extend|extends|append|appends)\b", re.I)
@@ -1758,6 +1845,18 @@ def lint_file(path):
                               f"AC {n}'s Live evidence names {tok!r}, which is not at origin/main of "
                               f"build_into and is not another AC's deliverable: add an AC that writes it, "
                               f"or name an existing script")
+
+        # live-ac-referent-args (ERROR, never WARN; Live ACs only; run 491 AC 6):
+        # phrase-detected, no schema access.
+        for n, body, ev, full in ac_info:
+            if ev is None:
+                continue
+            why = live_ac_referent_args_reason(body)
+            if why:
+                fail("live-ac-referent-args",
+                     f"AC {n} (Live) hands {why} to a verb that may look it up: a Live AC must not "
+                     f"hand placeholder/literal ids to a verb that looks them up; create the referent "
+                     f"in the same AC first (run 491 AC 6). phrase-detected (no schema access)")
 
         # live-evidence-off-host: a Live AC that pins a client "on <host>" for a host
         # the live judge does not read, with a filesystem path as evidence, is produced
