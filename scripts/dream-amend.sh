@@ -12,8 +12,11 @@
 #      queue counts only, not a run list, so it is not used.)
 #   2. status + dispatch iter_log — from the PRD file itself (build-queue/, then
 #      parked/, then built-prds/ under $PRD_DIR): its first `Status:` key and
-#      whether any `iter_log:` line is a dispatch line (anything but
-#      amended|created|premise|PARKED).
+#      whether any `iter_log:` line is a dispatch line. Dispatch is
+#      classified POSITIVELY (DISPATCH_HEAD / DISPATCH_ANY in the python below: run=<id>, decision
+#      <id> answered, dispatch <id>, resume-check, ... ); amended|created|premise|PARKED lines and any
+#      line of no dispatch form (e.g. the review line `amended by /dream (review) — Fable FIX ...`,
+#      or an operator note) are `other` and do not deny.
 #
 # Usage:
 #   dream-amend.sh <slug> <comma-keys>      keys the amendment would add/change
@@ -92,6 +95,17 @@ run_main() {
 import re, sys
 lines = open(sys.argv[1], encoding="utf-8", errors="replace").read().splitlines()[:80]
 status, disp, fence = "", "no", False
+# forms found in the PRDs repo history + wm-build src (daemon/verdict.rs, daemon/decision.rs):
+#   run=<id> <stage> code cause=...   decision <id> answered: ...   dispatch <id> (<host>, ...
+#   Direct-build dispatched by the operator   <host> dispatch / build dispatch / build tick
+#   resume-check|verify-blocker|verify-unchanged|reverify|blocked-encode (own-claim ...)   building (unchanged ...)   claimed by ...
+#   requeued ...   gate-retry|gate-recheck|gate-red ...   landed|hand-landed|r<id> ...
+DISPATCH_HEAD = re.compile(
+    r"(run=\d+|run \d+ dispatched|decision \d+ answered|dispatch(ed)?\b|\S+ dispatch\b|"
+    r"direct-build dispatched|build (tick|dispatch)|tick \(|resume-check|verify-(blocker|unchanged)|"
+    r"reverify|[\w-]+ \(own-claim|building \(|claimed by|requeued|gate-(retry|recheck|red|then-land)|landed\b|r\d+\b|needs_classification)",
+    re.I)
+DISPATCH_ANY = re.compile(r"run \d+ dispatched|dispatched (to|on) |wm-build run|admitted by|run=\d+ \w+ code cause=", re.I)
 for ln in lines:
     if ln.strip().startswith("```"):
         fence = not fence; continue
@@ -104,8 +118,14 @@ for ln in lines:
     if key == "status" and not status:
         status = (val.split() or ["unknown"])[0].lower()
     if key == "iter_log":
+        # POSITIVE classification: an iter_log line is `dispatch` only when it matches a form the
+        # daemon / operators write when a run touched the PRD; `amended|created|premise|parked` lines
+        # are /dream's or the premise timer's; anything else is `other` and does not deny.
         w = re.match(r"\S+\s+(\S+)", val)
-        if not (w and w.group(1).lower() in ("amended", "created", "premise", "parked")):
+        if w and w.group(1).lower() in ("amended", "created", "premise", "parked"):
+            continue
+        rest = (re.match(r"\S+\s+(.*)$", val) or [None, ""])[1]
+        if DISPATCH_HEAD.match(rest) or DISPATCH_ANY.search(rest):
             disp = "yes"
 print(status or "unknown", disp)
 PY
@@ -127,6 +147,12 @@ selftest() {
   printf '# PRD\n\n- Status: queued\n- iter_log: 2026-10-01T00:00:00Z amended by /dream (x) — y\n' > "$t/prds/build-queue/PRD-q-clean.md"
   printf '# PRD\n\n- Status: queued\n- iter_log: 2026-10-01T00:00:00Z run 12 dispatched\n' > "$t/prds/build-queue/PRD-q-disp.md"
   printf '# PRD\n\n- Status: building\n' > "$t/prds/build-queue/PRD-b-open.md"
+  printf '# PRD\n\n- Status: queued\n- iter_log: 2026-10-22T22:4xZ Fable FIX applied before persist (8 binding: a, b); kept x\n' > "$t/prds/build-queue/PRD-q-rev-old.md"
+  printf '# PRD\n\n- Status: queued\n- iter_log: 2026-10-22T22:4xZ amended by /dream (review) — Fable FIX applied before persist: (8 binding: a, b)\n' > "$t/prds/build-queue/PRD-q-rev-new.md"
+  printf '# PRD\n\n- Status: queued\n- iter_log: 2026-10-15T13:21:05.218566697+00:00 run=834 gate code cause=block: ["risk-gate"] blocker=rollback-plan\n' > "$t/prds/build-queue/PRD-q-run.md"
+  printf '# PRD\n\n- Status: queued\n- iter_log: 2026-10-22T22:4xZ amended by /dream (review) — Fable FIX applied before persist: (x)\n- iter_log: 2026-10-23T01:00:00Z decision 298 answered: housekeeping\n' > "$t/prds/build-queue/PRD-q-mixed.md"
+  printf '# PRD\n\n- Status: queued\n- iter_log: 2026-10-01T07:45Z Direct-build dispatched by the operator\n' > "$t/prds/build-queue/PRD-q-direct.md"
+  printf '# PRD\n\n- Status: queued\n- iter_log: 2026-10-20T10:00Z operator note (Joe via carbon session) — reworded AC 3\n' > "$t/prds/build-queue/PRD-q-note.md"
   printf '# PRD\n\nStatus: queued\n' > "$t/prds/build-queue/PRD-bare.md"
   printf '#!/usr/bin/env bash\ncat <<X\nruns: 2 total\nr77 b-open inner 10m box=- tokens=0\nr78 other land 3m\nX\n' > "$t/wb"
   printf '#!/usr/bin/env bash\necho "runs: 0 total"; echo "runs: none in flight"\n' > "$t/wb-empty"
@@ -150,6 +176,12 @@ selftest() {
   ck "queued, no dispatch iter_log -> allow verdict" 0 "^allow" q-clean Falsifier
   ck "bare 'Status:' key parsed" 0 "status=queued" bare Falsifier
   ck "queued WITH dispatch iter_log -> deny" 2 "dispatch-iter_log=yes" q-disp Falsifier
+  ck "queued, OLD review iter_log form (Fable FIX applied before persist) -> allow" 0 "dispatch-iter_log=no" q-rev-old Falsifier
+  ck "queued, NEW review iter_log form (amended by /dream (review) — …) -> allow" 0 "dispatch-iter_log=no" q-rev-new Falsifier
+  ck "queued, real daemon run= form -> deny" 2 "dispatch-iter_log=yes" q-run Falsifier
+  ck "queued, 'Direct-build dispatched by the operator' -> deny" 2 "dispatch-iter_log=yes" q-direct Falsifier
+  ck "queued, mixed (review line + decision-answered dispatch line) -> deny" 2 "dispatch-iter_log=yes" q-mixed Falsifier
+  ck "queued, operator-note iter_log (no dispatch form) -> allow" 0 "dispatch-iter_log=no" q-note Falsifier
   ck "unknown slug -> exit 1" 1 "no PRD-nope.md" nope Falsifier
   ck "missing keys arg -> exit 1" 1 "usage" q-clean
   if [ -x "$HOME/.claude/skills/dream/scripts/amend-key-gate.sh" ]; then
@@ -169,6 +201,6 @@ selftest() {
 
 case "${1:-}" in
   --selftest) selftest; exit $? ;;
-  -h|--help) sed -n '2,36p' "$0"; exit 0 ;;
+  -h|--help) sed -n '2,/^set -uo pipefail/p' "$0" | sed '$d'; exit 0 ;;
 esac
 run_main "$@"

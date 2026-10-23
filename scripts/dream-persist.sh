@@ -20,6 +20,9 @@
 #   4. `git pull --rebase --autostash` (when origin exists), so the manifest is
 #      computed on the latest tip and cannot conflict; then the hooksPath self-heal
 #      (below)
+#      then the review iter_log normalisation: a `Fable FIX applied before persist` iter_log line
+#      is rewritten to `amended by /dream (review) — Fable FIX applied before persist: …` so
+#      dream-amend.sh does not read it as a dispatch line (see review_iterlog_normalize)
 #   5. MANIFEST.md: upsert one line per given PRD (`- PRD-x.md — status · target ·
 #      Drafted`), replacing an existing line or inserting in filename order, plus the
 #      header timestamp. There is no manifest generator script in this repo
@@ -262,6 +265,22 @@ PY
   done
 }
 
+# review_iterlog_normalize <repo top> <rel PRD>... -- the /dream reviewer step leaves a free-form
+# `iter_log: <ts> Fable FIX applied before persist ...` line in a PRD it fixed. dream-amend.sh and the
+# daemon read an iter_log line that is not an `amended by /dream (...)` line as a daemon dispatch line,
+# so that form made every reviewed PRD un-amendable from birth. Rewrite only the prefix, in the
+# gate-allowed form, keeping the detail: `<ts> amended by /dream (review) — Fable FIX applied before
+# persist: <detail>`. Idempotent (the new form starts with `amended`); stderr NOTE only, stdout unchanged.
+review_iterlog_normalize() {
+  local top="$1" rel; shift
+  for rel in "$@"; do
+    if grep -qE '^([-*+][[:space:]]+)?iter_log:[[:space:]]+[^[:space:]]+[[:space:]]+Fable FIX applied before persist' "$top/$rel" 2>/dev/null; then
+      sed -i -E 's/^(([-*+][[:space:]]+)?iter_log:[[:space:]]+[^[:space:]]+[[:space:]]+)Fable FIX applied before persist:?/\1amended by \/dream (review) — Fable FIX applied before persist:/' "$top/$rel"
+      echo "NOTE review-iterlog-normalized ${rel##*/}" >&2
+    fi
+  done
+}
+
 # review_status -> `persists_24h=N with_review=N review_missing=N refused=N` (last 24 h of the log)
 review_status() {
   python3 - "$REVIEW_LOG" <<'PY'
@@ -414,6 +433,7 @@ persist_batch() {
     git pull --rebase --autostash -q || { die "git pull --rebase failed: nothing committed"; return 1; }
   fi
   hooks_selfheal
+  review_iterlog_normalize "$top" "${rels[@]}"
 
   # 5. manifest upsert, 6. diff guard
   local saved; saved="$(mktemp)"
@@ -646,6 +666,18 @@ PY
   runsplit "$t/w/build-queue/PRD-h6.md"
   chk "no .githooks dir -> no hooksPath line, config unset" "$(git -C "$t/w" config --local core.hooksPath >/dev/null 2>&1; [ $? -ne 0 ] && ! grep -q hooksPath <<<"$RS_ERR" && echo 0 || echo 1)" "err=$RS_ERR"
   chk "PREMISE / EXPIRES constants exist" "$([ -n "$PREMISE" ] && [ "$EXPIRES" = "2026-11-22" ] && grep -q '^PREMISE="seat PRD clones lacked core.hooksPath' "$0" && grep -q '^EXPIRES=2026-11-22$' "$0" && echo 0 || echo 1)" "PREMISE=$PREMISE EXPIRES=$EXPIRES"
+  # review iter_log normalisation: the old free-form `Fable FIX applied before persist` line becomes the
+  # gate-allowed `amended by /dream (review) — …` form, detail kept, committed that way; idempotent
+  rewind; fresh; mkprd "$t/w/build-queue/PRD-il1.md" il1; mkprd "$t/w/build-queue/PRD-il2.md" il2
+  printf -- '- iter_log: 2026-10-22T22:4xZ Fable FIX applied before persist (8 binding: a, b); kept x\n' >> "$t/w/build-queue/PRD-il1.md"
+  printf -- '- iter_log: 2026-10-22T22:4xZ amended by /dream (review) — Fable FIX applied before persist: (already new)\n' >> "$t/w/build-queue/PRD-il2.md"
+  runsplit "$t/w/build-queue/PRD-il1.md" "$t/w/build-queue/PRD-il2.md"
+  chk "review iter_log: old form rewritten to 'amended by /dream (review) — Fable FIX applied before persist: <detail>'" \
+    "$(git -C "$t/w" show HEAD:build-queue/PRD-il1.md | grep -qxF -- '- iter_log: 2026-10-22T22:4xZ amended by /dream (review) — Fable FIX applied before persist: (8 binding: a, b); kept x' && echo 0 || echo 1)" "$(git -C "$t/w" show HEAD:build-queue/PRD-il1.md | grep iter_log)"
+  chk "review iter_log: new-form line left byte-identical (idempotent)" \
+    "$(git -C "$t/w" show HEAD:build-queue/PRD-il2.md | grep -qxF -- '- iter_log: 2026-10-22T22:4xZ amended by /dream (review) — Fable FIX applied before persist: (already new)' && echo 0 || echo 1)" "$(git -C "$t/w" show HEAD:build-queue/PRD-il2.md | grep iter_log)"
+  chk "review iter_log: NOTE on stderr for il1 only, stdout unchanged, rc 0" \
+    "$(grep -q '^NOTE review-iterlog-normalized PRD-il1.md' <<<"$RS_ERR" && ! grep -q 'il2.md' <<<"$RS_ERR" && ! grep -qi 'iterlog' <<<"$RS_OUT" && [ "$RS_RC" -eq 0 ] && echo 0 || echo 1)" "rc=$RS_RC err=$RS_ERR"
   if [ "$fails" -ne 0 ]; then echo "SELFTEST FAILED ($fails/$total checks)"; return 1; fi
   echo "SELFTEST PASSED ($total checks)"
 }
