@@ -27,7 +27,9 @@
 #   status=<s> dispatch-iter_log=<yes|no>    (read: <PRD file>)
 #                                            a `shipped`/`built` PRD under parked/ prints
 #                                            `status=parked (file Status: shipped, in parked/)` and the
-#                                            gate is passed `parked` (lineage keys only, see the gate)
+#                                            gate is passed `parked` (lineage keys only, see the gate); its
+#                                            dispatch-iter_log is then `yes (implied by Status: shipped)`,
+#                                            since that Status is itself proof of dispatch
 #   <gate verdict>                           (allow | deny: ...), from
 #                                            ~/.claude/skills/dream/scripts/amend-key-gate.sh
 # Exit: 0 allow | 2 refused (open run, or the gate denies) | 1 usage / PRD not found
@@ -137,8 +139,10 @@ PY
   if [ "$file" = "$PRD_DIR/parked/PRD-$slug.md" ] && { [ "$status" = "shipped" ] || [ "$status" = "built" ]; }; then
     # a shipped/built PRD that sits in parked/ is parked work (its successor carries the build): the gate
     # must see `parked` so the lineage keys (Superseded-by, transferred_acs) are accepted
-    echo "status=parked (file Status: $status, in parked/) dispatch-iter_log=$disp   (read: $file)"
-    status="parked"
+    # and a shipped/built Status is itself proof the PRD was dispatched, even with no iter_log line
+    # (the gate's parked case needs has-dispatch-iter-log=yes)
+    echo "status=parked (file Status: $status, in parked/) dispatch-iter_log=yes (implied by Status: $status)   (read: $file)"
+    status="parked"; disp="yes"
   else
     echo "status=$status dispatch-iter_log=$disp   (read: $file)"
   fi
@@ -216,6 +220,13 @@ selftest() {
     ck "shipped PRD in built-prds/ + Superseded-by -> deny unchanged (gate sees shipped)" 2 "^deny: shipped is not amendable in place" s-built Superseded-by
     ck "queued PRD in parked/, no dispatch log -> status=queued, allow unchanged" 0 "^status=queued dispatch-iter_log=no
 ^allow" p-queued Falsifier
+    # a shipped/built Status is itself proof of dispatch: no iter_log line needed (the real parked/ shipped PRD has none)
+    printf '# PRD\n\n- Status: shipped\n- iter_log: 2026-10-01T00:00:00Z created by dream\n' > "$t/prds/parked/PRD-p-ship-nolog.md"
+    ck "(g) shipped PRD in parked/, NO dispatch iter_log + Superseded-by -> dispatch-iter_log=yes implied, allow (exit 0)" 0 "^status=parked (file Status: shipped, in parked/) dispatch-iter_log=yes (implied by Status: shipped)
+^allow" p-ship-nolog Superseded-by
+    ck "(h) same + acceptance_criteria -> deny (exit 2)" 2 "^deny" p-ship-nolog Superseded-by,acceptance_criteria
+    ck "(i) queued PRD in parked/, no log + Superseded-by,Status -> unchanged (status=queued dispatch-iter_log=no, allow)" 0 "^status=queued dispatch-iter_log=no
+^allow" p-queued Superseded-by,Status
   fi
   # remote host: local has no daemon (skipped), rb has the run, down is unverified
   GATE="$t/gate-allow"; WB="$t/wb-empty"
