@@ -25,6 +25,9 @@
 # Prints:
 #   open-run: <id|none> host=<h> stage=<s>   (read: wm-build runs @<host>)
 #   status=<s> dispatch-iter_log=<yes|no>    (read: <PRD file>)
+#                                            a `shipped`/`built` PRD under parked/ prints
+#                                            `status=parked (file Status: shipped, in parked/)` and the
+#                                            gate is passed `parked` (lineage keys only, see the gate)
 #   <gate verdict>                           (allow | deny: ...), from
 #                                            ~/.claude/skills/dream/scripts/amend-key-gate.sh
 # Exit: 0 allow | 2 refused (open run, or the gate denies) | 1 usage / PRD not found
@@ -131,7 +134,14 @@ print(status or "unknown", disp)
 PY
 )"
   disp="${status#* }"; status="${status%% *}"
-  echo "status=$status dispatch-iter_log=$disp   (read: $file)"
+  if [ "$file" = "$PRD_DIR/parked/PRD-$slug.md" ] && { [ "$status" = "shipped" ] || [ "$status" = "built" ]; }; then
+    # a shipped/built PRD that sits in parked/ is parked work (its successor carries the build): the gate
+    # must see `parked` so the lineage keys (Superseded-by, transferred_acs) are accepted
+    echo "status=parked (file Status: $status, in parked/) dispatch-iter_log=$disp   (read: $file)"
+    status="parked"
+  else
+    echo "status=$status dispatch-iter_log=$disp   (read: $file)"
+  fi
   if [ -x "$GATE" ]; then
     "$GATE" "$status" "$disp" "$keys"; return $?
   fi
@@ -188,6 +198,24 @@ selftest() {
     GATE="$HOME/.claude/skills/dream/scripts/amend-key-gate.sh"
     ck "real amend-key-gate passes its verdict through (allow)" 0 "^allow" q-clean Falsifier
     ck "real amend-key-gate passes its verdict through (deny)" 2 "^deny" q-disp Falsifier
+    # shipped-in-parked/: the gate sees `parked`. A COPY of the gate inside the throwaway root decides.
+    mkdir -p "$t/prds/built-prds"
+    cp "$GATE" "$t/gate-copy.sh"; chmod +x "$t/gate-copy.sh"; GATE="$t/gate-copy.sh"
+    printf '# PRD\n\n- Status: shipped\n- iter_log: 2026-10-01T00:00:00Z run 12 dispatched\n' > "$t/prds/parked/PRD-p-ship.md"
+    printf '# PRD\n\n- Status: built\n- iter_log: 2026-10-01T00:00:00Z run=12 land code cause=ok\n' > "$t/prds/parked/PRD-p-built.md"
+    printf '# PRD\n\n- Status: shipped\n- iter_log: 2026-10-01T00:00:00Z run 12 dispatched\n' > "$t/prds/built-prds/PRD-s-built.md"
+    printf '# PRD\n\n- Status: queued\n' > "$t/prds/parked/PRD-p-queued.md"
+    ck "shipped PRD in parked/ + Superseded-by -> status=parked read printed, allow (exit 0)" 0 "^status=parked (file Status: shipped, in parked/)
+^allow" p-ship Superseded-by
+    ck "shipped PRD in parked/ + Superseded-by,transferred_acs -> allow" 0 "^allow" p-ship Superseded-by,transferred_acs
+    ck "built PRD in parked/ + Superseded-by -> status=parked read printed, allow" 0 "^status=parked (file Status: built, in parked/)
+^allow" p-built Superseded-by
+    ck "shipped PRD in parked/ + Superseded-by,acceptance_criteria -> deny (exit 2)" 2 "^deny" p-ship Superseded-by,acceptance_criteria
+    ck "shipped PRD in parked/ + Status key -> deny" 2 "^deny" p-ship Status
+    ck "shipped PRD in parked/ + Depends-on key -> deny" 2 "^deny" p-ship Depends-on
+    ck "shipped PRD in built-prds/ + Superseded-by -> deny unchanged (gate sees shipped)" 2 "^deny: shipped is not amendable in place" s-built Superseded-by
+    ck "queued PRD in parked/, no dispatch log -> status=queued, allow unchanged" 0 "^status=queued dispatch-iter_log=no
+^allow" p-queued Falsifier
   fi
   # remote host: local has no daemon (skipped), rb has the run, down is unverified
   GATE="$t/gate-allow"; WB="$t/wb-empty"

@@ -43,6 +43,9 @@
 # REVIEW GUARD (`--review <file>`): the file holds one line per PRD,
 # `<slug> APPROVE|FIX|REJECT <reviewer>` (slug = PRD filename minus `PRD-` and `.md`;
 # `#` comments and blank lines ignored; a malformed line = `review-malformed <lineno>`).
+# A slug may carry several lines (a FIX round, then the re-review): the LAST verdict line
+# for a slug in the file is its verdict (`x FIX r1` then `x APPROVE r2` = approved; the
+# reverse = review-not-approved).
 # Conditions, evaluated from the lint output + frontmatter after lint and before the pull:
 #   review-missing                no --review given
 #   review-not-approved <slug>    a batch PRD has no line, or its verdict is not APPROVE
@@ -213,8 +216,7 @@ else:
             rows.setdefault(p[0], []).append((p[1], " ".join(p[2:])))
         for s in slugs:
             if s in rows:
-                bad = [r for r in rows[s] if r[0] != "APPROVE"]   # any non-APPROVE line for a slug wins
-                verdicts[s] = bad[0] if bad else rows[s][0]
+                verdicts[s] = rows[s][-1]   # the LAST verdict line for a slug is the verdict
         for s in slugs:
             if s not in verdicts or verdicts[s][0] != "APPROVE":
                 got = verdicts[s][0] if s in verdicts else "no line"
@@ -620,6 +622,21 @@ selftest() {
   chk "unknown slug: review-unknown-slug ghost" "$(grep -q '^WARN review-unknown-slug ghost' <<<"$RS_ERR" && echo 0 || echo 1)" "err=$RS_ERR"
   chk "FIX verdict and a missing line: review-not-approved m2 and m1" "$(grep -q '^WARN review-not-approved m2 (FIX)' <<<"$RS_ERR" && grep -q '^WARN review-not-approved m1 (no line)' <<<"$RS_ERR" && echo 0 || echo 1)" "err=$RS_ERR"
   chk "warn mode with all of the above still persists (rc 0)" "$([ "$RS_RC" -eq 0 ] && git -C "$t/w" log --format=%s -1 | grep -q '^dream: 2 PRDs' && echo 0 || echo 1)" "rc=$RS_RC"
+  # last verdict line for a slug wins: FIX r1 then APPROVE r2 -> approved; APPROVE r1 then FIX r2 -> not approved
+  rewind; fresh; mkprd "$t/w/build-queue/PRD-lv1.md" lv1
+  printf 'lv1 FIX r1\nlv1 APPROVE r2\n' > "$t/rev-lv-fa.txt"
+  runsplit --review "$t/rev-lv-fa.txt" "$t/w/build-queue/PRD-lv1.md"
+  chk "review last-line: 'FIX r1' then 'APPROVE r2' -> approved (no warning)" "$(! grep -q 'review-not-approved' <<<"$RS_ERR" && [ "$RS_RC" -eq 0 ] && lastlog | python3 -c 'import json,sys; d=json.loads(sys.stdin.read()); sys.exit(0 if d["verdict"]=="APPROVE" and d["reviewer"]=="r2" else 1)' && echo 0 || echo 1)" "rc=$RS_RC err=$RS_ERR $(lastlog)"
+  rewind; fresh; mkprd "$t/w/build-queue/PRD-lv2.md" lv2
+  printf 'lv2 APPROVE r1\nlv2 FIX r2\n' > "$t/rev-lv-af.txt"
+  runsplit --review "$t/rev-lv-af.txt" "$t/w/build-queue/PRD-lv2.md"
+  chk "review last-line: 'APPROVE r1' then 'FIX r2' -> review-not-approved (FIX)" "$(grep -q '^WARN review-not-approved lv2 (FIX)' <<<"$RS_ERR" && echo 0 || echo 1)" "rc=$RS_RC err=$RS_ERR"
+  rewind; fresh; mkprd "$t/w/build-queue/PRD-lv2.md" lv2
+  DREAM_PERSIST_REVIEW_MODE=enforce runsplit --review "$t/rev-lv-af.txt" "$t/w/build-queue/PRD-lv2.md"
+  chk "review last-line (enforce): trailing FIX refuses, exit 2" "$([ "$RS_RC" -eq 2 ] && grep -q '^FAIL review-not-approved lv2 (FIX)' <<<"$RS_ERR" && echo 0 || echo 1)" "rc=$RS_RC err=$RS_ERR"
+  rewind; fresh; mkprd "$t/w/build-queue/PRD-lv1.md" lv1
+  DREAM_PERSIST_REVIEW_MODE=enforce runsplit --review "$t/rev-lv-fa.txt" "$t/w/build-queue/PRD-lv1.md"
+  chk "review last-line (enforce): FIX then APPROVE persists, exit 0" "$([ "$RS_RC" -eq 0 ] && [ -z "$RS_ERR" ] && echo 0 || echo 1)" "rc=$RS_RC err=$RS_ERR"
   # enforce with a clean review proceeds
   fresh; mkprd "$t/w/build-queue/PRD-e1.md" e1; printf 'e1 APPROVE fable\n' > "$t/rev-e.txt"
   DREAM_PERSIST_REVIEW_MODE=enforce runsplit --review "$t/rev-e.txt" "$t/w/build-queue/PRD-e1.md"
