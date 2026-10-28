@@ -56,7 +56,7 @@ points here instead of listing scripts inline).
 - `scripts/dispatch-distrust-selftest.sh` — regression-proofs the coordinator-message
 - `scripts/dispatch-selftest.sh` — exercises dispatch.sh (PRD-build-programmatic-
 - `scripts/dispatch.sh` — the tick is a program; a model is spent only inside a
-- `scripts/dream-amend.sh` — /dream hook `dream.amend` (before any amend): may this PRD be
+- `scripts/dream-amend.sh` — /dream hook `dream.amend` (before any amend; open runs from fleet-dash status.json): may this PRD be
 - `scripts/dream-contract-drift-selftest.sh` — fails when build-contract.md's Frontmatter
 - `scripts/dream-governor-selftest.sh` — acceptance harness for dream-governor.sh
 - `scripts/dream-governor.sh` — fires /dream when the queue thins and the budget
