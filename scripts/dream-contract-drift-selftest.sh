@@ -34,9 +34,12 @@ set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONTRACT="${CONTRACT:-$HERE/../build-contract.md}"
-SKILL_MD="${DREAM_SKILL_MD:-$HOME/.claude/skills/dream/SKILL.md}"
-WM_SRC="${WM_BUILD_SRC:-$HOME/wintermute/wm-build}"
-PRD_DIR="${PRD_DIR:-$HOME/Documents/PRDs}"
+# Read-only against the operator's real clones: under run-selftests.sh HOME is
+# a throwaway fixture, so prefer the runner's BUILD_TEST_REAL_HOME marker.
+REAL_HOME="${BUILD_TEST_REAL_HOME:-$HOME}"
+SKILL_MD="${DREAM_SKILL_MD:-$REAL_HOME/.claude/skills/dream/SKILL.md}"
+WM_SRC="${WM_BUILD_SRC:-$REAL_HOME/wintermute/wm-build}"
+PRD_DIR="${PRD_DIR:-$REAL_HOME/Documents/PRDs}"
 MIN="${DRIFT_MIN_PRDS:-10}"
 LINT_SELFTEST="${LINT_SELFTEST:-$HERE/prd-lint-selftest.sh}"
 
