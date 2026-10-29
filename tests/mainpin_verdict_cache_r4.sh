@@ -54,6 +54,12 @@ done
 # (default $HOME/.claude/skills/rustbuild/scripts); run-selftests.sh swaps HOME
 # for a throwaway, so resolve it against the real home it records.
 export RUSTBUILD_SCRIPTS="${RUSTBUILD_SCRIPTS:-${BUILD_TEST_REAL_HOME:-$HOME}/.claude/skills/rustbuild/scripts}"
+# Same for the installed autobuilder/cargo: a non-login shell (ssh, systemd)
+# or the isolated HOME can leave ~/.local/bin and ~/.cargo/bin off PATH.
+for _d in "${BUILD_TEST_REAL_HOME:-$HOME}/.local/bin" "${BUILD_TEST_REAL_HOME:-$HOME}/.cargo/bin"; do
+  [ -d "$_d" ] && case ":$PATH:" in *":$_d:"*) ;; *) PATH="$PATH:$_d" ;; esac
+done
+export PATH
 
 fail=0
 expect() {

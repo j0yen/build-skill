@@ -43,6 +43,12 @@ command -v cargo >/dev/null 2>&1 || { echo "selftest: no real cargo on ambient P
 T="$(mktemp -d "${TMPDIR:-/tmp}/cargo-shim-chain-selftest.XXXXXX")"
 trap 'rm -rf "$T"' EXIT
 
+# The cargo-budget shim claims slots and appends a ledger/journal under its
+# state dir; point both at this test's own tree so a run never touches the
+# real state/cargo-budget (run-selftests.sh --all AC7 fails on that).
+export CARGO_BUDGET_STATE_DIR="$T/cargo-budget-state"
+export CARGO_BUDGET_JOURNAL="$T/journal.md"
+
 # --- trivial fixture crate, written directly (no `cargo init` needed) -------
 FIXTURE="$T/fixture-crate"
 mkdir -p "$FIXTURE/src"
