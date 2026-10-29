@@ -33,6 +33,11 @@ expect() {
 
 [ -x "$BUDGET_DIR/cargo" ] || { echo "selftest: $BUDGET_DIR/cargo not executable" >&2; exit 2; }
 [ -x "$BURST_DIR/cargo" ] || { echo "selftest: $BURST_DIR/cargo not executable" >&2; exit 2; }
+# A non-login shell (ssh/systemd) or the runner's isolated HOME may not carry
+# rustup's bin dir on PATH; the real cargo still lives under the real home.
+command -v cargo >/dev/null 2>&1 || for _d in "${BUILD_TEST_REAL_HOME:-$HOME}/.cargo/bin" "${CARGO_HOME:-/nonexistent}/bin"; do
+  [ -x "$_d/cargo" ] && { PATH="$PATH:$_d"; export PATH; break; }
+done
 command -v cargo >/dev/null 2>&1 || { echo "selftest: no real cargo on ambient PATH, cannot run" >&2; exit 2; }
 
 T="$(mktemp -d "${TMPDIR:-/tmp}/cargo-shim-chain-selftest.XXXXXX")"
