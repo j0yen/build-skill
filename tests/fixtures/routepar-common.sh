@@ -49,6 +49,19 @@ routepar_run_gate() {
   mkdir -p "$(dirname "$journal")"
   local prompt="$(dirname "$journal")/reviewer-prompt.md"
   [ -f "$prompt" ] || echo "fake reviewer prompt" > "$prompt"
+  # Hermetic branch scope: the intent-card refresh resolves the PRD under
+  # GATE_PATIENCE_PRD_DIR (default $HOME/Documents/PRDs, which only exists on
+  # an operator laptop). Point it at a per-journal disposable dir holding a
+  # stub for whatever --slug the caller passes.
+  local prd_dir; prd_dir="$(dirname "$journal")/prds"
+  mkdir -p "$prd_dir/build-queue"
+  local a prev=""
+  for a in "$@"; do
+    [ "$prev" = --slug ] && echo "# PRD: $a -- disposable routepar fixture, never a real product" > "$prd_dir/build-queue/PRD-$a.md"
+    prev="$a"
+  done
+  INTENT_CARD_REFRESH_BIN="$ROUTEPAR_FAKE/intent-card-refresh.sh" \
+  GATE_PATIENCE_PRD_DIR="$prd_dir" \
   PATH="$ROUTEPAR_FAKE:$PATH" \
   AUTOBUILDER_CANONICAL_CARGO_TOML="$(dirname "$journal")/no-such-canonical/Cargo.toml" \
   RUSTBUILD_SCRIPTS="$ROUTEPAR_FAKE" \
