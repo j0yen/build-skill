@@ -50,6 +50,11 @@ for bin in git jq sha256sum; do
   command -v "$bin" >/dev/null 2>&1 || { echo "selftest: $bin not on \$PATH, cannot run" >&2; exit 2; }
 done
 
+# extend-gate.sh preflights extended-receipts.sh under RUSTBUILD_SCRIPTS
+# (default $HOME/.claude/skills/rustbuild/scripts); run-selftests.sh swaps HOME
+# for a throwaway, so resolve it against the real home it records.
+export RUSTBUILD_SCRIPTS="${RUSTBUILD_SCRIPTS:-${BUILD_TEST_REAL_HOME:-$HOME}/.claude/skills/rustbuild/scripts}"
+
 fail=0
 expect() {
   local label="$1" cond="$2"
