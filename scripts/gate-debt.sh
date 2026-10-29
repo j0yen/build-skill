@@ -428,6 +428,8 @@ for f in json.loads(sys.argv[1]):
 - test_prefix: gatedebt-${shortsha}
 - Vision: ${vision}
 - Drafted: $(date -u +%F)
+- Seed: traffic:gate-debt-${shortsha}
+- Grounding: failure-derived (inherited gate findings at ${shortsha})
 
 ## TL;DR
 
