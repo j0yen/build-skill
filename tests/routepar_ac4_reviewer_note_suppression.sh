@@ -48,8 +48,14 @@ out_fail="$(routepar_run_gate "$REPO" "$JOURNAL" 2>&1)"
 rc_fail=$?
 unset FAKE_REVCLAUDE_RC
 line_fail="$(grep '  gate  ' "$JOURNAL" | tail -1)"
-expect "AC4 passes: extend-gate.sh still exits 0 (nothing else blocking)" "[ $rc_fail -eq 0 ]"
-expect "AC4 passes: gate line verdict is pass" "[[ '$line_fail' == *'  gate  '*'  pass  '* ]]"
+# Since PRD-build-gate-infra-outcome a reviewer mechanism failure is never a
+# pass and never a block: the verdict is `incomplete` (exit 9) with an
+# infra=reviewer-agent field. What this AC still pins is that no
+# "reviewer-agent —" BLOCK note rides on the line.
+expect "AC4 passes: extend-gate.sh exits 9 (incomplete: infra, not a block)" "[ $rc_fail -eq 9 ]"
+expect "AC4 passes: gate line verdict is incomplete" "[[ '$line_fail' == *'  gate  '*'  incomplete  '* ]]"
+expect "AC4 passes: gate line names infra=reviewer-agent" "[[ '$line_fail' == *'infra=reviewer-agent'* ]]"
+expect "AC4 passes: gate line has no blocking producer" "[[ '$line_fail' == *'blocking=none'* ]]"
 expect "AC4 passes: no 'reviewer-agent —' note on this pass line" "[[ '$line_fail' != *'reviewer-agent —'* ]]"
 expect "AC4 passes: reviewer-agent.json still reads decision=pass (untouched stale receipt)" \
   "[ \"\$(jq -r '.decision' '$REPO/target/autobuilder/receipts/reviewer-agent.json')\" = pass ]"
