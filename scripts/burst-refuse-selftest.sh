@@ -8,7 +8,7 @@
 # ~/.config/wm-burst/.env (which carries a live HCLOUD_TOKEN) — it points
 # burst-lane.sh at an isolated, deliberately-dormant fixture env file
 # instead, in an isolated state dir, so this test can never provision a
-# real box even if the operator's real env file is populated when it runs.
+# real box even if the real operator env file is populated when it runs.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BL="$HERE/burst-lane.sh"
@@ -76,7 +76,11 @@ would_proceed="$(BUILD_BURST_ENABLED=1 bash -c '. "$1/lib/burst-configured.sh" &
 expect "burst_configured() true under BUILD_BURST_ENABLED=1 (gate is conditional)" "[ \"\$would_proceed\" = would-proceed ]"
 
 not_would_proceed="$(env -u BUILD_BURST_ENABLED bash -c '
-  BURST_LANE_ENV_FILE="$1" . "$2/lib/burst-configured.sh"
+  # exported, not a `VAR=x .` prefix: the prefix assignment ends with the
+  # `.` builtin, so burst_configured() below would read the real operator
+  # ~/.config/wm-burst/.env (a host that ran `burst-lane.sh enable` says yes).
+  export BURST_LANE_ENV_FILE="$1"
+  . "$2/lib/burst-configured.sh"
   burst_configured && echo would-proceed || echo refused
 ' _ "$T/wm-burst.env" "$HERE" 2>/dev/null)"
 expect "burst_configured() false against the dormant fixture env (no opt-in)" "[ \"\$not_would_proceed\" = refused ]"

@@ -50,6 +50,17 @@ for bin in git jq sha256sum; do
   command -v "$bin" >/dev/null 2>&1 || { echo "selftest: $bin not on \$PATH, cannot run" >&2; exit 2; }
 done
 
+# extend-gate.sh preflights extended-receipts.sh under RUSTBUILD_SCRIPTS
+# (default $HOME/.claude/skills/rustbuild/scripts); run-selftests.sh swaps HOME
+# for a throwaway, so resolve it against the real home it records.
+export RUSTBUILD_SCRIPTS="${RUSTBUILD_SCRIPTS:-${BUILD_TEST_REAL_HOME:-$HOME}/.claude/skills/rustbuild/scripts}"
+# Same for the installed autobuilder/cargo: a non-login shell (ssh, systemd)
+# or the isolated HOME can leave ~/.local/bin and ~/.cargo/bin off PATH.
+for _d in "${BUILD_TEST_REAL_HOME:-$HOME}/.local/bin" "${BUILD_TEST_REAL_HOME:-$HOME}/.cargo/bin"; do
+  [ -d "$_d" ] && case ":$PATH:" in *":$_d:"*) ;; *) PATH="$PATH:$_d" ;; esac
+done
+export PATH
+
 fail=0
 expect() {
   local label="$1" cond="$2"
@@ -162,10 +173,19 @@ jq -n --arg head "$M_SHA" --arg tree "$M_TREE" --arg hash "$SELF_HASH" \
    verdict: "pass", exit_code: 0, scope: $scope, slug: $slug, deferred_receipts: []}' > "$MIRROR2"
 
 out2="$T/run2.out"
-env BUILD_STATE_DIR="$STATE_DIR" BUILD_WT_ROOT="$WT_ROOT" EXTEND_GATE_JOURNAL="$JOURNAL" \
+# `timeout` only signals its direct child, and every producer it launches puts
+# itself in its own process group, so on a real fall-through the gate's
+# producers (flake-audit, determinism, cold-build-time, mutation-kill: 1500 s
+# bounds, real cargo builds) would outlive this test as orphans. Once the gate
+# returns, kill everything whose command line names this test's private tree.
+setsid env BUILD_STATE_DIR="$STATE_DIR" BUILD_WT_ROOT="$WT_ROOT" EXTEND_GATE_JOURNAL="$JOURNAL" \
     PATH="$HOME/.claude/skills/build/scripts/cargo-budget-bin:$PATH" \
-    timeout -k 5 15 "$PIN_GATE" "$REPO" "$SLUG2" >"$out2" 2>&1
+    timeout -k 5 15 "$PIN_GATE" "$REPO" "$SLUG2" >"$out2" 2>&1 &
+gate_pid=$!
+wait "$gate_pid"
 rc2=$?
+kill -KILL -- "-$gate_pid" 2>/dev/null || true
+pkill -KILL -f -- "$T/" 2>/dev/null || true
 cat "$out2"
 # A real run's cache decision happens near-immediately (right after the
 # integration lock, well before any of the 25 producers start). This
