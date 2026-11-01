@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
-# dream-amend.sh — /dream hook `dream.amend` (before any amend): may this PRD be
+# dream-amend.sh — /dream hook `dream.amend` (before any amend; open runs from fleet-dash status.json): may this PRD be
 # amended in place, or does an open run mean "cordon, or draft a successor"?
 #
 # Read-only. Two reads, both named in the output:
-#   1. open run  — `wm-build runs` (the read-only list verb; it never creates a
-#      run) on every daemon host, in order: local carbon (only when wm-build is on
-#      PATH AND ~/.config/wm-build/config.toml exists, i.e. a real state dir),
-#      then `ssh redbaron`, then `ssh ryzen7` (non-login ssh: the PATH export is
-#      part of the remote command). A host that cannot be reached is reported
-#      `unverified`, never assumed empty. (~/.cache/fleet-dash/status.json carries
-#      queue counts only, not a run list, so it is not used.)
+#   1. open run  — the fleet-dash status file (FLEET_STATUS, default
+#      ~/.cache/fleet-dash/status.json when present, else FLEET_STATUS_URL via
+#      curl): `.ts` + `.hosts.{redbaron,ryzen7}.open_runs[]` ({id,slug,stage,...}).
+#      No wm-build and no ssh, ever: a raw `wm-build runs` on a build host is a
+#      whole-journal read that froze ryzen7 (10-24). FAIL CLOSED: an unreadable,
+#      unparseable, host-less or stale (> FLEET_STATUS_MAX_AGE s) status is
+#      `REFUSED: fleet status unreadable or stale (...)`, exit 2, no fallback.
 #   2. status + dispatch iter_log — from the PRD file itself (build-queue/, then
 #      parked/, then built-prds/ under $PRD_DIR): its first `Status:` key and
 #      whether any `iter_log:` line is a dispatch line. Dispatch is
@@ -23,7 +23,7 @@
 #   dream-amend.sh --selftest
 #
 # Prints:
-#   open-run: <id|none> host=<h> stage=<s>   (read: wm-build runs @<host>)
+#   open-run: <id|none> host=<h> stage=<s>   (read: <status file or URL>)
 #   status=<s> dispatch-iter_log=<yes|no>    (read: <PRD file>)
 #                                            a `shipped`/`built` PRD under parked/ prints
 #                                            `status=parked (file Status: shipped, in parked/)` and the
@@ -34,28 +34,51 @@
 #                                            ~/.claude/skills/dream/scripts/amend-key-gate.sh
 # Exit: 0 allow | 2 refused (open run, or the gate denies) | 1 usage / PRD not found
 #
-# Env: PRD_DIR (default ~/Documents/PRDs); DREAM_AMEND_HOSTS (default "local redbaron ryzen7");
-#      DREAM_AMEND_WM_BUILD (default wm-build); DREAM_AMEND_SSH (default `ssh -o ConnectTimeout=8`);
+# Env: PRD_DIR (default ~/Documents/PRDs); FLEET_STATUS (file; default
+#      ~/.cache/fleet-dash/status.json if it exists); FLEET_STATUS_URL (default
+#      http://carbon:8787/status.json); FLEET_STATUS_MAX_AGE (default 300 s);
 #      DREAM_AMEND_GATE (default ~/.claude/skills/dream/scripts/amend-key-gate.sh).
 set -uo pipefail
 
 PRD_DIR="${PRD_DIR:-$HOME/Documents/PRDs}"
-HOSTS="${DREAM_AMEND_HOSTS:-local redbaron ryzen7}"
-WB="${DREAM_AMEND_WM_BUILD:-wm-build}"
-SSH="${DREAM_AMEND_SSH:-ssh -o ConnectTimeout=8}"
 GATE="${DREAM_AMEND_GATE:-$HOME/.claude/skills/dream/scripts/amend-key-gate.sh}"
-PATHX='export PATH=$HOME/.local/bin:$HOME/.cargo/bin:$PATH;'
+FLEET_STATUS_URL="${FLEET_STATUS_URL:-http://carbon:8787/status.json}"
+FLEET_STATUS_MAX_AGE="${FLEET_STATUS_MAX_AGE:-300}"
 
-# runs_on <host> -> prints `wm-build runs` output; returns 3 when the host is not
-# usable (unreachable, or local without a daemon state dir)
-runs_on() {
-  if [ "$1" = "local" ]; then
-    command -v "$WB" >/dev/null 2>&1 || [ -x "$WB" ] || return 3
-    [ -n "${DREAM_AMEND_ASSUME_LOCAL_CONFIG:-}" ] || [ -f "$HOME/.config/wm-build/config.toml" ] || return 3
-    "$WB" runs 2>&1
+# open_run_of <slug> -> reads the fleet-dash status (file, else URL). Prints
+#   `OPEN <id> <host> <stage>` | `NONE <source>` | `BAD <reason>`; always rc 0.
+open_run_of() {
+  local src="${FLEET_STATUS:-}" body="" reason=""
+  if [ -z "$src" ] && [ -f "$HOME/.cache/fleet-dash/status.json" ]; then src="$HOME/.cache/fleet-dash/status.json"; fi
+  if [ -n "$src" ]; then
+    body="$(cat -- "$src" 2>/dev/null)" || { echo "BAD cannot read $src"; return 0; }
   else
-    $SSH "$1" "$PATHX wm-build runs" 2>&1
+    src="$FLEET_STATUS_URL"
+    body="$(curl -fsS --max-time 8 "$src" 2>&1)" || { echo "BAD cannot fetch $src"; return 0; }
   fi
+  python3 -c '
+import json, sys, time
+slug, src, maxage = sys.argv[1], sys.argv[2], float(sys.argv[3])
+try:
+    d = json.loads(sys.stdin.read())
+    ts = float(d["ts"])
+    hosts = d["hosts"]
+    assert isinstance(hosts, dict)
+except Exception as e:
+    print("BAD unparseable or missing .ts/.hosts (%s)" % type(e).__name__); sys.exit(0)
+age = time.time() - ts
+if age > maxage:
+    print("BAD stale: ts is %ds old, max %ds" % (age, maxage)); sys.exit(0)
+for h in ("redbaron", "ryzen7"):
+    hd = hosts.get(h)
+    if not isinstance(hd, dict) or not isinstance(hd.get("open_runs"), list):
+        print("BAD host %s has no open_runs" % h); sys.exit(0)
+for h in ("redbaron", "ryzen7"):
+    for r in hosts[h]["open_runs"]:
+        if isinstance(r, dict) and r.get("slug") == slug:
+            print("OPEN %s %s %s" % (r.get("id"), h, r.get("stage") or "-")); sys.exit(0)
+print("NONE " + src)
+' "$1" "$src" "$FLEET_STATUS_MAX_AGE" <<<"$body"
 }
 
 prd_file() {
@@ -75,25 +98,18 @@ run_main() {
   local file
   file="$(prd_file "$slug")" || { echo "dream-amend: no PRD-$slug.md under $PRD_DIR/{build-queue,parked,built-prds}" >&2; return 1; }
 
-  local h out rc open_id="none" open_host="-" open_stage="-" unverified=""
-  for h in $HOSTS; do
-    out="$(runs_on "$h")"; rc=$?
-    if [ "$rc" -ne 0 ] || ! grep -q '^runs:' <<<"$out"; then
-      [ "$h" = "local" ] && [ "$rc" -eq 3 ] && continue   # carbon without a daemon: not a host to verify
-      unverified="$unverified $h"; continue
-    fi
-    local line
-    line="$(grep -E "^r[0-9]+ ${slug} " <<<"$out" | head -1)"
-    if [ -n "$line" ]; then
-      open_id="$(awk '{print substr($1,2)}' <<<"$line")"; open_host="$h"; open_stage="$(awk '{print $3}' <<<"$line")"
-      break
-    fi
-  done
-  echo "open-run: $open_id host=$open_host stage=$open_stage   (read: wm-build runs @${HOSTS// /,}${unverified:+; unverified:${unverified}})"
-  if [ "$open_id" != "none" ]; then
-    echo "REFUSED: run $open_id is open on $open_host ($open_stage): cordon then redrive --from inner after the amend, or draft a successor"
-    return 2
-  fi
+  local res kind open_id open_host open_stage rest
+  res="$(open_run_of "$slug")"
+  kind="${res%% *}"; rest="${res#* }"
+  case "$kind" in
+    OPEN)
+      read -r open_id open_host open_stage <<<"$rest"
+      echo "open-run: $open_id host=$open_host stage=$open_stage   (read: fleet-dash status.json)"
+      echo "REFUSED: run $open_id is open on $open_host ($open_stage): cordon then redrive --from inner after the amend, or draft a successor"
+      return 2 ;;
+    NONE) echo "open-run: none host=- stage=-   (read: $rest)" ;;
+    *)    echo "REFUSED: fleet status unreadable or stale ($rest); no wm-build fallback"; return 2 ;;
+  esac
 
   local status disp
   status="$(python3 - "$file" <<'PY'
@@ -110,7 +126,7 @@ DISPATCH_HEAD = re.compile(
     r"direct-build dispatched|build (tick|dispatch)|tick \(|resume-check|verify-(blocker|unchanged)|"
     r"reverify|[\w-]+ \(own-claim|building \(|claimed by|requeued|gate-(retry|recheck|red|then-land)|landed\b|r\d+\b|needs_classification)",
     re.I)
-DISPATCH_ANY = re.compile(r"run \d+ dispatched|dispatched (to|on) |wm-build run|admitted by|run=\d+ \w+ code cause=", re.I)
+DISPATCH_ANY = re.compile(r"run \d+ dispatched|dispatched (to|on) |wm-build[ ]run|admitted by|run=\d+ \w+ code cause=", re.I)
 for ln in lines:
     if ln.strip().startswith("```"):
         fence = not fence; continue
@@ -168,22 +184,28 @@ selftest() {
   printf '# PRD\n\n- Status: queued\n- iter_log: 2026-10-01T07:45Z Direct-build dispatched by the operator\n' > "$t/prds/build-queue/PRD-q-direct.md"
   printf '# PRD\n\n- Status: queued\n- iter_log: 2026-10-20T10:00Z operator note (Joe via carbon session) — reworded AC 3\n' > "$t/prds/build-queue/PRD-q-note.md"
   printf '# PRD\n\nStatus: queued\n' > "$t/prds/build-queue/PRD-bare.md"
-  printf '#!/usr/bin/env bash\ncat <<X\nruns: 2 total\nr77 b-open inner 10m box=- tokens=0\nr78 other land 3m\nX\n' > "$t/wb"
-  printf '#!/usr/bin/env bash\necho "runs: 0 total"; echo "runs: none in flight"\n' > "$t/wb-empty"
-  printf '#!/usr/bin/env bash\nshift; h="$1"; shift\nif [ "$h" = down ]; then exit 255; fi\nif [ "$h" = rb ]; then cat <<X\nruns: 1 total\nr90 q-clean inner 5m\nX\nelse echo "runs: 0 total"; fi\n' > "$t/ssh"
+  now="$(date +%s)"
+  mk() { printf '{"ts": %s, "hosts": {"redbaron": {"open_runs": %s}, "ryzen7": {"open_runs": %s}}}\n' "$1" "$2" "$3" > "$4"; }
+  mk "$now" '[{"id": 77, "slug": "b-open", "stage": "inner"}]' '[]' "$t/st-match"
+  mk "$now" '[{"id": 90, "slug": "q-clean", "stage": "inner"}]' '[]' "$t/st-match-rb"
+  mk "$now" '[]' '[{"id": 91, "slug": "b-open", "stage": "land"}]' "$t/st-match-r7"
+  mk "$now" '[{"id": 78, "slug": "other", "stage": "land"}]' '[]' "$t/st-nomatch"
+  mk "$((now-9999))" '[]' '[]' "$t/st-stale"
+  printf '{"ts": %s, "hosts": {' "$now" > "$t/st-bad"
+  printf '{"ts": %s}\n' "$now" > "$t/st-nohosts"
   printf '#!/usr/bin/env bash\necho allow\n' > "$t/gate-allow"
-  chmod +x "$t/wb" "$t/wb-empty" "$t/ssh" "$t/gate-allow"
-  export PRD_DIR="$t/prds" DREAM_AMEND_ASSUME_LOCAL_CONFIG=1 DREAM_AMEND_SSH="$t/ssh x"
+  chmod +x "$t/gate-allow"
+  export PRD_DIR="$t/prds"
   PRD_DIR="$t/prds"
   ck() { # $1=label $2=want-rc $3=pattern ; env set by caller via vars; $4.. args
     total=$((total+1))
     out="$(run_main "${@:4}" 2>&1)"; rc=$?
     if [ "$rc" -eq "$2" ] && grep -q -- "$3" <<<"$out"; then echo "ok: $1"; else echo "FAIL: $1 exit=$rc want $2 /$3/ :: $out"; fails=$((fails+1)); fi
   }
-  HOSTS="local"; WB="$t/wb"
+  FLEET_STATUS="$t/st-match"
   ck "open run -> refused, names the cordon/successor path" 2 "cordon then redrive --from inner after the amend, or draft a successor" b-open keys
-  ck "open run line names id/host/stage" 2 "open-run: 77 host=local stage=inner" b-open keys
-  WB="$t/wb-empty"
+  ck "open run line names id/host/stage" 2 "open-run: 77 host=redbaron stage=inner" b-open keys
+  FLEET_STATUS="$t/st-nomatch"
   # the real gate (when installed) decides; the fixtures below also hold under the fallback
   GATE="$t/none"
   ck "queued, no dispatch iter_log -> allow (names the read)" 0 "read: .*PRD-q-clean.md" q-clean Falsifier
@@ -228,12 +250,19 @@ selftest() {
     ck "(i) queued PRD in parked/, no log + Superseded-by,Status -> unchanged (status=queued dispatch-iter_log=no, allow)" 0 "^status=queued dispatch-iter_log=no
 ^allow" p-queued Superseded-by,Status
   fi
-  # remote host: local has no daemon (skipped), rb has the run, down is unverified
-  GATE="$t/gate-allow"; WB="$t/wb-empty"
-  HOSTS="local rb"; DREAM_AMEND_SSH="$t/ssh x"; SSH="$t/ssh x"
-  ck "remote host run found -> refused with host" 2 "open-run: 90 host=rb stage=inner" q-clean Falsifier
-  HOSTS="down"; SSH="$t/ssh x"
-  ck "unreachable host -> unverified, not assumed empty" 0 "unverified: down" q-clean Falsifier
+  GATE="$t/gate-allow"
+  FLEET_STATUS="$t/st-match-r7"
+  ck "ryzen7 run found -> refused naming id and host" 2 "REFUSED: run 91 is open on ryzen7 (land)" b-open keys
+  FLEET_STATUS="$t/st-match-rb"
+  ck "redbaron run found -> refused naming id and host" 2 "REFUSED: run 90 is open on redbaron (inner)" q-clean Falsifier
+  FLEET_STATUS="$t/st-stale"
+  ck "stale ts -> fail closed" 2 "REFUSED: fleet status unreadable or stale (stale.*no wm-build fallback" q-clean Falsifier
+  FLEET_STATUS="$t/st-bad"
+  ck "malformed json -> fail closed" 2 "REFUSED: fleet status unreadable or stale (unparseable" q-clean Falsifier
+  FLEET_STATUS="$t/st-nohosts"
+  ck "missing .hosts -> fail closed" 2 "REFUSED: fleet status unreadable or stale" q-clean Falsifier
+  FLEET_STATUS="$t/absent"
+  ck "unreadable file -> fail closed" 2 "REFUSED: fleet status unreadable or stale (cannot read" q-clean Falsifier
   if [ "$fails" -ne 0 ]; then echo "SELFTEST FAILED ($fails/$total checks)"; return 1; fi
   echo "SELFTEST PASSED ($total checks)"
 }

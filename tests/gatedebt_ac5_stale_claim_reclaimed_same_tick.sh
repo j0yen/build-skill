@@ -81,6 +81,10 @@ export LANE_CLAIM="$LC"
 # (PRD-build-lane-claim-integrity, AC5) doesn't read it as unknown/
 # unreachable and skip the reclaim this test is actually about.
 export LANE_CLAIM_REACHABLE_OVERRIDE="otherlane=yes"
+# Pin the loop-tick-stale watch to a unit that cannot exist: on a host that
+# runs the real claude-build.timer (RedBaron) the invariants pass would add
+# a second, unrelated loop-tick-stale alarm and break the exact count below.
+export LOOP_TICK_STALE_TIMER="gatedebt-fixture-no-such.timer"
 : > "$JOURNAL"
 
 out="$("$MI" --prd-dir "$ROOT/clone" --format json)"; rc=$?

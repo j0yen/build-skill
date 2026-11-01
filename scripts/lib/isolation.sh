@@ -107,6 +107,7 @@ isolation_apply() {
   export BURST_LANE_STATE_DIR="$BUILD_TEST_ROOT/state/burst-lane"
   export GATE_WEDGE_STATE_DIR="$BUILD_TEST_ROOT/state/gate-wedge"
   export GATE_BURST_STATE_DIR="$BUILD_TEST_ROOT/state/gate-burst"
+  export CARGO_BUDGET_STATE_DIR="$BUILD_TEST_ROOT/state/cargo-budget"
   export PRD_DIR="$HOME/Documents/PRDs"
 
   # select-tick.sh's BUILD_SUBAGENT_LIMIT (PRD-build-tick-under-dispatch-

@@ -22,10 +22,10 @@ step — see §8). Do NOT re-acquire it: a `flock -n` from your shell is a child
 of the holder and fails by design; that failure is not a foreign holder.
 Verify instead with `fuser <lock>` — if every holder pid is in your own
 ancestor chain (walk `ps -o ppid= -p <pid>` upward from `$$`), proceed. Only
-when a holder is NOT your ancestor: log `prd-lock-held` and exit. (Hotfix
-2026-09-18 11:58Z, operator: the dispatch.sh wrapper plus this section made
-every branch skip itself; PRD-build-programmatic-dispatch owns the permanent
-wording and a test.) See history.md#lock-holder.
+when a holder is NOT your ancestor: log `prd-lock-held` and exit. (Hotfix:
+the dispatch.sh wrapper plus this section made every branch skip itself;
+PRD-build-programmatic-dispatch owns the permanent wording and a test.)
+See history.md#lock-holder.
 
 ## 2. Worktree isolation
 
@@ -159,7 +159,7 @@ once more in the same dispatch. See history.md#in-tick-chaining.
 
 A Bash tool call that runs past ~120 s is auto-backgrounded by the harness,
 and in `claude -p` ending your turn ends the process — nothing "picks it
-back up". (2026-09-18 14:50Z build-reviewer-agent-auth-contract: 10m39s,
+back up". (build-reviewer-agent-auth-contract: 10m39s,
 last output "Waiting for the background selftest to finish — I'll pick this
 back up automatically", exit 0, no journal line, R9 left uncommitted.) So:
 run any selftest, gate or build that may exceed ~100 s with stdout/stderr

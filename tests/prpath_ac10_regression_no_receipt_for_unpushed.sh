@@ -124,7 +124,7 @@ prpath_expect "AC10: 3 landing records exist" \
 # gotcha prpath_ac6's own test file already documents for JSON).
 EXTEND_GATE_SRC="$PRPATH_HERE/scripts/extend-gate.sh"
 block_file="$ROOT/pvb-main-scope-block.txt"
-awk '/elif \( cd "\$repo" && autobuilder ci-checks/{exit} /if \[ "\$\(push_via_branch_for/{flag=1} flag{print}' \
+awk '/elif \( cd "\$repo" && autobuilder ci-checks/{exit} /if .*\[ "\$\(push_via_branch_for/{flag=1} flag{print}' \
   "$EXTEND_GATE_SRC" > "$block_file"
 prpath_expect "AC10: extend-gate.sh's push_via_branch main-scope block was found (non-empty)" "[ -s \"$block_file\" ]"
 prpath_expect "AC10: that block never runs 'git push'" "! grep -q 'git push' \"$block_file\""

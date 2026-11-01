@@ -527,3 +527,15 @@ Directive 15 ("Host contract") added to `docs/branch-contract.md`
 (requirement 6, P1): a branch agent that hits a host fault mid-dispatch
 runs `host-contract.sh check` itself, reports `host-drift:<key>`, and
 stops `needs-user` — never patches the caller that tripped over it.
+
+## lock-holder-hotfix — 2026-09-18 11:58Z, operator
+
+Dates moved out of branch-contract.md §1 (lock-holder paragraph): hotfix at
+2026-09-18 11:58Z by the operator, after the dispatch.sh wrapper plus that
+section made every branch skip itself.
+
+## long-running-commands-incident — 2026-09-18 14:50Z, build-reviewer-agent-auth-contract
+
+Dates moved out of branch-contract.md §7a: the 10m39s run ended with "Waiting
+for the background selftest to finish", exit 0, no journal line, R9 left
+uncommitted.
