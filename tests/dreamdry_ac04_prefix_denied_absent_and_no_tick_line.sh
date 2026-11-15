@@ -48,12 +48,13 @@ dd_answer dreamdry-p "STDERR:wm-build: config parse error at line 3"
 dd_run --prd-dir "$DD_T/dest" "$DD_T/drafts/PRD-dreamdry-p.md"
 dd_expect_line dreamdry-p "admit-would: dreamdry-p unknown — explain: wm-build: config parse error at line 3 claims=unknown open-runs=unknown" "R1(c) no tick-would line, first stderr line"
 dd_expect_rc 4 "R1(c) stderr"
-# edge: a hung explain is cut at the timeout (10 s default; DREAM_DRYRUN_EXPLAIN_TIMEOUT for the test)
+# edge: a hung explain under the OPTIONAL caller-selected diagnostic deadline (no default deadline:
+# A1710 timeout amendment; the no-default behaviour is dreamdry_ac04_no_default_explain_deadline.sh)
 dd_answer dreamdry-p "SLEEP:30"
 s0=$(date +%s)
 DREAM_DRYRUN_EXPLAIN_TIMEOUT=1 dd_run --prd-dir "$DD_T/dest" "$DD_T/drafts/PRD-dreamdry-p.md"
 el=$(( $(date +%s) - s0 ))
-dd_expect_line dreamdry-p "admit-would: dreamdry-p unknown — explain: timeout claims=unknown open-runs=unknown" "edge hung explain"
+dd_expect_line dreamdry-p "admit-would: dreamdry-p unknown — explain: diagnostic-timeout 1s claims=unknown open-runs=unknown" "edge hung explain, diagnostic deadline"
 dd_expect_rc 4 "edge hung explain"
 [ "$el" -lt 15 ] && dd_ok "edge hung explain: returned after ${el}s (no wait on the 30 s child)" || dd_fail "edge hung explain took ${el}s"
 sp="$(cat "$FAKE_WB_LOG.sleep-pid" 2>/dev/null)"

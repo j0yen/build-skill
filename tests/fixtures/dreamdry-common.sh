@@ -64,7 +64,20 @@ case "${1:-}" in
     [ -f "$pd/build-queue/PRD-$slug.md" ] || { echo "wm-build: no PRD found for slug \"$slug\"" >&2; exit 1; }
     ans="$(awk -F'\t' -v s="$slug" '$1 == s { print $2 }' "$FAKE_WB_ANSWERS" | tail -1)"
     [ -n "$ans" ] || ans="tick-would: admit"
+    code=0
     case "$ans" in STDERR:*) echo "${ans#STDERR:}" >&2; exit 1 ;; SLEEP:*) echo "$$" > "$FAKE_WB_LOG.sleep-pid"; exec sleep "${ans#SLEEP:}" ;; esac
+    # EXIT1:<line>        print <line> but exit 1 (the exit code is never trusted)
+    # SLOW:<s>:<line>     a healthy explain that takes <s> seconds, then prints <line>
+    # GRANDCHILD:<line>   leave a grandchild (sleep 20) in this process group, print, exit
+    # GRANDHANG:<s>       leave a grandchild (sleep 20) in this process group, then hang <s> s
+    # SETSID:<line>       leave a setsid grandchild (sleep 8) holding stdout, print, exit
+    case "$ans" in
+      EXIT1:*) ans="${ans#EXIT1:}"; code=1 ;;
+      SLOW:*) rest="${ans#SLOW:}"; sleep "${rest%%:*}"; ans="${rest#*:}" ;;
+      GRANDCHILD:*) ans="${ans#GRANDCHILD:}"; sleep 20 >/dev/null 2>&1 & echo "$!" > "$FAKE_WB_LOG.grandchild-pid" ;;
+      GRANDHANG:*) sleep 20 >/dev/null 2>&1 & echo "$!" > "$FAKE_WB_LOG.grandchild-pid"; echo "$$" > "$FAKE_WB_LOG.sleep-pid"; exec sleep "${ans#GRANDHANG:}" ;;
+      SETSID:*) ans="${ans#SETSID:}"; setsid sleep 8 & echo "$!" > "$FAKE_WB_LOG.setsid-pid" ;;
+    esac
     printf '{\n  "slug": "%s",\n  "eligible": true,\n  "checks": [\n    {\n      "name": "status",\n      "passed": true,\n      "detail": "status=queued"\n    }\n  ]\n}\n' "$slug"
     echo "last-signature: none"
     echo "config-source: file"
@@ -73,7 +86,7 @@ case "${1:-}" in
       *skip:depends-unresolved:*) d="${ans##*depends-unresolved:}"; d="${d%% *}"; echo "check: depends:$d passed=false {}" ;;
     esac
     [ "$ans" = NONE ] || echo "$ans"
-    exit 0 ;;
+    exit "$code" ;;
 esac
 echo "fake wm-build: unexpected argv: $*" >&2; exit 64
 EOS
@@ -112,6 +125,22 @@ PY
 }
 
 dd_answer() { printf '%s\t%s\n' "$1" "$2" >> "$DD_T/wb-answers"; }
+
+# dd_prd_urls <dir> <slug> <url>... — a lint-clean PRD whose Live ACs name the URLs, three
+# per AC line (each line stays under the intent-card cap)
+dd_prd_urls() {
+  local dir="$1" slug="$2" n=3 line=""; shift 2
+  dd_prd "$dir" "$slug"
+  while [ "$#" -gt 0 ]; do
+    line="$1"; shift
+    for _ in 1 2; do [ "$#" -gt 0 ] && { line="$line $1"; shift; }; done
+    printf '%s\n' "$n. P0 — Given the fixture, When the judge fetches, Then 200. (Live; evidence: \`cmd:curl -sf -o /dev/null $line\`)" >> "$dir/PRD-$slug.md"
+    n=$((n + 1))
+  done
+}
+
+# dd_alive <pid> — 0 when the pid is a live (non-zombie) process
+dd_alive() { [ -n "$1" ] && [ -d "/proc/$1" ] && ! grep -q '^State:[[:space:]]*Z' "/proc/$1/status" 2>/dev/null; }
 dd_probe()  { printf '%s %s\t%s\n' "$1" "$2" "$3" >> "$DD_T/probe-answers"; }
 
 # dd_run <args...> — runs the script; DD_OUT (stdout+stderr), DD_RC
