@@ -622,7 +622,7 @@ for g, ms in metrics.items():
         vs = json.dumps(v, sort_keys=True) if isinstance(v, dict) else str(v)
         rows.append((f"{g}.{n}", vs, windows[f"{g}.{n}"], m["source"], m.get("note", "")))
 w0 = max(len(r[0]) for r in rows); w1 = max(8, max(len(r[1]) for r in rows)); w2 = max(len(r[2]) for r in rows)
-print(f"dream-scorecard  generated {result['generated_at']}  window since {since}  host-local paths")
+print(f"dream-scorecard  generated {result['generated_at']}  window since {since}")
 for k, v in sources.items():
     if not k.endswith("_attempted"):
         print(f"  source {k:<18} {v}")
