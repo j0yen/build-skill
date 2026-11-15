@@ -2,8 +2,12 @@
 # dream-scorecard.sh — /dream hook `dream.scorecard` (Phase 0): one read-only command that
 # prints the numbers that say whether Dream got better (PRD-dream-scorecard-hook).
 #
-# Read-only: it opens every source for reading only and writes no file (the reused
-# prd-lint.sh's repo-surface cache is pointed at an uncreatable path for that call).
+# Read-only: it opens every source for reading only and writes no file. For the reused
+# prd-lint.sh it points the repo-surface cache at an uncreatable path and sets
+# PRD_LINT_NO_FETCH=1 and GIT_OPTIONAL_LOCKS=0, so prd-lint's Live-evidence referent check
+# reads each build_into's existing origin/main and never runs `git fetch`: no network, no
+# write into any live clone (the referent answer is as fresh as that clone's last fetch).
+# No elapsed-time deadline is put on the tools it reuses: a slow healthy tool is waited for.
 # Every metric is {value, source, note?}; value is a number, an object of numbers, or an
 # `na:<reason>` string:
 #   absent source              na:no-review-log | na:no-decisions-log | na:no-dream-log |
@@ -29,7 +33,11 @@
 #   pipeline sidecar seam $DREAM_PIPELINE_SIDECAR_DIR, else
 #                    ${BUILD_STATE_DIR:-${BUILD_SKILL_DIR:-<parent of scripts/>}/state}/prd-pipeline
 #                    (newest <YYYY-MM-DD>.json written by prd-pipeline.sh --json)
-# Windows: review and decisions rows by `ts` date (first 10 chars) >= --since; queued PRDs
+# Windows: review and decisions rows by the date their `ts` is written in (its first 10
+# chars) >= --since, for a `ts` that parses as an ISO-8601 timestamp (a `ts` that does not
+# parse is a schema_mismatch); the last row per slug is the latest parsed instant (offsets
+# honoured, a ts without an offset read as UTC; file order breaks a tie). Review rows whose
+# slug has no PRD file are set aside as rows_without_prd BEFORE the field check. Queued PRDs
 # by `Drafted:`; visions and parked files by mtime (local date); dream-log entries by the
 # header timestamp. The default window is the last 30 days. malformed_lines and the
 # pipeline sidecar fields are not windowed.
@@ -73,6 +81,8 @@ REPO = os.path.dirname(os.path.dirname(SELF))
 PRD_LINT = os.path.join(REPO, "scripts", "prd-lint.sh")
 MAX_BYTES = 50 * 1024 * 1024
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+TS_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2})(?::(\d{2})(?:[.,](\d{1,9}))?)?)?"
+                   r"(Z|z|[+-]\d{2}(?::?\d{2})?)?$")
 USAGE = "usage: dream-scorecard.sh [--json] [--since <YYYY-MM-DD>] [--prd-dir <dir>] [--check <metric path>]"
 
 
@@ -80,6 +90,31 @@ def usage(msg):
     print(f"dream-scorecard: {msg}", file=sys.stderr)
     print(USAGE, file=sys.stderr)
     sys.exit(2)
+
+
+def parse_ts(s):
+    """(written date, epoch seconds) for an ISO-8601 timestamp string, else None.
+    A timestamp without an offset is read as UTC."""
+    if not isinstance(s, str):
+        return None
+    m = TS_RE.match(s.strip())
+    if not m:
+        return None
+    y, mo, d, hh, mi, ss, frac, off = m.groups()
+    try:
+        dt = datetime.datetime(int(y), int(mo), int(d), int(hh or 0), int(mi or 0), int(ss or 0),
+                               int((frac or "0")[:6].ljust(6, "0")), tzinfo=datetime.timezone.utc)
+    except ValueError:
+        return None
+    shift = 0
+    if off and off not in ("Z", "z"):
+        sign = -1 if off[0] == "-" else 1
+        digits = off[1:].replace(":", "")
+        hours, mins = int(digits[:2]), int(digits[2:4] or 0)
+        if hours > 23 or mins > 59:
+            return None
+        shift = sign * (hours * 3600 + mins * 60)
+    return s.strip()[:10], dt.timestamp() - shift
 
 
 def valid_day(s):
@@ -101,7 +136,7 @@ while i < len(argv):
     if a == "--json":
         as_json = True
     elif a in ("--since", "--prd-dir", "--check"):
-        if i + 1 >= len(argv) or argv[i + 1] == "":
+        if i + 1 >= len(argv) or (argv[i + 1] == "" and a != "--check"):
             usage(f"{a} needs a value")
         v = argv[i + 1]; i += 1
         if a == "--since": since = v
@@ -169,30 +204,37 @@ def jsonl(text):
     return rows, bad
 
 
-def window_rows(rows, required):
-    """Split parsed rows into (good rows in window, schema_mismatch count, all_missing set).
-    A row with no valid `ts` cannot be windowed: it is a candidate and a mismatch. A field
-    is all-missing when every candidate row (in window or ts-less) lacks it; `ts` is
-    all-missing when no row in the file carries a valid one."""
-    good, mismatch, cand = [], 0, 0
+def window_rows(rows, required, keep_field=None, keep=None):
+    """Split parsed rows into (good, schema_mismatch count, all_missing set, excluded count).
+    good = [(epoch, file index, row)] for rows in the window carrying every required field.
+    A row whose `ts` does not parse cannot be windowed: it is a candidate and a mismatch.
+    When keep_field/keep are given, a row carrying keep_field for which keep(row) is false
+    is set aside (excluded) BEFORE the field check: it takes part in no mismatch count and
+    no all-missing decision. A field is all-missing when every candidate row lacks it (for
+    keep_field, only when no row was set aside); `ts` is all-missing when no row in the
+    file carries a parsable one."""
+    good, mismatch, cand, excluded = [], 0, 0, 0
     lacking = collections.Counter()
-    any_ts = any(valid_day(r.get("ts")) for r in rows)
-    for r in rows:
-        d = valid_day(r.get("ts"))
-        if d is not None and d < since:
+    any_ts = any(parse_ts(r.get("ts")) for r in rows)
+    for idx, r in enumerate(rows):
+        p = parse_ts(r.get("ts")) if "ts" in r else None
+        if p is not None and p[0] < since:
+            continue
+        if keep_field is not None and keep_field in r and not keep(r):
+            excluded += 1
             continue
         cand += 1
-        miss = [f for f in required if f not in r or (f == "ts" and d is None)]
+        miss = [f for f in required if f not in r or (f == "ts" and p is None)]
         for f in miss:
             lacking[f] += 1
         if miss:
             mismatch += 1
             continue
-        good.append(r)
-    all_missing = {f for f in required if cand and lacking[f] == cand}
+        good.append((p[1], idx, r))
+    all_missing = {f for f in required if cand and lacking[f] == cand and not (f == keep_field and excluded)}
     if not any_ts and rows:
         all_missing.add("ts")
-    return good, mismatch, all_missing
+    return good, mismatch, all_missing, excluded
 
 
 def first_mismatch(needs, all_missing):
@@ -238,7 +280,8 @@ R_NOTES = {
     "no_verdict_pushed": "rows with outcome pushed and no verdict",
     "rounds_max_per_slug": "most rows for one slug",
     "malformed_lines": "lines that do not parse as a JSON object (whole file)",
-    "schema_mismatch": "rows lacking ts, slug, outcome or verdict; excluded from every count",
+    "schema_mismatch": "rows with a PRD (or no slug) lacking ts, slug, outcome or verdict, or whose ts does not "
+                       "parse; excluded from every count",
     "rows_without_prd": "rows whose slug has no PRD-<slug>.md in build-queue/, built-prds/ or parked/ "
                         "(mostly persist-selftest fixture slugs); excluded from every other count",
 }
@@ -249,16 +292,12 @@ if na:
         put("review", name, na, review_path)
 else:
     rows, bad = jsonl(text)
-    good, mismatch, all_missing = window_rows(rows, ("ts", "slug", "outcome", "verdict"))
-    counted, without = [], 0
-    for r in good:
-        if r.get("slug") in prd_slugs:
-            counted.append(r)
-        else:
-            without += 1
+    good, mismatch, all_missing, without = window_rows(
+        rows, ("ts", "slug", "outcome", "verdict"), keep_field="slug", keep=lambda r: r["slug"] in prd_slugs)
+    counted = [r for _, _, r in good]
     last = {}
     per_slug = collections.Counter()
-    for idx, r in sorted(enumerate(counted), key=lambda t: (str(t[1].get("ts")), t[0])):
+    for _, _, r in sorted(good, key=lambda t: (t[0], t[1])):   # parsed instant, then file order
         last[r["slug"]] = r
         per_slug[r["slug"]] += 1
     verdict = lambda r: str(r.get("verdict") or "").strip().upper()
@@ -304,7 +343,8 @@ if na:
         put("routing", name, na, decisions_path)
 else:
     rows, bad = jsonl(text)
-    good, mismatch, all_missing = window_rows(rows, ("ts", "decision", "skill", "task_id", "route"))
+    good, mismatch, all_missing, _ = window_rows(rows, ("ts", "decision", "skill", "task_id", "route"))
+    good = [r for _, _, r in good]
     by_route = collections.Counter()
     dream_tasks = set()
     for r in good:
@@ -393,9 +433,11 @@ else:
         else:
             env = dict(os.environ)
             env["PRD_LINT_CACHE"] = "/dev/null/dream-scorecard-writes-nothing"   # uncreatable: the surface cache is never written
+            env["PRD_LINT_NO_FETCH"] = "1"      # the referent check reads origin/main as fetched: no network, no live-clone write
+            env["GIT_OPTIONAL_LOCKS"] = "0"     # git reads take no optional lock (no index refresh write)
             try:
                 r = subprocess.run(["bash", PRD_LINT, bq, "--format", "pass-fail"], stdin=subprocess.DEVNULL,
-                                   capture_output=True, text=True, timeout=600, env=env)
+                                   capture_output=True, text=True, env=env)
                 rc, lout = r.returncode, r.stdout
             except (OSError, subprocess.SubprocessError) as e:
                 rc, lout = -1, ""
@@ -497,7 +539,7 @@ else:
         for ts in entries:
             try:
                 r = subprocess.run([lint, log, "--entry", ts, "--json", "--prd-dir", prd_dir],
-                                   stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=120)
+                                   stdin=subprocess.DEVNULL, capture_output=True, text=True)
                 rc = r.returncode
             except (OSError, subprocess.SubprocessError):
                 rc = None
@@ -523,7 +565,7 @@ else:
                 errs += 1
         extra = []
         if errs:
-            extra.append(f"{errs} entr{'y' if errs == 1 else 'ies'} where the lint exited other than 0/1/2 or timed out (in no bucket)")
+            extra.append(f"{errs} entr{'y' if errs == 1 else 'ies'} where the lint exited other than 0/1/2 or could not run (in no bucket)")
         if unparsed:
             extra.append(f"{unparsed} exit-0/1 output(s) without a parsable analysis object")
         if other_kinds:
