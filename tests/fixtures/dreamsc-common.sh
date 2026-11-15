@@ -106,9 +106,19 @@ sc_writes() {
   local tr="$SC_T/strace.$$.log"
   strace -f -qq -e trace=open,openat,creat,rename,renameat,renameat2,unlink,unlinkat,mkdir,mkdirat,truncate,ftruncate,utimensat,link,linkat,symlink,symlinkat -o "$tr" \
     bash "$SC_SCRIPT" "$@" >/dev/null 2>&1
-  grep -vE '= -1 ' "$tr" \
+  local w; w="$(grep -vE '= -1 ' "$tr" \
     | grep -E 'O_WRONLY|O_RDWR|O_CREAT|O_TRUNC|creat\(|rename|unlink|mkdir|truncate|utimensat|link\(|linkat\(|symlink' \
-    | grep -vE '"/dev/null"' || true
+    | grep -vE '"/dev/null"' || true)"
+  # One allowed exception, reported by name in out/report.md: bash's own here-document
+  # temp file (`sh-thd.*` in TMPDIR) that a reused bash+python script (prd-lint.sh) creates
+  # for a heredoc larger than a pipe, PROVIDED bash unlinks it again in the same run.
+  local p
+  for p in $(grep -oE '"[^"]*/sh-thd\.[A-Za-z0-9]+"' <<<"$w" | sort -u | tr -d '"'); do
+    if grep -qE "unlink(at)?\(.*\"$p\"" <<<"$w"; then
+      w="$(grep -vF "\"$p\"" <<<"$w" || true)"
+    fi
+  done
+  printf '%s' "$w"
   rm -f "$tr"
 }
 
