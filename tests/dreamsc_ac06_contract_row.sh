@@ -3,7 +3,8 @@
 # `## Dream hooks` table names scripts/dream-scorecard.sh for dream.scorecard with args
 # `--json [--since <date>]` and phase `Phase 0`, and dream-contract-drift-selftest.sh exits 0.
 set -uo pipefail
-source "$(dirname "$0")/fixtures/dreamsc-common.sh"
+HERE="$(cd "$(dirname "$0")" && pwd)"
+source "$HERE/fixtures/dreamsc-common.sh"
 row="$(python3 -I - "$SC_REPO/build-contract.md" <<'PY'
 import re, sys
 sec = ""

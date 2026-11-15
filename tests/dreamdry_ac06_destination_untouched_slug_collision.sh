@@ -5,7 +5,8 @@
 # batch file whose slug equals a destination built-prds/ slug reads `ineligible —
 # lint: slug-not-unique`, which a lint run in the file's own home does not report.
 set -uo pipefail
-source "$(dirname "$0")/fixtures/dreamdry-common.sh"
+HERE="$(cd "$(dirname "$0")" && pwd)"
+source "$HERE/fixtures/dreamdry-common.sh"
 dd_setup
 dd_prd "$DD_T/dest/built-prds" dreamdry-old
 # a DIFFERENT, earlier PRD that holds the slug (prd-lint tolerates an identical title+Drafted copy as "in transit")

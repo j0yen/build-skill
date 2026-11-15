@@ -17,12 +17,25 @@ SC_SCRIPT="$SC_REPO/scripts/dream-scorecard.sh"
 SC_FIXTURE_PRD="$SC_TESTS/dreamdry_fixture/PRD-dreamdry-fixture.md"
 SC_FAILS=0
 
+# The repo's isolation prelude (scripts/lib/isolation.sh selftest_init): BUILD_TEST=1, a
+# per-run BUILD_TEST_ROOT, HOME/journal/state redirected, BUILD_TEST_REAL_HOME kept for
+# read-only real-clone reads (dream-contract-drift-selftest.sh). A root minted here is
+# removed on exit; one inherited from run-selftests.sh is left to it.
+SC_OWN_ROOT=0; [ -n "${BUILD_TEST_ROOT:-}" ] || SC_OWN_ROOT=1
+# shellcheck source=../../scripts/lib/isolation.sh
+source "$SC_REPO/scripts/lib/isolation.sh"
+_real_home="${BUILD_TEST_REAL_HOME:-$HOME}"   # outermost real HOME: a nested isolation_apply would re-point it at the runner's fixture HOME
+selftest_init || { echo "FAIL isolation prelude (selftest_init) failed"; exit 1; }
+export BUILD_TEST_REAL_HOME="$_real_home"
+sc_root_cleanup() { [ "$SC_OWN_ROOT" = 1 ] && rm -rf "$BUILD_TEST_ROOT"; return 0; }
+trap sc_root_cleanup EXIT
+
 sc_ok()   { echo "ok   $*"; }
 sc_fail() { echo "FAIL $*"; SC_FAILS=$((SC_FAILS + 1)); }
 
 sc_setup() {
   SC_T="$(mktemp -d)"
-  trap 'chmod -R u+rwX "$SC_T" 2>/dev/null; rm -rf "$SC_T"' EXIT
+  trap 'chmod -R u+rwX "$SC_T" 2>/dev/null; rm -rf "$SC_T"; sc_root_cleanup' EXIT
   mkdir -p "$SC_T/home" "$SC_T/prds/build-queue" "$SC_T/prds/built-prds" "$SC_T/prds/parked" \
            "$SC_T/prds/visions" "$SC_T/prds/notes" "$SC_T/state" "$SC_T/bin" "$SC_T/sidecar" \
            "$SC_T/empty-state" "$SC_T/noskill"

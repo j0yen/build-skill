@@ -4,7 +4,8 @@
 # head-not-allowed`, exit 4; the prober printing an error -> `unknown — url: <url>
 # <error>`; a loopback URL is never passed to the prober.
 set -uo pipefail
-source "$(dirname "$0")/fixtures/dreamdry-common.sh"
+HERE="$(cd "$(dirname "$0")" && pwd)"
+source "$HERE/fixtures/dreamdry-common.sh"
 dd_setup
 u1="https://dreamdry.example.com/head-refused.csv"
 dd_prd "$DD_T/drafts" dreamdry-u405 "" "3. P0 — Given the fixture, When the judge fetches, Then 200. (Live; evidence: \`cmd:curl -sf -o /dev/null $u1\`)"

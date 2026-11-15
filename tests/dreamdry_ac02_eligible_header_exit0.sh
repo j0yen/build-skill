@@ -4,7 +4,8 @@
 # and the fake's --version, then `admit-would: <slug> eligible claims=unknown
 # open-runs=unknown`, exit 0. Also: explain and wm-build lint read the STAGED corpus.
 set -uo pipefail
-source "$(dirname "$0")/fixtures/dreamdry-common.sh"
+HERE="$(cd "$(dirname "$0")" && pwd)"
+source "$HERE/fixtures/dreamdry-common.sh"
 dd_setup
 dd_prd "$DD_T/drafts" dreamdry-a
 dd_run --prd-dir "$DD_T/dest" "$DD_T/drafts/PRD-dreamdry-a.md"

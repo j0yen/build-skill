@@ -6,7 +6,8 @@
 # leaked into ryzen7's real review log (slugs ok-one, bad-two, new-three), plus one row
 # for a PRD that was renamed away.
 set -uo pipefail
-source "$(dirname "$0")/fixtures/dreamsc-common.sh"
+HERE="$(cd "$(dirname "$0")" && pwd)"
+source "$HERE/fixtures/dreamsc-common.sh"
 sc_setup
 sc_prd_file built-prds scx; sc_prd_file parked scy; sc_prd_file build-queue scz
 sc_review '{"ts": "2026-11-01T01:00:00Z", "host": "h", "slug": "scx", "verdict": "APPROVE", "reviewer": "fable", "mode": "warn", "batch_size": 1, "outcome": "pushed", "commit": "1111111", "warnings": []}'

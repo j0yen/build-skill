@@ -9,6 +9,7 @@
 # Exit 0 only when the header reads wm-build=<version> (never absent) and the one
 # verdict is `eligible` or `ineligible — prefix-denied@<this host>` (never unknown);
 # else 1. The script's own output is printed in full.
+# lint-journal-fixtures:tests-exempt PRD-dream-*-hook — this is AC8's live proof: the judge runs it on the build host against the REAL wm-build and corpus; isolation would hide both. It writes only its own mktemp dir and the dry run's.
 set -uo pipefail
 HERE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 REPO="$(cd "$HERE/.." && pwd)"

@@ -6,7 +6,8 @@
 # known count, each malformed_lines is 1, exit 0.
 set -uo pipefail
 REAL_HOME="$HOME"
-source "$(dirname "$0")/fixtures/dreamsc-common.sh"
+HERE="$(cd "$(dirname "$0")" && pwd)"
+source "$HERE/fixtures/dreamsc-common.sh"
 sc_setup
 for s in sca scb scc scd sce; do sc_prd_file built-prds "$s"; done
 r() { sc_review "{\"ts\": \"$1\", \"host\": \"h\", \"slug\": \"$2\", \"verdict\": $3, \"reviewer\": null, \"mode\": \"warn\", \"batch_size\": 1, \"outcome\": \"$4\", \"commit\": \"abc1234\", \"warnings\": []}"; }

@@ -5,7 +5,8 @@
 # a file absent from the batch and the destination, Then `ineligible — lint:
 # depends-on-missing`, explain and the prober are not called, exit 3.
 set -uo pipefail
-source "$(dirname "$0")/fixtures/dreamdry-common.sh"
+HERE="$(cd "$(dirname "$0")" && pwd)"
+source "$HERE/fixtures/dreamdry-common.sh"
 dd_setup
 
 url="https://dreamdry.example.com/missing.csv"

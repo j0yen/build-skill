@@ -5,7 +5,8 @@
 # header wm-build=absent, `unknown — wm-build not found`, exit 4. A fake printing no
 # tick-would line -> `unknown — explain: no tick-would line`, exit 4.
 set -uo pipefail
-source "$(dirname "$0")/fixtures/dreamdry-common.sh"
+HERE="$(cd "$(dirname "$0")" && pwd)"
+source "$HERE/fixtures/dreamdry-common.sh"
 dd_setup
 dd_prd "$DD_T/drafts" dreamdry-p
 dd_answer dreamdry-p 'tick-would: skip:prefix-denied {"reasons":["prefix-denied"]}'

@@ -7,7 +7,8 @@
 # default resolves a stub (PATH, DREAM_SKILL_DIR, ~/.claude/skills/dream), and a
 # non-executable seam reads na with the attempted path in sources.
 set -uo pipefail
-source "$(dirname "$0")/fixtures/dreamsc-common.sh"
+HERE="$(cd "$(dirname "$0")" && pwd)"
+source "$HERE/fixtures/dreamsc-common.sh"
 sc_setup
 log="$SC_T/prds/notes/dream-log.md"
 cat > "$log" <<'LOG'

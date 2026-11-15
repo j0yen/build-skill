@@ -5,7 +5,8 @@
 # 4, visions_citing_wwhtbt_page 1, visions_citing_fivewhys_page 1, parked_prd_defect 1, and
 # queued_lint_fail_by_id names the one failing id. Out-of-window files are controls.
 set -uo pipefail
-source "$(dirname "$0")/fixtures/dreamsc-common.sh"
+HERE="$(cd "$(dirname "$0")" && pwd)"
+source "$HERE/fixtures/dreamsc-common.sh"
 sc_setup
 v="$SC_T/prds/visions"
 sc_queued sc-clean

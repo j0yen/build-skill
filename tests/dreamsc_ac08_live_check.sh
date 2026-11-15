@@ -5,6 +5,7 @@
 # one object whose metrics.review.persisted_rows.value is that number or an na: string.
 # The landed-path evidence (`~/wintermute/build-skill/scripts/dream-scorecard.sh`) is the
 # judge's after land; this test runs the script of the tree it lives in.
+# lint-journal-fixtures:tests-exempt PRD-dream-*-hook — AC8's live shape reads the REAL host sources on purpose; the scorecard opens nothing for writing (R7, strace-checked in dreamsc_ac01/ac04).
 set -uo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 S="$REPO/scripts/dream-scorecard.sh"

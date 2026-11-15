@@ -5,7 +5,8 @@
 # the runs.* metrics after `entries` read na:no-run-record-lint and the pipeline.* metrics
 # na:no-pipeline-sidecar.
 set -uo pipefail
-source "$(dirname "$0")/fixtures/dreamsc-common.sh"
+HERE="$(cd "$(dirname "$0")" && pwd)"
+source "$HERE/fixtures/dreamsc-common.sh"
 sc_setup
 sc_prd_file built-prds sca
 sc_review '{"ts": "2026-11-10T01:00:00Z", "host": "h", "slug": "sca", "verdict": "APPROVE", "reviewer": "r", "mode": "warn", "batch_size": 1, "outcome": "pushed", "commit": "abc1234", "warnings": []}'

@@ -6,7 +6,8 @@
 # na:schema-mismatch:decision, never 0. Known-bad controls, plus R5: empty source reads 0,
 # unreadable reads na:unreadable, over 50 MB reads na:too-large, no python3 exits 2.
 set -uo pipefail
-source "$(dirname "$0")/fixtures/dreamsc-common.sh"
+HERE="$(cd "$(dirname "$0")" && pwd)"
+source "$HERE/fixtures/dreamsc-common.sh"
 sc_setup
 sc_prd_file built-prds sca
 real_review="$DREAM_REVIEW_LOG"

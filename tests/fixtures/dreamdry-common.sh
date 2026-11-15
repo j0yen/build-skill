@@ -22,12 +22,25 @@ DD_FIXTURE="$DD_TESTS/dreamdry_fixture/PRD-dreamdry-fixture.md"
 DD_HOST="$(hostname)"
 DD_FAILS=0
 
+# The repo's isolation prelude (scripts/lib/isolation.sh selftest_init): BUILD_TEST=1, a
+# per-run BUILD_TEST_ROOT, HOME/journal/state redirected, BUILD_TEST_REAL_HOME kept for
+# read-only real-clone reads (dream-contract-drift-selftest.sh). A root minted here is
+# removed on exit; one inherited from run-selftests.sh is left to it.
+DD_OWN_ROOT=0; [ -n "${BUILD_TEST_ROOT:-}" ] || DD_OWN_ROOT=1
+# shellcheck source=../../scripts/lib/isolation.sh
+source "$DD_REPO/scripts/lib/isolation.sh"
+_real_home="${BUILD_TEST_REAL_HOME:-$HOME}"   # outermost real HOME: a nested isolation_apply would re-point it at the runner's fixture HOME
+selftest_init || { echo "FAIL isolation prelude (selftest_init) failed"; exit 1; }
+export BUILD_TEST_REAL_HOME="$_real_home"
+dd_root_cleanup() { [ "$DD_OWN_ROOT" = 1 ] && rm -rf "$BUILD_TEST_ROOT"; return 0; }
+trap dd_root_cleanup EXIT
+
 dd_ok()   { echo "ok   $*"; }
 dd_fail() { echo "FAIL $*"; DD_FAILS=$((DD_FAILS + 1)); }
 
 dd_setup() {
   DD_T="$(mktemp -d)"
-  trap 'chmod -R u+w "$DD_T" 2>/dev/null; rm -rf "$DD_T"' EXIT
+  trap 'chmod -R u+w "$DD_T" 2>/dev/null; rm -rf "$DD_T"; dd_root_cleanup' EXIT
   mkdir -p "$DD_T/home" "$DD_T/dest/build-queue" "$DD_T/dest/built-prds" "$DD_T/dest/parked" \
            "$DD_T/dest/visions" "$DD_T/drafts/visions" "$DD_T/bin" "$DD_T/tmpd"
   cp "$DD_TESTS/dreamdry_fixture/visions/dreamdry-fixture.md" "$DD_T/drafts/visions/"

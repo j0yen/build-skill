@@ -4,7 +4,8 @@
 # `<PRD file>...` and phase `end of Phase 3, every PRD`, the script exists and is
 # executable, and dream-contract-drift-selftest.sh exits 0.
 set -uo pipefail
-source "$(dirname "$0")/fixtures/dreamdry-common.sh"
+HERE="$(cd "$(dirname "$0")" && pwd)"
+source "$HERE/fixtures/dreamdry-common.sh"
 row="$(python3 -I - "$DD_REPO/build-contract.md" <<'PY'
 import re, sys
 sec = ""

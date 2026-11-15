@@ -9,7 +9,8 @@
 # only with A in the destination built-prds/ (lint passes, A is not queued). Both
 # shapes are asserted below.
 set -uo pipefail
-source "$(dirname "$0")/fixtures/dreamdry-common.sh"
+HERE="$(cd "$(dirname "$0")" && pwd)"
+source "$HERE/fixtures/dreamdry-common.sh"
 dd_setup
 dd_prd "$DD_T/drafts" dreamdry-a
 dd_prd "$DD_T/drafts" dreamdry-b "- Depends-on: PRD-dreamdry-a.md"
