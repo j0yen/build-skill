@@ -51,7 +51,7 @@ case "${1:-}" in
     [ -f "$pd/build-queue/PRD-$slug.md" ] || { echo "wm-build: no PRD found for slug \"$slug\"" >&2; exit 1; }
     ans="$(awk -F'\t' -v s="$slug" '$1 == s { print $2 }' "$FAKE_WB_ANSWERS" | tail -1)"
     [ -n "$ans" ] || ans="tick-would: admit"
-    case "$ans" in STDERR:*) echo "${ans#STDERR:}" >&2; exit 1 ;; esac
+    case "$ans" in STDERR:*) echo "${ans#STDERR:}" >&2; exit 1 ;; SLEEP:*) echo "$$" > "$FAKE_WB_LOG.sleep-pid"; exec sleep "${ans#SLEEP:}" ;; esac
     printf '{\n  "slug": "%s",\n  "eligible": true,\n  "checks": [\n    {\n      "name": "status",\n      "passed": true,\n      "detail": "status=queued"\n    }\n  ]\n}\n' "$slug"
     echo "last-signature: none"
     echo "config-source: file"

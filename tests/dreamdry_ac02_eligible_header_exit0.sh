@@ -36,4 +36,26 @@ assert f["lint"]["exit"] == 0 and f["explain"]["tick_would"] == "admit", f
 ' "$DD_OUT" "$DD_T/bin/wm-build"; then dd_ok "R6 --json object carries the named keys"; else dd_fail "R6 --json: $DD_OUT"; fi
 dd_expect_rc 0 "R6 --json"
 dd_tmp_empty "AC2"
+
+# R3 / edge cases: usage, a destination that is not a directory, an unreadable file
+dd_run --prd-dir "$DD_T/dest"
+dd_expect_rc 2 "R3 no files: usage"
+dd_run --prd-dir "$DD_T/no-such-dir" "$DD_T/drafts/PRD-dreamdry-a.md"
+dd_expect_rc 1 "edge destination not a directory"
+grep -q "not a directory: $DD_T/no-such-dir" <<<"$DD_OUT" && dd_ok "edge destination not a directory: named" || dd_fail "edge destination message: $DD_OUT"
+if [ "$(id -u)" -ne 0 ]; then
+  dd_prd "$DD_T/drafts" dreamdry-locked; chmod 000 "$DD_T/drafts/PRD-dreamdry-locked.md"
+  dd_run --prd-dir "$DD_T/dest" "$DD_T/drafts/PRD-dreamdry-a.md" "$DD_T/drafts/PRD-dreamdry-locked.md"
+  dd_expect_line dreamdry-locked "admit-would: dreamdry-locked unknown — cannot read claims=unknown open-runs=unknown" "edge unreadable file"
+  dd_expect_line dreamdry-a "admit-would: dreamdry-a eligible claims=unknown open-runs=unknown" "edge unreadable file: the other file still answered"
+  dd_expect_rc 4 "edge unreadable file"
+  chmod 644 "$DD_T/drafts/PRD-dreamdry-locked.md"
+fi
+# R2: the temporary directory goes on a signal too (SIGTERM via coreutils timeout, mid-explain)
+dd_answer dreamdry-a "SLEEP:30"
+timeout -s TERM 2 bash "$DD_SCRIPT" --prd-dir "$DD_T/dest" "$DD_T/drafts/PRD-dreamdry-a.md" >/dev/null 2>&1
+sleep 0.5
+dd_tmp_empty "R2 SIGTERM mid-explain"
+sp="$(cat "$FAKE_WB_LOG.sleep-pid" 2>/dev/null)"
+[ -n "$sp" ] && [ ! -d "/proc/$sp" ] && dd_ok "R2 SIGTERM mid-explain: its explain child was reaped" || dd_fail "R2 SIGTERM: child pid '$sp' state: $(ls -d /proc/$sp 2>&1)"
 dd_finish

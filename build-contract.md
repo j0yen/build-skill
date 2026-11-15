@@ -367,7 +367,7 @@ parentheses has not shipped; `/dream` skips it.
 | `dream.lint` | `scripts/dream-lint.sh` | `<PRD file>...` | end of Phase 3, every PRD |
 | `dream.amend` | `scripts/dream-amend.sh` | `<slug> <comma-keys>` | before any amend |
 | `dream.persist` | `scripts/dream-persist.sh` | `[--review <file>] <PRD file>...` | Phase 4, per batch ≤ 4 |
-| `dream.dryrun` | `(stage 2)` | | |
+| `dream.dryrun` | `scripts/dream-dryrun.sh` | `<PRD file>...` | end of Phase 3, every PRD |
 | `dream.premise` | `(stage 2)` | | |
 | `dream.scorecard` | `scripts/dream-scorecard.sh` | `--json [--since <date>]` | Phase 0 |
 

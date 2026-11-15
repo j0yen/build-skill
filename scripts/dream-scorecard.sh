@@ -53,7 +53,7 @@ fi
 
 SELF="${BASH_SOURCE[0]}"
 case "${1:-}" in
-  -h|--help) sed -n '2,46p' "$SELF"; exit 0 ;;
+  -h|--help) awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$SELF"; exit 0 ;;
   --selftest)
     here="$(cd "$(dirname "$SELF")" && pwd)"; fails=0; n=0
     for t in "$here"/../tests/dreamsc_ac0[1-7]_*.sh; do

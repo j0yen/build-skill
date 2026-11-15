@@ -8,6 +8,8 @@ set -uo pipefail
 source "$(dirname "$0")/fixtures/dreamdry-common.sh"
 dd_setup
 dd_prd "$DD_T/dest/built-prds" dreamdry-old
+# a DIFFERENT, earlier PRD that holds the slug (prd-lint tolerates an identical title+Drafted copy as "in transit")
+sed -i -e 's/^# PRD — dreamdry-old:.*/# PRD — dreamdry-old: an older PRD that already holds this slug/' -e 's/^- Drafted: 2026-11-15$/- Drafted: 2026-10-01/' "$DD_T/dest/built-prds/PRD-dreamdry-old.md"
 dd_prd "$DD_T/dest/build-queue" dreamdry-queued
 dd_prd "$DD_T/dest/parked" dreamdry-parked
 printf 'parked note\n' > "$DD_T/dest/parked/notes.txt"
@@ -36,6 +38,13 @@ dd_expect_line dreamdry-old "admit-would: dreamdry-old ineligible — lint: slug
 dd_expect_rc 3 "AC6 collision"
 home_lint="$(bash "$DD_REPO/scripts/prd-lint.sh" "$DD_T/drafts/PRD-dreamdry-old.md" 2>&1)"
 if grep -q 'slug-not-unique' <<<"$home_lint"; then dd_fail "AC6 control: the home lint already reports slug-not-unique: $home_lint"; else dd_ok "AC6 control: a lint in the file's own home does not report slug-not-unique"; fi
+
+# documented boundary: an identical copy (same title and Drafted:) is prd-lint's "same PRD in transit"
+dd_prd "$DD_T/dest/built-prds" dreamdry-transit; dd_prd "$DD_T/drafts" dreamdry-transit
+dd_run --prd-dir "$DD_T/dest" "$DD_T/drafts/PRD-dreamdry-transit.md"
+grep -q '^admit-would: dreamdry-transit ineligible — lint: slug-not-unique' <<<"$DD_OUT" \
+  && dd_fail "in-transit copy refused (prd-lint's tolerance not inherited): $DD_OUT" || dd_ok "boundary: an identical in-transit copy keeps prd-lint's tolerance (the dry run adds no lint rule)"
+rm -f "$DD_T/dest/built-prds/PRD-dreamdry-transit.md"
 
 # two batch members with one slug (same file name from two homes)
 mkdir -p "$DD_T/drafts2/visions"; cp "$DD_T/drafts/visions/"* "$DD_T/drafts2/visions/"
