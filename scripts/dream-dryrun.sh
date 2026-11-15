@@ -2,35 +2,61 @@
 # dream-dryrun.sh — /dream hook `dream.dryrun` (end of Phase 3, every PRD): before persist,
 # ask the destination's own intake and admission checks, and the public URLs a PRD's Live
 # ACs or `Premise:` name, what they would say about each drafted PRD
-# (PRD-dream-dryrun-hook).
+# (PRD-dream-dryrun-hook, with the A1710 explain-lifetime amendment).
 #
-# Read-only toward the destination corpus. Steps:
+# Read-only toward the destination corpus, and toward every live clone the composed lint
+# reaches. Steps:
 #   (a) stage one temporary corpus: build-queue/ = a COPY of every given file plus
 #       symlinks to the destination's other build-queue/PRD-*.md (a given file wins over a
 #       same-named link); built-prds/ and parked/ = symlinks to the destination's
 #       directories; visions/ = copies of each given file's own home's visions (home = the
 #       parent of build-queue/|built-prds/|parked/, else the file's own directory); an
 #       empty state/. The lint and `explain` then answer about ONE corpus, the
-#       destination's view.
+#       destination's view. Two given files with one file name are both `ineligible —
+#       lint: slug-not-unique` and neither is linted or explained.
 #   (b) scripts/dream-lint.sh on each staged copy (reused), with DREAM_LINT_WM_BUILD set to a
-#       one-line wrapper running the resolved binary with `--prd-dir <tmp>`; a FAIL yields
-#       `ineligible — lint: <first failing id>` and skips (c) and the URL probe.
-#   (c) `<wm-build> explain --prd-dir <tmp> --state-dir <tmp>/state <slug>` (10 s timeout;
-#       DREAM_DRYRUN_EXPLAIN_TIMEOUT overrides: the real 0.77.112 explain took 7.1 s on
-#       ryzen7 against ~/Documents/PRDs, 11-15),
-#       parsing ONLY the `tick-would:` line — never the JSON `eligible` flag, never the exit:
+#       one-line wrapper running the resolved binary with `--prd-dir <tmp>` (named relative
+#       to the run's temporary directory, so a TMPDIR holding spaces or glob characters
+#       still works with dream-lint.sh's unquoted expansion), PRD_LINT_NO_FETCH=1 and
+#       GIT_OPTIONAL_LOCKS=0 (prd-lint's referent check reads each build_into's existing
+#       origin/main: no `git fetch`, no network, no write into a live clone; its answer is
+#       as fresh as that clone's last fetch). A FAIL yields `ineligible — lint: <first
+#       failing id>` and skips (c) and the URL probe.
+#   (c) `<wm-build> explain --prd-dir <tmp> --state-dir <tmp>/state <slug>`, waited for to
+#       completion: there is NO default deadline (A1710 amendment; a healthy real explain
+#       takes 7.8–11.6 s on a loaded build host). DREAM_DRYRUN_EXPLAIN_TIMEOUT=<seconds> is
+#       an optional caller-selected diagnostic, unset by default; when it fires the verdict
+#       is `unknown — explain: diagnostic-timeout <n>s`, never a refusal or eligibility.
+#       Only the `tick-would:` line is parsed — never the JSON `eligible` flag, never the exit:
 #         admit                          -> eligible
 #         skip:depends-unresolved:<dep>  -> waiting — … when <dep> is a batch member or a
 #                                           destination build-queue/ file, else ineligible — …
 #         skip:prefix-denied             -> ineligible — prefix-denied@<hostname>
 #         skip:<reason>                  -> ineligible — <reason>
 #         no/unparseable line            -> unknown — explain: <first stderr line | no tick-would line>
+#   Every child (lint, explain, prober) runs in a new process group the script creates;
+#   its output goes to files, so the script waits for the child itself and never for a
+#   pipe a grandchild holds. When the child exits, or the caller cancels the run
+#   (SIGTERM, SIGINT, SIGHUP), what is left of that group is killed; nothing outside it
+#   is signalled, and the temporary directory goes on every exit path.
 #   URL probe (R7), for a file not already ineligible: every distinct scheme:// URL in a Live
-#   AC's evidence or the `Premise:` value; loopback/private/non-http -> unknown — url: <url>
-#   not-public (never probed); at most 10 per file (more: unknown — url: over-limit). One HEAD
-#   (5 s, no body, no credentials, no redirects); 2xx/3xx ok; 405 -> one ranged GET decides
-#   (405 again: unknown — url: <url> head-not-allowed); other 4xx/5xx -> ineligible — url:
-#   <url> <code>; an error or timeout -> unknown — url: <url> <error>.
+#   AC's evidence or the `Premise:` value, IPv6 literals included. Never probed, each
+#   `unknown — url: <url> <why>`: a non-http(s) scheme, a loopback/private/link-local/
+#   reserved IP literal (legacy IPv4 spellings such as 127.1, 0x7f.0.0.1, 2130706433 and
+#   IPv6 forms embedding one, ::ffff:127.0.0.1, 64:ff9b::7f00:1, 2002:7f00:1::, included)
+#   or a local name (localhost, a single label, .local/.internal/…) -> not-public; userinfo
+#   in the URL -> credentials (shown as scheme://***@host…, never printed); a host that is
+#   not an IP literal or an ASCII letters-digits-hyphen name -> invalid-host. At most 10
+#   probed per file (more: unknown — url: over-limit). One HEAD (5 s, no body, no
+#   credentials, no redirects); 2xx/3xx ok (a 3xx Location is not followed or checked);
+#   405 -> one ranged GET decides (405 again: unknown — url: <url> head-not-allowed);
+#   other 4xx/5xx -> ineligible — url: <url> <code>; an error or timeout -> unknown — url:
+#   <url> <error>.
+#   Default prober trust boundary: a name is resolved first (5 s); if any answer is not a
+#   global address the URL is `not-public (resolves to <addr>)` and nothing connects; else
+#   curl is pinned to exactly the checked addresses (--resolve), so a second lookup cannot
+#   land elsewhere; curl runs with -q (no .curlrc), --noproxy '*', -g, --proto =http,https,
+#   no -L. A probe seam is trusted to do its own network handling.
 # Every line ends ` claims=unknown open-runs=unknown`: the empty state dir cannot know them.
 #
 # wm-build discovery (R8): $DREAM_DRYRUN_WM_BUILD when set (a path; non-executable or
@@ -38,16 +64,19 @@
 # $HOME/.cargo/bin/wm-build, $HOME/.local/bin/wm-build (the daemon unit's PATH order), so
 # a judge's bare `bash -c` PATH still finds it. None: header wm-build=absent and every
 # verdict that reaches (c) is `unknown — wm-build not found` (the lint half still runs).
-# URL prober seam: $DREAM_DRYRUN_URL_PROBE, a command given `<METHOD> <url>` that prints the
-# status code (default: curl -sS -I / curl -sS -r 0-0, -o /dev/null -w '%{http_code}',
-# --max-time 5, no .curlrc, no redirects).
+# The header version is the first x.y.z[-pre][+build] token of `--version`'s first line,
+# `unknown` when there is none.
+# Seams: $DREAM_DRYRUN_URL_PROBE, a command given `<METHOD> <url>` that prints the status
+# code (default: curl as above, -o /dev/null -w '%{http_code}', --max-time 5);
+# $DREAM_DRYRUN_RESOLVE, a command given `<host>` that prints one address per line (default:
+# the system resolver; used by the default prober only).
 #
 # Usage:
 #   dream-dryrun.sh [--prd-dir <destination corpus>] [--json] <PRD file>...
 #   dream-dryrun.sh --selftest        (runs tests/dreamdry_ac0[1-7]_*.sh on fixtures)
 # Destination default: $DREAM_PRD_DIR, else ~/Documents/PRDs.
-# Output: `dream-dryrun: host=<hostname> wm-build=<version|absent> prd-dir=<path>`, then one
-# `admit-would: <slug> <verdict>[ — <reason>[; <reason>…]] claims=unknown open-runs=unknown`
+# Output: `dream-dryrun: host=<hostname> wm-build=<version|absent|unknown> prd-dir=<path>`, then
+# one `admit-would: <slug> <verdict>[ — <reason>[; <reason>…]] claims=unknown open-runs=unknown`
 # per file in argument order; --json prints one object instead (R6).
 # Exit: 0 all eligible | 3 any ineligible | 4 no ineligible, any unknown | 5 only eligible
 #       and waiting, at least one waiting | 2 usage | 1 internal error or the destination
@@ -74,7 +103,8 @@ case "${1:-}" in
 esac
 
 exec python3 -I - "$SELF" "$@" <<'PY'
-import ipaddress, json, os, re, shlex, shutil, signal, subprocess, sys, tempfile, urllib.parse
+import ipaddress, json, math, os, re, shlex, shutil, signal, socket, subprocess, sys, tempfile, threading, time
+import urllib.parse
 
 SELF = os.path.realpath(sys.argv[1])
 HERE = os.path.dirname(SELF)
@@ -82,7 +112,9 @@ DREAM_LINT = os.path.join(HERE, "dream-lint.sh")
 USAGE = "usage: dream-dryrun.sh [--prd-dir <destination corpus>] [--json] <PRD file>..."
 TAIL = " claims=unknown open-runs=unknown"
 URL_LIMIT = 10
+PROBE_SECONDS = 5
 RANK = {"eligible": 0, "waiting": 1, "unknown": 2, "ineligible": 3}
+WRAPPER = "wm-build-prd-dir"
 
 
 def usage(msg):
@@ -114,6 +146,19 @@ while i < len(argv):
 if not args:
     usage("no PRD file given")
 
+# Explain lifetime (A1710 amendment): no default deadline. An optional, caller-selected
+# diagnostic deadline only when DREAM_DRYRUN_EXPLAIN_TIMEOUT is set and non-empty.
+EXPLAIN_TIMEOUT = None
+_raw = os.environ.get("DREAM_DRYRUN_EXPLAIN_TIMEOUT", "")
+if _raw != "":
+    try:
+        EXPLAIN_TIMEOUT = float(_raw)
+    except ValueError:
+        EXPLAIN_TIMEOUT = None
+    if EXPLAIN_TIMEOUT is None or not math.isfinite(EXPLAIN_TIMEOUT) or EXPLAIN_TIMEOUT <= 0:
+        usage(f"DREAM_DRYRUN_EXPLAIN_TIMEOUT must be a positive number of seconds, got {_raw!r} "
+              "(an optional diagnostic; unset means no deadline)")
+
 HOME = os.path.expanduser("~")
 dest = os.path.abspath(prd_dir or os.environ.get("DREAM_PRD_DIR") or os.path.join(HOME, "Documents", "PRDs"))
 if not os.path.isdir(dest):
@@ -134,13 +179,7 @@ else:
              os.path.join(HOME, ".local", "bin", "wm-build")]
 wb = next((c for c in cands if executable(c)), None)
 version = "absent"
-if wb:
-    try:
-        r = subprocess.run([wb, "--version"], stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=10)
-        first = (r.stdout.strip().splitlines() or [""])[0].split()
-        version = first[-1] if r.returncode == 0 and first else "unknown"
-    except (OSError, subprocess.SubprocessError):
-        version = "unknown"
+VERSION_RE = re.compile(r"(?<![\w.])(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?)(?![\w.])")
 
 
 def slug_of(path):
@@ -155,9 +194,12 @@ def home_of(path):
 
 
 # ---- URL extraction and classification (R7) ---------------------------------
-URL_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://[^\s`'\"<>()\[\]{}]+")
+URL_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://(?:\[[^\]\s`'\"<>]*\]|[^\s`'\"<>()\[\]{}])+")
 LIVE_RE = re.compile(r"\(Live;\s*evidence:\s*(.*)\)\s*$")
 PRIVATE_SUFFIX = (".localhost", ".local", ".internal", ".lan", ".home.arpa", ".ts.net")
+LABEL_RE = re.compile(r"^[a-z0-9_-]+$")
+NUMERIC_LABEL_RE = re.compile(r"^(?:0x[0-9a-f]*|[0-9]+)$")
+EMBEDS_V4 = [ipaddress.ip_network(n) for n in ("::/96", "64:ff9b::/96", "64:ff9b:1::/48")]
 
 
 def urls_of(text):
@@ -188,32 +230,123 @@ def urls_of(text):
     return out
 
 
-def not_public(url):
+def redact(url):
+    """The URL with any userinfo replaced by ***: a credential is never printed."""
+    return re.sub(r"^([A-Za-z][A-Za-z0-9+.-]*://)[^/?#]*@", r"\1***@", url)
+
+
+def ip_public(ip):
+    """A global address that embeds no non-global IPv4 (mapped, 6to4, Teredo, NAT64,
+    IPv4-compatible)."""
+    if not ip.is_global:
+        return False
+    if ip.version == 6:
+        emb = [ip.ipv4_mapped, ip.sixtofour] + list(ip.teredo or ())
+        if any(ip in n for n in EMBEDS_V4):
+            emb.append(ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF))
+        if any(e is not None and not e.is_global for e in emb):
+            return False
+    return True
+
+
+def classify(url):
+    """('probe', host, port, ip-or-None) for a URL the prober may ask, else
+    (outcome,) with outcome not-public | credentials | invalid-host."""
     try:
         parts = urllib.parse.urlsplit(url)
-        h = parts.hostname
     except ValueError:
-        return True
-    if parts.scheme.lower() not in ("http", "https") or not h:
-        return True
+        return ("invalid-host",)
+    scheme = parts.scheme.lower()
+    if scheme not in ("http", "https"):
+        return ("not-public",)
+    if "@" in parts.netloc:
+        return ("credentials",)
     try:
-        return not ipaddress.ip_address(h).is_global
+        h, port = parts.hostname, parts.port
     except ValueError:
-        pass
-    h = h.lower().rstrip(".")
-    return h == "localhost" or "." not in h or h.endswith(PRIVATE_SUFFIX)
+        return ("invalid-host",)
+    if not h:
+        return ("invalid-host",)
+    port = port or (443 if scheme == "https" else 80)
+    if parts.netloc.startswith("["):
+        try:
+            ip = ipaddress.IPv6Address(h.split("%")[0])
+        except ValueError:
+            return ("invalid-host",)
+        return ("probe", h, port, ip) if ip_public(ip) else ("not-public",)
+    name = h.rstrip(".")
+    labels = name.split(".")
+    if not name or not name.isascii() or any(not LABEL_RE.match(x) for x in labels):
+        return ("invalid-host",)
+    if NUMERIC_LABEL_RE.match(labels[-1]):
+        # an IPv4 address in any spelling the URL standard and inet_aton accept
+        try:
+            ip = ipaddress.IPv4Address(socket.inet_aton(name))
+        except OSError:
+            return ("invalid-host",)
+        return ("probe", h, port, ip) if ip_public(ip) else ("not-public",)
+    if name == "localhost" or len(labels) == 1 or ("." + name).endswith(PRIVATE_SUFFIX):
+        return ("not-public",)
+    return ("probe", h, port, None)
 
 
-def probe(method, url):
+def resolve(name, port):
+    """-> ([ip, ...], None) | (None, "resolve: <error>") within PROBE_SECONDS."""
+    seam = os.environ.get("DREAM_DRYRUN_RESOLVE", "")
+    raw = []
+    if seam:
+        try:
+            rc, out, err = run(shlex.split(seam) + [name], PROBE_SECONDS + 1)
+        except OSError as e:
+            return None, f"resolve: {e.strerror or e}"
+        if rc is None:
+            return None, "resolve: timeout"
+        raw = [x.strip() for x in out.splitlines() if x.strip()]
+        if rc != 0 or not raw:
+            return None, "resolve: " + ((err.strip().splitlines() or [""])[0].strip() or f"exit-{rc}")
+    else:
+        box = {}
+
+        def work():
+            try:
+                box["r"] = socket.getaddrinfo(name, port, type=socket.SOCK_STREAM)
+            except OSError as e:
+                box["e"] = e
+        th = threading.Thread(target=work, daemon=True)
+        th.start()
+        th.join(PROBE_SECONDS)
+        if th.is_alive():
+            return None, "resolve: timeout"
+        if "e" in box:
+            e = box["e"]
+            return None, f"resolve: {getattr(e, 'strerror', None) or e}"
+        raw = [ai[4][0] for ai in box.get("r", [])]
+        if not raw:
+            return None, "resolve: no address"
+    addrs = []
+    for a in raw:
+        try:
+            ip = ipaddress.ip_address(a.split("%")[0])
+        except ValueError:
+            return None, f"resolve: not an address: {a[:60]}"
+        if ip not in addrs:
+            addrs.append(ip)
+    return addrs, None
+
+
+def probe(method, url, pin=None):
     """-> ("code", "404") | ("error", "<text>")"""
     seam = os.environ.get("DREAM_DRYRUN_URL_PROBE", "")
     if seam:
         cmd = shlex.split(seam) + [method, url]
     else:
-        cmd = ["curl", "-q", "-sS", "--max-time", "5", "--proto", "=http,https", "-o", "/dev/null",
-               "-w", "%{http_code}"] + (["-I"] if method == "HEAD" else ["-r", "0-0"]) + ["--", url]
+        cmd = ["curl", "-q", "-sS", "-g", "--max-time", str(PROBE_SECONDS), "--proto", "=http,https",
+               "--noproxy", "*", "-o", "/dev/null", "-w", "%{http_code}"]
+        if pin:
+            cmd += ["--resolve", f"{pin[0]}:{pin[1]}:" + ",".join(f"[{a}]" if a.version == 6 else str(a) for a in pin[2])]
+        cmd += (["-I"] if method == "HEAD" else ["-r", "0-0"]) + ["--", url]
     try:
-        rc, sout, serr = run(cmd, 6)
+        rc, sout, serr = run(cmd, PROBE_SECONDS + 1)
     except OSError as e:
         return "error", f"prober: {e.strerror or e}"
     if rc is None:
@@ -264,30 +397,55 @@ def parse_checks(stdout):
     return checks
 
 
-def run(cmd, timeout, env=None):
-    """subprocess.run with a timeout that also reaps grandchildren: the child runs in its
-    own process group (created here), and only that group is killed on timeout.
-    -> (rc, stdout, stderr), rc None on timeout."""
-    p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                         text=True, env=env, start_new_session=True)
+# ---- children: own process group, output to files, scoped cleanup -----------
+def wait_exited(pid, timeout):
+    """Wait until the child has exited WITHOUT reaping it (WNOWAIT), so its process-group
+    id cannot be reused before the group is cleaned up. True when it exited; False when
+    `timeout` seconds passed first (timeout None: no deadline)."""
+    if timeout is None:
+        os.waitid(os.P_PID, pid, os.WEXITED | os.WNOWAIT)
+        return True
+    deadline = time.monotonic() + timeout
+    while True:
+        if os.waitid(os.P_PID, pid, os.WEXITED | os.WNOWAIT | os.WNOHANG) is not None:
+            return True
+        left = deadline - time.monotonic()
+        if left <= 0:
+            return False
+        time.sleep(min(0.05, left))
+
+
+def kill_group(pid):
     try:
-        out, err = p.communicate(timeout=timeout)
-        return p.returncode, out, err
-    except BaseException as e:            # timeout, or this script being stopped mid-call
+        os.killpg(pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
+def run(cmd, timeout=None, env=None, cwd=None):
+    """Run cmd in a new process group created here, stdout/stderr to unlinked files in the
+    run's temporary directory. Waits for the child itself, never for a pipe a grandchild
+    could hold. When the child exits, when `timeout` fires (only when a caller gave one),
+    or when this script is stopped mid-call, what remains of the child's own group is
+    killed; a process that left the group (setsid) is not this script's to signal.
+    -> (rc, stdout, stderr), rc None when the timeout fired."""
+    with tempfile.TemporaryFile(dir=tmp) as fo, tempfile.TemporaryFile(dir=tmp) as fe:
+        p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=fo, stderr=fe, env=env, cwd=cwd,
+                             start_new_session=True)
         try:
-            os.killpg(p.pid, signal.SIGKILL)
-        except OSError:
-            pass
-        p.communicate()
-        if isinstance(e, subprocess.TimeoutExpired):
+            exited = wait_exited(p.pid, timeout)
+        except BaseException:              # this script being stopped mid-call
+            kill_group(p.pid)
+            p.wait()
+            raise
+        kill_group(p.pid)                  # leftovers of the owned group (leader not yet reaped)
+        p.wait()
+        if not exited:
             return None, "", ""
-        raise
+        fo.seek(0); fe.seek(0)
+        return (p.returncode, fo.read().decode("utf-8", errors="replace"),
+                fe.read().decode("utf-8", errors="replace"))
 
-
-try:
-    EXPLAIN_TIMEOUT = float(os.environ.get("DREAM_DRYRUN_EXPLAIN_TIMEOUT") or 10)
-except ValueError:
-    usage("DREAM_DRYRUN_EXPLAIN_TIMEOUT must be a number of seconds")
 
 tmp = None
 
@@ -302,6 +460,13 @@ for s in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
 files = []
 try:
     tmp = tempfile.mkdtemp(prefix="dream-dryrun.")
+    if wb:
+        try:
+            vrc, vout, _ = run([wb, "--version"])
+            m = VERSION_RE.search((vout.strip().splitlines() or [""])[0]) if vrc == 0 else None
+            version = m.group(1) if m else "unknown"
+        except OSError:
+            version = "unknown"
     sbq = os.path.join(tmp, "build-queue")
     for d in ("build-queue", "visions", "state"):
         os.mkdir(os.path.join(tmp, d))
@@ -316,33 +481,34 @@ try:
         else:
             os.mkdir(os.path.join(tmp, sub))
 
-    # (a) staging: copies of the given files (a given file wins over a same-named link)
-    staged_by = {}
+    # (a) staging: copies of the given files (a given file wins over a same-named link);
+    # two given files with one name collide: both are refused, neither is linted or explained
+    readable = []
     for path in args:
         f = {"file": path, "slug": slug_of(path), "reasons": [], "lint": {"exit": None, "first_fail": None},
              "explain": {"tick_would": None, "checks": []}, "urls": [], "unknown": [], "staged": None}
         files.append(f)
         try:
             with open(path, "rb") as fh:
-                data = fh.read()
+                readable.append((f, fh.read()))
         except OSError:
             f["reasons"].append(("unknown", "cannot read"))
-            continue
-        name = os.path.basename(path)
-        if name in staged_by:
-            for g in (staged_by[name], f):
-                if not any(t == "lint: slug-not-unique" for _, t in g["reasons"]):
-                    g["reasons"].append(("ineligible", "lint: slug-not-unique"))
-                g["lint"] = {"exit": None, "first_fail": "slug-not-unique"}
+    names = {}
+    for f, _ in readable:
+        names.setdefault(os.path.basename(f["file"]), []).append(f)
+    for f, data in readable:
+        name = os.path.basename(f["file"])
+        if len(names[name]) > 1:
+            f["reasons"].append(("ineligible", "lint: slug-not-unique"))
+            f["lint"] = {"exit": None, "first_fail": "slug-not-unique"}
             continue
         target = os.path.join(sbq, name)
         if os.path.lexists(target):
             os.unlink(target)                  # removes OUR symlink in <tmp>, never its target
         with open(target, "wb") as fh:
             fh.write(data)
-        staged_by[name] = f
         f["staged"] = target
-        vdir = os.path.join(home_of(path), "visions")
+        vdir = os.path.join(home_of(f["file"]), "visions")
         if os.path.isdir(vdir):
             for vn in sorted(os.listdir(vdir)):
                 src, dst = os.path.join(vdir, vn), os.path.join(tmp, "visions", vn)
@@ -351,25 +517,22 @@ try:
     batch = {f["slug"] for f in files}
 
     env = dict(os.environ)
+    env["PRD_LINT_NO_FETCH"] = "1"         # the referent check reads origin/main as fetched: no network, no live-clone write
+    env["GIT_OPTIONAL_LOCKS"] = "0"
     if wb:
-        wrapper = os.path.join(tmp, "wm-build-prd-dir")
-        with open(wrapper, "w") as fh:
+        with open(os.path.join(tmp, WRAPPER), "w") as fh:
             fh.write(f"#!/bin/sh\nexec {shlex.quote(wb)} \"$@\" --prd-dir {shlex.quote(tmp)}\n")
-        os.chmod(wrapper, 0o700)
-        env["DREAM_LINT_WM_BUILD"] = wrapper
+        os.chmod(os.path.join(tmp, WRAPPER), 0o700)
+        env["DREAM_LINT_WM_BUILD"] = "./" + WRAPPER   # relative to cwd=tmp: no space or glob in the word
     else:
         env["DREAM_LINT_WM_BUILD"] = ""
 
     for f in files:
         if f["staged"] is None:
             continue
-        # (b) the lint hook, on the staged copy
-        lrc, lo, le = run(["bash", DREAM_LINT, f["staged"]], 300, env)
+        # (b) the lint hook, on the staged copy (no deadline)
+        lrc, lo, le = run(["bash", DREAM_LINT, f["staged"]], env=env, cwd=tmp)
         lout = lo + le
-        if lrc is None:
-            f["lint"] = {"exit": None, "first_fail": "timeout"}
-            f["reasons"].append(("unknown", "lint: timeout"))
-            continue
         f["lint"] = {"exit": lrc, "first_fail": None if lrc == 0 else first_fail(lout, lrc)}
         if lrc != 0:
             f["reasons"].append(("ineligible", f"lint: {f['lint']['first_fail']}"))
@@ -378,10 +541,13 @@ try:
         if not wb:
             f["reasons"].append(("unknown", "wm-build not found"))
         else:
-            erc, out, err = run([wb, "explain", "--prd-dir", tmp, "--state-dir", os.path.join(tmp, "state"), f["slug"]],
-                                EXPLAIN_TIMEOUT)
+            try:
+                erc, out, err = run([wb, "explain", "--prd-dir", tmp, "--state-dir", os.path.join(tmp, "state"), f["slug"]],
+                                    EXPLAIN_TIMEOUT)
+            except OSError as e:
+                erc, out, err = -1, "", f"{e.strerror or e}"
             if erc is None:
-                f["reasons"].append(("unknown", "explain: timeout"))
+                f["reasons"].append(("unknown", f"explain: diagnostic-timeout {EXPLAIN_TIMEOUT:g}s"))
             else:
                 f["explain"]["checks"] = parse_checks(out)
                 tw = [ln[len("tick-would:"):].strip() for ln in out.splitlines() if ln.startswith("tick-would:")]
@@ -411,37 +577,56 @@ try:
         except OSError:
             urls = []
         probed = 0
+        seam_probe = bool(os.environ.get("DREAM_DRYRUN_URL_PROBE", ""))
         for u in urls:
-            rec = {"url": u, "probes": [], "outcome": None}
+            shown = redact(u)
+            rec = {"url": shown, "probes": [], "outcome": None}
             f["urls"].append(rec)
-            if not_public(u):
-                rec["outcome"] = "not-public"
-                f["reasons"].append(("unknown", f"url: {u} not-public"))
+            c = classify(u)
+            if c[0] != "probe":
+                rec["outcome"] = c[0]
+                f["reasons"].append(("unknown", f"url: {shown} {c[0]}"))
                 continue
             if probed >= URL_LIMIT:
                 rec["outcome"] = "over-limit"
                 continue
             probed += 1
-            kind, val = probe("HEAD", u)
+            _, uhost, uport, uip = c
+            pin = None
+            if not seam_probe and uip is None:
+                addrs, rerr = resolve(uhost, uport)
+                if rerr:
+                    rec["outcome"] = "error"
+                    rec["probes"].append({"method": "RESOLVE", "error": rerr})
+                    f["reasons"].append(("unknown", f"url: {shown} {rerr}"))
+                    continue
+                rec["probes"].append({"method": "RESOLVE", "addresses": [str(a) for a in addrs]})
+                bad = [a for a in addrs if not ip_public(a)]
+                if bad:
+                    rec["outcome"] = "not-public"
+                    f["reasons"].append(("unknown", f"url: {shown} not-public (resolves to {bad[0]})"))
+                    continue
+                pin = (uhost, uport, addrs)
+            kind, val = probe("HEAD", u, pin)
             rec["probes"].append({"method": "HEAD", kind: val})
             if kind == "code" and val == "405":
-                kind, val = probe("GET", u)
+                kind, val = probe("GET", u, pin)
                 rec["probes"].append({"method": "GET", kind: val})
                 if kind == "code" and val == "405":
                     rec["outcome"] = "head-not-allowed"
-                    f["reasons"].append(("unknown", f"url: {u} head-not-allowed"))
+                    f["reasons"].append(("unknown", f"url: {shown} head-not-allowed"))
                     continue
             if kind == "error":
                 rec["outcome"] = "error"
-                f["reasons"].append(("unknown", f"url: {u} {val}"))
+                f["reasons"].append(("unknown", f"url: {shown} {val}"))
             elif val[0] in "23":
                 rec["outcome"] = "ok"
             elif val[0] in "45":
                 rec["outcome"] = "refused"
-                f["reasons"].append(("ineligible", f"url: {u} {val}"))
+                f["reasons"].append(("ineligible", f"url: {shown} {val}"))
             else:
                 rec["outcome"] = "unknown"
-                f["reasons"].append(("unknown", f"url: {u} {val}"))
+                f["reasons"].append(("unknown", f"url: {shown} {val}"))
         if any(r["outcome"] == "over-limit" for r in f["urls"]):
             f["reasons"].append(("unknown", "url: over-limit"))
 except SystemExit:
