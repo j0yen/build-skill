@@ -10,6 +10,8 @@ source "$HERE/fixtures/dreamsc-common.sh"
 sc_setup
 v="$SC_T/prds/visions"
 sc_queued sc-clean
+# an AC naming a command makes prd-lint run repo-surface.sh, whose cache the scorecard must keep unwritten (R7 control)
+printf '%s\n' '3. P0 — Given the fixture, When `dream-lint.sh --selftest` runs, Then it exits 0.' >> "$SC_T/prds/build-queue/PRD-sc-clean.md"
 sc_queued sc-bad "- Depends-on: PRD-sc-nowhere.md"
 sc_queued sc-old; sed -i 's/^- Drafted: 2026-11-15$/- Drafted: 2026-10-01/' "$SC_T/prds/build-queue/PRD-sc-old.md"   # out of window by Drafted:
 # the fixture vision sc_queued copied (visions/dreamdry-fixture.md) is the 4th in-window vision, no page cited
