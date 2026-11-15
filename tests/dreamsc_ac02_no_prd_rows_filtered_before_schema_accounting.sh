@@ -51,5 +51,22 @@ sc_run --json --since 2026-11-01
 sc_expect metrics.review.schema_mismatch.value 1 "slug-less row"
 sc_expect metrics.review.rows_without_prd.value 1 "slug-less row"
 sc_expect metrics.review.fix_last.value 1 "slug-less row"
+
+# every candidate row lacks slug, but rows without a PRD do carry one: slug is not
+# missing from every row, so the counts are numbers (never na:schema-mismatch:slug)
+: > "$DREAM_REVIEW_LOG"
+full 2026-11-10T01:00:00Z d1 '"FIX"'
+full 2026-11-10T02:00:00Z ok-one '"APPROVE"'
+sc_review '{"ts": "2026-11-10T03:00:00Z", "host": "h", "verdict": "APPROVE", "outcome": "pushed"}'
+sc_run --json --since 2026-11-01
+sc_expect metrics.review.rows_without_prd.value 2 "slug-less candidates beside rows without a PRD"
+sc_expect metrics.review.persisted_rows.value 0 "slug-less candidates beside rows without a PRD"
+sc_expect metrics.review.schema_mismatch.value 1 "slug-less candidates beside rows without a PRD"
+# control: when no row carries slug at all, the metrics needing it read na:schema-mismatch:slug
+: > "$DREAM_REVIEW_LOG"
+sc_review '{"ts": "2026-11-10T03:00:00Z", "host": "h", "verdict": "APPROVE", "outcome": "pushed"}'
+sc_run --json --since 2026-11-01
+sc_expect metrics.review.rows_without_prd.value '"na:schema-mismatch:slug"' "no row carries slug"
+sc_expect metrics.review.persisted_rows.value '"na:schema-mismatch:slug"' "no row carries slug"
 sc_home_untouched "R7"
 sc_finish
