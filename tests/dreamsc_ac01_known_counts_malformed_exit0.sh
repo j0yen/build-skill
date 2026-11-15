@@ -89,4 +89,5 @@ fix_after="$(find "$SC_T/prds" "$SC_T/state" "$SC_T/sidecar" -type f -printf '%p
 [ "$fix_before" = "$fix_after" ] && sc_ok "R7 fixture sources unchanged (mtime, size, sha256)" || sc_fail "R7 fixture changed"
 real_after="$(stat -c '%n %Y %s' "$REAL_HOME/.local/state/dream/review-log.jsonl" "$REAL_HOME/.local/state/skill-routing/decisions.jsonl" "$REAL_HOME/Documents/PRDs/notes/dream-log.md" 2>/dev/null)"
 [ "$real_before" = "$real_after" ] && sc_ok "R7 real sources on this host unchanged" || sc_fail "R7 real sources changed"
+sc_home_untouched "R7"
 sc_finish

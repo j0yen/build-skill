@@ -83,4 +83,5 @@ sc_run --since not-a-date
 sc_expect_rc 2 "R5 usage: bad --since"
 sc_run --bogus
 sc_expect_rc 2 "R5 usage: unknown flag"
+sc_home_untouched "R7"
 sc_finish

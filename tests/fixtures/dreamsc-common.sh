@@ -135,6 +135,13 @@ sc_writes() {
   rm -f "$tr"
 }
 
+# sc_home_untouched <label> — the private HOME holds no file: nothing the scorecard (or a
+# tool it reuses) ran wrote a cache, state or log under HOME
+sc_home_untouched() {
+  local f; f="$(find "$SC_T/home" -type f 2>/dev/null | grep -v '/\.claude/skills/' | head -5)"
+  if [ -z "$f" ]; then sc_ok "$1: the private HOME is still empty"; else sc_fail "$1: files appeared under HOME: $f"; fi
+}
+
 sc_finish() {
   if [ "$SC_FAILS" -eq 0 ]; then echo "PASS $(basename "$0")"; exit 0; fi
   echo "FAILED $(basename "$0") ($SC_FAILS)"; exit 1

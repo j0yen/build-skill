@@ -29,4 +29,5 @@ sc_expect_rc 0 "AC2"
 after="$(counts)"
 [ -n "$before" ] && [ "$before" = "$after" ] && sc_ok "AC2 the rows without a PRD changed no review.* count: $after" || sc_fail "AC2 counts moved: before $before after $after"
 sc_expect metrics.review.rows_without_prd.value 4 "AC2"
+sc_home_untouched "R7"
 sc_finish

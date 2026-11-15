@@ -51,4 +51,5 @@ if na != want: print(json.dumps(na, indent=1, sort_keys=True)); sys.exit(1)
 assert d["metrics"]["runs"]["entries"]["value"] == 1, d["metrics"]["runs"]
 assert d["sources"]["run_note_lint"] == "absent" and d["sources"]["pipeline_sidecar"] == "absent", d["sources"]
 PY
+sc_home_untouched "R7"
 sc_finish
