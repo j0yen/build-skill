@@ -80,6 +80,13 @@ cd_expect "scan (vellum path with ARCHIVE/) exits 0" "[ $rc_va -eq 0 ]"
 cut -f1 "$T.lint" | tr '\n' '\0' | xargs -0 "$CD_LINT" --print-crate-dir -- > "$CD_ROOT/reader.json" 2> "$CD_ROOT/reader.err"
 rc_reader=$?
 cd_expect "prd-lint.sh --print-crate-dir exits 0" "[ $rc_reader -eq 0 ]"
+# A path gone by the time the reader runs (a pull racing a scan) reads as no
+# crate_dir, the way parse_frontmatter reads a file it cannot open, and the
+# reader still answers for every other path.
+canon="$CD_ROOT/corpus/built-prds/PRD-f-canon-bullet.md" gone="$CD_ROOT/gone/PRD-gone.md"
+gone_out="$("$CD_LINT" --print-crate-dir -- "$canon" "$gone" 2>/dev/null)"; rc_gone=$?
+cd_expect "reader: a vanished path reads null and the others still answer (exit 0)" \
+  "[ $rc_gone -eq 0 ] && python3 -c 'import json,sys; m=json.loads(sys.argv[1]); sys.exit(0 if m[sys.argv[2]] == \"ledger-read\" and m[sys.argv[3]] is None else 1)' \"\$gone_out\" \"\$canon\" \"\$gone\" 2>/dev/null"
 
 out="$(python3 - "$T.lint" "$CD_ROOT" <<'PY'
 import json, sys
