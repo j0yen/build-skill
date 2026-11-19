@@ -252,7 +252,7 @@ JQ="${JQ:-$(command -v jq 2>/dev/null || echo /usr/bin/jq)}"
 [ -x "$JQ" ] || { echo "jq not at $JQ" >&2; exit 1; }
 
 emit_one() {
-  local path="$1" slug status_line build_auto build_target build_priority build_into build_version_bump deferred_acs deferred_ac_reasons publish test_prefix deferred_acs_unparsed operator_authorization operator_authorization_unparsed superseded_by transferred_acs transferred_acs_unparsed absorbs absorbs_unparsed foreign_surface_ok foreign_surface_reasons
+  local path="$1" slug status_line build_auto build_target build_priority build_into build_version_bump deferred_acs deferred_ac_reasons publish test_prefix deferred_acs_unparsed operator_authorization operator_authorization_unparsed superseded_by transferred_acs transferred_acs_unparsed absorbs absorbs_unparsed foreign_surface_ok foreign_surface_reasons crate_dir
   slug="$(basename "$path" .md)"
   slug="${slug#PRD-}"
 
@@ -308,6 +308,10 @@ emit_one() {
   # prd-lint.sh (foreign-surface-ok-prose / -reason-missing) is the enforcer.
   foreign_surface_ok="[]"
   foreign_surface_reasons="{}"
+  # Per PRD-build-contract-declared-crate-dir R3: the one Rust crate directory
+  # a rust-extend PRD on a Python repo declares; always a string, "" when the
+  # key is absent. prd-lint.sh (crate-dir-invalid) is the enforcer.
+  crate_dir=""
   status_line=""
   gate_stale=false
 
@@ -317,7 +321,7 @@ emit_one() {
   # the parse. First-match-wins for build_* keys so real frontmatter
   # always beats later in-doc examples.
   local in_fence=false
-  local seen_target=false seen_priority=false seen_into=false seen_bump=false seen_deferred=false seen_test_prefix=false seen_operator_authorization=false seen_superseded_by=false seen_transferred_acs=false seen_absorbs=false seen_foreign_ok=false seen_foreign_reasons=false
+  local seen_target=false seen_priority=false seen_into=false seen_bump=false seen_deferred=false seen_test_prefix=false seen_operator_authorization=false seen_superseded_by=false seen_transferred_acs=false seen_absorbs=false seen_foreign_ok=false seen_foreign_reasons=false seen_crate_dir=false
   # strip leading ws, trailing ws, trailing inline-comment (` #...`), surrounding quotes
   strip_val() {
     printf '%s' "$1" | sed -E 's/^[[:space:]]*//;s/[[:space:]]+#.*$//;s/[[:space:]]*$//;s/^"//;s/"$//'
@@ -564,6 +568,11 @@ emit_one() {
         fi
         seen_foreign_reasons=true
         ;;
+      "crate_dir:"*)
+        [ "$seen_crate_dir" = true ] && continue
+        crate_dir="$(strip_val "$(printf '%s' "$kline" | sed -E 's/^crate_dir[[:space:]]*:[[:space:]]*//')")"
+        seen_crate_dir=true
+        ;;
       "**Status:**"*|"Status:"*|"**Status**"*|"## Status"*|"- Status:"*|"- **Status:**"*|"* Status:"*|"* **Status:**"*)
         # Strip a leading markdown list marker (`- ` / `* `) first, then the
         # `*`/`#` decoration, then trim — so `- Status: Draft v0.1` parses the
@@ -685,7 +694,8 @@ except Exception:
     --argjson absorbs_unparsed "$absorbs_unparsed" \
     --argjson foreign_surface_ok "$foreign_surface_ok" \
     --argjson foreign_surface_reasons "$foreign_surface_reasons" \
-    '{slug:$slug, path:$path, build_auto:$build_auto, build_target:$build_target, build_priority:$build_priority, build_into:$build_into, build_version_bump:$build_version_bump, publish:$publish, deferred_acs:$deferred_acs, deferred_acs_unparsed:$deferred_acs_unparsed, deferred_ac_reasons:$deferred_ac_reasons, operator_authorization:$operator_authorization, operator_authorization_unparsed:$operator_authorization_unparsed, test_prefix:$test_prefix, status_line:$status_line, size_bytes:$size, mtime_iso:$mtime, gate_stale:$gate_stale, substrate:$substrate, live_acs:$live_acs, superseded_by:$superseded_by, transferred_acs:$transferred_acs, transferred_acs_unparsed:$transferred_acs_unparsed, absorbs:$absorbs, absorbs_unparsed:$absorbs_unparsed, foreign_surface_ok:$foreign_surface_ok, foreign_surface_reasons:$foreign_surface_reasons}'
+    --arg crate_dir "$crate_dir" \
+    '{slug:$slug, path:$path, build_auto:$build_auto, build_target:$build_target, build_priority:$build_priority, build_into:$build_into, build_version_bump:$build_version_bump, publish:$publish, deferred_acs:$deferred_acs, deferred_acs_unparsed:$deferred_acs_unparsed, deferred_ac_reasons:$deferred_ac_reasons, operator_authorization:$operator_authorization, operator_authorization_unparsed:$operator_authorization_unparsed, test_prefix:$test_prefix, status_line:$status_line, size_bytes:$size, mtime_iso:$mtime, gate_stale:$gate_stale, substrate:$substrate, live_acs:$live_acs, superseded_by:$superseded_by, transferred_acs:$transferred_acs, transferred_acs_unparsed:$transferred_acs_unparsed, absorbs:$absorbs, absorbs_unparsed:$absorbs_unparsed, foreign_surface_ok:$foreign_surface_ok, foreign_surface_reasons:$foreign_surface_reasons, crate_dir:$crate_dir}'
 }
 
 # Emit top-level PRDs (buildable) AND ARCHIVE/ PRDs (already done).
