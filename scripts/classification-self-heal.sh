@@ -107,11 +107,16 @@ read_field() {
     | sed -E 's/[[:space:]]+$//'
 }
 
-# PRD-build-contract-declared-crate-dir R4: true when the frontmatter (the
-# contract's first 80 lines, fenced blocks skipped; bullet, bare and bold
-# forms, the key case-folded as prd-lint.sh reads it) carries `crate_dir`,
-# whatever its value. awk reads the file itself (no `head |` pipe): an early
-# exit on a match must not turn into a SIGPIPE status under pipefail.
+# PRD-build-contract-declared-crate-dir R4: whether the PRD carries
+# `crate_dir`, whatever its value. 0 = it does, 1 = it does not, 2 = unknown
+# (prd-lint.sh's reader failed; resolve declines on that too). prd-lint.sh's
+# own frontmatter reader decides (`--print-crate-dir`: its 80-line window,
+# fence rule, line splitting and key folding), so this guard is never
+# narrower than the lint. The awk pass first is broader: it also counts
+# forms the lint does not read (an indented bullet, a key past a lone CR),
+# which then park for a human instead of being rewritten. awk reads the file
+# itself (no `head |` pipe): an early exit on a match must not turn into a
+# SIGPIPE status under pipefail.
 declares_crate_dir() {
   awk '
     NR > 80 { exit }
@@ -123,7 +128,17 @@ declares_crate_dir() {
       sub(/^[[:space:]]*\*\*crate[ _]dir:\*\*/, "crate_dir:", line)
       if (line ~ /^[[:space:]]*crate[ _]dir[[:space:]]*:/) { found = 1; exit }
     }
-    END { exit !found }' "$1"
+    END { exit !found }' "$1" && return 0
+  local read
+  read="$("$LINT_SH" --print-crate-dir -- "$1")" || return 2
+  python3 -c '
+import json, sys
+try:
+    value = json.loads(sys.argv[1])[sys.argv[2]]
+except Exception:
+    sys.exit(2)
+sys.exit(1 if value is None else 0)
+' "$read" "$1"
 }
 
 manifest_entry_json() {
@@ -299,8 +314,13 @@ cmd_resolve() {
   # PRD-build-contract-declared-crate-dir R4: a declared crate is a Rust crate
   # inside a Python repo, which the probe below would read as python and
   # rewrite. Decline before probing, whatever the Status, and write nothing.
-  if declares_crate_dir "$prd_file"; then
+  local crate_rc=0
+  declares_crate_dir "$prd_file" || crate_rc=$?
+  if [ "$crate_rc" -eq 0 ]; then
     echo "declined: $slug: crate_dir declared -- never rewritten"
+    exit 1
+  elif [ "$crate_rc" -ne 1 ]; then
+    echo "declined: $slug: crate_dir unknown (prd-lint.sh --print-crate-dir failed) -- never rewritten"
     exit 1
   fi
 
