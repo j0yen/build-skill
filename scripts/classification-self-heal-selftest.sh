@@ -172,6 +172,44 @@ expect "AC7: a third identical tick is skipped again, no 2nd alarm" \
 b4="$(run_csh "$D7" bounce-check "$D7/prds/build-queue/PRD-bouncer.md" build-into-substrate-mismatch 'a DIFFERENT diagnosis now' 2>&1)"
 expect "AC7: a changed diagnosis resets to a fresh bounce"      "grep -q 'bounce: bouncer diagnosis changed (bounces=1)' <<<\"\$b4\""
 
+# ======================================================================
+# PRD-build-contract-declared-crate-dir R4 — resolve declines any PRD whose
+# frontmatter carries crate_dir, before probing and whatever its Status, and
+# writes nothing (no file edit, commit, push, manifest or journal write).
+# Without R4 the parked PRD below (rust-extend on a Python repo) would be
+# probed as python and rewritten to python-cli.
+# ======================================================================
+DCD="$T/crate-dir"; mkdir -p "$DCD"
+DEFBRC="$(new_prd_fixture "$DCD")"
+mkdir -p "$DCD/py-ws/ledger-read"
+printf '[project]\nname = "swarm"\n' > "$DCD/py-ws/pyproject.toml"
+for st in needs_classification blocked; do
+  {
+    printf '# PRD: declared-%s\n\n- Status: %s\n' "$st" "$st"
+    printf -- '- build_target: rust-extend\n- build_into: %s\n- crate_dir: ledger-read\n' "$DCD/py-ws"
+    printf -- '- Vision: visions/none.md\n'
+  } > "$DCD/prds/build-queue/PRD-declared-$st.md"
+done
+gc "$DCD/prds" add -A; gc "$DCD/prds" commit -qm "add declared"
+git -C "$DCD/prds" push -q origin "$DEFBRC"
+new_scratch_state "$DCD"
+printf '#!/bin/sh\necho called >> "%s"\nexec "%s" "$@"\n' "$DCD/probe-calls" "$HERE/substrate-probe.sh" > "$DCD/probe.sh"
+chmod +x "$DCD/probe.sh"
+headC="$(git -C "$DCD/prds" rev-parse HEAD)"
+originC="$(git -C "$DCD/origin.git" rev-parse "$DEFBRC")"
+manC="$(cat "$DCD/state/manifest.json")"
+for st in needs_classification blocked; do
+  fC="$DCD/prds/build-queue/PRD-declared-$st.md"
+  beforeC="$(cat "$fC")"
+  outC="$(SUBSTRATE_PROBE="$DCD/probe.sh" run_csh "$DCD" resolve "$fC" 2>&1)"; rcC=$?
+  expect "crate_dir R4 ($st): resolve exits 1 (declined)"        "[ $rcC -eq 1 ]"
+  expect "crate_dir R4 ($st): prints the never-rewritten line"   "grep -qx 'declined: declared-$st: crate_dir declared -- never rewritten' <<<\"\$outC\""
+  expect "crate_dir R4 ($st): frontmatter unchanged"             "[ \"\$beforeC\" = \"\$(cat '$fC')\" ]"
+done
+expect "crate_dir R4: declined before probing (probe never called)" "[ ! -e '$DCD/probe-calls' ]"
+expect "crate_dir R4: no commit, nothing pushed"                    "[ \"\$headC\" = \"\$(git -C '$DCD/prds' rev-parse HEAD)\" ] && [ \"\$originC\" = \"\$(git -C '$DCD/origin.git' rev-parse '$DEFBRC')\" ]"
+expect "crate_dir R4: manifest unchanged, no journal written"       "[ \"\$manC\" = \"\$(cat '$DCD/state/manifest.json')\" ] && [ ! -e '$DCD/journal.md' ]"
+
 # --------------------------------------------------------------------------
 if [ "$FAIL" -ne 0 ]; then
   echo "SELFTEST FAILED ($FAIL fail / $((PASS+FAIL)) total)"

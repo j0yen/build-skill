@@ -235,6 +235,26 @@ if [ "${1:-}" = "--selftest" ]; then
   total=$((total+1))
   if out="$(LINT_SRC="$t/lint/e3.sh" "$0" 2>&1)"; then echo "FAIL: drift test passed with an id in the contract but not the lint"; bad=$((bad+1)); else
     grep -q "FAIL (e): contract built-in id 'unknown-frontmatter-key' is not in the list" <<<"$out" && echo "ok: contract-only id is caught by (e)" || { echo "FAIL: (e3) did not name the contract-only id: $out"; bad=$((bad+1)); }; fi
+  # PRD-build-contract-declared-crate-dir: crate_dir is a row of the Frontmatter
+  # table (R1); its two lint ids are structural checks, not built-in shift-left
+  # ids: absent from the contract paragraph and from --print-builtin-ids, and
+  # each answers --explain (R2); a contract copy that lists one in the
+  # paragraph is caught by (e)
+  total=$((total+1))
+  if contract_keys | grep -qx crate_dir; then echo "ok: crate_dir is a row of the contract Frontmatter table"; else
+    echo "FAIL: crate_dir is not a row of the contract Frontmatter table"; bad=$((bad+1)); fi
+  for id in crate-dir-invalid crate-dir-undeclared; do
+    total=$((total+1))
+    cb_ids="$(contract_builtin_ids)"; lb_ids="$(bash "$HERE/prd-lint.sh" --print-builtin-ids 2>/dev/null)"
+    if ! grep -qxF -- "$id" <<<"$cb_ids" && ! grep -qxF -- "$id" <<<"$lb_ids" \
+       && bash "$HERE/prd-lint.sh" --explain "$id" >/dev/null 2>&1; then
+      echo "ok: $id is a structural id (not built-in, answers --explain)"
+    else echo "FAIL: $id must stay out of the built-in ids and answer --explain"; bad=$((bad+1)); fi
+  done
+  sed 's/`hand-built-marker-missing`, /`hand-built-marker-missing`, `crate-dir-invalid`, /' "$CONTRACT" > "$t/e4-contract.md"
+  total=$((total+1))
+  if out="$(CONTRACT="$t/e4-contract.md" "$0" 2>&1)"; then echo "FAIL: drift test passed with crate-dir-invalid listed as a built-in id"; bad=$((bad+1)); else
+    grep -q "FAIL (e): contract built-in id 'crate-dir-invalid' is not in the list" <<<"$out" && echo "ok: crate-dir-invalid listed as built-in is caught by (e)" || { echo "FAIL: (e4) did not name crate-dir-invalid: $out"; bad=$((bad+1)); }; fi
   # the real contract passes
   total=$((total+1))
   if out="$("$0" 2>&1)"; then echo "ok: real contract has no drift"; else echo "FAIL: real contract drifts: $out"; bad=$((bad+1)); fi

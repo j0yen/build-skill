@@ -270,6 +270,86 @@ expect_clean_no_id "$q/PRD-substrate-py-vs-py.md" failures build-into-substrate-
 # does not also fire a failure for it (no compounding).
 expect_clean_no_id "$q/PRD-into-not-found.md" failures build-into-substrate-mismatch "substrate-mismatch/missing-path-unchanged"
 
+# ===================================== crate-dir-invalid / crate-dir-undeclared
+# PRD-build-contract-declared-crate-dir: a rust-extend PRD on a Python repo
+# declares its one crate with `crate_dir`. The value and target reasons fail
+# on every host; the substrate reasons fail only where build_into exists (the
+# depth-1 test's own gate), and a declared crate never gets
+# build-into-substrate-mismatch. One failing fixture per reason, each checked
+# for the message that names it.
+expect_fail_reason() { # $1=path $2=id $3=message regex $4=label
+  total=$((total+1))
+  local out; out="$(json_of "$1")"
+  if printf '%s' "$out" | python3 -c '
+import json, re, sys
+d = json.load(sys.stdin)[0]
+sys.exit(0 if any(x["id"] == sys.argv[1] and re.search(sys.argv[2], x["message"]) for x in d.get("failures", [])) else 1)
+' "$2" "$3"; then
+    echo "ok: $4 -> FAIL $2 /$3/"
+  else
+    echo "FAIL: $4 expected failure $2 matching /$3/, got: $out"
+    fails=$((fails+1))
+  fi
+}
+mk_cd() { # $1=file $2=build_target $3=build_into $4=crate_dir ("-" = no crate_dir line)
+  { printf -- '- Status: queued\n- build_target: %s\n- build_into: %s\n' "$2" "$3"
+    [ "$4" = "-" ] || printf -- '- crate_dir: %s\n' "$4"
+    printf -- '- Vision: visions/plain.md\n\n## Acceptance criteria\n\n1. P0 — Given a, When b, Then c.\n'
+  } > "$1"
+}
+mkdir -p "$tmp/cd-py" "$tmp/cd-nopy" "$tmp/cd-rootcargo" "$tmp/cd-dir-nocargo/ledger-read" "$tmp/cd-landed/ledger-read"
+for r in cd-py cd-rootcargo cd-dir-nocargo cd-landed; do printf '[project]\nname = "swarm"\n' > "$tmp/$r/pyproject.toml"; done
+echo "no manifests here" > "$tmp/cd-nopy/README.md"
+printf '[workspace]\n' > "$tmp/cd-rootcargo/Cargo.toml"
+printf '[package]\nname = "ledger-read"\n' > "$tmp/cd-landed/ledger-read/Cargo.toml"
+
+# failing: one per reason
+mk_cd "$q/PRD-cd-pattern.md" rust-extend "$tmp/cd-py" Ledger_Read
+expect_fail_reason "$q/PRD-cd-pattern.md" crate-dir-invalid "does not match" "crate-dir-invalid/fail (value misses the pattern)"
+mk_cd "$q/PRD-cd-slash.md" rust-extend "$tmp/cd-py" a/b
+expect_fail_reason "$q/PRD-cd-slash.md" crate-dir-invalid "contains '/'" "crate-dir-invalid/fail (value contains /)"
+mk_cd "$q/PRD-cd-dot.md" rust-extend "$tmp/cd-py" ledger.read
+expect_fail_reason "$q/PRD-cd-dot.md" crate-dir-invalid "contains '\.'" "crate-dir-invalid/fail (value contains .)"
+mk_cd "$q/PRD-cd-dotdot.md" rust-extend "$tmp/cd-py" ..
+expect_fail_reason "$q/PRD-cd-dotdot.md" crate-dir-invalid "contains '\.\.'" "crate-dir-invalid/fail (value is ..)"
+mk_cd "$q/PRD-cd-target.md" python-cli "$tmp/cd-py" ledger-read
+expect_fail_reason "$q/PRD-cd-target.md" crate-dir-invalid "build_target 'python-cli'" "crate-dir-invalid/fail (target is not rust-extend)"
+mk_cd "$q/PRD-cd-nopy.md" rust-extend "$tmp/cd-nopy" ledger-read
+expect_fail_reason "$q/PRD-cd-nopy.md" crate-dir-invalid "no root pyproject\.toml" "crate-dir-invalid/fail (build_into has no root pyproject.toml)"
+mk_cd "$q/PRD-cd-rootcargo.md" rust-extend "$tmp/cd-rootcargo" ledger-read
+expect_fail_reason "$q/PRD-cd-rootcargo.md" crate-dir-invalid "has a root Cargo\.toml" "crate-dir-invalid/fail (build_into has a root Cargo.toml)"
+mk_cd "$q/PRD-cd-dir-nocargo.md" rust-extend "$tmp/cd-dir-nocargo" ledger-read
+expect_fail_reason "$q/PRD-cd-dir-nocargo.md" crate-dir-invalid "exists but has no Cargo\.toml" "crate-dir-invalid/fail (crate_dir present without a Cargo.toml)"
+for f in cd-nopy cd-rootcargo cd-dir-nocargo; do
+  expect_clean_no_id "$q/PRD-$f.md" failures build-into-substrate-mismatch "substrate-mismatch/pass ($f: a declared crate fails crate-dir-invalid, never this id)"
+done
+
+# passing: before and after the crate's first landing
+mk_cd "$q/PRD-cd-first.md" rust-extend "$tmp/cd-py" ledger-read
+expect_clean_no_id "$q/PRD-cd-first.md" failures crate-dir-invalid "crate-dir-invalid/pass (crate absent before its first landing)"
+expect_clean_no_id "$q/PRD-cd-first.md" failures build-into-substrate-mismatch "substrate-mismatch/pass (declared crate replaces the depth-1 test)"
+expect_clean_no_id "$q/PRD-cd-first.md" warnings unknown-frontmatter-key "unknown-frontmatter-key/pass (crate_dir is a contract Frontmatter key)"
+mk_cd "$q/PRD-cd-landed.md" rust-extend "$tmp/cd-landed" ledger-read
+expect_clean_no_id "$q/PRD-cd-landed.md" failures crate-dir-invalid "crate-dir-invalid/pass (crate landed with its Cargo.toml)"
+expect_clean_no_id "$q/PRD-cd-landed.md" warnings crate-dir-undeclared "crate-dir-undeclared/pass (the crate is declared)"
+
+# the missing-build_into pair (AC 7): value reasons only, the WARNING stands alone
+mk_cd "$q/PRD-cd-absent-ok.md" rust-extend /no/such/dir/anywhere ledger-read
+expect_warn "$q/PRD-cd-absent-ok.md" build-into-not-found "build-into-not-found/warn (crate_dir PRD, build_into absent on this host)"
+expect_clean_no_id "$q/PRD-cd-absent-ok.md" failures crate-dir-invalid "crate-dir-invalid/pass (absent build_into: substrate reasons not evaluated)"
+expect_clean_no_id "$q/PRD-cd-absent-ok.md" failures build-into-substrate-mismatch "substrate-mismatch/pass (absent build_into, crate_dir PRD)"
+mk_cd "$q/PRD-cd-absent-bad.md" rust-extend /no/such/dir/anywhere a/b
+expect_fail_reason "$q/PRD-cd-absent-bad.md" crate-dir-invalid "contains '/'" "crate-dir-invalid/fail (absent build_into: the value reason applies on every host)"
+
+# without the key: the depth-1 rule and its message are unchanged; a Python
+# repo with a crate one level down only warns crate-dir-undeclared
+mk_cd "$q/PRD-cd-nokey.md" rust-extend "$tmp/cd-py" -
+expect_fail "$q/PRD-cd-nokey.md" build-into-substrate-mismatch "substrate-mismatch/fail (rust-extend without crate_dir on a Python repo, unchanged)"
+mk_cd "$q/PRD-cd-undeclared.md" rust-extend "$tmp/cd-landed" -
+expect_warn "$q/PRD-cd-undeclared.md" crate-dir-undeclared "crate-dir-undeclared/warn (Python repo, crate one level down, no crate_dir)"
+expect_clean_no_id "$q/PRD-cd-undeclared.md" failures build-into-substrate-mismatch "substrate-mismatch/pass (undeclared crate one level down still passes depth-1)"
+expect_clean_no_id "$q/PRD-substrate-09-12-fixed.md" warnings crate-dir-undeclared "crate-dir-undeclared/pass (a Cargo workspace root is not a Python repo)"
+
 # =========================================================== deferred-acs-prose
 # Real defect (2026-09-03): PRD-mcphost-code-tools.md carried this exact line.
 cat > "$q/PRD-deferred-prose.md" <<'EOF'
@@ -1009,7 +1089,7 @@ SCAN_PRDS="$HERE/scan-prds.sh"
 # with prd-lint.sh's own fm.get("...")/"..." in fm checks, same
 # duplicate-and-comment convention prd-lint.sh itself uses for
 # RUST_SUBSTRATE_TARGETS mirroring substrate-probe.sh.
-KNOWN_LINT_KEYS="status build_target build_into deferred_acs mock_justifications deferred_ac_reasons depends_on vision loop operator_authorization grounding superseded_by transferred_acs absorbs foreign_surface_ok foreign_surface_reasons"
+KNOWN_LINT_KEYS="status build_target build_into deferred_acs mock_justifications deferred_ac_reasons depends_on vision loop operator_authorization grounding superseded_by transferred_acs absorbs foreign_surface_ok foreign_surface_reasons crate_dir"
 
 # scan-prds.sh-only fields with no lint shape to check -- one reason each.
 declare -A PARITY_ALLOWLIST=(
@@ -1710,6 +1790,12 @@ if [ "$rc" -eq 0 ] && grep -q 'Direct-build: hand' <<<"$o"; then echo "ok: --exp
 total=$((total+1))
 o="$("$LINT" --explain build-priority-default 2>&1)"; rc=$?
 if [ "$rc" -eq 0 ] && grep -q 'creative' <<<"$o"; then echo "ok: --explain build-priority-default"; else echo "FAIL: --explain build-priority-default rc=$rc: $o"; fails=$((fails+1)); fi
+total=$((total+1))
+o="$("$LINT" --explain crate-dir-invalid 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ] && grep -qF '^[a-z0-9][a-z0-9-]{0,62}$' <<<"$o" && grep -q 'build-into-not-found' <<<"$o"; then echo "ok: --explain crate-dir-invalid"; else echo "FAIL: --explain crate-dir-invalid rc=$rc: $o"; fails=$((fails+1)); fi
+total=$((total+1))
+o="$("$LINT" --explain crate-dir-undeclared 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ] && grep -q 'crate-dir-undeclared' <<<"$o"; then echo "ok: --explain crate-dir-undeclared"; else echo "FAIL: --explain crate-dir-undeclared rc=$rc: $o"; fails=$((fails+1)); fi
 
 # --------------------------------------------------------------------------
 if [ "$fails" -ne 0 ]; then
