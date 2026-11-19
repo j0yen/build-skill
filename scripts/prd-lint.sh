@@ -55,7 +55,10 @@
 # crate-dir): a rust-extend PRD on a Python repo declares its one crate with
 # `crate_dir`, checked in place of the depth-1 substrate test; structural
 # checks like build-into-substrate-mismatch, not built-in shift-left ids; see
-# `--explain crate-dir-invalid`.
+# `--explain crate-dir-invalid`. `--print-crate-dir <file>...` prints
+# `{file: crate_dir-or-null}` from the same frontmatter reader and lints
+# nothing: scan-prds.sh's manifest field and classification-self-heal.sh's
+# resolve guard read the key through it, never a second parser of their own.
 #
 # Exit: 0 = every file clean (warnings allowed), 1 = at least one FAIL
 #       anywhere, 2 = usage error.
@@ -83,6 +86,7 @@ usage() {
   echo "       prd-lint.sh --explain <check-id>" >&2
   echo "       prd-lint.sh --print-live-hosts [--contract <path>]" >&2
   echo "       prd-lint.sh --print-builtin-ids" >&2
+  echo "       prd-lint.sh --print-crate-dir <file>..." >&2
 }
 
 format="text"
@@ -91,6 +95,7 @@ contract=""
 explain_id=""
 print_hosts=0
 print_builtin_ids=0
+print_crate_dir=0
 files=()
 # The built-in shift-left rule ids this lint emits. ONE list: `--print-builtin-ids` exports it and
 # dream-contract-drift-selftest.sh compares it as a SET with build-contract.md's built-in ids (both
@@ -141,6 +146,10 @@ while [ "$#" -gt 0 ]; do
       ;;
     --print-builtin-ids)
       print_builtin_ids=1
+      shift
+      ;;
+    --print-crate-dir)
+      print_crate_dir=1
       shift
       ;;
     -h|--help)
@@ -329,6 +338,7 @@ if [ "${#files[@]}" -eq 0 ] && [ "$print_hosts" -eq 0 ]; then
   exit 2
 fi
 export LINT_PRINT_LIVE_HOSTS="$print_hosts"
+export LINT_PRINT_CRATE_DIR="$print_crate_dir"
 case "$format" in
   text|json|pass-fail) ;;
   *) echo "prd-lint: --format must be text, json, or pass-fail" >&2; exit 2 ;;
@@ -359,8 +369,10 @@ for f in "${files[@]}"; do
 done
 files=("${expanded[@]}")
 
+# --print-crate-dir answers for every path it is given: a file that is gone
+# (a pull racing a scan) reads as no crate_dir, as parse_frontmatter reads it.
 for f in "${files[@]}"; do
-  if [ ! -f "$f" ]; then
+  if [ ! -f "$f" ] && [ "$print_crate_dir" -eq 0 ]; then
     echo "prd-lint: no such file: $f" >&2
     exit 2
   fi
@@ -2271,6 +2283,16 @@ def lint_file(path):
 
 if os.environ.get("LINT_PRINT_LIVE_HOSTS") == "1":
     print(live_hosts_canon(load_contract_tables(contract_path or DEFAULT_CONTRACT)["live_hosts"]))
+    sys.exit(0)
+
+if os.environ.get("LINT_PRINT_CRATE_DIR") == "1":
+    # PRD-build-contract-declared-crate-dir R3/R4: the one crate_dir reader.
+    # scan-prds.sh (the manifest field) and classification-self-heal.sh (the
+    # resolve guard) take the key from this parse_frontmatter, the reading
+    # lint_file validates, so neither carries a value the lint never checked
+    # nor misses a key the lint acts on. Prints {file: value}; null = no
+    # crate_dir key (parse_frontmatter reads a file it cannot open as empty).
+    print(json.dumps({path: parse_frontmatter(path).get("crate_dir") for path in targets}))
     sys.exit(0)
 
 results = []
