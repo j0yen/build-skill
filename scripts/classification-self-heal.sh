@@ -59,6 +59,11 @@
 #       classification.sh's pull/commit/push-with-one-retry, run in the
 #       opposite direction), then updates the manifest cache to match so
 #       the next scan doesn't have to wait on a reconcile pass.
+#       Before any of that, a PRD whose frontmatter carries `crate_dir` is
+#       declined (`declined: <slug>: crate_dir declared -- never
+#       rewritten`, exit 1, nothing written): it declares a Rust crate
+#       inside a Python repo, which the probe would misread as python
+#       (PRD-build-contract-declared-crate-dir R4).
 #
 # Exit codes (resolve): 0 resolved-and-pushed | 1 declined (not eligible,
 #   ambiguous, no evidence, or build_into missing -- message says which,
@@ -100,6 +105,23 @@ read_field() {
     | sed -E "s/^(- *${key}:|${key}:|\*\*${key}:\*\*)[[:space:]]*//" \
     | sed -E 's/[[:space:]]*#.*$//' \
     | sed -E 's/[[:space:]]+$//'
+}
+
+# PRD-build-contract-declared-crate-dir R4: true when the frontmatter (the
+# contract's first 80 lines, fenced blocks skipped; bullet, bare and bold
+# forms, the key case-folded as prd-lint.sh reads it) carries `crate_dir`,
+# whatever its value.
+declares_crate_dir() {
+  head -n 80 "$1" | awk '
+    /^[[:space:]]*```/ { fence = !fence; next }
+    fence { next }
+    {
+      line = tolower($0)
+      sub(/^[[:space:]]*[-*+][[:space:]]+/, "", line)
+      sub(/^[[:space:]]*\*\*crate[ _]dir:\*\*/, "crate_dir:", line)
+      if (line ~ /^[[:space:]]*crate[ _]dir[[:space:]]*:/) { found = 1; exit }
+    }
+    END { exit !found }'
 }
 
 manifest_entry_json() {
@@ -271,6 +293,14 @@ cmd_resolve() {
   local prd_file="$1"
   [ -f "$prd_file" ] || die "no such file: $prd_file" 4
   local slug; slug="$(slug_of "$prd_file")"
+
+  # PRD-build-contract-declared-crate-dir R4: a declared crate is a Rust crate
+  # inside a Python repo, which the probe below would read as python and
+  # rewrite. Decline before probing, whatever the Status, and write nothing.
+  if declares_crate_dir "$prd_file"; then
+    echo "declined: $slug: crate_dir declared -- never rewritten"
+    exit 1
+  fi
 
   local status; status="$(read_field "$prd_file" Status)"
   case "$status" in
