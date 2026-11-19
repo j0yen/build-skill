@@ -183,11 +183,16 @@ DCD="$T/crate-dir"; mkdir -p "$DCD"
 DEFBRC="$(new_prd_fixture "$DCD")"
 mkdir -p "$DCD/py-ws/ledger-read"
 printf '[project]\nname = "swarm"\n' > "$DCD/py-ws/pyproject.toml"
-for st in needs_classification blocked; do
+# "huge": a header whose first 80 lines run to megabytes, so a reader that
+# stops early must not turn its own early exit into a "not declared" answer.
+pad="$(head -c 60000 /dev/zero | tr '\0' x)"
+for st in needs_classification blocked huge; do
+  stc="$st"; [ "$st" = huge ] && stc=needs_classification
   {
-    printf '# PRD: declared-%s\n\n- Status: %s\n' "$st" "$st"
+    printf '# PRD: declared-%s\n\n- Status: %s\n' "$st" "$stc"
     printf -- '- build_target: rust-extend\n- build_into: %s\n- crate_dir: ledger-read\n' "$DCD/py-ws"
     printf -- '- Vision: visions/none.md\n'
+    if [ "$st" = huge ]; then for i in $(seq 1 75); do printf -- '- Note%s: %s\n' "$i" "$pad"; done; fi
   } > "$DCD/prds/build-queue/PRD-declared-$st.md"
 done
 gc "$DCD/prds" add -A; gc "$DCD/prds" commit -qm "add declared"
@@ -198,7 +203,7 @@ chmod +x "$DCD/probe.sh"
 headC="$(git -C "$DCD/prds" rev-parse HEAD)"
 originC="$(git -C "$DCD/origin.git" rev-parse "$DEFBRC")"
 manC="$(cat "$DCD/state/manifest.json")"
-for st in needs_classification blocked; do
+for st in needs_classification blocked huge; do
   fC="$DCD/prds/build-queue/PRD-declared-$st.md"
   beforeC="$(cat "$fC")"
   outC="$(SUBSTRATE_PROBE="$DCD/probe.sh" run_csh "$DCD" resolve "$fC" 2>&1)"; rcC=$?
