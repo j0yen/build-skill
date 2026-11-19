@@ -110,9 +110,11 @@ read_field() {
 # PRD-build-contract-declared-crate-dir R4: true when the frontmatter (the
 # contract's first 80 lines, fenced blocks skipped; bullet, bare and bold
 # forms, the key case-folded as prd-lint.sh reads it) carries `crate_dir`,
-# whatever its value.
+# whatever its value. awk reads the file itself (no `head |` pipe): an early
+# exit on a match must not turn into a SIGPIPE status under pipefail.
 declares_crate_dir() {
-  head -n 80 "$1" | awk '
+  awk '
+    NR > 80 { exit }
     /^[[:space:]]*```/ { fence = !fence; next }
     fence { next }
     {
@@ -121,7 +123,7 @@ declares_crate_dir() {
       sub(/^[[:space:]]*\*\*crate[ _]dir:\*\*/, "crate_dir:", line)
       if (line ~ /^[[:space:]]*crate[ _]dir[[:space:]]*:/) { found = 1; exit }
     }
-    END { exit !found }'
+    END { exit !found }' "$1"
 }
 
 manifest_entry_json() {
