@@ -241,7 +241,8 @@ if [ "${1:-}" = "--selftest" ]; then
   # each answers --explain (R2); a contract copy that lists one in the
   # paragraph is caught by (e)
   total=$((total+1))
-  if contract_keys | grep -qx crate_dir; then echo "ok: crate_dir is a row of the contract Frontmatter table"; else
+  ck_keys="$(contract_keys)"   # captured, not piped: pipefail + grep -q would SIGPIPE
+  if grep -qx crate_dir <<<"$ck_keys"; then echo "ok: crate_dir is a row of the contract Frontmatter table"; else
     echo "FAIL: crate_dir is not a row of the contract Frontmatter table"; bad=$((bad+1)); fi
   for id in crate-dir-invalid crate-dir-undeclared; do
     total=$((total+1))
