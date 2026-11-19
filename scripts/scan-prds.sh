@@ -215,12 +215,16 @@ is_collided() {
 # `operator_authorization_unparsed` (PRD-build-operator-authorization-
 # contract) -- not backfilled onto vellum's rows either, for the same reason.
 # Same known gap applies to `live_acs` (PRD-build-live-ac-no-defer).
+# `crate_dir` (PRD-build-contract-declared-crate-dir R3) is the exception: it
+# is added to vellum's rows below, by path, from prd-lint.sh's reader, the same
+# one the bash path uses, so every manifest entry carries it on either path.
 # Emit BOTH top-level (buildable) and ARCHIVE/ (already-done) so Phase 1 diff
 # can distinguish archived from truly-vanished. Without this, PRDs moved to
 # ARCHIVE/ after shipping would be marked "vanished" on the next scan and
 # re-queued or lost — wasting cloud server time re-building done work.
 if command -v vellum >/dev/null 2>&1; then
     ARCHIVE_DIR="${PRD_DIR}/ARCHIVE"
+    _tmp_rows="$(mktemp)"
     if [ -d "$ARCHIVE_DIR" ]; then
         # Merge top-level + ARCHIVE results into one JSON array.
         # vellum emits pretty-printed JSON; use temp files so python3 parses
@@ -228,7 +232,7 @@ if command -v vellum >/dev/null 2>&1; then
         _tmp_top="$(mktemp)" _tmp_arc="$(mktemp)"
         vellum scan "${PRD_DIR}"      >"$_tmp_top"
         vellum scan "${ARCHIVE_DIR}"  >"$_tmp_arc"
-        python3 - "$_tmp_top" "$_tmp_arc" <<'PY'
+        python3 - "$_tmp_top" "$_tmp_arc" >"$_tmp_rows" <<'PY'
 import json, sys
 merged = []
 for path in sys.argv[1:]:
@@ -241,15 +245,48 @@ print(json.dumps(merged))
 PY
         rm -f "$_tmp_top" "$_tmp_arc"
     else
-        exec vellum scan "${PRD_DIR}"
+        vellum scan "${PRD_DIR}" >"$_tmp_rows"
+        _vrc=$?
+        if [ "$_vrc" -ne 0 ]; then
+            cat "$_tmp_rows"; rm -f "$_tmp_rows"; exit "$_vrc"
+        fi
     fi
-    exit 0
+    # PRD-build-contract-declared-crate-dir R3: crate_dir on every row, by its
+    # path, from prd-lint.sh's reader ("" when it finds no key). Rows without a
+    # path, or a reader that fails, leave no manifest (exit non-zero).
+    python3 - "$_tmp_rows" "$SCAN_HERE/prd-lint.sh" <<'PY'
+import json, subprocess, sys
+rows = json.load(open(sys.argv[1]))
+paths = [r["path"] for r in rows]
+crate_dirs = {}
+if paths:
+    crate_dirs = json.loads(subprocess.run([sys.argv[2], "--print-crate-dir", "--", *paths],
+                                           stdout=subprocess.PIPE, check=True, text=True).stdout)
+for r in rows:
+    r["crate_dir"] = crate_dirs[r["path"]] or ""
+print(json.dumps(rows))
+PY
+    _rc=$?
+    rm -f "$_tmp_rows"
+    exit "$_rc"
 fi
 # Fallback: bash parser (used when vellum is absent or upgrading).
 JQ="${JQ:-$(command -v jq 2>/dev/null || echo /usr/bin/jq)}"
 
 [ -d "$PRD_DIR" ] || { printf '[]\n'; exit 0; }
 [ -x "$JQ" ] || { echo "jq not at $JQ" >&2; exit 1; }
+
+# PRD-build-contract-declared-crate-dir R3: read_crate_dirs <out> <file>...
+# writes one JSON string per file, in argument order, to <out>: the crate_dir
+# prd-lint.sh's own frontmatter reader parses from that file, "" when it finds
+# no crate_dir key. Non-zero if the reader fails or skips a file.
+read_crate_dirs() {
+  local out="$1"; shift
+  "$SCAN_HERE/prd-lint.sh" --print-crate-dir -- "$@" \
+    | "$JQ" -c --args '. as $m | $ARGS.positional[] | . as $p
+        | if ($m | has($p)) then ($m[$p] // "") else error("no crate_dir read for \($p)") end' "$@" \
+    > "$out"
+}
 
 emit_one() {
   local path="$1" slug status_line build_auto build_target build_priority build_into build_version_bump deferred_acs deferred_ac_reasons publish test_prefix deferred_acs_unparsed operator_authorization operator_authorization_unparsed superseded_by transferred_acs transferred_acs_unparsed absorbs absorbs_unparsed foreign_surface_ok foreign_surface_reasons crate_dir
@@ -309,9 +346,11 @@ emit_one() {
   foreign_surface_ok="[]"
   foreign_surface_reasons="{}"
   # Per PRD-build-contract-declared-crate-dir R3: the one Rust crate directory
-  # a rust-extend PRD on a Python repo declares; always a string, "" when the
-  # key is absent. prd-lint.sh (crate-dir-invalid) is the enforcer.
-  crate_dir=""
+  # a rust-extend PRD on a Python repo declares, as a JSON string ("" when the
+  # key is absent). It is prd-lint.sh's own reading of the file (passed in as
+  # $2 by the emission loop below), not this loop's, so the manifest carries
+  # exactly the value prd-lint.sh (crate-dir-invalid) validates.
+  crate_dir="${2:-\"\"}"
   status_line=""
   gate_stale=false
 
@@ -321,7 +360,7 @@ emit_one() {
   # the parse. First-match-wins for build_* keys so real frontmatter
   # always beats later in-doc examples.
   local in_fence=false
-  local seen_target=false seen_priority=false seen_into=false seen_bump=false seen_deferred=false seen_test_prefix=false seen_operator_authorization=false seen_superseded_by=false seen_transferred_acs=false seen_absorbs=false seen_foreign_ok=false seen_foreign_reasons=false seen_crate_dir=false
+  local seen_target=false seen_priority=false seen_into=false seen_bump=false seen_deferred=false seen_test_prefix=false seen_operator_authorization=false seen_superseded_by=false seen_transferred_acs=false seen_absorbs=false seen_foreign_ok=false seen_foreign_reasons=false
   # strip leading ws, trailing ws, trailing inline-comment (` #...`), surrounding quotes
   strip_val() {
     printf '%s' "$1" | sed -E 's/^[[:space:]]*//;s/[[:space:]]+#.*$//;s/[[:space:]]*$//;s/^"//;s/"$//'
@@ -568,11 +607,6 @@ emit_one() {
         fi
         seen_foreign_reasons=true
         ;;
-      "crate_dir:"*)
-        [ "$seen_crate_dir" = true ] && continue
-        crate_dir="$(strip_val "$(printf '%s' "$kline" | sed -E 's/^crate_dir[[:space:]]*:[[:space:]]*//')")"
-        seen_crate_dir=true
-        ;;
       "**Status:**"*|"Status:"*|"**Status**"*|"## Status"*|"- Status:"*|"- **Status:**"*|"* Status:"*|"* **Status:**"*)
         # Strip a leading markdown list marker (`- ` / `* `) first, then the
         # `*`/`#` decoration, then trim — so `- Status: Draft v0.1` parses the
@@ -694,7 +728,7 @@ except Exception:
     --argjson absorbs_unparsed "$absorbs_unparsed" \
     --argjson foreign_surface_ok "$foreign_surface_ok" \
     --argjson foreign_surface_reasons "$foreign_surface_reasons" \
-    --arg crate_dir "$crate_dir" \
+    --argjson crate_dir "$crate_dir" \
     '{slug:$slug, path:$path, build_auto:$build_auto, build_target:$build_target, build_priority:$build_priority, build_into:$build_into, build_version_bump:$build_version_bump, publish:$publish, deferred_acs:$deferred_acs, deferred_acs_unparsed:$deferred_acs_unparsed, deferred_ac_reasons:$deferred_ac_reasons, operator_authorization:$operator_authorization, operator_authorization_unparsed:$operator_authorization_unparsed, test_prefix:$test_prefix, status_line:$status_line, size_bytes:$size, mtime_iso:$mtime, gate_stale:$gate_stale, substrate:$substrate, live_acs:$live_acs, superseded_by:$superseded_by, transferred_acs:$transferred_acs, transferred_acs_unparsed:$transferred_acs_unparsed, absorbs:$absorbs, absorbs_unparsed:$absorbs_unparsed, foreign_surface_ok:$foreign_surface_ok, foreign_surface_reasons:$foreign_surface_reasons, crate_dir:$crate_dir}'
 }
 
@@ -720,8 +754,7 @@ except Exception:
   done
 } | LC_ALL=C sort -z \
   | {
-      first=true
-      printf '['
+      paths=()
       while IFS= read -r -d '' f; do
         case "$f" in
           "$PRD_DIR/build-queue/"*)
@@ -729,9 +762,32 @@ except Exception:
             is_collided "$_sl" && continue
             ;;
         esac
+        paths+=("$f")
+      done
+      # PRD-build-contract-declared-crate-dir R3: every entry's crate_dir from
+      # prd-lint.sh's reader, one call for the whole scan. A reader that fails
+      # leaves no manifest rather than one whose crate_dir reads "" everywhere.
+      crate_dirs=()
+      if [ "${#paths[@]}" -gt 0 ]; then
+        _cd_tmp="$(mktemp)" || exit 1
+        if ! read_crate_dirs "$_cd_tmp" "${paths[@]}"; then
+          rm -f "$_cd_tmp"
+          echo "scan-prds: crate_dir read (prd-lint.sh --print-crate-dir) failed; no manifest emitted" >&2
+          exit 1
+        fi
+        mapfile -t crate_dirs < "$_cd_tmp"
+        rm -f "$_cd_tmp"
+        if [ "${#crate_dirs[@]}" -ne "${#paths[@]}" ]; then
+          echo "scan-prds: crate_dir read returned ${#crate_dirs[@]} values for ${#paths[@]} PRDs; no manifest emitted" >&2
+          exit 1
+        fi
+      fi
+      first=true
+      printf '['
+      for _i in "${!paths[@]}"; do
         $first || printf ','
         first=false
-        emit_one "$f"
+        emit_one "${paths[$_i]}" "${crate_dirs[$_i]}"
       done
       printf ']\n'
     } \
