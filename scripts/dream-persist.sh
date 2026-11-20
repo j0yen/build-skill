@@ -46,7 +46,14 @@
 # the PRD home's run-note lint decides whether a batch PRD is held. It runs
 # `dream-run-note-lint.sh <home>/notes/dream-log.md --last --json` (cwd = the home), and the same
 # read with `--entry <ts>` of the latest entry of every other `Task:` (not `none`) and every other
-# `Mission:` name in the log, so an entry of another run appended later does not hide a hold. A batch
+# `Mission:` name in the log, so an entry of another run appended later does not hide a hold. The
+# entries are the lint's own (its find_entries and entry_task): a `## <ts>  /dream  vision-` line
+# starts one, any other line starting `## ` ends it; its Task is its last `Task:` line read as
+# `Task: <id> ... Consumer:`; its missions are the first word of each `Mission:` line. An entry with
+# a `Task:` line naming no Task is read on its own (no later entry can carry its holds); one of
+# `Task: none` or with no `Task:` line is read only as the log's last. `--entry <ts>` reads the last
+# entry with that ts, so an entry the gate must read that shares its ts with a later entry cannot be
+# read: hold-unknown. A batch
 # PRD (slug = filename minus `PRD-` and `.md`) named in any read's `mission.dependent_slugs` (the
 # mission hold, dream SKILL.md Phase 3) or `consumption.held` (unconsumed analysis findings) prints
 # `FAIL hold-held <slug>: <why> [<read>]` on STDERR. A read that exits 2, does not finish within
@@ -55,7 +62,8 @@
 # `FAIL hold-unknown: <why>`, as does a run-note lint that is not there: the gate cannot tell, so it
 # refuses. Any FAIL line refuses the batch: exit 2, nothing staged or committed, review-log outcome
 # refused, whatever REVIEW_MODE and whether or not the PRD's Depends-on resolves. A home with no
-# notes/dream-log.md has no run note to hold a PRD: the gate runs nothing and prints nothing. The
+# notes/dream-log.md, or one whose log has no entry, has no run note to hold a PRD: the gate runs
+# nothing and prints nothing (a dangling symlink is a log the gate cannot read: hold-unknown). The
 # lint is found as dream-scorecard.sh finds it: $DREAM_RUN_NOTE_LINT, else `command -v
 # dream-run-note-lint.sh`, else ${DREAM_SKILL_DIR:-$(readlink -f ~/.claude/skills/dream)}/scripts/
 # dream-run-note-lint.sh; it runs with bash and this process's environment (its decisions log
@@ -86,7 +94,7 @@
 # once per run, with the final outcome (pushed | refused | failed); an EXIT trap writes it
 # even when the run dies. Fields: ts host slug verdict reviewer mode batch_size outcome commit
 # warnings. Outcome refused = a deliberate stop (count, daemon clone, lint FAIL, enforced review
-# guard); failed = a git/manifest/guard error; pushed = committed and pushed (or committed with
+# guard, hold gate); failed = a git/manifest/guard error; pushed = committed and pushed (or committed with
 # no origin remote). `--review-status` reads it, over the last 24 h by ts: persists_24h = rows with
 # outcome pushed, with_review = of those, rows that had a review line, review_missing = pushed rows
 # with no review line, refused = rows with outcome refused.
@@ -113,6 +121,7 @@ if [ -n "${DREAM_RUN_NOTE_LINT:-}" ]; then RUN_NOTE_LINT="$DREAM_RUN_NOTE_LINT" 
 elif ! RUN_NOTE_LINT="$(command -v dream-run-note-lint.sh 2>/dev/null)"; then
   RUN_NOTE_LINT="${DREAM_SKILL_DIR:-$(readlink -f "$HOME/.claude/skills/dream" 2>/dev/null)}/scripts/dream-run-note-lint.sh"
 fi
+case "$RUN_NOTE_LINT" in /*) ;; *) RUN_NOTE_LINT="$PWD/$RUN_NOTE_LINT" ;; esac    # the reader runs it from the PRD home
 HOLD_TIMEOUT="${DREAM_PERSIST_HOLD_TIMEOUT:-600}"
 
 # Review guard mode (warn first; flip to enforce once `--review-status` shows callers pass --review).
@@ -126,7 +135,7 @@ die() { echo "dream-persist: $*" >&2; }
 
 # manifest_upsert <manifest> <repo-relative PRD path>... (cwd = repo toplevel)
 manifest_upsert() {
-  python3 - "$@" <<'PY'
+  python3 -I - "$@" <<'PY'
 import datetime, os, re, sys, tempfile
 manifest, files = sys.argv[1], sys.argv[2:]
 
@@ -192,7 +201,7 @@ review_mode() {
 # Prints tab-separated protocol lines: W <slug or -> <text> (a warning), N <text> (a note),
 # V <slug> <verdict or -> <reviewer or -> (the review line per PRD).
 review_eval() {
-  python3 - "$@" <<'PY'
+  python3 -I - "$@" <<'PY'
 import os, re, sys
 review, lintout, batch = sys.argv[1], sys.argv[2], int(sys.argv[3])
 files = sys.argv[4:]
@@ -280,7 +289,7 @@ review_log_write() {
   mkdir -p "$(dirname "$REVIEW_LOG")" 2>/dev/null || return 0
   for s in "${RV_SLUGS[@]}"; do
     w="$( { [ "${#RV_BW[@]}" -gt 0 ] && printf '%s\n' "${RV_BW[@]}"; printf '%s\n' "${RV_SW[$s]:-}"; } | sed '/^$/d')"
-    python3 - "$s" "${RV_VERDICT[$s]:--}" "${RV_REVIEWER[$s]:--}" "$RV_MODE" "$RV_BATCH" "$RV_OUTCOME" "$RV_SHA" "$w" >> "$REVIEW_LOG" 2>/dev/null <<'PY' || true
+    python3 -I - "$s" "${RV_VERDICT[$s]:--}" "${RV_REVIEWER[$s]:--}" "$RV_MODE" "$RV_BATCH" "$RV_OUTCOME" "$RV_SHA" "$w" >> "$REVIEW_LOG" 2>/dev/null <<'PY' || true
 import datetime, json, socket, sys
 slug, verdict, reviewer, mode, batch, outcome, sha, warns = sys.argv[1:9]
 print(json.dumps({
@@ -312,7 +321,7 @@ review_iterlog_normalize() {
 
 # review_status -> `persists_24h=N with_review=N review_missing=N refused=N` (last 24 h of the log)
 review_status() {
-  python3 - "$REVIEW_LOG" <<'PY'
+  python3 -I - "$REVIEW_LOG" <<'PY'
 import datetime, json, os, sys
 now = datetime.datetime.now(datetime.timezone.utc)
 c = dict(persists_24h=0, with_review=0, review_missing=0, refused=0)
@@ -355,8 +364,8 @@ hooks_selfheal() {
 # Prints tab-separated lines: R <read> (one per lint run), H <slug> <why> (a batch PRD is held) and
 # U <why> (the gate cannot tell). Exits 0; any other exit is an evaluator failure, which refuses.
 hold_eval() {
-  python3 - "$@" <<'PY'
-import json, re, subprocess, sys
+  python3 -I - "$@" <<'PY'
+import json, os, re, subprocess, sys
 lint, log, tmo, slugs = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4:]
 flat = lambda s: " ".join(str(s).split())
 
@@ -410,22 +419,56 @@ try:
 except OSError as e:
     print(f"U\tthe run-note log {log} is unreadable ({e})")
     sys.exit(0)
-heads = list(re.finditer(r"^## (\S+)  /dream  vision-[^\n]*$", text, re.M))
-order = [h.group(1) for h in heads]
-latest = {}                                  # (kind, name) -> ts of that Task's or mission's latest entry
-for k, h in enumerate(heads):
-    body = text[h.end():heads[k + 1].start() if k + 1 < len(heads) else len(text)]
-    t = re.search(r"^Task:[ \t]*(\S+)", body, re.M)
-    mi = re.search(r"^Mission:[ \t]*(\S+)", body, re.M)
-    if t and t.group(1) != "none":
-        latest[("Task", t.group(1))] = h.group(1)
-    if mi:
-        latest[("mission", mi.group(1))] = h.group(1)
-reads, seen = [(None, ["--last"])], {order[-1]} if order else set()
-for (kind, name), ts in sorted(latest.items(), key=lambda kv: order.index(kv[1])):
-    if ts not in seen:
-        seen.add(ts)
-        reads.append((f"entry {ts}, the latest of {kind} {name}", ["--entry", ts]))
+HEADER_RE = re.compile(r"^## (\S+)  /dream  vision-")
+entries, cur = [], None                      # the lint's find_entries: a header starts an entry, any other `## ` line ends it
+for ln in text.split("\n"):
+    m = HEADER_RE.match(ln)
+    if m:
+        cur = {"ts": m.group(1), "lines": []}
+        entries.append(cur)
+    elif ln.startswith("## "):
+        cur = None
+    elif cur is not None:
+        cur["lines"].append(ln)
+if not entries:
+    sys.exit(0)                              # no run note: nothing in the log can hold a PRD (as a home with no log)
+if not os.path.isfile(lint):
+    print(f"U	no run-note lint at {lint} (DREAM_RUN_NOTE_LINT, PATH, DREAM_SKILL_DIR)")
+    sys.exit(0)
+
+def entry_task(e):
+    """The lint's entry_task: the entry's last `Task:` line read as `Task: <id> ... Consumer:`, else None."""
+    t = None
+    for ln in e["lines"]:
+        if ln.startswith("Task:"):
+            m = re.match(r"^Task:\s+(\S+)\s+Consumer:", ln)
+            t = m.group(1) if m else None
+    return t
+
+need = {}                                    # (kind, name) -> index of the entry the gate reads for it
+for k, e in enumerate(entries):
+    t = entry_task(e)
+    if t is None and any(ln.startswith("Task:") for ln in e["lines"]):
+        need[("unread", k)] = k              # a Task: line naming no Task: no later entry carries this entry's holds
+    elif t not in (None, "none"):
+        need[("Task", t)] = k
+    for ln in e["lines"]:
+        if ln.startswith("Mission:"):
+            w = ln[len("Mission:"):].split()
+            if w:
+                need[("mission", w[0])] = k
+last = len(entries) - 1
+reads, seen = [(None, ["--last"])], {last}
+for (kind, name), k in sorted(need.items(), key=lambda kv: kv[1]):
+    if k in seen:
+        continue
+    seen.add(k)
+    ts = entries[k]["ts"]
+    label = f"entry {ts}, " + ("whose Task: line names no Task" if kind == "unread" else f"the latest of {kind} {name}")
+    if any(e["ts"] == ts for e in entries[k + 1:]):
+        print(f"U\t{flat(label)}: a later entry has the same header ts and --entry reads only the last of them")
+        continue
+    reads.append((label, ["--entry", ts]))
 for label, args in reads:
     d, why = read(args)
     if label is None:
@@ -445,25 +488,22 @@ PY
 
 # hold_gate <PRD home> <slug>... -> 0 when no batch PRD is held; 2 when one is or the gate cannot
 # tell, with one `FAIL hold-held|hold-unknown ...` line each on STDERR (kept in HOLD_FAILS).
-# A home with no notes/dream-log.md: 0, nothing run, nothing printed.
+# A home with no notes/dream-log.md, or a log with no entry: 0, nothing run, nothing printed (a dangling
+# symlink there is a log: the reader cannot open it, hold-unknown).
 HOLD_FAILS=()
 hold_gate() {
   local top="$1" log kind a b line out rc; shift
   log="$top/notes/dream-log.md"
   HOLD_FAILS=()
-  [ -e "$log" ] || return 0
-  if [ ! -f "$RUN_NOTE_LINT" ]; then
-    HOLD_FAILS+=("hold-unknown: no run-note lint at $RUN_NOTE_LINT (DREAM_RUN_NOTE_LINT, PATH, DREAM_SKILL_DIR)")
-  else
-    out="$(cd "$top" && hold_eval "$RUN_NOTE_LINT" "$log" "$HOLD_TIMEOUT" "$@")"; rc=$?
-    [ "$rc" -eq 0 ] || HOLD_FAILS+=("hold-unknown: the hold reader exited $rc")
-    while IFS=$'\t' read -r kind a b; do
-      case "$kind" in
-        H) HOLD_FAILS+=("hold-held $a: $b") ;;
-        U) HOLD_FAILS+=("hold-unknown: $a") ;;
-      esac
-    done <<<"$out"
-  fi
+  [ -e "$log" ] || [ -L "$log" ] || return 0
+  out="$(cd "$top" && hold_eval "$RUN_NOTE_LINT" "$log" "$HOLD_TIMEOUT" "$@")"; rc=$?   # the reader checks the lint after the log's entries
+  [ "$rc" -eq 0 ] || HOLD_FAILS+=("hold-unknown: the hold reader exited $rc")
+  while IFS=$'\t' read -r kind a b; do
+    case "$kind" in
+      H) HOLD_FAILS+=("hold-held $a: $b") ;;
+      U) HOLD_FAILS+=("hold-unknown: $a") ;;
+    esac
+  done <<<"$out"
   [ "${#HOLD_FAILS[@]}" -eq 0 ] && return 0
   for line in "${HOLD_FAILS[@]}"; do echo "FAIL $line" >&2; done
   return 2
@@ -477,7 +517,7 @@ explain_one() {
   else
     out="$($SSH redbaron "$PATHX wm-build explain $slug" 2>&1)"
   fi
-  python3 - "$slug" "$out" <<'PY'
+  python3 -I - "$slug" "$out" <<'PY'
 import json, sys
 slug, out = sys.argv[1], sys.argv[2]
 if "no PRD found" in out:
@@ -797,7 +837,7 @@ selftest() {
   DREAM_PERSIST_REVIEW_MODE=enforce runsplit --review "$t/rev-e.txt" "$t/w/build-queue/PRD-e1.md"
   chk "enforce with an APPROVE line persists" "$([ "$RS_RC" -eq 0 ] && [ -z "$RS_ERR" ] && echo 0 || echo 1)" "rc=$RS_RC err=$RS_ERR"
   # --review-status counts: pushed with/without a review line, refused, and a row older than 24 h
-  python3 - "$REVIEW_LOG" <<'PY'
+  python3 -I - "$REVIEW_LOG" <<'PY'
 import datetime, json, sys
 now = datetime.datetime.now(datetime.timezone.utc)
 def row(h, outcome, verdict):
@@ -950,6 +990,59 @@ EOF
   runsplit "$t/w/build-queue/PRD-ok-free.md"
   chk "hold gate: the latest entry of another Task that the lint cannot read refuses (exit 2)" \
     "$([ "$RS_RC" -eq 2 ] && grep -q "^FAIL hold-unknown: entry $HT1, the latest of Task A1: the run-note lint exited 2" <<<"$RS_ERR" && echo 0 || echo 1)" "rc=$RS_RC err=$RS_ERR"
+  # review r16 F1: --entry reads the last entry with a ts, so an entry the gate needs that shares its ts with a later one refuses (no --entry read) ...
+  rewind; fresh; hreset; mkprd "$t/w/build-queue/PRD-ok-free.md" ok-free; hlog "$HT1|A1|m1" "$HT1|A2|-"; hstub last 0 "$HN"; hstub "$HT1" 0 "$HM"
+  runsplit "$t/w/build-queue/PRD-ok-free.md"
+  chk "hold gate: the mission's entry sharing its header ts with a later entry refuses even an unrelated PRD (hold-unknown, no --entry read)" \
+    "$([ "$RS_RC" -eq 2 ] && grep -qxF "FAIL hold-unknown: entry $HT1, the latest of Task A1: a later entry has the same header ts and --entry reads only the last of them" <<<"$RS_ERR" \
+       && ! grep -q -- '--entry' "$HOLD_STUB/calls" && nothing_committed && echo 0 || echo 1)" "rc=$RS_RC err=$RS_ERR calls=$(cat "$HOLD_STUB/calls")"
+  # ... while an entry the gate needs that is the last of its ts is read, whatever earlier entry shares that ts
+  rewind; fresh; hreset; mkprd "$t/w/build-queue/PRD-held-one.md" held-one; hlog "$HT1|A1|-" "$HT1|A1|m1" "$HT2|A2|-"; hstub last 0 "$HN"; hstub "$HT1" 0 "$HM"
+  runsplit "$t/w/build-queue/PRD-held-one.md"
+  chk "hold gate: the needed entry last of its header ts is read by --entry (hold-held; an earlier entry with that ts is no reason to refuse)" \
+    "$([ "$RS_RC" -eq 2 ] && grep -qxF "FAIL hold-held held-one: mission m1 holds it (per-PRD verdict FIX) [entry $HT1, the latest of Task A1]" <<<"$RS_ERR" \
+       && ! grep -q 'hold-unknown' <<<"$RS_ERR" && nothing_committed && echo 0 || echo 1)" "rc=$RS_RC err=$RS_ERR"
+  # review r16 F4: entries as the lint splits them: any other `## ` line ends an entry (a Mission: line after it is in no entry) ...
+  rewind; fresh; hreset; mkprd "$t/w/build-queue/PRD-held-one.md" held-one; mkdir -p "$t/w/notes"
+  printf '## %s  /dream  vision-x\nTask: A1   Consumer: none\nMission: m1 edges=notes/missions/m1.edges.jsonl\n## %s  /dream  vision-x\nTask: A1   Consumer: none\n## scratch\nMission: m1 edges=notes/missions/m1.edges.jsonl\n## %s  /dream  vision-x\nTask: A2   Consumer: none\n' \
+    "$HT1" "$HT2" "$HT3" > "$t/w/notes/dream-log.md"
+  hstub last 0 "$HN"; hstub "$HT1" 0 "$HM"; hstub "$HT2" 0 '{"ts": "'"$HT2"'", "findings": [], "mission": null}'
+  runsplit "$t/w/build-queue/PRD-held-one.md"
+  chk "hold gate: a Mission: line after a non-entry ## line is in no entry; the mission's latest entry is still read (hold-held)" \
+    "$([ "$RS_RC" -eq 2 ] && grep -qxF "FAIL hold-held held-one: mission m1 holds it (per-PRD verdict FIX) [entry $HT1, the latest of mission m1]" <<<"$RS_ERR" && nothing_committed && echo 0 || echo 1)" "rc=$RS_RC err=$RS_ERR calls=$(cat "$HOLD_STUB/calls")"
+  # ... and an entry's Task is its last Task: line
+  rewind; fresh; hreset; mkprd "$t/w/build-queue/PRD-held-one.md" held-one; mkdir -p "$t/w/notes"
+  printf '## %s  /dream  vision-x\nTask: A1   Consumer: none\nTask: A3   Consumer: none\n## %s  /dream  vision-x\nTask: A1   Consumer: none\n## %s  /dream  vision-x\nTask: A2   Consumer: none\n' \
+    "$HT1" "$HT2" "$HT3" > "$t/w/notes/dream-log.md"
+  hstub last 0 "$HN"; hstub "$HT2" 0 '{"ts": "'"$HT2"'", "findings": [], "mission": null}'
+  hstub "$HT1" 1 '{"ts": "'"$HT1"'", "findings": ["consumption-blocked"], "mission": null, "consumption": {"held": [{"slug": "held-one", "by": ["row c-m1 (wwhtbt.md#mechanism:1) refused"]}]}}'
+  runsplit "$t/w/build-queue/PRD-held-one.md"
+  chk "hold gate: an entry with two Task: lines is its last Task's latest entry and is read (hold-held)" \
+    "$([ "$RS_RC" -eq 2 ] && grep -qxF "FAIL hold-held held-one: an unconsumed analysis finding holds it (row c-m1 (wwhtbt.md#mechanism:1) refused) [entry $HT1, the latest of Task A3]" <<<"$RS_ERR" && nothing_committed && echo 0 || echo 1)" "rc=$RS_RC err=$RS_ERR calls=$(cat "$HOLD_STUB/calls")"
+  # ... and an entry whose Task: line names no Task is read on its own
+  rewind; fresh; hreset; mkprd "$t/w/build-queue/PRD-held-one.md" held-one; mkdir -p "$t/w/notes"
+  printf '## %s  /dream  vision-x\nTask:A1   Consumer: none\n## %s  /dream  vision-x\nTask: A2   Consumer: none\n' "$HT1" "$HT2" > "$t/w/notes/dream-log.md"
+  hstub last 0 "$HN"; hstub "$HT1" 1 '{"ts": "'"$HT1"'", "findings": ["line-missing", "consumption-blocked"], "mission": null, "consumption": {"held": [{"slug": "held-one", "by": ["x"]}]}}'
+  runsplit "$t/w/build-queue/PRD-held-one.md"
+  chk "hold gate: an entry whose Task: line names no Task is read on its own (hold-held)" \
+    "$([ "$RS_RC" -eq 2 ] && grep -qxF "FAIL hold-held held-one: an unconsumed analysis finding holds it (x) [entry $HT1, whose Task: line names no Task]" <<<"$RS_ERR" && nothing_committed && echo 0 || echo 1)" "rc=$RS_RC err=$RS_ERR calls=$(cat "$HOLD_STUB/calls")"
+  # review r16 F3: a dangling symlink at notes/dream-log.md is a log the gate cannot read
+  rewind; fresh; hreset; mkprd "$t/w/build-queue/PRD-ok-free.md" ok-free; mkdir -p "$t/w/notes"; ln -s ../nowhere.md "$t/w/notes/dream-log.md"
+  runsplit "$t/w/build-queue/PRD-ok-free.md"
+  chk "hold gate: a dangling symlink log refuses (hold-unknown: unreadable), no read" \
+    "$([ "$RS_RC" -eq 2 ] && grep -q "^FAIL hold-unknown: the run-note log .*/notes/dream-log.md is unreadable" <<<"$RS_ERR" && [ ! -e "$HOLD_STUB/calls" ] && nothing_committed && echo 0 || echo 1)" "rc=$RS_RC err=$RS_ERR"
+  # review r16 F5: a log with no entry is no run note, as a home with no log: no read, nothing printed, even with no lint
+  rewind; fresh; hreset; mkprd "$t/w/build-queue/PRD-ok-free.md" ok-free; mkdir -p "$t/w/notes"; printf '# dream log\n\n## notes\ntext\n' > "$t/w/notes/dream-log.md"
+  printf 'ok-free APPROVE fable\n' > "$t/rev-free.txt"
+  RUN_NOTE_LINT="$t/no-such-lint" runsplit --review "$t/rev-free.txt" "$t/w/build-queue/PRD-ok-free.md"
+  chk "hold gate: a log with no entry runs no read and prints nothing, even with no lint (rc 0, committed)" \
+    "$([ "$RS_RC" -eq 0 ] && [ ! -e "$HOLD_STUB/calls" ] && [ -z "$RS_ERR" ] && grep -q '^committed: ' <<<"$RS_OUT" && echo 0 || echo 1)" "rc=$RS_RC err=$RS_ERR"
+  # review r16 F2: the reader runs isolated, so a json.py in the PRD home is not imported
+  rewind; fresh; hreset; mkprd "$t/w/build-queue/PRD-held-one.md" held-one; hlog "$HT1|A1|m1"; hstub last 0 "$HM"
+  printf 'def loads(s, *a, **k):\n    return {}\n' > "$t/w/json.py"
+  runsplit "$t/w/build-queue/PRD-held-one.md"
+  chk "hold gate: a json.py in the PRD home does not take over the reader (hold-held)" \
+    "$([ "$RS_RC" -eq 2 ] && grep -q '^FAIL hold-held held-one: ' <<<"$RS_ERR" && nothing_committed && echo 0 || echo 1)" "rc=$RS_RC err=$RS_ERR"
   # --hold-check: the gate alone, read-only
   rewind; fresh; hreset; hlog "$HT1|A1|m1"; hstub last 0 "$HM"
   out="$(DREAM_RUN_NOTE_LINT="$t/rnl" "$0" --hold-check "$t/w" held-one ok-free 2>"$t/hc.err")"; rc=$?
