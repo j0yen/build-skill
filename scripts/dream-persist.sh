@@ -56,9 +56,10 @@
 # refuses. Any FAIL line refuses the batch: exit 2, nothing staged or committed, review-log outcome
 # refused, whatever REVIEW_MODE and whether or not the PRD's Depends-on resolves. A home with no
 # notes/dream-log.md has no run note to hold a PRD: the gate runs nothing and prints nothing. The
-# lint is the dream skill's: ${DREAM_PERSIST_RUN_NOTE_LINT:-~/.claude/skills/dream/scripts/dream-run-note-lint.sh},
-# run with bash, with this process's environment (its decisions log default, SKILL_ROUTING_DECISIONS,
-# and the wm-asks on PATH).
+# lint is found as dream-scorecard.sh finds it: $DREAM_RUN_NOTE_LINT, else `command -v
+# dream-run-note-lint.sh`, else ${DREAM_SKILL_DIR:-$(readlink -f ~/.claude/skills/dream)}/scripts/
+# dream-run-note-lint.sh; it runs with bash and this process's environment (its decisions log
+# default, SKILL_ROUTING_DECISIONS, and the wm-asks on PATH).
 #
 # REVIEW GUARD (`--review <file>`): the file holds one line per PRD,
 # `<slug> APPROVE|FIX|REJECT <reviewer>` (slug = PRD filename minus `PRD-` and `.md`;
@@ -98,7 +99,7 @@
 #   DREAM_PERSIST_WM_BUILD (command for explain, default wm-build), DREAM_PERSIST_SSH,
 #   DREAM_PERSIST_NO_PULL=1, DREAM_REVIEW_LOG, DREAM_PERSIST_REVIEW_MODE,
 #   DREAM_PERSIST_TODAY (YYYY-MM-DD; overrides today's date for the EXPIRES test),
-#   DREAM_PERSIST_RUN_NOTE_LINT, DREAM_PERSIST_HOLD_TIMEOUT (the HOLD GATE).
+#   DREAM_RUN_NOTE_LINT, DREAM_SKILL_DIR, DREAM_PERSIST_HOLD_TIMEOUT (the HOLD GATE).
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -108,7 +109,10 @@ CONFIG="${WM_BUILD_CONFIG:-$HOME/.config/wm-build/config.toml}"
 WB="${DREAM_PERSIST_WM_BUILD:-wm-build}"
 SSH="${DREAM_PERSIST_SSH:-ssh -o ConnectTimeout=8}"
 PATHX='export PATH=$HOME/.local/bin:$HOME/.cargo/bin:$PATH;'
-RUN_NOTE_LINT="${DREAM_PERSIST_RUN_NOTE_LINT:-$HOME/.claude/skills/dream/scripts/dream-run-note-lint.sh}"
+if [ -n "${DREAM_RUN_NOTE_LINT:-}" ]; then RUN_NOTE_LINT="$DREAM_RUN_NOTE_LINT"      # the HOLD GATE's lint (header)
+elif ! RUN_NOTE_LINT="$(command -v dream-run-note-lint.sh 2>/dev/null)"; then
+  RUN_NOTE_LINT="${DREAM_SKILL_DIR:-$(readlink -f "$HOME/.claude/skills/dream" 2>/dev/null)}/scripts/dream-run-note-lint.sh"
+fi
 HOLD_TIMEOUT="${DREAM_PERSIST_HOLD_TIMEOUT:-600}"
 
 # Review guard mode (warn first; flip to enforce once `--review-status` shows callers pass --review).
@@ -449,7 +453,7 @@ hold_gate() {
   HOLD_FAILS=()
   [ -e "$log" ] || return 0
   if [ ! -f "$RUN_NOTE_LINT" ]; then
-    HOLD_FAILS+=("hold-unknown: no run-note lint at $RUN_NOTE_LINT (DREAM_PERSIST_RUN_NOTE_LINT)")
+    HOLD_FAILS+=("hold-unknown: no run-note lint at $RUN_NOTE_LINT (DREAM_RUN_NOTE_LINT, PATH, DREAM_SKILL_DIR)")
   else
     out="$(cd "$top" && hold_eval "$RUN_NOTE_LINT" "$log" "$HOLD_TIMEOUT" "$@")"; rc=$?
     [ "$rc" -eq 0 ] || HOLD_FAILS+=("hold-unknown: the hold reader exited $rc")
@@ -948,12 +952,24 @@ EOF
     "$([ "$RS_RC" -eq 2 ] && grep -q "^FAIL hold-unknown: entry $HT1, the latest of Task A1: the run-note lint exited 2" <<<"$RS_ERR" && echo 0 || echo 1)" "rc=$RS_RC err=$RS_ERR"
   # --hold-check: the gate alone, read-only
   rewind; fresh; hreset; hlog "$HT1|A1|m1"; hstub last 0 "$HM"
-  out="$(DREAM_PERSIST_RUN_NOTE_LINT="$t/rnl" "$0" --hold-check "$t/w" held-one ok-free 2>"$t/hc.err")"; rc=$?
+  out="$(DREAM_RUN_NOTE_LINT="$t/rnl" "$0" --hold-check "$t/w" held-one ok-free 2>"$t/hc.err")"; rc=$?
   chk "--hold-check: a held slug -> 'hold-check: refused (1)', exit 2, the FAIL line on stderr" \
     "$([ "$rc" -eq 2 ] && [ "$out" = "hold-check: refused (1)" ] && grep -q '^FAIL hold-held held-one: ' "$t/hc.err" && echo 0 || echo 1)" "rc=$rc out=$out err=$(cat "$t/hc.err")"
-  out="$(DREAM_PERSIST_RUN_NOTE_LINT="$t/rnl" "$0" --hold-check "$t/w" ok-free 2>"$t/hc.err")"; rc=$?
+  out="$(DREAM_RUN_NOTE_LINT="$t/rnl" "$0" --hold-check "$t/w" ok-free 2>"$t/hc.err")"; rc=$?
   chk "--hold-check: an unheld slug -> 'hold-check: clear', exit 0, nothing committed" \
     "$([ "$rc" -eq 0 ] && [ "$out" = "hold-check: clear" ] && [ ! -s "$t/hc.err" ] && nothing_committed && echo 0 || echo 1)" "rc=$rc out=$out err=$(cat "$t/hc.err")"
+  # lint discovery, as dream-scorecard.sh's: no seam -> PATH, then ${DREAM_SKILL_DIR}/scripts
+  mkdir -p "$t/pbin" "$t/skill/scripts"; cp "$t/rnl" "$t/pbin/dream-run-note-lint.sh"; cp "$t/rnl" "$t/skill/scripts/dream-run-note-lint.sh"
+  : > "$HOLD_STUB/calls"
+  out="$(env -u DREAM_RUN_NOTE_LINT PATH="$t/pbin:/usr/bin:/bin" DREAM_SKILL_DIR="$t/nowhere" "$0" --hold-check "$t/w" held-one 2>"$t/hc.err")"; rc=$?
+  chk "hold gate lint discovery: no seam, the lint on PATH is read" "$([ "$rc" -eq 2 ] && [ -s "$HOLD_STUB/calls" ] && echo 0 || echo 1)" "rc=$rc out=$out err=$(cat "$t/hc.err")"
+  : > "$HOLD_STUB/calls"
+  out="$(env -u DREAM_RUN_NOTE_LINT PATH="/usr/bin:/bin" DREAM_SKILL_DIR="$t/skill" "$0" --hold-check "$t/w" held-one 2>"$t/hc.err")"; rc=$?
+  chk "hold gate lint discovery: no seam and none on PATH, \${DREAM_SKILL_DIR}/scripts/dream-run-note-lint.sh is read" \
+    "$([ "$rc" -eq 2 ] && [ -s "$HOLD_STUB/calls" ] && echo 0 || echo 1)" "rc=$rc out=$out err=$(cat "$t/hc.err")"
+  out="$(env -u DREAM_RUN_NOTE_LINT PATH="/usr/bin:/bin" DREAM_SKILL_DIR="$t/nowhere" "$0" --hold-check "$t/w" ok-free 2>"$t/hc.err")"; rc=$?
+  chk "hold gate lint discovery: none found -> refused even for an unheld slug (hold-unknown)" \
+    "$([ "$rc" -eq 2 ] && grep -q "^FAIL hold-unknown: no run-note lint at $t/nowhere/scripts/dream-run-note-lint.sh" "$t/hc.err" && echo 0 || echo 1)" "rc=$rc out=$out err=$(cat "$t/hc.err")"
   if [ "$fails" -ne 0 ]; then echo "SELFTEST FAILED ($fails/$total checks)"; return 1; fi
   echo "SELFTEST PASSED ($total checks)"
 }
