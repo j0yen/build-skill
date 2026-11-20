@@ -55,9 +55,10 @@
 # entry with that ts, so an entry the gate must read that shares its ts with a later entry cannot be
 # read: hold-unknown. The lint carries a Task's consumption holds only through its entries on or after
 # its cutover (R9): when a Task's latest entry reads with no `consumption` block, the gate also reads
-# back through the Task's entries dated later than every later entry of it (header date, or its
-# Route's decision date when later) until one reads with that block, and takes that read's
-# consumption holds (not its mission's). A batch
+# back through the Task's earlier entries, latest first, until one reads with that block, and takes
+# that read's consumption holds (not its mission's). An entry read with no block is before the
+# cutover by its header date, so an earlier entry dated no later than that (header date, and each
+# Route decision date as the lint compares it) is before the cutover too and is not read. A batch
 # PRD (slug = filename minus `PRD-` and `.md`) named in any read's `mission.dependent_slugs` (the
 # mission hold, dream SKILL.md Phase 3) or `consumption.held` (unconsumed analysis findings) prints
 # `FAIL hold-held <slug>: <why> [<read>]` on STDERR. A read that exits 2, does not finish within
@@ -472,14 +473,21 @@ def hdate(ts):
         return None
 
 def edate(e):
-    """The latest date the lint's R9 can place an entry at: its header date (none: after any cutover), or its Route's decision date when later."""
+    """The latest date the lint's R9 can place an entry at: its header date (none: after any cutover), or a Route decision date when later, read
+    as the lint's entry_post compares it (the text's first 10 characters, review r16c Y5). Only chooses which entries are read."""
     d = hdate(e["ts"]) or "9999-12-31"
     for ln in e["lines"]:
         if ln.startswith("Route:"):
             m = re.search(r"\sdecision=(\S+)$", ln.rstrip())
-            if m and hdate(m.group(1)):
-                d = max(d, hdate(m.group(1)))
+            if m:
+                d = max(d, m.group(1)[:10])
     return d
+
+def pre_bound(e):
+    """An entry the lint read with no consumption block is before its cutover (R9): its header date is a valid date before the cutover, and its
+    Route did not count. -> that header date, a bound below the cutover (review r16c Y: never its Route's date, which may not resolve); "" when the
+    header has no readable date (the lint counts such an entry after the cutover, so nothing is learned)."""
+    return hdate(e["ts"]) or ""
 
 def reachable(k, label):
     """--entry <ts> reads the last entry with that ts: an entry sharing its ts with a later one cannot be read (hold-unknown)."""
@@ -514,9 +522,10 @@ for k, label, args in reads:
     results[k] = d
     report(label or (f"entry {d.get('ts')}, the log's last" if d is not None else "the log's last entry"), d, why)
 # Review r16b X1: the lint carries a Task's consumption holds only through its entries on or after the cutover (R9). When the Task's latest entry
-# reads with no consumption block, its holds stand at the Task's last entry the lint counts as after the cutover. That entry is one dated later
-# (edate) than every later entry of the Task, so the gate reads back through those, latest first, until one reads with a consumption block, and takes
-# that read's consumption holds only (the latest entries decide the mission).
+# reads with no consumption block, its holds stand at the Task's last entry the lint counts as after the cutover, so the gate reads back through the
+# Task's entries, latest first, until one reads with a consumption block, and takes that read's consumption holds only (the latest entries decide the
+# mission). Each entry read with no block is before the cutover by its header date (pre_bound), so an earlier entry whose every date (edate) is no
+# later than the latest such bound is before the cutover too and is not read (review r16c Y: the bound is never a Route's date, which may not resolve).
 tasks = {}
 for k, e in enumerate(entries):
     t = entry_task(e)
@@ -526,14 +535,14 @@ for t, ps in tasks.items():
     d = results.get(ps[-1])
     if d is None or "consumption" in d:
         continue                                 # unread (refused already) or the lint carries the Task's holds at its latest entry
-    cur = edate(entries[ps[-1]])
+    cur = pre_bound(entries[ps[-1]])
     for q in reversed(ps[:-1]):
         if edate(entries[q]) <= cur:
-            continue
-        cur = edate(entries[q])
+            continue                             # dated no later than an entry the lint placed before the cutover: before it too
         if q in results:                         # read above, its holds reported
             if results[q] is None or "consumption" in results[q]:
                 break
+            cur = max(cur, pre_bound(entries[q]))
             continue
         label = f"entry {entries[q]['ts']}, Task {t}'s entry dated after its latest entry {entries[ps[-1]]['ts']}"
         if not reachable(q, label):
@@ -546,6 +555,7 @@ for t, ps in tasks.items():
         if "consumption" in dq:
             report(label, dq, None, mission=False)
             break
+        cur = max(cur, pre_bound(entries[q]))
         print(f"R\t{flat(label)}")
 PY
 }
@@ -1138,6 +1148,32 @@ EOF
   runsplit "$t/w/build-queue/PRD-held-one.md"
   chk "hold gate: the read back takes no mission hold (a later APPROVE decides the mission; rc 0, the earlier entry read)" \
     "$([ "$RS_RC" -eq 0 ] && grep -q -- "--entry $HT1 --json" "$HOLD_STUB/calls" && echo 0 || echo 1)" "rc=$RS_RC err=$RS_ERR calls=$(cat "$HOLD_STUB/calls")"
+  # review r16c Y: a later entry the lint read with no block (before the cutover) whose Route names a later decision date that does not resolve: only
+  # its header date bounds the read back, so the earlier entry dated after that is still read (hold-held)
+  rewind; fresh; hreset; mkprd "$t/w/build-queue/PRD-held-one.md" held-one; mkdir -p "$t/w/notes"
+  printf '## %s  /dream  vision-x\nTask: A1   Consumer: none\n## %s  /dream  vision-x\nTask: A1   Consumer: none\nRoute: dream opus-xhigh claude-opus-5-5 session=s9 decision=2026-11-21T00:00:00Z\n' \
+    "$HT1" "$HP" > "$t/w/notes/dream-log.md"
+  hstub last 1 '{"ts": "'"$HP"'", "findings": ["route-provenance-mismatch"], "mission": null}'; hstub "$HT1" 1 "$HC"
+  runsplit "$t/w/build-queue/PRD-held-one.md"
+  chk "hold gate: a later entry's unresolved Route date does not stop the read back (its header date bounds it: hold-held)" \
+    "$([ "$RS_RC" -eq 2 ] && grep -qxF "FAIL hold-held held-one: an unconsumed analysis finding holds it (x) [entry $HT1, Task A1's entry dated after its latest entry $HP]" <<<"$RS_ERR" \
+       && nothing_committed && echo 0 || echo 1)" "rc=$RS_RC err=$RS_ERR calls=$(cat "$HOLD_STUB/calls")"
+  # review r16c Y5: a Route decision date is read as the lint compares it (its first 10 characters), so an entry whose decision is no ISO time but
+  # starts with a date after the cutover is read back (hold-held)
+  rewind; fresh; hreset; mkprd "$t/w/build-queue/PRD-held-one.md" held-one; mkdir -p "$t/w/notes"
+  printf '## %s  /dream  vision-x\nTask: A1   Consumer: none\nRoute: dream opus-xhigh claude-opus-5-5 session=s1 decision=2026-11-20_00:10:00Z\n## %s  /dream  vision-x\nTask: A1   Consumer: none\n' \
+    2026-11-19T01:00:00-08:00 "$HP" > "$t/w/notes/dream-log.md"
+  hstub last 0 '{"ts": "'"$HP"'", "findings": [], "mission": null}'; hstub 2026-11-19T01:00:00-08:00 1 "$HC"
+  runsplit "$t/w/build-queue/PRD-held-one.md"
+  chk "hold gate: a Route decision date is read as the lint compares it (its first 10 characters): the entry is read back (hold-held)" \
+    "$([ "$RS_RC" -eq 2 ] && grep -q "^FAIL hold-held held-one: .*\[entry 2026-11-19T01:00:00-08:00, Task A1's entry dated after its latest entry $HP\]" <<<"$RS_ERR" \
+       && nothing_committed && echo 0 || echo 1)" "rc=$RS_RC err=$RS_ERR calls=$(cat "$HOLD_STUB/calls")"
+  # ... while an earlier entry dated no later than a later entry the lint read with no block is before the cutover too and is not read (rc 0)
+  rewind; fresh; hreset; mkprd "$t/w/build-queue/PRD-held-one.md" held-one; hlog "2026-11-18T01:00:00-08:00|A1|-" "$HP|A1|-"
+  hstub last 0 '{"ts": "'"$HP"'", "findings": [], "mission": null}'; hstub 2026-11-18T01:00:00-08:00 1 "$HC"
+  runsplit "$t/w/build-queue/PRD-held-one.md"
+  chk "hold gate: an earlier entry dated before a later entry the lint read with no block is not read (rc 0)" \
+    "$([ "$RS_RC" -eq 0 ] && ! grep -q -- "--entry 2026-11-18T01:00:00-08:00" "$HOLD_STUB/calls" && echo 0 || echo 1)" "rc=$RS_RC err=$RS_ERR calls=$(cat "$HOLD_STUB/calls")"
   # --hold-check: the gate alone, read-only
   rewind; fresh; hreset; hlog "$HT1|A1|m1"; hstub last 0 "$HM"
   out="$(DREAM_RUN_NOTE_LINT="$t/rnl" "$0" --hold-check "$t/w" held-one ok-free 2>"$t/hc.err")"; rc=$?
