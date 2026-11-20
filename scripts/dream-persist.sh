@@ -53,7 +53,11 @@
 # a `Task:` line naming no Task is read on its own (no later entry can carry its holds); one of
 # `Task: none` or with no `Task:` line is read only as the log's last. `--entry <ts>` reads the last
 # entry with that ts, so an entry the gate must read that shares its ts with a later entry cannot be
-# read: hold-unknown. A batch
+# read: hold-unknown. The lint carries a Task's consumption holds only through its entries on or after
+# its cutover (R9): when a Task's latest entry reads with no `consumption` block, the gate also reads
+# back through the Task's entries dated later than every later entry of it (header date, or its
+# Route's decision date when later) until one reads with that block, and takes that read's
+# consumption holds (not its mission's). A batch
 # PRD (slug = filename minus `PRD-` and `.md`) named in any read's `mission.dependent_slugs` (the
 # mission hold, dream SKILL.md Phase 3) or `consumption.held` (unconsumed analysis findings) prints
 # `FAIL hold-held <slug>: <why> [<read>]` on STDERR. A read that exits 2, does not finish within
@@ -365,7 +369,7 @@ hooks_selfheal() {
 # U <why> (the gate cannot tell). Exits 0; any other exit is an evaluator failure, which refuses.
 hold_eval() {
   python3 -I - "$@" <<'PY'
-import json, os, re, subprocess, sys
+import datetime, json, os, re, subprocess, sys
 lint, log, tmo, slugs = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4:]
 flat = lambda s: " ".join(str(s).split())
 
@@ -393,10 +397,10 @@ def read(args):
 def listed(v, key):
     return isinstance(v, list) and all(isinstance(x, dict) and isinstance(x.get(key), str) for x in v)
 
-def holds(d):
-    """(slug, why) pairs of the mission hold and the consumption hold; texts for what cannot be read."""
+def holds(d, mission=True):
+    """(slug, why) pairs of the mission hold (unless mission=False) and the consumption hold; texts for what cannot be read."""
     got, bad = [], []
-    m = d.get("mission")
+    m = d.get("mission") if mission else None
     if m is not None:
         deps = m.get("dependent_slugs") if isinstance(m, dict) else None
         name = m.get("name") if isinstance(m, dict) else m
@@ -457,32 +461,92 @@ for k, e in enumerate(entries):
             w = ln[len("Mission:"):].split()
             if w:
                 need[("mission", w[0])] = k
-last = len(entries) - 1
-reads, seen = [(None, ["--last"])], {last}
-for (kind, name), k in sorted(need.items(), key=lambda kv: kv[1]):
-    if k in seen:
-        continue
-    seen.add(k)
-    ts = entries[k]["ts"]
-    label = f"entry {ts}, " + ("whose Task: line names no Task" if kind == "unread" else f"the latest of {kind} {name}")
-    if any(e["ts"] == ts for e in entries[k + 1:]):
+def hdate(ts):
+    """The lint's header_date: a valid leading ISO date, else None (which the lint counts as after its cutover)."""
+    m = re.match(r"^(\d{4})-(\d{2})-(\d{2})(?=$|[T ])", ts or "")
+    if not m:
+        return None
+    try:
+        return datetime.date(int(m.group(1)), int(m.group(2)), int(m.group(3))).isoformat()
+    except ValueError:
+        return None
+
+def edate(e):
+    """The latest date the lint's R9 can place an entry at: its header date (none: after any cutover), or its Route's decision date when later."""
+    d = hdate(e["ts"]) or "9999-12-31"
+    for ln in e["lines"]:
+        if ln.startswith("Route:"):
+            m = re.search(r"\sdecision=(\S+)$", ln.rstrip())
+            if m and hdate(m.group(1)):
+                d = max(d, hdate(m.group(1)))
+    return d
+
+def reachable(k, label):
+    """--entry <ts> reads the last entry with that ts: an entry sharing its ts with a later one cannot be read (hold-unknown)."""
+    if any(e["ts"] == entries[k]["ts"] for e in entries[k + 1:]):
         print(f"U\t{flat(label)}: a later entry has the same header ts and --entry reads only the last of them")
-        continue
-    reads.append((label, ["--entry", ts]))
-for label, args in reads:
-    d, why = read(args)
-    if label is None:
-        label = f"entry {d.get('ts')}, the log's last" if d is not None else "the log's last entry"
+        return False
+    return True
+
+def report(label, d, why, mission=True):
     print(f"R\t{flat(label)}")
     if d is None:
         print(f"U\t{flat(label)}: {flat(why)}")
-        continue
-    got, bad = holds(d)
+        return
+    got, bad = holds(d, mission)
     for b in bad:
         print(f"U\t{flat(label)}: {flat(b)}")
     for s, w in got:
         if s in slugs:
             print(f"H\t{s}\t{flat(w)} [{flat(label)}]")
+
+last = len(entries) - 1
+reads, seen, results = [(last, None, ["--last"])], {last}, {}
+for (kind, name), k in sorted(need.items(), key=lambda kv: kv[1]):
+    if k in seen:
+        continue
+    seen.add(k)
+    label = f"entry {entries[k]['ts']}, " + ("whose Task: line names no Task" if kind == "unread" else f"the latest of {kind} {name}")
+    if reachable(k, label):
+        reads.append((k, label, ["--entry", entries[k]["ts"]]))
+for k, label, args in reads:
+    d, why = read(args)
+    results[k] = d
+    report(label or (f"entry {d.get('ts')}, the log's last" if d is not None else "the log's last entry"), d, why)
+# Review r16b X1: the lint carries a Task's consumption holds only through its entries on or after the cutover (R9). When the Task's latest entry
+# reads with no consumption block, its holds stand at the Task's last entry the lint counts as after the cutover. That entry is one dated later
+# (edate) than every later entry of the Task, so the gate reads back through those, latest first, until one reads with a consumption block, and takes
+# that read's consumption holds only (the latest entries decide the mission).
+tasks = {}
+for k, e in enumerate(entries):
+    t = entry_task(e)
+    if t not in (None, "none"):
+        tasks.setdefault(t, []).append(k)
+for t, ps in tasks.items():
+    d = results.get(ps[-1])
+    if d is None or "consumption" in d:
+        continue                                 # unread (refused already) or the lint carries the Task's holds at its latest entry
+    cur = edate(entries[ps[-1]])
+    for q in reversed(ps[:-1]):
+        if edate(entries[q]) <= cur:
+            continue
+        cur = edate(entries[q])
+        if q in results:                         # read above, its holds reported
+            if results[q] is None or "consumption" in results[q]:
+                break
+            continue
+        label = f"entry {entries[q]['ts']}, Task {t}'s entry dated after its latest entry {entries[ps[-1]]['ts']}"
+        if not reachable(q, label):
+            break
+        dq, why = read(["--entry", entries[q]["ts"]])
+        results[q] = dq
+        if dq is None:
+            report(label, None, why)
+            break
+        if "consumption" in dq:
+            report(label, dq, None, mission=False)
+            break
+        print(f"R\t{flat(label)}")
 PY
 }
 
@@ -1043,6 +1107,37 @@ EOF
   runsplit "$t/w/build-queue/PRD-held-one.md"
   chk "hold gate: a json.py in the PRD home does not take over the reader (hold-held)" \
     "$([ "$RS_RC" -eq 2 ] && grep -q '^FAIL hold-held held-one: ' <<<"$RS_ERR" && nothing_committed && echo 0 || echo 1)" "rc=$RS_RC err=$RS_ERR"
+  # review r16b X1: a later entry of the Task dated before the cutover (no consumption block) does not hide the Task's holds at its post-cutover entry
+  local HP=2026-11-19T03:00:00-08:00 HQ=2026-11-21T01:00:00-08:00
+  local HC='{"ts": "'"$HT1"'", "findings": ["consumption-blocked"], "mission": null, "consumption": {"held": [{"slug": "held-one", "by": ["x"]}]}}'
+  rewind; fresh; hreset; mkprd "$t/w/build-queue/PRD-held-one.md" held-one; hlog "$HT1|A1|-" "$HP|A1|-"
+  hstub last 0 '{"ts": "'"$HP"'", "findings": [], "mission": null}'; hstub "$HT1" 1 "$HC"
+  runsplit "$t/w/build-queue/PRD-held-one.md"
+  chk "hold gate: a later entry of the Task dated before the cutover does not hide its holds (the entry dated after it is read: hold-held)" \
+    "$([ "$RS_RC" -eq 2 ] && grep -qxF "FAIL hold-held held-one: an unconsumed analysis finding holds it (x) [entry $HT1, Task A1's entry dated after its latest entry $HP]" <<<"$RS_ERR" \
+       && nothing_committed && echo 0 || echo 1)" "rc=$RS_RC err=$RS_ERR calls=$(cat "$HOLD_STUB/calls")"
+  # ... while a latest entry the lint reads with a consumption block decides (no read back, so a lift there is not undone)
+  rewind; fresh; hreset; mkprd "$t/w/build-queue/PRD-held-one.md" held-one; hlog "$HQ|A1|-" "$HT2|A1|-"
+  hstub last 0 '{"ts": "'"$HT2"'", "findings": [], "mission": null, "consumption": {"held": []}}'; hstub "$HQ" 1 "$HC"
+  runsplit "$t/w/build-queue/PRD-held-one.md"
+  chk "hold gate: a latest entry with a consumption block decides; the earlier entry dated after it is not read (rc 0)" \
+    "$([ "$RS_RC" -eq 0 ] && ! grep -q -- "--entry $HQ" "$HOLD_STUB/calls" && echo 0 || echo 1)" "rc=$RS_RC err=$RS_ERR calls=$(cat "$HOLD_STUB/calls")"
+  # ... an entry after the cutover by its Route's decision date only (its header dated the day before) is read back too
+  rewind; fresh; hreset; mkprd "$t/w/build-queue/PRD-held-one.md" held-one; mkdir -p "$t/w/notes"
+  printf '## %s  /dream  vision-x\nTask: A1   Consumer: none\nRoute: dream opus-xhigh claude-opus-5-5 session=s1 decision=2026-11-20T07:00:00Z\n## %s  /dream  vision-x\nTask: A1   Consumer: none\n' \
+    2026-11-19T23:00:00-08:00 2026-11-19T23:30:00-08:00 > "$t/w/notes/dream-log.md"
+  hstub last 0 '{"ts": "2026-11-19T23:30:00-08:00", "findings": [], "mission": null}'; hstub 2026-11-19T23:00:00-08:00 1 "$HC"
+  runsplit "$t/w/build-queue/PRD-held-one.md"
+  chk "hold gate: an entry after the cutover by its Route's decision date is read back (hold-held)" \
+    "$([ "$RS_RC" -eq 2 ] && grep -q "^FAIL hold-held held-one: .*\[entry 2026-11-19T23:00:00-08:00, Task A1's entry dated after its latest entry" <<<"$RS_ERR" && nothing_committed && echo 0 || echo 1)" \
+    "rc=$RS_RC err=$RS_ERR calls=$(cat "$HOLD_STUB/calls")"
+  # ... and the read back takes consumption holds only: the latest entries decide the mission
+  rewind; fresh; hreset; mkprd "$t/w/build-queue/PRD-held-one.md" held-one; hlog "$HT1|A1|m1" "$HP|A1|m1"
+  hstub last 0 '{"ts": "'"$HP"'", "findings": [], "mission": {"name": "m1", "verdict": "APPROVE", "dependent_slugs": []}}'
+  hstub "$HT1" 0 '{"ts": "'"$HT1"'", "findings": [], "mission": {"name": "m1", "verdict": "FIX", "dependent_slugs": [{"slug": "held-one", "reason": "per-PRD verdict FIX"}]}, "consumption": {"held": []}}'
+  runsplit "$t/w/build-queue/PRD-held-one.md"
+  chk "hold gate: the read back takes no mission hold (a later APPROVE decides the mission; rc 0, the earlier entry read)" \
+    "$([ "$RS_RC" -eq 0 ] && grep -q -- "--entry $HT1 --json" "$HOLD_STUB/calls" && echo 0 || echo 1)" "rc=$RS_RC err=$RS_ERR calls=$(cat "$HOLD_STUB/calls")"
   # --hold-check: the gate alone, read-only
   rewind; fresh; hreset; hlog "$HT1|A1|m1"; hstub last 0 "$HM"
   out="$(DREAM_RUN_NOTE_LINT="$t/rnl" "$0" --hold-check "$t/w" held-one ok-free 2>"$t/hc.err")"; rc=$?
