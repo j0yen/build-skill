@@ -54,6 +54,9 @@ printf '%s\n' "$*" >> "$FAKE_WB_LOG"
 case "${1:-}" in
   --version) echo "wm-build ${FAKE_WB_VERSION:-0.77.999}"; exit 0 ;;
   lint)
+    # a repeated --prd-dir is refused as wm-build 0.77.112 refuses it (read on RedBaron 2026-11-21: exit 2)
+    n=0; for a in "$@"; do [ "$a" = --prd-dir ] && n=$((n + 1)); done
+    [ "$n" -le 1 ] || { echo "error: the argument '--prd-dir <PRD_DIR>' cannot be used multiple times" >&2; exit 2; }
     f="$2"; s="$(basename "$f" .md)"; s="${s#PRD-}"
     echo "$s: live_acs=[2] acs=2 deferred=[]"; exit 0 ;;
   explain)

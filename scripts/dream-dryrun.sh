@@ -17,7 +17,9 @@
 #   (b) scripts/dream-lint.sh on each staged copy (reused), with DREAM_LINT_WM_BUILD set to a
 #       one-line wrapper running the resolved binary with `--prd-dir <tmp>` (named relative
 #       to the run's temporary directory, so a TMPDIR holding spaces or glob characters
-#       still works with dream-lint.sh's unquoted expansion), PRD_LINT_NO_FETCH=1 and
+#       still works with dream-lint.sh's unquoted expansion), DREAM_PRD_DIR removed (the
+#       wrapper names the corpus; dream-lint.sh would add the destination's own --prd-dir
+#       from it, and wm-build refuses a repeated --prd-dir), PRD_LINT_NO_FETCH=1 and
 #       GIT_OPTIONAL_LOCKS=0 (prd-lint's referent check reads each build_into's existing
 #       origin/main: no `git fetch`, no network, no write into a live clone; its answer is
 #       as fresh as that clone's last fetch). A FAIL yields `ineligible — lint: <first
@@ -519,6 +521,7 @@ try:
     env = dict(os.environ)
     env["PRD_LINT_NO_FETCH"] = "1"         # the referent check reads origin/main as fetched: no network, no live-clone write
     env["GIT_OPTIONAL_LOCKS"] = "0"
+    env.pop("DREAM_PRD_DIR", None)         # the wrapper names the staged corpus: one --prd-dir, never the destination's too
     if wb:
         with open(os.path.join(tmp, WRAPPER), "w") as fh:
             fh.write(f"#!/bin/sh\nexec {shlex.quote(wb)} \"$@\" --prd-dir {shlex.quote(tmp)}\n")
