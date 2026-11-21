@@ -8,7 +8,10 @@
 #      curl): `.ts` + `.hosts.{redbaron,ryzen7}.open_runs[]` ({id,slug,stage,...}).
 #      No wm-build and no ssh, ever: a raw `wm-build runs` on a build host is a
 #      whole-journal read that froze ryzen7 (10-24). FAIL CLOSED: an unreadable,
-#      unparseable, host-less or stale (> FLEET_STATUS_MAX_AGE s) status is
+#      unparseable, host-less or stale (> FLEET_STATUS_MAX_AGE s) status, one whose
+#      `.ts` is in the future, infinite or NaN (review r26-bs F6; P1's
+#      dream-correct.py keeps the same rule), or a FLEET_STATUS_MAX_AGE that is not a
+#      finite positive number of seconds, is
 #      `REFUSED: fleet status unreadable or stale (...)`, exit 2, no fallback.
 #   2. status + dispatch iter_log — from the PRD file itself (build-queue/, then
 #      parked/, then built-prds/ under $PRD_DIR): its first `Status:` key and
@@ -57,8 +60,14 @@ open_run_of() {
     body="$(curl -fsS --max-time 8 "$src" 2>&1)" || { echo "BAD cannot fetch $src"; return 0; }
   fi
   python3 -c '
-import json, sys, time
-slug, src, maxage = sys.argv[1], sys.argv[2], float(sys.argv[3])
+import json, math, sys, time
+slug, src = sys.argv[1], sys.argv[2]
+try:
+    maxage = float(sys.argv[3])
+except ValueError:
+    maxage = float("nan")
+if not math.isfinite(maxage) or maxage <= 0:
+    print("BAD FLEET_STATUS_MAX_AGE %r is not a finite positive number of seconds" % sys.argv[3]); sys.exit(0)
 try:
     d = json.loads(sys.stdin.read())
     ts = float(d["ts"])
@@ -66,7 +75,9 @@ try:
     assert isinstance(hosts, dict)
 except Exception as e:
     print("BAD unparseable or missing .ts/.hosts (%s)" % type(e).__name__); sys.exit(0)
-age = time.time() - ts
+age = time.time() - ts if math.isfinite(ts) else float("nan")
+if not math.isfinite(age) or age < 0:  # review r26-bs F6: a future, infinite or NaN ts is no current status
+    print("BAD not current: ts %r (age %s s, max %d s)" % (d["ts"], "%.0f" % age if math.isfinite(age) else "unknown", maxage)); sys.exit(0)
 if age > maxage:
     print("BAD stale: ts is %ds old, max %ds" % (age, maxage)); sys.exit(0)
 for h in ("redbaron", "ryzen7"):
@@ -263,6 +274,25 @@ selftest() {
   ck "missing .hosts -> fail closed" 2 "REFUSED: fleet status unreadable or stale" q-clean Falsifier
   FLEET_STATUS="$t/absent"
   ck "unreadable file -> fail closed" 2 "REFUSED: fleet status unreadable or stale (cannot read" q-clean Falsifier
+  # review r26-bs F6: a future, infinite or NaN ts is no current status; FLEET_STATUS_MAX_AGE must be a finite positive number
+  mk "$((now+9999))" '[]' '[]' "$t/st-future"
+  mk "$(($(date +%s)-1))" '[]' '[]' "$t/st-recent"
+  for v in NaN '"nan"' Infinity; do
+    printf '{"ts": %s, "hosts": {"redbaron": {"open_runs": []}, "ryzen7": {"open_runs": []}}}\n' "$v" > "$t/st-ts-$(printf '%s' "$v" | tr -cd 'A-Za-z')"
+  done
+  FLEET_STATUS="$t/st-future"
+  ck "future ts -> fail closed" 2 "REFUSED: fleet status unreadable or stale (not current: ts .*no wm-build fallback" q-clean Falsifier
+  FLEET_STATUS="$t/st-ts-NaN"
+  ck "NaN ts -> fail closed" 2 "(not current: ts nan (age unknown s" q-clean Falsifier
+  FLEET_STATUS="$t/st-ts-nan"
+  ck "\"nan\" ts -> fail closed" 2 "(not current: ts 'nan' (age unknown s" q-clean Falsifier
+  FLEET_STATUS="$t/st-ts-Infinity"
+  ck "Infinity ts -> fail closed" 2 "(not current: ts inf (age unknown s" q-clean Falsifier
+  FLEET_STATUS="$t/st-recent"
+  ck "a ts 1 s old -> current (control)" 0 "open-run: none" q-clean Falsifier
+  for m in nan inf 0 -5 abc; do
+    FLEET_STATUS="$t/st-recent" FLEET_STATUS_MAX_AGE="$m" ck "FLEET_STATUS_MAX_AGE=$m -> fail closed" 2 "(FLEET_STATUS_MAX_AGE '$m' is not a finite positive number" q-clean Falsifier
+  done
   if [ "$fails" -ne 0 ]; then echo "SELFTEST FAILED ($fails/$total checks)"; return 1; fi
   echo "SELFTEST PASSED ($total checks)"
 }
