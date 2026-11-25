@@ -713,6 +713,142 @@ authz_refuse_if_missing() {  # $1=subcommand name -> 0 ok to proceed, 1 refused 
 
 mkdir -p "$STATE_DIR" 2>/dev/null || true
 
+# ---- layout lock (concurrent first invocations; review b2c38bfa of A1300
+# component 0 r3, section 1.6) ----------------------------------------------
+# Every invocation runs migrate_state_layout and box_ensure_current before it
+# takes any other lock, and `up` re-points `current` from inside a run. Unlocked,
+# concurrent invocations raced those steps: one linked `current` to
+# boxes/pending while another migrated the flat session.json into boxes/<id>,
+# folded pending away and only then re-pointed; `ln -sfn` (uutils on RedBaron)
+# also unlinks before it links. Runs that opened current/run.lock or
+# current/up.lock in those gaps hit ENOENT and exited 3, a lane could be left
+# with `current` dangling, and a run that locked pending's run.lock saw no
+# session and went `up` over a live verified box.
+# The fix, in four parts:
+#   1. one lane-wide lock, flock(2) on the $STATE_DIR directory itself (never on
+#      anything reached through `current`, and no new state name), held
+#      exclusively across migrate_state_layout + box_ensure_current and every
+#      re-point of `current`, the pending fold included;
+#   2. every re-point is a rename of a fresh link over `current`, so `current`
+#      is never absent, and pending is removed only after `current` has left it;
+#   3. run.lock and up.lock are opened on the box `current` resolves to under the
+#      lock, and once held are re-checked to still be current/<name> (same
+#      inode); otherwise they are dropped and taken again;
+#   4. `run` decides "no session, go up" only under the lock, and a dangling
+#      `current` is repaired under it (or refused with a reason, never ENOENT).
+# _BL_LAYOUT_DEPTH lets a holder of the exclusive lock call a function that
+# takes it again; only the process that opened the descriptor releases it, so
+# a subshell that inherits a held lock never drops its parent's.
+_BL_LAYOUT_FD=""; _BL_LAYOUT_DEPTH=0; _BL_LAYOUT_PID=""
+layout_lock() {  # $1 = -x (exclusive) | -s (shared; never taken around a call that wants -x)
+  if [ "$_BL_LAYOUT_DEPTH" -gt 0 ]; then
+    _BL_LAYOUT_DEPTH=$((_BL_LAYOUT_DEPTH + 1)); return 0
+  fi
+  [ -d "$STATE_DIR" ] || return 0
+  { exec {_BL_LAYOUT_FD}<"$STATE_DIR"; } 2>/dev/null || return 0
+  flock "$1" "$_BL_LAYOUT_FD" 2>/dev/null || true
+  _BL_LAYOUT_DEPTH=1; _BL_LAYOUT_PID="$BASHPID"
+}
+layout_unlock() {
+  [ "$_BL_LAYOUT_DEPTH" -gt 0 ] || return 0
+  _BL_LAYOUT_DEPTH=$((_BL_LAYOUT_DEPTH - 1))
+  if [ "$_BL_LAYOUT_DEPTH" -eq 0 ] && [ "$_BL_LAYOUT_PID" = "$BASHPID" ]; then
+    flock -u "$_BL_LAYOUT_FD" 2>/dev/null || true
+    exec {_BL_LAYOUT_FD}<&-
+  fi
+  return 0
+}
+
+# box_link_current <relative target>: make `current` a link to <target> by
+# renaming a fresh link over it (rename(2) replaces the old link in one step,
+# whichever ln is installed). The temporary link lives in boxes/, the
+# structural container, and exists only while the caller holds the lock.
+box_link_current() {
+  local tmp="$STATE_DIR/boxes/.current.$BASHPID"
+  mkdir -p "$STATE_DIR/boxes" 2>/dev/null || true
+  rm -f "$tmp" 2>/dev/null || true
+  ln -s "$1" "$tmp" || return 1
+  mv -fT "$tmp" "$STATE_DIR/current" || { rm -f "$tmp" 2>/dev/null; return 1; }
+}
+
+# box_repair_current: `current` is a link to a directory that no longer exists
+# (a lane left wedged by the race above). Caller holds the lock exclusively.
+# Exactly one box with a live session.json: point at it. None: start over at a
+# fresh pending box, as box_ensure_current does for an absent `current`. More
+# than one: leave it; `run` refuses with cause=current-unresolvable.
+box_repair_current() {
+  local was ids id n=0
+  was="$(readlink "$STATE_DIR/current" 2>/dev/null || true)"
+  ids="$(list_active_box_ids)"
+  for id in $ids; do n=$((n + 1)); done
+  if [ "$n" -eq 1 ]; then
+    box_link_current "boxes/$ids" || return 1
+  elif [ "$n" -eq 0 ]; then
+    mkdir -p "$STATE_DIR/boxes/pending" 2>/dev/null || true
+    box_link_current "boxes/pending" || return 1
+  else
+    return 1
+  fi
+  journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  state  current-repaired  (was=${was:-none} now=$(readlink "$STATE_DIR/current" 2>/dev/null))"
+}
+
+# box_fd_is_current <fd> <name>: the file held on <fd> is current/<name> right
+# now (same inode). Caller holds the lock. /dev/fd/<n> is used when it can be
+# read; without it, the box `current` names must still be the one opened.
+box_fd_is_current() {
+  if [ -e "/dev/fd/$1" ]; then
+    [ "/dev/fd/$1" -ef "$STATE_DIR/current/$2" ]
+  else
+    [ "$(readlink "$STATE_DIR/current" 2>/dev/null || echo current)" = "$BOX_LOCK_REL" ]
+  fi
+}
+
+# box_lock_current <fd> <name> [-n]: open <name> on <fd> in the box `current`
+# resolves to (under the lock, so no re-point can land between resolving and
+# opening), flock it (blocking, or -n), then confirm under the lock that it is
+# still current/<name>; if a re-point moved it, drop it and try again.
+# rc 0 held; 1 flock failed (busy under -n); 3 `current` resolves to no box
+# directory (BOX_LOCK_REL names what it pointed at).
+BOX_LOCK_REL=""
+box_lock_current() {
+  local fd="$1" name="$2" nb="${3:-}" rel dir tries=0
+  while [ "$tries" -lt 100 ]; do
+    tries=$((tries + 1))
+    layout_lock -s
+    if [ -L "$STATE_DIR/current" ]; then rel="$(readlink "$STATE_DIR/current" 2>/dev/null || true)"
+    else rel="current"
+    fi
+    case "$rel" in /*) dir="$rel" ;; *) dir="$STATE_DIR/$rel" ;; esac
+    BOX_LOCK_REL="$rel"
+    if [ -z "$rel" ] || [ ! -d "$dir" ]; then
+      layout_unlock
+      return 3
+    fi
+    eval "exec $fd>\"\$dir/\$name\""
+    layout_unlock
+    flock $nb "$fd" || return 1
+    layout_lock -s
+    if box_fd_is_current "$fd" "$name"; then
+      layout_unlock
+      return 0
+    fi
+    layout_unlock
+    flock -u "$fd" 2>/dev/null || true
+  done
+  return 3
+}
+
+# box_no_session_settled <fd> <name>: "no session" is a reason to go `up` only
+# when, under the lock (which waits out any re-point in flight), the lock held
+# on <fd> is still current/<name> and current/ still has no session.json.
+box_no_session_settled() {
+  local r=1
+  layout_lock -s
+  if box_fd_is_current "$1" "$2" && ! state_active; then r=0; fi
+  layout_unlock
+  return $r
+}
+
 # ---- state layout migration (PRD-build-burst-state-keyed-by-server-v2
 # requirement 1) -------------------------------------------------------------
 # migrate_state_layout: one-time (per top-level residue) move of every
@@ -737,8 +873,9 @@ mkdir -p "$STATE_DIR" 2>/dev/null || true
 # one; only a real directory or the "pending" placeholder gets folded
 # forward.
 box_point_current_at() {
-  local id="$1"
+  local id="$1" fold_pending=0 lk rc
   [ -n "$id" ] || return 0
+  layout_lock -x
   mkdir -p "$STATE_DIR/boxes/$id" 2>/dev/null || true
   if [ -e "$STATE_DIR/current" ] && [ ! -L "$STATE_DIR/current" ]; then
     ( cd "$STATE_DIR/current" 2>/dev/null \
@@ -746,11 +883,24 @@ box_point_current_at() {
     rm -rf "$STATE_DIR/current" 2>/dev/null || true
   elif [ -L "$STATE_DIR/current" ] && [ "$(readlink "$STATE_DIR/current" 2>/dev/null)" = "boxes/pending" ] \
          && [ "$id" != "pending" ] && [ -d "$STATE_DIR/boxes/pending" ]; then
+    # The lock files an in-flight run/up holds in pending must become the
+    # box's own: `mv -n` below keeps an existing name, so a box directory that
+    # already has them (an adopt whose directory survived) would otherwise
+    # carry a second, unheld run.lock/up.lock for the next invocation to take.
+    for lk in run.lock up.lock; do
+      [ -f "$STATE_DIR/boxes/pending/$lk" ] || continue
+      mv -f "$STATE_DIR/boxes/pending/$lk" "$STATE_DIR/boxes/$id/$lk" 2>/dev/null || true
+    done
     ( cd "$STATE_DIR/boxes/pending" 2>/dev/null \
         && find . -mindepth 1 -maxdepth 1 -exec mv -n {} "$STATE_DIR/boxes/$id/" \; ) 2>/dev/null || true
-    rmdir "$STATE_DIR/boxes/pending" 2>/dev/null || true
+    fold_pending=1
   fi
-  ln -sfn "boxes/$id" "$STATE_DIR/current"
+  box_link_current "boxes/$id"; rc=$?
+  # pending is removed only after `current` has left it, so `current` never
+  # names a missing directory, even for a reader that takes no lock.
+  if [ "$fold_pending" = 1 ]; then rmdir "$STATE_DIR/boxes/pending" 2>/dev/null || true; fi
+  layout_unlock
+  return $rc
 }
 
 migrate_state_layout() {
@@ -841,10 +991,14 @@ migrate_state_layout() {
 # up.pid, inflight.log) lands in the disposable "pending" box and is
 # folded into the real one by box_activate.
 box_ensure_current() {
+  layout_lock -x
   if [ ! -e "$STATE_DIR/current" ] && [ ! -L "$STATE_DIR/current" ]; then
     mkdir -p "$STATE_DIR/boxes/pending" 2>/dev/null || true
-    ln -sfn "boxes/pending" "$STATE_DIR/current" 2>/dev/null || true
+    box_link_current "boxes/pending" 2>/dev/null || true
+  elif [ -L "$STATE_DIR/current" ] && [ ! -e "$STATE_DIR/current" ]; then
+    box_repair_current 2>/dev/null || true
   fi
+  layout_unlock
 }
 
 # box_carry_forward_volume_state <new server id>: volume.json is the one
@@ -884,9 +1038,13 @@ box_carry_forward_volume_state() {
 # inside the tripwire's box_path()/migration block) since it shares that
 # block's one license to spell "boxes/" literally.
 box_reset_pending() {
+  local rc
+  layout_lock -x
   rm -rf "$STATE_DIR/boxes/pending" 2>/dev/null || true
   mkdir -p "$STATE_DIR/boxes/pending" 2>/dev/null || true
-  ln -sfn "boxes/pending" "$STATE_DIR/current"
+  box_link_current "boxes/pending"; rc=$?
+  layout_unlock
+  return $rc
 }
 
 # count_active_boxes: number of boxes/<id>/ directories carrying a live
@@ -1075,12 +1233,18 @@ select_run_box() {  # $1 = worktree (passed through to acquire_run_slot's own jo
 # function's own closing brace — still covers every "boxes/" literal those
 # three helpers spell.
 box_activate() {
+  local rc
+  layout_lock -x
   box_carry_forward_volume_state "$1"
-  box_point_current_at "$1"
+  box_point_current_at "$1"; rc=$?
+  layout_unlock
+  return $rc
 }
 
+layout_lock -x
 migrate_state_layout
 box_ensure_current
+layout_unlock
 
 # ---- config -------------------------------------------------------------
 load_env() {
@@ -5360,8 +5524,21 @@ cmd_up() {
   # up_one_box()'s own header for why a second, genuinely concurrent `up`
   # invocation still serializes here rather than racing a sibling box
   # (a documented simplification, not the tech consideration's ideal).
-  exec 221>"$UP_LOCK_FILE"
-  if ! flock -n 221; then
+  # Opened on the box `current` resolves to and re-checked once held (see
+  # box_lock_current), never through a `current` that can move underneath it.
+  local _up_lk=0
+  if [ "$UP_LOCK_FILE" = "$STATE_DIR/current/up.lock" ]; then
+    box_lock_current 221 up.lock -n; _up_lk=$?
+  else
+    exec 221>"$UP_LOCK_FILE"
+    flock -n 221 || _up_lk=1
+  fi
+  if [ "$_up_lk" -eq 3 ]; then
+    journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  up  up-refused  (cause=current-unresolvable current=${BOX_LOCK_REL:-none})"
+    echo "up-refused: state/current does not resolve to a box (${BOX_LOCK_REL:-absent})" >&2
+    exit 3
+  fi
+  if [ "$_up_lk" -ne 0 ]; then
     local holder_pid; holder_pid="$(up_lock_holder_pid)"
     local holder_desc; holder_desc="$(up_lock_holder_describe "$holder_pid")"
     journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  up  up-refused  (lock-held $holder_desc)"
@@ -7581,8 +7758,30 @@ cmd_run() {
   # one box's blocking wait once the real acquisition found it already
   # taken — caught by this PRD's own multibox AC3 fixture, all 12 runs
   # landing on one box instead of splitting 4+4).
-  exec 201>"$RUN_LOCK"
-  flock 201
+  # run.lock is opened on the box `current` resolves to and re-checked once
+  # held (box_lock_current); "no session" sends this run `up` only if it still
+  # holds under the layout lock (box_no_session_settled), else the lock is
+  # taken again on whatever `current` names now.
+  if [ "$RUN_LOCK" = "$STATE_DIR/current/run.lock" ]; then
+    local _rl=0 _rl_tries=0
+    while [ "$_rl_tries" -lt 100 ]; do
+      _rl_tries=$((_rl_tries + 1))
+      box_lock_current 201 run.lock; _rl=$?
+      [ "$_rl" -eq 3 ] && break
+      state_active && break
+      box_no_session_settled 201 run.lock && break
+      flock -u 201 2>/dev/null || true
+      _rl=3  # survives only if all 100 tries end unsettled: refuse below, never `up`
+    done
+    if [ "$_rl" -eq 3 ]; then
+      journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  run  fallback  (cause=current-unresolvable current=${BOX_LOCK_REL:-none} worktree=$worktree)"
+      echo "fallback: state/current does not resolve to a box (${BOX_LOCK_REL:-absent}) — running locally"
+      exit 3
+    fi
+  else
+    exec 201>"$RUN_LOCK"
+    flock 201
+  fi
   if ! state_active; then
     local up_out; up_out="$(cmd_up 2>&1)"; local up_rc=$?
     if [ "$up_rc" -ne 0 ]; then
@@ -7616,8 +7815,17 @@ cmd_run() {
   # later per-box read/write in this function assumes is already held for
   # the read-modify-write it does; verify happens here, once, against that
   # SAME box.
-  exec 201>"$RUN_LOCK"
-  flock 201
+  if [ "$RUN_LOCK" = "$STATE_DIR/current/run.lock" ]; then
+    box_lock_current 201 run.lock
+    if [ $? -eq 3 ]; then
+      journal_line --file "$JOURNAL" "$(now_iso)  burst-lane  run  fallback  (cause=current-unresolvable current=${BOX_LOCK_REL:-none} worktree=$worktree)"
+      echo "fallback: state/current does not resolve to a box (${BOX_LOCK_REL:-absent}) — running locally"
+      exit 3
+    fi
+  else
+    exec 201>"$RUN_LOCK"
+    flock 201
+  fi
   local id ip; id="$(state_read server_id)"; ip="$(state_read ip)"
   if [ "$(state_read verified)" != "true" ]; then
     # PRD-build-fail-loud-evidence-kept AC4: this was the truly silent
