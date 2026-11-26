@@ -31,6 +31,7 @@ inside fenced code blocks are ignored; first match wins.
 | `build_into` | absolute path of the repo to mutate | for `rust-extend`, `kernel-extend`, and any `python-*` that extends an existing repo | must exist locally at build time |
 | `build_priority` | `high` `normal` `low` | no | queue order; default `normal`. Queued grounded PRDs carry `high`, creative `low`: `prd-lint.sh` WARN `build-priority-default` otherwise |
 | `build_version_bump` | `patch` `minor` `major` | no | `rust-extend` only; default `minor` |
+| `crate_dir` | one path segment matching `^[a-z0-9][a-z0-9-]{0,62}$` | no; `rust-extend` only; where `build_into` exists on the lint host, also only when it has a `pyproject.toml` at its root and no root `Cargo.toml` | declares one native Rust crate directly under `build_into`. Where `build_into` exists locally, the substrate check tests `<build_into>/<crate_dir>/Cargo.toml` instead of the depth-1 probe; for the crate's first landing, `<build_into>/<crate_dir>` may be absent. A bad value or a target other than `rust-extend` fails `crate-dir-invalid` on every host; the substrate conditions fail it only where `build_into` exists locally, and a `build_into` absent on this host keeps the `build-into-not-found` WARNING alone. Read by `scan-prds.sh` (manifest field `crate_dir`). `classification-self-heal.sh resolve` declines every PRD that carries it |
 | `deferred_acs` | inline list of bare integers, e.g. `[3, 4]` | no | block-list form parses to `[]` silently (no key at all reads the same way); a PROSE value (e.g. `deferred_acs: see note below`) is flagged — `scan-prds.sh` emits `deferred_acs_unparsed: true` and `verified-completed.sh --derive` prints `deferred_acs: unparsed — use [N, N]` instead of silently treating it as "none declared" |
 | `test_prefix` | bare scalar (`test_prefix: http`) or inline list (`test_prefix: [http, https]`) | no | names the test-file prefix an extend PRD's ACs use on a shared crate, e.g. `mcphost`'s `http_ac01_*.rs` / `python_ac01_*.rs`. Read by `verified-completed.sh --derive`'s AC-pairing derivation (see SKILL.md "archive" / Verified-completed checklist). Without it, derivation guesses a prefix from the slug, which is often wrong for a crate whose PRDs don't name themselves after their test convention |
 | `mock_unjustified_for` / `mock_justifications` | see SKILL.md C5 | with deferred ACs | one sentence per deferred AC |
@@ -183,6 +184,7 @@ it.
 ## Language routing
 
 - `rust-*` → `/rustbuild` (cargo runs on RedBaron: locally there, remotely from every other node via the skill's cargo shim).
+- `rust-extend` with `crate_dir` → `/rustbuild` as for every `rust-*` target, with every cargo command rooted at `--manifest-path <build_into>/<crate_dir>/Cargo.toml`. The land also runs the repo's own suite and generator check (for swarm-decide: `tests/run.sh` with zero skips, and `bin/wm-decide gen --check`), because the crate's compatibility tests read the repo's Python. `python-*` PRDs on the same repo keep the python route unchanged.
 - `python-*` → `/pybuild` (`--target cli|lib|agent` from the suffix); with `build_into` set, extends in place via `scripts/worktree-extend.sh add`/`land` (unconditional worktree isolation, PRD-build-python-worktree-isolation).
 - `shell`/`hooks`/`config` WITH `build_into` set → worktree-isolated, same
   unconditional guarantee as python (PRD-build-shell-worktree-isolation):
@@ -250,6 +252,7 @@ and auto-resolution for a PRD this check parks live in
 `scripts/classification-self-heal.sh` (`bounce-check` / `resolve`
 subcommands, wired into `scan-prds.sh`'s lint pass) — see that script's own
 header for the full contract.
+A `rust-extend` PRD that declares `crate_dir` is checked, when its `build_into` exists locally, against `<build_into>/<crate_dir>` instead (present with a `Cargo.toml`, or absent for the first landing), and its failures use `crate-dir-invalid`, never `build-into-substrate-mismatch`, so `classification-self-heal.sh` never acts on them. When its `build_into` does not exist on this host, it gets the pre-existing `build-into-not-found` WARNING alone and no substrate reason of `crate-dir-invalid` compounds with it; only the value and target reasons of `crate-dir-invalid` apply on every host. A `rust-extend` PRD without `crate_dir` keeps the depth-1 rule unchanged; if its `build_into` has a root `pyproject.toml`, no root `Cargo.toml`, and a `Cargo.toml` one level down, the lint adds the warning `crate-dir-undeclared`.
 
 **Slug uniqueness check, `slug-not-unique` (PRD-build-prd-slug-uniqueness,
 2026-09-13).** A slug (`PRD-<slug>.md`) is a primary key — the manifest,

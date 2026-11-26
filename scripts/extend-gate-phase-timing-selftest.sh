@@ -12,7 +12,9 @@
 # extended-receipts.sh, ship-tag.sh — every subcommand independently
 # sleep-and-exit-code scriptable via env vars) so every phase's duration
 # is pinned and deterministic instead of depending on a real cargo
-# compile or a real Sonnet call.
+# compile or a real Sonnet call. The gate runs against a virtual clock
+# this selftest owns (see "virtual clock" below), so the asserted seconds
+# do not depend on the wall clock or on host load.
 #
 #   AC1 — every step sleeps a known duration and exits 0: the journal
 #         line's `phases=` field (right after `wall=`) names every
@@ -74,8 +76,57 @@ git -C "$REPO" -c user.name=t -c user.email=t@t add -A
 git -C "$REPO" -c user.name=t -c user.email=t@t commit -q -m init
 echo "fake reviewer prompt" > "$T/reviewer-prompt.md"
 
+# ---- virtual clock: no wall-clock or load sensitivity ---------------------
+# extend-gate.sh times every phase as a `date +%s` pair. On the real clock a
+# phase's seconds depend on host load and on where a second boundary falls
+# in the milliseconds of untimed code between two `date` calls: intake has
+# read 1s against 0s, and on a ~9s wall (whose 5% tolerance is 0 in integer
+# seconds) one boundary crossing outside every phase becomes
+# unattributed:1. So run_gate runs the gate against a clock owned by this
+# selftest, kept under $T only (the shared tests/fixtures/gatephase-fake
+# toolchain, which other suites use, is not touched):
+#   - `date +%s` (exactly that argv) prints the virtual clock; every other
+#     `date` form runs the real date;
+#   - the clock moves only when a fake producer (autobuilder, claude) calls
+#     `sleep N`: run_gate finds wrappers named after those two fakes first
+#     on PATH, and each runs the real fake with a `sleep` that first
+#     advances the clock by N (integer N; anything else passes straight
+#     through) and then sleeps N for real, so process lifetimes are the
+#     same as before;
+#   - the product's own sleeps (gate-wedge.sh's 1s poll) and all untimed
+#     code between phases take zero virtual seconds.
+# Every phase value is then an exact function of the scripted fake sleeps,
+# under any load, so every tolerance below is 0.
+VCLOCK="$T/vclock"
+mkdir -p "$VCLOCK/bin" "$VCLOCK/producer-sleep" "$VCLOCK/wrap" || { echo "selftest: cannot create $VCLOCK" >&2; exit 2; }
+vclock_real_date="$(command -v date)"; vclock_real_sleep="$(command -v sleep)"
+"$vclock_real_date" +%s > "$VCLOCK/now" || { echo "selftest: cannot start the virtual clock" >&2; exit 2; }
+printf -v q_now '%q' "$VCLOCK/now"
+printf -v q_date '%q' "$vclock_real_date"
+printf -v q_sleep '%q' "$vclock_real_sleep"
+printf -v q_ps '%q' "$VCLOCK/producer-sleep"
+cat > "$VCLOCK/bin/date" <<EOF
+#!/usr/bin/env bash
+if [ "\$#" -eq 1 ] && [ "\$1" = "+%s" ]; then exec cat $q_now; fi
+exec $q_date "\$@"
+EOF
+cat > "$VCLOCK/producer-sleep/sleep" <<EOF
+#!/usr/bin/env bash
+case "\${1:-}" in ''|*[!0-9]*) exec $q_sleep "\$@" ;; esac
+( flock 9 || exit 1
+  v="\$(cat $q_now)" || exit 1
+  printf '%s\n' "\$(( v + \$1 ))" > $q_now.next && mv -f $q_now.next $q_now
+) 9>>$q_now.lock || exit 1
+exec $q_sleep "\$1"
+EOF
+for p in autobuilder claude; do
+  printf -v q_fake '%q' "$FAKE/$p"
+  printf '#!/usr/bin/env bash\nPATH=%s:"$PATH" exec %s "$@"\n' "$q_ps" "$q_fake" > "$VCLOCK/wrap/$p"
+done
+chmod +x "$VCLOCK/bin/date" "$VCLOCK/producer-sleep/sleep" "$VCLOCK/wrap/autobuilder" "$VCLOCK/wrap/claude"
+
 run_gate() {  # extra env assignments come from the caller's own exported vars
-  PATH="$FAKE:$PATH" \
+  PATH="$VCLOCK/wrap:$VCLOCK/bin:$FAKE:$PATH" \
   AUTOBUILDER_CANONICAL_CARGO_TOML="$T/no-such-canonical/Cargo.toml" \
   RUSTBUILD_SCRIPTS="$FAKE" \
   REVIEWER_PROMPT="$T/reviewer-prompt.md" \
@@ -108,15 +159,13 @@ unset FAKE_VTI_PLAN_SLEEP FAKE_CI_CHECKS_SLEEP FAKE_GATE_SLEEP FAKE_REVCLAUDE_SL
 line1="$(tail -1 "$JOURNAL")"
 expect "AC1: extend-gate.sh exits 0 on an all-pass fake gate" "[ $rc1 -eq 0 ]"
 expect "AC1: journal line carries a phases= field after wall=" "[[ '$line1' == *'wall='*'phases='* ]]"
-# proof-receipt's tolerance is ±1s, not ±0s like its sibling near-instant
-# fakes: PRD-build-cargo-budget-per-invocation requirement 7 wrapped this
-# step in gate-wedge.sh, whose own "while tree_alive" poll loop has a 1s
-# granularity — a fake producer that exits in well under a second can
-# still be caught "alive" on the loop's first check and pay one full
-# `sleep 1` before the recheck notices it already finished. Real
-# `autobuilder loop` runs take seconds-to-minutes, so this is invisible in
-# production; only this fixture's near-zero fake sleep makes it visible.
-for pair in "risk-gate:skip" "intake:0:0" "proof-receipt:0:1" "vti-plan:1:1" "rollback-plan:0:0" "ci-checks:2:1" "receipts:0:0" "reviewer:1:1" "gate:3:1"; do
+# Every tolerance is 0: under the virtual clock a phase reads exactly the
+# seconds its fake producer slept. (On the real clock proof-receipt needed
+# ±1s: PRD-build-cargo-budget-per-invocation requirement 7 wrapped this
+# step in gate-wedge.sh, whose "while tree_alive" poll loop sleeps a real
+# 1s; that sleep takes no virtual time.) The PRD's own AC1 allows ±1s for a
+# real gate; this fixture's clock is exact, so it asserts the exact value.
+for pair in "risk-gate:skip" "intake:0:0" "proof-receipt:0:0" "vti-plan:1:0" "rollback-plan:0:0" "ci-checks:2:0" "receipts:0:0" "reviewer:1:0" "gate:3:0"; do
   name="${pair%%:*}"
   rest="${pair#*:}"
   if [ "$rest" = "skip" ]; then
@@ -147,7 +196,7 @@ unset FAKE_VTI_PLAN_SLEEP FAKE_VTI_PLAN_RC FAKE_GATE_RC FAKE_GATE_VERDICT
 line2="$(tail -1 "$JOURNAL")"
 expect "AC2: extend-gate.sh's exit code mirrors the fake gate's own (0) despite vti-plan failing" "[ $rc2 -eq 0 ]"
 val2="$(phase_of "$line2" "vti-plan")"
-expect "AC2: failed step reads vti-plan:<s>! (got $val2)" "[[ '$val2' == *'!' ]] && within '$val2' 2 1"
+expect "AC2: failed step reads vti-plan:<s>! (got $val2)" "[[ '$val2' == *'!' ]] && within '$val2' 2 0"
 
 # ---- AC3: a step this run never invokes reads <name>:skip ----------------
 # risk-gate: no scripts/audit.sh in the fixture repo -> always skip, every

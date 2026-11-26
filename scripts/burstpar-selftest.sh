@@ -166,6 +166,11 @@ BURST_LANE_SSH_BIN="$T/ssh_slow" BURST_MAX_CONCURRENT_RUNS=1 \
 holder=$!
 waited=0
 while [ ! -s "$SPAN_LOG" ] && [ "$waited" -lt 50 ]; do sleep 0.1; waited=$((waited+1)); done
+# Stop the holder first: between `pkill -P` and `kill -9` a running holder
+# can fork its next ssh_slow (the capacity probe after the killed warm
+# check), and that child would inherit the slot and worktree-lock fds and
+# outlive the kill. A stopped holder forks nothing; SIGKILL still ends it.
+kill -STOP "$holder" >/dev/null 2>&1
 pkill -9 -P "$holder" >/dev/null 2>&1
 kill -9 "$holder" >/dev/null 2>&1
 wait "$holder" 2>/dev/null
