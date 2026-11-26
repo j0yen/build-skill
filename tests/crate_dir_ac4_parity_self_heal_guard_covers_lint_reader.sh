@@ -15,8 +15,9 @@
 # build_into holding ledger-read/ without a Cargo.toml (the probe reads it as
 # python, so a resolve that is not declined rewrites build_target and pushes
 # to the fixture origin), scratch manifest/journal.
-. "$(dirname "$0")/fixtures/crate-dir-common.sh"
-. "$(dirname "$0")/fixtures/crate-dir-forms.sh"
+HERE="$(cd "$(dirname "$0")" && pwd)"
+. "$HERE/fixtures/crate-dir-common.sh"
+. "$HERE/fixtures/crate-dir-forms.sh"
 CSH="$CD_REPO/scripts/classification-self-heal.sh"
 [ -x "$CSH" ] || { echo "FAIL: $CSH not executable" >&2; exit 2; }
 PY3="$(command -v python3)"

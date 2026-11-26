@@ -10,7 +10,8 @@
 # scan-prds.sh's lint pass writes only to the scratch manifest/journal set
 # below. Like scan-prds-selftest.sh, this reads the bash emission path (the
 # `vellum` fast path is an external binary that is not installed here).
-. "$(dirname "$0")/fixtures/crate-dir-common.sh"
+HERE="$(cd "$(dirname "$0")" && pwd)"
+. "$HERE/fixtures/crate-dir-common.sh"
 SCAN="$CD_REPO/scripts/scan-prds.sh"
 JQ="${JQ:-$(command -v jq)}"
 

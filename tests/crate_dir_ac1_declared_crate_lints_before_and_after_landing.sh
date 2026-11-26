@@ -8,7 +8,8 @@
 # Then both runs report no build-into-substrate-mismatch and no
 # crate-dir-invalid, and with ledger-read/ present but no Cargo.toml it fails
 # crate-dir-invalid.
-. "$(dirname "$0")/fixtures/crate-dir-common.sh"
+HERE="$(cd "$(dirname "$0")" && pwd)"
+. "$HERE/fixtures/crate-dir-common.sh"
 
 f="$CD_Q/PRD-cd1-ledger-read.md"
 cd_prd "$f" rust-extend "$CD_PY" ledger-read

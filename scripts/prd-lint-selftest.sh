@@ -1391,7 +1391,7 @@ else echo "FAIL: --explain ac-names-foreign-surface rc=$rc: $o"; fails=$((fails+
 total=$((total+1))
 mkdir -p "$tmp/xscan/build-queue"
 cp "$xq/PRD-xrepo-ok-reason.md" "$xq/PRD-xrepo-own.md" "$tmp/xscan/build-queue/"
-sj="$(PRD_DIR="$tmp/xscan" BUILD_STATE_DIR="$tmp/xscan/state" "$HERE/scan-prds.sh" 2>/dev/null)"
+sj="$(PRD_DIR="$tmp/xscan" BUILD_STATE_DIR="$tmp/xscan/state" JOURNAL="$tmp/xscan/journal.md" "$HERE/scan-prds.sh" 2>/dev/null)"
 got="$(printf '%s' "$sj" | python3 -c '
 import json, sys
 d = {p["slug"]: p for p in json.load(sys.stdin)}

@@ -17,8 +17,9 @@
 # from any reader under test. Fixtures only: one mktemp root, scratch
 # state/manifest/journal per scan, a refusing `docket` first on PATH; the
 # corpus is not a git repo, so the lint pass's self-heal call commits nothing.
-. "$(dirname "$0")/fixtures/crate-dir-common.sh"
-. "$(dirname "$0")/fixtures/crate-dir-forms.sh"
+HERE="$(cd "$(dirname "$0")" && pwd)"
+. "$HERE/fixtures/crate-dir-common.sh"
+. "$HERE/fixtures/crate-dir-forms.sh"
 SCAN="$CD_REPO/scripts/scan-prds.sh"
 JQ="${JQ:-$(command -v jq)}"
 PY3="$(command -v python3)"
