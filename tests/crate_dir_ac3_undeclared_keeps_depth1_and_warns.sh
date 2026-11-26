@@ -6,7 +6,8 @@
 # scripts/prd-lint.sh runs, Then it fails build-into-substrate-mismatch with
 # today's message; after a ledger-read/Cargo.toml is added it passes with one
 # crate-dir-undeclared warning.
-. "$(dirname "$0")/fixtures/crate-dir-common.sh"
+HERE="$(cd "$(dirname "$0")" && pwd)"
+. "$HERE/fixtures/crate-dir-common.sh"
 
 f="$CD_Q/PRD-cd3-undeclared.md"
 cd_prd "$f" rust-extend "$CD_PY" -

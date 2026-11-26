@@ -7,7 +7,8 @@
 # each, Then each fails crate-dir-invalid with a message naming that reason,
 # and `scripts/prd-lint.sh --explain crate-dir-invalid` exits 0 and prints the
 # rule.
-. "$(dirname "$0")/fixtures/crate-dir-common.sh"
+HERE="$(cd "$(dirname "$0")" && pwd)"
+. "$HERE/fixtures/crate-dir-common.sh"
 
 # check <label> <file> <message regex naming the reason>
 check() {

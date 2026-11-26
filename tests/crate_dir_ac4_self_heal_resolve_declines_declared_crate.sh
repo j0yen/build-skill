@@ -11,7 +11,8 @@
 # scratch manifest/journal, and a recording stand-in for substrate-probe.sh
 # so the test also sees that resolve declines before probing. The whole
 # fixture tree is hashed before and after: resolve must write nothing.
-. "$(dirname "$0")/fixtures/crate-dir-common.sh"
+HERE="$(cd "$(dirname "$0")" && pwd)"
+. "$HERE/fixtures/crate-dir-common.sh"
 CSH="$CD_REPO/scripts/classification-self-heal.sh"
 [ -x "$CSH" ] || { echo "FAIL: $CSH not executable" >&2; exit 2; }
 

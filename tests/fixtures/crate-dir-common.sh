@@ -13,6 +13,7 @@ CD_LINT="$CD_REPO/scripts/prd-lint.sh"
 CD_ROOT="$(mktemp -d)"
 trap 'rm -rf "$CD_ROOT"' EXIT
 export PRD_LINT_CACHE="$CD_ROOT/cache"
+export BUILD_JOURNAL_ROOT="$CD_ROOT/journal"
 mkdir -p "$CD_ROOT/corpus/build-queue" "$CD_ROOT/corpus/built-prds" "$CD_ROOT/corpus/parked" "$CD_ROOT/corpus/visions"
 echo "plain vision." > "$CD_ROOT/corpus/visions/plain.md"
 CD_Q="$CD_ROOT/corpus/build-queue"

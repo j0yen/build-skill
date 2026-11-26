@@ -12,7 +12,8 @@
 # missing path read as "no pyproject.toml") fails the first half; gating the
 # value reason behind existence too fails the second half; dropping the
 # warning for crate_dir PRDs fails the first half's warning check.
-. "$(dirname "$0")/fixtures/crate-dir-common.sh"
+HERE="$(cd "$(dirname "$0")" && pwd)"
+. "$HERE/fixtures/crate-dir-common.sh"
 
 absent="$CD_ROOT/not-on-this-host/swarm-decide"
 f="$CD_Q/PRD-cd7-absent.md"
