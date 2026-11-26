@@ -51,6 +51,15 @@
 # a wm-build-repo PRD must carry `Direct-build: hand`; a queued PRD's
 # build_priority must match its grounding; see `--explain <id>`.
 #
+# `crate-dir-invalid` / `crate-dir-undeclared` (PRD-build-contract-declared-
+# crate-dir): a rust-extend PRD on a Python repo declares its one crate with
+# `crate_dir`, checked in place of the depth-1 substrate test; structural
+# checks like build-into-substrate-mismatch, not built-in shift-left ids; see
+# `--explain crate-dir-invalid`. `--print-crate-dir <file>...` prints
+# `{file: crate_dir-or-null}` from the same frontmatter reader and lints
+# nothing: scan-prds.sh's manifest field and classification-self-heal.sh's
+# resolve guard read the key through it, never a second parser of their own.
+#
 # Exit: 0 = every file clean (warnings allowed), 1 = at least one FAIL
 #       anywhere, 2 = usage error.
 #
@@ -77,6 +86,7 @@ usage() {
   echo "       prd-lint.sh --explain <check-id>" >&2
   echo "       prd-lint.sh --print-live-hosts [--contract <path>]" >&2
   echo "       prd-lint.sh --print-builtin-ids" >&2
+  echo "       prd-lint.sh --print-crate-dir <file>..." >&2
 }
 
 format="text"
@@ -85,6 +95,7 @@ contract=""
 explain_id=""
 print_hosts=0
 print_builtin_ids=0
+print_crate_dir=0
 files=()
 # The built-in shift-left rule ids this lint emits. ONE list: `--print-builtin-ids` exports it and
 # dream-contract-drift-selftest.sh compares it as a SET with build-contract.md's built-in ids (both
@@ -135,6 +146,10 @@ while [ "$#" -gt 0 ]; do
       ;;
     --print-builtin-ids)
       print_builtin_ids=1
+      shift
+      ;;
+    --print-crate-dir)
+      print_crate_dir=1
       shift
       ;;
     -h|--help)
@@ -283,6 +298,34 @@ Queue-hygiene checks (/dream persist guards).
 EXPLAIN
       exit 0
       ;;
+    crate-dir-invalid|crate-dir-undeclared)
+      cat <<'EXPLAIN'
+crate-dir-invalid (FAIL, every Drafted date): `crate_dir:` declares the one native Rust crate
+directly under build_into that a rust-extend PRD on a Python repo builds, e.g.
+
+  - crate_dir: ledger-read
+
+The message names which reason failed. Two groups:
+  on every host: the value is not one path segment matching ^[a-z0-9][a-z0-9-]{0,62}$ (it is
+    empty, contains `/`, `.` or `..`, or otherwise misses the pattern); or build_target is not
+    rust-extend.
+  only when build_into exists on this host (the same gate as the depth-1 substrate test):
+    build_into has no root pyproject.toml; it has a root Cargo.toml; or <build_into>/<crate_dir>
+    exists without a Cargo.toml. For the crate's first landing <build_into>/<crate_dir> may be
+    absent.
+When build_into does not exist on this host the substrate reasons are not evaluated: a valid
+value and target get the existing build-into-not-found WARNING alone; the two never compound.
+A PRD that declares crate_dir is checked against <build_into>/<crate_dir> instead of the
+depth-1 test and never gets build-into-substrate-mismatch, so classification-self-heal.sh never
+acts on it (its `resolve` also declines any PRD that carries the key).
+
+crate-dir-undeclared (WARN): a rust-extend PRD without crate_dir whose build_into has a root
+pyproject.toml, no root Cargo.toml and a Cargo.toml one level down; declare that directory
+with crate_dir. Both are structural checks, not shift-left rules: neither is in
+--print-builtin-ids. Contract: build-contract.md, `crate_dir` row and "Substrate check".
+EXPLAIN
+      exit 0
+      ;;
     *)
       echo "prd-lint: no --explain text for check id: $explain_id" >&2
       exit 2
@@ -295,6 +338,7 @@ if [ "${#files[@]}" -eq 0 ] && [ "$print_hosts" -eq 0 ]; then
   exit 2
 fi
 export LINT_PRINT_LIVE_HOSTS="$print_hosts"
+export LINT_PRINT_CRATE_DIR="$print_crate_dir"
 case "$format" in
   text|json|pass-fail) ;;
   *) echo "prd-lint: --format must be text, json, or pass-fail" >&2; exit 2 ;;
@@ -325,8 +369,10 @@ for f in "${files[@]}"; do
 done
 files=("${expanded[@]}")
 
+# --print-crate-dir answers for every path it is given: a file that is gone
+# (a pull racing a scan) reads as no crate_dir, as parse_frontmatter reads it.
 for f in "${files[@]}"; do
-  if [ ! -f "$f" ]; then
+  if [ ! -f "$f" ] && [ "$print_crate_dir" -eq 0 ]; then
     echo "prd-lint: no such file: $f" >&2
     exit 2
   fi
@@ -386,6 +432,8 @@ EXTEND_TARGETS = {"rust-extend", "kernel-extend"}
 RUST_SUBSTRATE_TARGETS = {"rust-cli", "rust-lib", "rust-extend", "kernel-extend"}
 PYTHON_SUBSTRATE_TARGETS = {"python-cli", "python-lib", "python-agent"}
 SLUG_RE = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
+# PRD-build-contract-declared-crate-dir: build-contract.md's `crate_dir` row.
+CRATE_DIR_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 FILENAME_RE = re.compile(r"^PRD-([a-z0-9]+(?:-[a-z0-9]+)*)\.md$")
 AC_HEADING_RE = re.compile(r"^##\s+Acceptance(?:\s+(criteria|tests))?\s*$", re.I)
 AC_NUM_RE = re.compile(r"^(\d+)\.\s+(.*)$")
@@ -1445,6 +1493,41 @@ def lint_file(path):
 
     if build_target in EXTEND_TARGETS and not build_into:
         fail("build-into-missing", f"build_target {build_target!r} requires a `build_into:` path")
+
+    # PRD-build-contract-declared-crate-dir: `crate_dir` declares the one Rust
+    # crate directly under a Python repo's build_into, so the crate's first
+    # landing is admissible before its Cargo.toml exists. The value and target
+    # reasons of crate-dir-invalid apply on every host; the substrate reasons
+    # sit behind the same build_into-exists gate as the depth-1 test below, so
+    # a build_into on another fleet host keeps build-into-not-found alone. A PRD
+    # that carries the key never gets build-into-substrate-mismatch, the one id
+    # scan-prds.sh hands to classification-self-heal.sh's rewrite.
+    has_crate_dir = "crate_dir" in fm
+    crate_dir = fm.get("crate_dir", "")
+    crate_dir_value_ok = False
+    if has_crate_dir:
+        why = []
+        if not crate_dir:
+            why.append("it is empty")
+        if "/" in crate_dir:
+            why.append("it contains '/'")
+        if ".." in crate_dir:
+            why.append("it contains '..'")
+        elif "." in crate_dir:
+            why.append("it contains '.'")
+        if crate_dir and not why and not CRATE_DIR_RE.match(crate_dir):
+            why.append(f"it does not match {CRATE_DIR_RE.pattern}")
+        if why:
+            fail("crate-dir-invalid",
+                 f"crate_dir {crate_dir!r} is not one path segment matching {CRATE_DIR_RE.pattern}: "
+                 + " and ".join(why))
+        else:
+            crate_dir_value_ok = True
+        if build_target != "rust-extend":
+            fail("crate-dir-invalid",
+                 f"crate_dir is declared on build_target {build_target!r}: only a rust-extend PRD "
+                 "may declare crate_dir")
+
     if build_into and not os.path.isdir(build_into):
         # Downgraded to a warning: a PRD's build_into commonly lives on a
         # different fleet host (e.g. RedBaron for Rust) than wherever this
@@ -1468,7 +1551,27 @@ def lint_file(path):
         # notebook/mixed/product carry no substrate expectation.
         cargo_found, cargo_members = substrate_marker(build_into, "Cargo.toml")
         pyproject_found, pyproject_dirs = substrate_marker(build_into, "pyproject.toml")
-        if build_target in RUST_SUBSTRATE_TARGETS and not cargo_found:
+        root_pyproject = os.path.isfile(os.path.join(build_into, "pyproject.toml"))
+        root_cargo = os.path.isfile(os.path.join(build_into, "Cargo.toml"))
+        if has_crate_dir:
+            # The crate_dir check replaces the depth-1 test (contract
+            # "Substrate check"): <build_into>/<crate_dir> present with a
+            # Cargo.toml, or absent for the crate's first landing.
+            if not root_pyproject:
+                fail("crate-dir-invalid",
+                     f"build_into {build_into!r} has no root pyproject.toml: crate_dir declares a "
+                     "Rust crate inside a Python repo")
+            if root_cargo:
+                fail("crate-dir-invalid",
+                     f"build_into {build_into!r} has a root Cargo.toml: crate_dir is only for a "
+                     "Python repo without a root crate")
+            if crate_dir_value_ok:
+                crate_path = os.path.join(build_into, crate_dir)
+                if os.path.exists(crate_path) and not os.path.isfile(os.path.join(crate_path, "Cargo.toml")):
+                    fail("crate-dir-invalid",
+                         f"crate_dir {crate_dir!r}: {crate_path!r} exists but has no Cargo.toml "
+                         "(it must hold one, or be absent before the crate's first landing)")
+        elif build_target in RUST_SUBSTRATE_TARGETS and not cargo_found:
             fail(
                 "build-into-substrate-mismatch",
                 f"build_target {build_target!r} requires a Cargo.toml at or under "
@@ -1482,6 +1585,14 @@ def lint_file(path):
                 f"build_into {build_into!r}; none found "
                 f"(Cargo.toml present: {cargo_found}, members: {cargo_members})",
             )
+        if (not has_crate_dir and build_target == "rust-extend"
+                and root_pyproject and not root_cargo and cargo_members):
+            # The depth-1 rule passes on a crate one level down, but a Python
+            # repo holding it is the case crate_dir exists for.
+            warn("crate-dir-undeclared",
+                 f"build_into {build_into!r} is a Python repo (root pyproject.toml, no root "
+                 f"Cargo.toml) with a Cargo.toml one level down in {cargo_members}: declare the "
+                 "crate with `crate_dir: <dir>` (see --explain crate-dir-undeclared)")
 
     # -- deferred_acs ------------------------------------------------------------
     # PRD-build-prd-lint-deferred-reasons-key: the justification for a
@@ -2172,6 +2283,16 @@ def lint_file(path):
 
 if os.environ.get("LINT_PRINT_LIVE_HOSTS") == "1":
     print(live_hosts_canon(load_contract_tables(contract_path or DEFAULT_CONTRACT)["live_hosts"]))
+    sys.exit(0)
+
+if os.environ.get("LINT_PRINT_CRATE_DIR") == "1":
+    # PRD-build-contract-declared-crate-dir R3/R4: the one crate_dir reader.
+    # scan-prds.sh (the manifest field) and classification-self-heal.sh (the
+    # resolve guard) take the key from this parse_frontmatter, the reading
+    # lint_file validates, so neither carries a value the lint never checked
+    # nor misses a key the lint acts on. Prints {file: value}; null = no
+    # crate_dir key (parse_frontmatter reads a file it cannot open as empty).
+    print(json.dumps({path: parse_frontmatter(path).get("crate_dir") for path in targets}))
     sys.exit(0)
 
 results = []

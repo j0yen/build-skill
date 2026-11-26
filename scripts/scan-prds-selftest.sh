@@ -171,5 +171,63 @@ else
 fi
 rm -f "$tmp/PRD-pred-x.md" "$tmp/PRD-succ-y.md"
 
+# --- PRD-build-contract-declared-crate-dir R3: every entry carries crate_dir
+# as a string ("" when the PRD declares none). R2/R4 at the scan's lint pass:
+# a queued crate_dir PRD that fails lint parks with a crate-dir-invalid reason
+# and is never handed to the self-heal rewrite (its bytes, its repo's HEAD and
+# origin stay as they were). The corpus is a git clone of a bare origin so a
+# rewrite, were one attempted, could commit and push. ----------------------
+cdq="$tmp/cd-corpus"
+git init -q --bare "$tmp/cd-origin.git"
+git clone -q "$tmp/cd-origin.git" "$cdq" 2>/dev/null
+mkdir -p "$cdq/build-queue" "$cdq/visions" "$tmp/cd-swarm/ledger-read" "$tmp/cd-state"
+echo "plain vision." > "$cdq/visions/plain.md"
+printf '[project]\nname = "swarm"\n' > "$tmp/cd-swarm/pyproject.toml"
+printf '{"prds":{},"built_at":"2020-01-01T00:00:00Z"}\n' > "$tmp/cd-state/manifest.json"
+cat > "$cdq/build-queue/PRD-cd-declared.md" <<EOF
+- Status: queued
+- build_target: rust-extend
+- build_into: $tmp/cd-swarm
+- crate_dir: ledger-read
+- Vision: visions/plain.md
+
+## Acceptance criteria
+
+1. P0 — Given a, When b, Then c.
+EOF
+cat > "$cdq/build-queue/PRD-cd-plain.md" <<'EOF'
+- Status: queued
+- build_target: shell
+- Vision: visions/plain.md
+
+## Acceptance criteria
+
+1. P0 — Given a, When b, Then c.
+EOF
+git -C "$cdq" add -A && git -C "$cdq" -c user.email=t@t -c user.name=t commit -qm init
+git -C "$cdq" push -q origin "$(git -C "$cdq" symbolic-ref --short HEAD)"
+cd_before="$(sha256sum < "$cdq/build-queue/PRD-cd-declared.md")"
+cd_head="$(git -C "$cdq" rev-parse HEAD)"
+cd_origin="$(git -C "$tmp/cd-origin.git" rev-parse HEAD)"
+out="$(PRD_DIR="$cdq" JQ="$JQ" BUILD_STATE_DIR="$tmp/cd-state" BUILD_MANIFEST="$tmp/cd-state/manifest.json" \
+  JOURNAL="$tmp/cd-journal.md" bash "$SCAN" 2>/dev/null)" || { echo "FAIL: scan exited non-zero (crate_dir fixtures)"; exit 1; }
+check cd-declared crate_dir ledger-read
+if "$JQ" -e '.[] | select(.slug=="cd-plain") | (.crate_dir | type) == "string" and .crate_dir == ""' >/dev/null <<<"$out"; then
+  echo "ok: R3 cd-plain.crate_dir = \"\" (string, key absent)"
+else
+  echo "FAIL: R3 cd-plain.crate_dir is not the empty string"; fails=$((fails+1))
+fi
+cd_reason="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["prds"].get("cd-declared",{}).get("needs_classification_reason",""))' "$tmp/cd-state/manifest.json" 2>/dev/null)"
+case "$cd_reason" in
+  crate-dir-invalid:*"exists but has no Cargo.toml"*) echo "ok: R2 cd-declared parked with a crate-dir-invalid reason that says why" ;;
+  *) echo "FAIL: R2 cd-declared reason = '$cd_reason' (expected crate-dir-invalid naming the missing Cargo.toml)"; fails=$((fails+1)) ;;
+esac
+if [ "$(sha256sum < "$cdq/build-queue/PRD-cd-declared.md")" = "$cd_before" ] \
+   && [ "$(git -C "$cdq" rev-parse HEAD)" = "$cd_head" ] && [ "$(git -C "$tmp/cd-origin.git" rev-parse HEAD)" = "$cd_origin" ]; then
+  echo "ok: R4 cd-declared never rewritten (bytes, HEAD and origin unchanged)"
+else
+  echo "FAIL: R4 cd-declared was rewritten by the scan's lint pass"; fails=$((fails+1))
+fi
+
 if [ "$fails" -ne 0 ]; then echo "SELFTEST FAILED ($fails)"; exit 1; fi
 echo "SELFTEST PASSED"
